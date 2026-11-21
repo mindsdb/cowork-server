@@ -141,6 +141,18 @@ no new connection is accepted or edited through this server. Encrypted records
 stay in auth, where users can still delete them, and OAuth connections are
 unaffected.
 
+`deployment.customApiTurnsEnabled`, rendered as `COWORK_TURN_CUSTOM_API_ENABLED`,
+gives a member's org-mode turns the custom API connections they connected. It
+is `"false"` in `values.yaml`; an environment sets `"true"` in its own values
+file and is listed in `CUSTOM_API_ENVIRONMENTS` in `tests/test_chart_values.py`.
+Turn it on only after auth serves the custom API connection listing and grants,
+mindshub_inference serves the custom API gateway, the turn controller forwards
+the `custom_api` block, a scratchpad image whose anton reads the version 1
+custom API block is deployed, and the producer key bundle
+(`datasource-service-keys`) exists in the namespace. Rollback removes the
+line from the environment's values file and the environment from
+`CUSTOM_API_ENVIRONMENTS` in the same change.
+
 ## Required cluster permissions
 
 In `dev`, `staging` and `prod` this chart renders a NetworkPolicy (`networkPolicy.enabled`
@@ -162,7 +174,7 @@ The policy admits connections on ports 9010 and 9011 from pods in the `infrastru
 
 uvicorn runs with `--forwarded-allow-ips '*'` (the `Dockerfile` CMD), so it takes `X-Forwarded-For` and `X-Forwarded-Proto` from every peer above and rewrites the client address from them. A controller fills `X-Forwarded-For` from what its own caller sent when that caller sits inside the network it trusts, so the client address the app sees is not a credential. `require_local` (`cowork/api/v1/endpoints/guards.py`) decides on the local address of the socket the request landed on, which no header changes. A request through the ingress lands on the pod's own address, so it is refused there.
 
-These six routes hand out or write secrets, and only the desktop app calls them. Each declares `LoopbackDesktopOnly`, so MindsHub mode refuses it whatever the request carries:
+These seven routes hand out or write secrets, and only the desktop app calls them. Each declares `LoopbackDesktopOnly`, so MindsHub mode refuses it whatever the request carries:
 
 | Route | What it does on the desktop |
 |-------|-----------------------------|
@@ -170,6 +182,7 @@ These six routes hand out or write secrets, and only the desktop app calls them.
 | `POST /api/v1/connectors/connections/save` | stores a connector's credentials |
 | `POST /api/v1/connectors/connections/validate-and-save` | checks and stores a Code connector's credentials |
 | `PATCH /api/v1/connectors/connections/{engine}/{name}/token` | stores a refreshed token |
+| `PUT /api/v1/connectors/connections/{engine}/{name}/app-held` | holds an MCP connection's access token and access mode in server memory |
 | `GET /api/v1/connectors/oauth/{engine}/credentials` | returns a built-in OAuth client ID and secret |
 | `POST /api/v1/connectors/oauth/{engine}/mcp/identity` | resolves the account behind an MCP access token |
 

@@ -112,12 +112,26 @@ MODEL_ROLE_DEFAULTS: dict[str, dict[str, str]] = {
 # The agent roles a model is resolved for, in the order the picker's
 # `recommendedPair` lists them. One declaration, because three places used to
 # spell it out: this order, the derived dicts below, and the pair overlay in the
-# recommended-models endpoint. Mirrors the role enum in the MindsHub model
-# policy's JSON Schema; the two are a cross-repo contract and a role in one and
-# not the other is silently dropped at the parse in fetch_minds_models.
+# recommended-models endpoint. With IMAGE_ROLE below, mirrors the role enum in
+# the MindsHub model policy's JSON Schema; the two are a cross-repo contract and
+# a role in one and not the other is silently dropped at the parse in
+# fetch_minds_models.
 # `test_role_default_dicts_match_the_source_table` holds it to the table above.
 AGENT_ROLE_ORDER: tuple[str, ...] = ("planning", "coding", "router")
 AGENT_ROLE_NAMES: frozenset[str] = frozenset(AGENT_ROLE_ORDER)
+
+# The role the agent's `generate_image` tool and the scratchpad's image helper
+# run on. Not one of the chat roles above: it has no slot in `recommendedPair`
+# and no per-provider table, because only MindsHub serves image models, and only
+# a `kind: "image"` catalog row may claim it (fetch_minds_models).
+IMAGE_ROLE = "image"
+# What the image role starts on until the catalog's `default_for: ["image"]`
+# declaration has been cached, and whenever it cannot be reached. Demoted the
+# same way the chat roles' compiled defaults are (_defaults_with_declared).
+IMAGE_MODEL_DEFAULT = "gpt-image-2.6-flare"
+# Every role a catalog row's `default_for` may name, which is what the parse
+# keeps and the `minds_role_defaults` cache holds.
+CATALOG_ROLE_NAMES: frozenset[str] = AGENT_ROLE_NAMES | {IMAGE_ROLE}
 
 # The table above, pivoted: role -> provider -> model. Anything that resolves a
 # role it was handed the name of reads this, so no caller has to line a role up
@@ -624,11 +638,21 @@ class OAuthSettings(Settings):
 
     posthog_client_id: str = Field(default="", validation_alias=AliasChoices("POSTHOG_CLIENT_ID"))
 
+    # Notion MCP is a public client like PostHog: the id is our hosted Client
+    # ID Metadata Document's URL, and there is no secret.
+    notion_client_id: str = Field(default="", validation_alias=AliasChoices("NOTION_CLIENT_ID"))
+
     # HubSpot's MCP Auth App — a fixed client_id/secret pair, same shape as
     # Google/Linear/GitHub/Supabase, but the resulting token can only call
     # HubSpot's remote MCP server, never its REST API.
     hubspot_client_id: str = Field(default="", validation_alias=AliasChoices("HUBSPOT_CLIENT_ID"))
     hubspot_client_secret: str = Field(default="", validation_alias=AliasChoices("HUBSPOT_CLIENT_SECRET"))
+
+    slack_client_id: str = Field(default="", validation_alias=AliasChoices("SLACK_CLIENT_ID"))
+    slack_client_secret: str = Field(default="", validation_alias=AliasChoices("SLACK_CLIENT_SECRET"))
+    # Offers Slack's `mcp` method for new connections. Off hides it and refuses
+    # new sign-ins; existing connections of any method keep working.
+    slack_connector_enabled: bool = Field(default=False, validation_alias=AliasChoices("SLACK_CONNECTOR_ENABLED"))
 
     # Browser-side key for the Google Picker widget (drive.file scope only
     # grants access to files the user explicitly picks via this UI).
@@ -749,6 +773,11 @@ class TurnQueueSettings(Settings):
     @property
     def is_remote(self) -> bool:
         return self.backend == "remote"
+
+    @property
+    def needs_turn_key_id(self) -> bool:
+        """Whether a turn key's public prefix is minted, which auth binds turn grants to."""
+        return self.datasource_enabled or self.custom_api_enabled
 
     redis_url: str = Field(
         default="redis://localhost:6379/0",
@@ -917,6 +946,32 @@ class TurnQueueSettings(Settings):
             "until the controller and pod support the datasource block."
         ),
     )  # COWORK_TURN_DATASOURCE_ENABLED
+    connector_drafts_enabled: bool = Field(
+        default=False,
+        description=(
+            "Let cloud turns build custom connector templates a member saves "
+            "from a card and connects. The code default is false; "
+            "the Helm chart turns it on in every environment (connectorDraftsEnabled)."
+        ),
+    )  # COWORK_TURN_CONNECTOR_DRAFTS_ENABLED
+    custom_api_enabled: bool = Field(
+        default=False,
+        description=(
+            "Give a member's org-mode cloud turns the custom API connections they "
+            "connected. Keep false until auth, the inference gateway and the pod's "
+            "anton that serve those connections are deployed."
+        ),
+    )  # COWORK_TURN_CUSTOM_API_ENABLED
+    custom_connect_refused_domains: list[str] = Field(
+        default=[
+            "mindshub.ai", "mindshub.co", "mindsdb.com", "mindsdb.cloud", "mindscloud.ai",
+            "minds-db.com", "mdb.ai", "4nton.ai", "cluster.local",
+        ],
+        description=(
+            "Domains a custom connector's address may not be, or be under: our own, "
+            "so a member cannot point the check at our services."
+        ),
+    )  # COWORK_TURN_CUSTOM_CONNECT_REFUSED_DOMAINS
     datasource_labels_enabled: bool = Field(
         default=False,
         description=(
@@ -1337,6 +1392,41 @@ class AppSettings(Settings):
                 "path (no query, fragment or credentials)"
             )
         return normalized
+
+    browser_decisions_url: str = Field(
+        default="",
+        validation_alias=AliasChoices("COWORK_BROWSER_DECISIONS_URL"),
+        description=(
+            "The full URL at which a cloud pod reaches this server's decisions proxy "
+            "(POST /api/v1/browse/decisions), for example "
+            "https://cowork.mindshub.ai/api/v1/browse/decisions. A web turn's browser "
+            "asks the organization's own decision model through it with the turn's "
+            "key, so the organization's key never reaches the pod "
+            "(cowork.services.decisions_proxy). https with an optional path; the "
+            "trailing slash is dropped. Blank (default): the route under "
+            "COWORK_PUBLIC_BASE_URL when that is https; without either, web turns "
+            "pick browser steps with Jev on MindsHub."
+        ),
+    )
+
+    @field_validator("browser_decisions_url", mode="before")
+    @classmethod
+    def _check_browser_decisions_url(cls, value: object) -> object:
+        if not isinstance(value, str) or not value.strip():
+            return "" if value is None else value
+        normalized = _router_url(value)
+        if normalized is None:
+            raise ValueError(
+                "COWORK_BROWSER_DECISIONS_URL must be an https URL with an optional "
+                "path (no query, fragment or credentials)"
+            )
+        return normalized
+
+    voice_operator_model: str = Field(
+        default=MINDS_FREE_MODEL,
+        validation_alias=AliasChoices("COWORK_VOICE_OPERATOR_MODEL"),
+        description="The MindsHub model that turns a voice call's requests into app actions (cowork.services.voice_operator).",
+    )
 
     browser_scope_key_file: str = Field(
         default="",

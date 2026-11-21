@@ -15,6 +15,7 @@ import os
 import uuid
 from pathlib import Path
 
+import anyio
 import pytest
 from sqlmodel import Session
 
@@ -22,6 +23,7 @@ from cowork.common.settings.app_settings import get_app_settings
 from cowork.db.session import get_engine
 from cowork.models.conversation import Conversation
 from cowork.models.project import Project
+from tests.support.pinned_responses import served_body
 
 ORG_A = "6ba7b810-9dad-11d1-80b4-00c04fd430c8"
 ORG_B = "0f7f0b6a-3f0f-4c58-9e0c-6dbb3ac0f0a1"
@@ -501,10 +503,16 @@ def _mount_page(*, tmp_path, scope) -> str:
     return _register_preview_mount((base / "page.html").resolve(), base, scope)
 
 
+def _sent(response):
+    """``response`` after sending it, which releases its pinned descriptors."""
+    anyio.run(served_body, response)
+    return response
+
+
 def _preview(*, token: str, scope):
     from cowork.api.v1.endpoints.project_files import _preview_asset as preview_asset
 
-    return preview_asset(token=token, rel_path="page.html", scope=scope)
+    return _sent(preview_asset(token=token, rel_path="page.html", scope=scope))
 
 
 def test_another_person_cannot_use_a_preview_token(tmp_path):
@@ -561,7 +569,7 @@ def _mount_token(target, base, scope):
 def _asset_for(token, rel_path, scope):
     from cowork.api.v1.endpoints.project_files import _preview_asset as preview_asset
 
-    return preview_asset(token=token, rel_path=rel_path, scope=scope)
+    return _sent(preview_asset(token=token, rel_path=rel_path, scope=scope))
 
 
 def test_a_shared_projects_private_workspace_is_not_reachable_through_a_root_token(tmp_path):

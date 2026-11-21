@@ -20,9 +20,11 @@ from cowork.coding.contracts import (
     GitState,
     WorkspaceInspection,
     WorkspaceKind,
+    WorkspaceReasonCode,
 )
 from cowork.coding.git_transport import ALLOWED_GIT_PROTOCOLS
-from cowork.coding.local_copy import LocalCopyError, LocalCopyManager
+from cowork.coding.local_copy import LocalCopyError, LocalCopyManager, force_remove
+from cowork.coding.pending_removals import PendingRemovals
 from cowork.coding.workspace_key import managed_key
 from cowork.common.paths import O_NOFOLLOW, open_fd
 from cowork.common.settings.app_settings import get_app_settings
@@ -37,7 +39,23 @@ class UsageRoots:
 
 
 class WorkspaceError(RuntimeError):
-    pass
+    """A workspace cannot be prepared or used as asked.
+
+    ``reason`` names the cases a client words itself, in the person's
+    language; ``folder`` is the project folder the message is about.
+    """
+
+    def __init__(
+        self, message: str = "", *, reason: WorkspaceReasonCode | None = None, folder: str | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.reason = reason
+        self.folder = folder
+
+    @classmethod
+    def in_folder(cls, folder: str, exc: Exception) -> WorkspaceError:
+        """``exc`` about one of a project's folders, named so the person knows which."""
+        return cls(f"{folder}: {exc}", reason=getattr(exc, "reason", None), folder=folder)
 
 
 class GitUnavailableError(WorkspaceError):
@@ -63,6 +81,15 @@ class GitIdentityMissingError(WorkspaceError):
         self.detail = detail
 
 
+# A worktree is a Git checkout, so isolation needs a repository with a commit.
+# Tasks on other folders work in them directly.
+NOT_A_REPOSITORY = "This folder isn't a Git repository. Initialize Git to use a Worktree"
+NO_COMMITS = "This repository has no commits yet. Make a first commit to use a Worktree"
+# Review compares against a starting commit, so an in-place task without one
+# works in the folder but has nothing to compare to.
+NO_REVIEW_WITHOUT_GIT = "This folder isn't a Git repository, so the task's changes cannot be reviewed. Initialize Git to review them."
+NO_REVIEW_WITHOUT_COMMITS = "This repository has no commits yet, so the task's changes cannot be reviewed. Make a first commit to review them."
+WRITES_HELD = "Until you allow writes, the agent can read the folder but must ask before changing it."
 MAX_DIFF_FILES = 250
 MAX_TEXT_DIFF_BYTES = 2 * 1024 * 1024
 MAX_TOTAL_DIFF_BYTES = 4 * 1024 * 1024
@@ -222,6 +249,8 @@ class WorkspaceManager:
         self.snapshots_root = root / "snapshots"
         self.git = git or GitRunner()
         self.local_copies = LocalCopyManager(root, self.worktrees_root)
+        # Under the coding root so moving a task folder here is a same-disk rename.
+        self.pending_removals = PendingRemovals(root / "pending-removal")
         self._mutation_lock = threading.RLock()
         self._refusals: dict[str, str] = {}
         self.worktrees_root.mkdir(parents=True, exist_ok=True)
@@ -261,32 +290,86 @@ class WorkspaceManager:
             ),
         )
 
-    def check_source(self, raw_path: str, allow_direct_folder: bool) -> None:
-        """Reject a task folder ``prepare`` would refuse, without its slower Git status work."""
+    def check_source(self, raw_path: str) -> None:
+        """Reject a folder a worktree task cannot use, without the slower Git status work."""
         path = self._resolve_existing(raw_path)
         if path is None or not path.is_dir():
             raise WorkspaceError("Choose an existing local folder")
-        if not allow_direct_folder and self._git_root(path) is None:
-            raise WorkspaceError("Local folder isolation was not enabled for this request")
+        root = self._git_root(path)
+        if root is None:
+            raise WorkspaceError(NOT_A_REPOSITORY, reason=WorkspaceReasonCode.not_a_repository)
+        if self._head_revision(root) is None:
+            raise WorkspaceError(NO_COMMITS, reason=WorkspaceReasonCode.no_commits)
+
+    def initialize_git(self, raw_path: str) -> None:
+        """Run ``git init`` in a folder that isn't in a Git repository yet.
+
+        Nothing is committed: the user decides what the first commit holds, and
+        a worktree is offered once there is one. Repositories already inside
+        the folder stay separate repositories.
+        """
+        path = self._resolve_existing(raw_path)
+        if path is None or not path.is_dir():
+            raise WorkspaceError("Choose an existing local folder")
+        if self._git_root(path) is not None:
+            raise WorkspaceError("This folder is already in a Git repository")
+        self.git.run(path, "init")
+
+    def in_place_root(self, raw_path: str) -> Path:
+        """Return the folder an in-place task on ``raw_path`` works in.
+
+        Inside a Git repository that is the repository, so review and the
+        one-task-per-folder check see all of it. Any other folder, including
+        one holding several repositories, is worked in as it is.
+        """
+        path = self._resolve_existing(raw_path)
+        if path is None or not path.is_dir():
+            raise WorkspaceError("Choose an existing local folder")
+        return self._git_root(path) or path
+
+    def prepare_in_place(self, raw_path: str) -> PreparedWorkspace:
+        """Point a task at the user's folder itself; nothing is created."""
+        root = self.in_place_root(raw_path)
+        inspection = self.inspect(str(root))
+        if not inspection.is_git or not inspection.revision:
+            return PreparedWorkspace(
+                source_path=root,
+                workspace_path=root,
+                kind=WorkspaceKind.direct_folder,
+                repository_root=root if inspection.is_git else None,
+                base_revision=None,
+                source_dirty=False,
+                warning=NO_REVIEW_WITHOUT_COMMITS if inspection.is_git else NO_REVIEW_WITHOUT_GIT,
+            )
+        return PreparedWorkspace(
+            source_path=root,
+            workspace_path=root,
+            kind=WorkspaceKind.direct_folder,
+            repository_root=root,
+            base_revision=inspection.revision,
+            source_dirty=inspection.dirty,
+            warning=(
+                "The folder already had uncommitted changes. They appear in this task's review alongside the agent's."
+                if inspection.dirty
+                else None
+            ),
+        )
 
     def prepare(
         self,
         session_id: str,
         raw_path: str,
-        allow_direct_folder: bool,
         base_branch: str | None = None,
         *,
         include_local_changes: bool = False,
     ) -> PreparedWorkspace:
+        """Create an isolated worktree for a task."""
         with self._mutation_lock:
             inspection = self.inspect(raw_path)
             if not inspection.exists or not inspection.is_directory:
                 raise WorkspaceError("Choose an existing local folder")
-            source = Path(inspection.path)
             if not inspection.is_git:
-                if not allow_direct_folder:
-                    raise WorkspaceError("Local folder isolation was not enabled for this request")
-                return self._prepare_local_copy(session_id, source)
+                raise WorkspaceError(NOT_A_REPOSITORY, reason=WorkspaceReasonCode.not_a_repository)
 
             repo = Path(inspection.repository_root or inspection.path)
             revision = inspection.revision
@@ -294,12 +377,9 @@ class WorkspaceManager:
                 revision = self.branch_revision(repo, base_branch)
                 if revision is None:
                     raise WorkspaceError(f"Base branch is unavailable: {base_branch}")
-            # Git cannot create a detached worktree until the repository has a
-            # commit. Preserve the same isolation guarantee with the existing
-            # conflict-checkable folder-copy engine; no source mutation or
-            # synthetic commit is required.
+            # Git cannot create a worktree until the repository has a commit.
             if revision is None:
-                return self._prepare_local_copy(session_id, repo)
+                raise WorkspaceError(NO_COMMITS, reason=WorkspaceReasonCode.no_commits)
 
             worktree = self.worktrees_root / managed_key(session_id)
             if worktree.exists():
@@ -355,7 +435,10 @@ class WorkspaceManager:
         with self._mutation_lock:
             source = Path(source_path)
             current = Path(workspace_path)
-            if kind == WorkspaceKind.direct_folder:
+            # A legacy direct-folder task has no starting commit, so its fork
+            # shares the folder. An in-place task's fork gets a worktree that
+            # carries its changes; two tasks never edit the same checkout.
+            if kind == WorkspaceKind.direct_folder and not base_revision:
                 return PreparedWorkspace(
                     source_path=source,
                     workspace_path=current,
@@ -397,7 +480,7 @@ class WorkspaceManager:
             return PreparedWorkspace(
                 source_path=source,
                 workspace_path=target,
-                kind=kind,
+                kind=WorkspaceKind.git_worktree,
                 repository_root=source,
                 base_revision=base_revision,
                 source_dirty=False,
@@ -747,11 +830,21 @@ class WorkspaceManager:
         workspace_path: str,
         kind: WorkspaceKind,
         base_revision: str | None,
+        *,
+        keep_recovery: bool = True,
     ) -> None:
         with self._mutation_lock:
+            # Without recovery the task is being deleted, so its folders are
+            # moved aside and removed in the background instead of holding the
+            # request for as long as a large tree takes to remove.
             if kind == WorkspaceKind.local_copy:
                 try:
-                    self.local_copies.cleanup(session_id, Path(workspace_path))
+                    self.local_copies.cleanup(
+                        session_id,
+                        Path(workspace_path),
+                        keep_recovery=keep_recovery,
+                        remove=None if keep_recovery else self._discard,
+                    )
                 except LocalCopyError as exc:
                     raise WorkspaceError(str(exc)) from exc
                 return
@@ -766,6 +859,15 @@ class WorkspaceManager:
             if actual not in expected:
                 raise WorkspaceError("Refusing to remove an unmanaged worktree path")
             source = Path(source_path)
+            if not keep_recovery:
+                self._discard(actual)
+                if source.is_dir():
+                    # The moved folder no longer exists where Git registered it,
+                    # so prune drops the registration and frees the task branch.
+                    # A failure only leaves a stale entry Git prunes itself later,
+                    # which must not stop the task from being deleted.
+                    self.git.run(source, "worktree", "prune", check=False)
+                return
             if actual.exists():
                 if base_revision and source.is_dir():
                     self._snapshot_changes(session_id, actual, base_revision, "cleanup.patch", truncate=True)
@@ -788,6 +890,8 @@ class WorkspaceManager:
         """
         return UsageRoots(
             workspace=(
+                # Folders waiting here belong to no task, so they count as removed.
+                self.pending_removals.root,
                 self.worktrees_root,
                 self.legacy_worktrees_root,
                 self.local_copies.legacy_copies_root,
@@ -1026,6 +1130,27 @@ class WorkspaceManager:
     @staticmethod
     def _release_ref(key: str) -> str:
         return "refs/cowork/released/" + managed_key(key).as_posix()
+
+    def discard_recovery(self, session_id: str) -> None:
+        """Remove everything kept to recover a task, once the task is deleted.
+
+        Recovery data outlives a released workspace on purpose, but a deleted
+        task can never be reopened, so its folder would only fill the disk.
+        """
+        relative = managed_key(session_id)
+        if len(relative.parts) != 1:
+            raise WorkspaceError("Invalid task recovery key")
+        with self._mutation_lock:
+            task_dir = self.snapshots_root / relative
+            if task_dir.is_symlink():
+                task_dir.unlink()
+            elif task_dir.is_dir():
+                self._discard(task_dir)
+
+    def _discard(self, path: Path) -> None:
+        """Remove a managed folder in the background, or now if it cannot be moved aside."""
+        if not self.pending_removals.discard(path):
+            force_remove(path)
 
     def prune_task_root(self, session_id: str) -> None:
         """Remove an empty project-task parent without discarding task files."""

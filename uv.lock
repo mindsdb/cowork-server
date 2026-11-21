@@ -1,5 +1,5 @@
 version = 1
-revision = 3
+revision = 5
 requires-python = ">=3.12, <3.14"
 resolution-markers = [
     "python_full_version >= '3.13' and platform_machine == 'x86_64' and sys_platform == 'darwin'",
@@ -141,7 +141,7 @@ wheels = [
 
 [[package]]
 name = "anton-agent"
-version = "2.26.11.15.1"
+version = "2.26.11.20.1rc3"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "anthropic" },
@@ -163,9 +163,9 @@ dependencies = [
     { name = "truststore" },
     { name = "typer" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/a4/7f/beb8b647416dcfab0ff2fcecbbd1c30a7480317668a3ce67529148427f0b/anton_agent-2.26.11.15.1.tar.gz", hash = "sha256:5a415982fcdc5e5520b6b461da3ca158d2f52dff29fe9920c3455e9bbaae556f", size = 7477857, upload-time = "2026-11-15T21:38:53.536Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/e4/cf/d6c67457b3c03999e9d168758d796bfdf61affdeeb59c6888457072ebf0a/anton_agent-2.26.11.20.1rc3.tar.gz", hash = "sha256:98b559d549da224edf6ee0373a45381fec6a89cbd2f3713762a8ddf486e33d15", size = 7672062, upload-time = "2026-11-20T08:27:45.089Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/bc/d3/7f86b0c65d4362bd033858667082cb63a338bbdc5cb4bbf22d3dd44a6364/anton_agent-2.26.11.15.1-py3-none-any.whl", hash = "sha256:e2bc0b8b3527425df527ad679fae38754a11dc5c51c540cf2fa3ed6dd406f03c", size = 4461985, upload-time = "2026-11-15T21:38:51.65Z" },
+    { url = "https://files.pythonhosted.org/packages/a3/21/435fdf6de39c5c4a820c309c7c75a62a540f36af1f175168db2fdd34a19e/anton_agent-2.26.11.20.1rc3-py3-none-any.whl", hash = "sha256:006893bf5de6d4945817efd8ea31d79a28deead54f54a41f69193c12bf1316dd", size = 4539682, upload-time = "2026-11-20T08:27:43.295Z" },
 ]
 
 [[package]]
@@ -459,7 +459,7 @@ requires-dist = [
     { name = "aiohttp", specifier = ">=3.14" },
     { name = "aiohttp", marker = "extra == 'channels'", specifier = ">=3.9.0" },
     { name = "alembic", specifier = ">=1.17.0" },
-    { name = "anton-agent", specifier = ">=2.26.11.15.1,<3" },
+    { name = "anton-agent", specifier = ">=2.26.11.20.1rc3,<3" },
     { name = "anyio", specifier = ">=4.14.2" },
     { name = "beautifulsoup4", specifier = "==4.15.0" },
     { name = "cryptography", specifier = ">=48.0.0,<51" },

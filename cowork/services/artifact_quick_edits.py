@@ -54,6 +54,7 @@ from cowork.services.artifact_journal import (
     write_journal_file,
 )
 from cowork.services.artifact_lock import artifact_lock
+from cowork.services.artifact_metadata import ArtifactMetadata
 
 logger = logging.getLogger(__name__)
 
@@ -292,7 +293,7 @@ def _record(folder: Path, edit_id: str) -> dict:
 
 def undo(
     folder: Path,
-    metadata: dict,
+    metadata: ArtifactMetadata,
     artifact_id: str,
     edit_id: str,
     *,

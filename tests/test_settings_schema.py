@@ -19,6 +19,7 @@ def test_env_aliases_reference_only_real_fields():
     # Model keys are CLI-only and must never be aliased into a bulk .env sync.
     assert "planning_model" not in SETTING_ENV_ALIASES
     assert "coding_model" not in SETTING_ENV_ALIASES
+    assert "image_model" not in SETTING_ENV_ALIASES
 
 
 def test_env_alias_inverse_is_exact():

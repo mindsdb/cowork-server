@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import concurrent.futures
 import contextlib
 import itertools
 import logging
@@ -10,14 +11,14 @@ import time
 from datetime import timedelta
 from pathlib import Path
 from types import SimpleNamespace
-from types import SimpleNamespace
 
 import pytest
 from fastapi import FastAPI, HTTPException
 from fastapi.testclient import TestClient
 
-from coding_service_fakes import (
+from tests.support.coding.service_fakes import (
     CREDS,
+    copy_folders_without_git,
     FakeEngine,
     git,
     repository,
@@ -48,6 +49,7 @@ from cowork.coding.contracts import (
     TaskCapabilities,
     WorkspaceKind,
     utc_now,
+    WorkspaceMode,
 )
 from cowork.api.v1.endpoints import coding
 from cowork.api.v1.endpoints.guards import require_local
@@ -55,7 +57,9 @@ from cowork.coding.context import is_context_exhaustion_error
 from cowork.coding.control_errors import StateConflict
 from cowork.coding.control_models import (
     CodeTask,
+    Computer,
     ComputerCapabilities,
+    ComputerStatus,
     RunStatus,
     RuntimeEvent,
     TaskCapability,
@@ -70,13 +74,17 @@ from cowork.coding.project_models import (
     ProjectCommand,
     ProjectCreateRequest,
     ProjectFolder,
+    ProjectEnvironment,
     ProjectUpdateRequest,
     PublishRequest,
     PullRequestActionRequest,
+    CodeProject,
+    LocalFolderResource,
     RepositoryResource,
 )
 from cowork.coding.project_service import CodeProjectService
 from cowork.coding.remote_execution import RemoteExecutionCoordinator
+from cowork.coding import service as coding_service_module
 from cowork.coding.store import CodingStore
 from cowork.coding.turns import EventBuffer, finish_turn, mark_running, terminal_status
 from cowork.coding.workspace import WorkspaceError
@@ -177,6 +185,120 @@ def stored_local_session(tmp_path: Path, status: SessionStatus) -> CodingSession
     return session
 
 
+def test_concurrent_first_requests_share_one_coding_service(monkeypatch: pytest.MonkeyPatch) -> None:
+    built: list[object] = []
+
+    class SlowService:
+        def __init__(self, _root: Path) -> None:
+            time.sleep(0.05)
+            built.append(self)
+
+    monkeypatch.setattr(coding_service_module, "CodingService", SlowService)
+    monkeypatch.setattr(
+        coding_service_module,
+        "get_app_settings",
+        lambda: SimpleNamespace(coding=SimpleNamespace(root_dir="unused")),
+    )
+    coding_service_module.get_coding_service.cache_clear()
+    try:
+        barrier = threading.Barrier(8)
+
+        def first_request() -> object:
+            barrier.wait()
+            return coding_service_module.get_coding_service()
+
+        with concurrent.futures.ThreadPoolExecutor(8) as pool:
+            services = list(pool.map(lambda _: first_request(), range(8)))
+    finally:
+        coding_service_module.get_coding_service.cache_clear()
+
+    assert len(built) == 1
+    assert all(item is built[0] for item in services)
+
+
+def test_task_bound_to_a_duplicate_local_computer_recovers_on_restart(tmp_path: Path) -> None:
+    session = stored_local_session(tmp_path, SessionStatus.completed)
+    service = service_with(tmp_path, FakeEngine())
+    local_id = service.control.local_computer.id
+    remote, _ = service.control.register_runtime(
+        service.control.issue_registration_token(),
+        "Build computer",
+        service.control.local_computer.capabilities,
+    )
+    # Reproduce what a lost first-start race left behind: a second local
+    # record that never heartbeats, with the task and a project folder on it.
+    duplicate = service.control.store.save_computer(Computer(
+        id="computer-duplicate",
+        name="This computer",
+        is_local=True,
+        status=ComputerStatus.offline,
+        capabilities=service.control.local_computer.capabilities,
+    ))
+    bound = service.get_session(session.id)
+    service.control.store.update_run(bound.run_id, lambda run: setattr(run, "computer_id", duplicate.id))
+    for workspace in service.control.store.list_workspaces(bound.run_id):
+        workspace.computer_id = duplicate.id
+        service.control.store.save_workspace(workspace)
+    service.store.save_session(
+        service.store.load_session(session.id).model_copy(update={"computer_id": duplicate.id}),
+        touch_updated_at=False,
+    )
+    service.project_store.save(CodeProject(
+        id="stranded-project",
+        name="Stranded",
+        resources=[LocalFolderResource(id="notes", name="Notes", path=str(tmp_path), computer_id=duplicate.id)],
+    ))
+    service.close_all()
+
+    restarted = service_with(tmp_path, FakeEngine())
+
+    recovered = restarted.get_session(session.id)
+    assert restarted.control.local_computer.id == local_id
+    assert recovered.computer_id == local_id
+    assert recovered.computer_is_local
+    assert recovered.computer_status == "online"
+    assert restarted.control.continue_task(recovered.task_id, recovered.run_id).computer_id == local_id
+    assert restarted.project_store.get("stranded-project").resources[0].computer_id == local_id
+    listed = {item.id: item for item in restarted.control.list_computers().items}
+    assert [item.id for item in listed.values() if item.is_local] == [local_id]
+    assert remote.id in listed
+
+
+def test_repaired_project_task_can_fork_without_expanding_its_frozen_scope(tmp_path: Path) -> None:
+    repo = repository(tmp_path)
+    service = service_with(tmp_path, FakeEngine())
+    project = service.projects.create(ProjectCreateRequest(
+        name="Scoped", default_engine_id="fake", default_model="fake-model",
+        folders=[ProjectFolder(id="repo", name="Repo", path=str(repo))],
+        environment=ProjectEnvironment(port_names=[]),
+    ))
+    session = service.create_session(
+        SessionCreateRequest(project_id=project.id, prompt="Go", workspace_mode=WorkspaceMode.in_place),
+        CREDS, "fake", "fake-model",
+    )
+    session = wait_for_status(service, session.id, SessionStatus.completed)
+    snapshot = service.control.store.get_task(session.task_id).execution_project.model_dump(mode="json")
+    old_id = service.control.local_computer.id
+    # A newer live project must not replace the task's frozen resources.
+    changed = service.project_store.get(project.id)
+    changed.resources.append(LocalFolderResource(id="later", name="Later", path=str(tmp_path), computer_id=old_id))
+    service.project_store.save(changed)
+    service.close_all()
+    (service.control.root / "control" / "local-computer-id").write_text("computer-survivor\n")
+
+    for _ in range(2):
+        service = service_with(tmp_path, FakeEngine())
+        repaired = service.control.store.get_task(session.task_id).execution_project.model_dump(mode="json")
+        expected = {**snapshot, "resources": [
+            {**resource, "computer_id": "computer-survivor"} for resource in snapshot["resources"]
+        ]}
+        assert repaired == expected
+        child = service.fork_session(session.id, CREDS)
+        assert child.computer_id == "computer-survivor"
+        assert child.resource_ids == ["repo"]
+        service.close_all()
+
+
 def test_finishing_a_turn_with_a_pending_approval_completes_the_run(tmp_path: Path) -> None:
     session = stored_local_session(tmp_path, SessionStatus.ready)
     service = service_with(tmp_path, FakeEngine())
@@ -267,6 +389,7 @@ def test_remote_runtime_claims_a_portable_task_without_receiving_local_paths(tmp
     ))
     created = service.create_session(
         SessionCreateRequest(
+            workspace_mode=WorkspaceMode.worktree,
             project_id=code_project.id,
             computer_id=remote.id,
             prompt="Build remotely",
@@ -351,6 +474,7 @@ def test_compatibility_events_cannot_overwrite_a_remote_runtime_lifecycle(tmp_pa
     ))
     created = service.create_session(
         SessionCreateRequest(
+            workspace_mode=WorkspaceMode.worktree,
             project_id=project.id,
             computer_id=remote.id,
             prompt="Build remotely",
@@ -467,6 +591,7 @@ def test_remote_cancel_is_deduplicated_per_turn_not_per_runtime_epoch(tmp_path: 
     ))
     created = service.create_session(
         SessionCreateRequest(
+            workspace_mode=WorkspaceMode.worktree,
             project_id=project.id,
             computer_id=remote.id,
             prompt="First turn",
@@ -539,6 +664,7 @@ def test_active_remote_task_must_stop_before_deletion(tmp_path: Path) -> None:
     ))
     created = service.create_session(
         SessionCreateRequest(
+            workspace_mode=WorkspaceMode.worktree,
             project_id=project.id,
             computer_id=remote.id,
             prompt="Keep working",
@@ -586,6 +712,52 @@ def test_deleting_task_survives_a_moved_source_repository(tmp_path: Path) -> Non
     assert not workspace.exists()
 
 
+def test_deleting_a_changed_folder_copy_task_leaves_no_recovery_data(tmp_path: Path) -> None:
+    folder = tmp_path / "plain-folder"
+    folder.mkdir()
+    (folder / "notes.txt").write_text("v1\n", encoding="utf-8")
+    service = service_with(tmp_path, FakeEngine())
+    copy_folders_without_git(service.workspaces)
+    created = service.create_session(
+        SessionCreateRequest(path=str(folder), prompt="Edit it", workspace_mode=WorkspaceMode.worktree),
+        CREDS,
+        "fake",
+        "fake-model",
+    )
+    created = wait_for_status(service, created.id, SessionStatus.completed)
+    assert created.workspace_kind == WorkspaceKind.local_copy
+    workspace = Path(created.workspace_path)
+    (workspace / "notes.txt").write_text("v2\n", encoding="utf-8")
+    recovery = service.workspaces.snapshots_root / created.id
+
+    service.delete_session(created.id)
+
+    assert not workspace.exists()
+    assert not recovery.exists()
+    assert (folder / "notes.txt").read_text(encoding="utf-8") == "v1\n"
+
+
+def test_deleting_a_released_task_removes_its_saved_recovery_data(tmp_path: Path) -> None:
+    repo = repository(tmp_path)
+    service = service_with(tmp_path, FakeEngine())
+    created = service.create_session(
+        SessionCreateRequest(path=str(repo), prompt="Edit it", workspace_mode=WorkspaceMode.worktree),
+        CREDS,
+        "fake",
+        "fake-model",
+    )
+    created = wait_for_status(service, created.id, SessionStatus.completed)
+    (Path(created.workspace_path) / "draft.txt").write_text("unsaved\n", encoding="utf-8")
+    service.retention.release(created.id)
+    recovery = service.workspaces.snapshots_root / created.id
+    # Releasing keeps the task's changes so reopening it can restore them.
+    assert recovery.is_dir()
+
+    service.delete_session(created.id)
+
+    assert not recovery.exists()
+
+
 def test_remote_runtime_reuses_one_run_for_follow_ups_and_persisted_queue(tmp_path: Path) -> None:
     repo = repository(tmp_path)
     service = service_with(tmp_path, FakeEngine())
@@ -613,6 +785,7 @@ def test_remote_runtime_reuses_one_run_for_follow_ups_and_persisted_queue(tmp_pa
     ))
     created = service.create_session(
         SessionCreateRequest(
+            workspace_mode=WorkspaceMode.worktree,
             project_id=project.id,
             computer_id=remote.id,
             prompt="Build remotely",
@@ -711,6 +884,7 @@ def test_remote_run_state_is_projected_and_can_be_restored(tmp_path: Path) -> No
     ))
     created = service.create_session(
         SessionCreateRequest(
+            workspace_mode=WorkspaceMode.worktree,
             project_id=project.id,
             computer_id=remote.id,
             prompt="Build remotely",
@@ -764,7 +938,7 @@ def remote_task(tmp_path: Path, service, prompt: str = "Build remotely"):
         )],
     ))
     created = service.create_session(
-        SessionCreateRequest(project_id=project.id, computer_id=remote.id, prompt=prompt, engine_id="fake"),
+        SessionCreateRequest(workspace_mode=WorkspaceMode.worktree, project_id=project.id, computer_id=remote.id, prompt=prompt, engine_id="fake"),
         CREDS,
         "fake",
         "fake-model",
@@ -1254,31 +1428,35 @@ def test_local_context_exhaustion_recovers_ready_with_a_fresh_agent_session(tmp_
     )
 
 
-def test_non_git_session_reports_its_isolated_local_copy(tmp_path: Path) -> None:
+def test_a_folder_without_git_is_worked_in_place_and_never_copied(tmp_path: Path) -> None:
     folder = tmp_path / "plain-folder"
     folder.mkdir()
     service = service_with(tmp_path, FakeEngine())
 
+    # Older clients still send the copy flag; it no longer makes a copy.
     created = service.create_session(
-        SessionCreateRequest(
-            path=str(folder),
-            prompt="Use the folder",
-            allow_direct_folder=True,
-        ),
+        SessionCreateRequest(path=str(folder), prompt="Use the folder", allow_folder_copy=True),
         CREDS,
         "fake",
         "fake-model",
     )
     created = wait_for_status(service, created.id, SessionStatus.completed)
 
+    assert created.workspace_mode == WorkspaceMode.in_place
+    assert created.workspace_kind == WorkspaceKind.direct_folder
+    assert created.workspace_path == str(folder.resolve())
     ready = next(event for event in service.events(created.id).items if event.title == "Task workspace ready")
-    assert ready.text == "Created an isolated task workspace."
-    assert ready.data["workspaceKind"] == "local_copy"
-    assert created.workspace_path != str(folder.resolve())
-    assert created.source_path == str(folder.resolve())
+    assert "Initialize Git to review them" in (ready.text or "")
+    with pytest.raises(WorkspaceError, match="Initialize Git to use a Worktree"):
+        service.create_session(
+            SessionCreateRequest(path=str(folder), prompt="Isolate it", workspace_mode=WorkspaceMode.worktree),
+            CREDS,
+            "fake",
+            "fake-model",
+        )
 
 
-def test_repository_without_commits_can_start_a_coding_session(tmp_path: Path) -> None:
+def test_repository_without_commits_can_start_a_coding_session_in_place(tmp_path: Path) -> None:
     repo = tmp_path / "unborn-repo"
     repo.mkdir()
     git(repo, "init")
@@ -1293,9 +1471,9 @@ def test_repository_without_commits_can_start_a_coding_session(tmp_path: Path) -
     )
     created = wait_for_status(service, created.id, SessionStatus.completed)
 
-    assert created.workspace_kind == WorkspaceKind.local_copy
-    assert created.workspace_path != str(repo.resolve())
-    assert Path(created.workspace_path, "README.md").read_text(encoding="utf-8") == "uncommitted source\n"
+    assert created.workspace_kind == WorkspaceKind.direct_folder
+    assert created.workspace_path == str(repo.resolve())
+    assert created.base_revision is None
 
 
 def test_git_mutation_cannot_race_a_new_turn(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -2278,16 +2456,16 @@ def test_tasks_inheriting_a_legacy_default_model_run_with_the_catalog_id(tmp_pat
     ))
 
     from_project = service.create_session(
-        SessionCreateRequest(project_id=project.id, prompt="Use the project default"),
+        SessionCreateRequest(workspace_mode=WorkspaceMode.worktree, project_id=project.id, prompt="Use the project default"),
         CREDS,
         "fake",
         "gpt-5.6-sol",
     )
     from_settings = service.create_session(
-        SessionCreateRequest(path=str(repo), prompt="Use the settings default"), CREDS, "fake", "gpt-5.6-sol"
+        SessionCreateRequest(path=str(repo), prompt="Use the settings default", workspace_mode=WorkspaceMode.worktree), CREDS, "fake", "gpt-5.6-sol"
     )
     explicit = service.create_session(
-        SessionCreateRequest(path=str(repo), prompt="Use an unknown id", model="fable"), CREDS, "fake", "gpt"
+        SessionCreateRequest(path=str(repo), prompt="Use an unknown id", model="fable", workspace_mode=WorkspaceMode.worktree), CREDS, "fake", "gpt"
     )
 
     assert (from_project.model, from_settings.model, explicit.model) == ("gpt", "gpt", "fable")
@@ -2305,10 +2483,10 @@ def test_a_project_default_reasoning_effort_applies_unless_the_task_chooses_its_
     ))
 
     inherited = service.create_session(
-        SessionCreateRequest(project_id=project.id, prompt="Use the project default"), CREDS, "fake", "fake-model"
+        SessionCreateRequest(workspace_mode=WorkspaceMode.worktree, project_id=project.id, prompt="Use the project default"), CREDS, "fake", "fake-model"
     )
     chosen = service.create_session(
-        SessionCreateRequest(project_id=project.id, prompt="Pick my own", reasoning_effort="xhigh"), CREDS, "fake", "fake-model"
+        SessionCreateRequest(workspace_mode=WorkspaceMode.worktree, project_id=project.id, prompt="Pick my own", reasoning_effort="xhigh"), CREDS, "fake", "fake-model"
     )
 
     assert inherited.reasoning_effort == "low"
@@ -2337,16 +2515,16 @@ def test_effort_levels_follow_what_the_gateway_advertises_for_the_task_model(tmp
 
     with pytest.raises(ValueError, match='Reasoning effort "xhigh" isn\'t available for fake-model. It offers: low, high, max.'):
         service.create_session(
-            SessionCreateRequest(project_id=project.id, prompt="Ask for a level it lacks", reasoning_effort="xhigh"),
+            SessionCreateRequest(workspace_mode=WorkspaceMode.worktree, project_id=project.id, prompt="Ask for a level it lacks", reasoning_effort="xhigh"),
             CREDS, "fake", "fake-model", model_levels=levels,
         )
     assert service.list_sessions(False).items == []
 
     inherited = service.create_session(
-        SessionCreateRequest(project_id=project.id, prompt="Inherit max"), CREDS, "fake", "fake-model", model_levels=levels
+        SessionCreateRequest(workspace_mode=WorkspaceMode.worktree, project_id=project.id, prompt="Inherit max"), CREDS, "fake", "fake-model", model_levels=levels
     )
     other_model = service.create_session(
-        SessionCreateRequest(project_id=project.id, prompt="A model without max", model="fake-small"),
+        SessionCreateRequest(workspace_mode=WorkspaceMode.worktree, project_id=project.id, prompt="A model without max", model="fake-small"),
         CREDS, "fake", "fake-model", model_levels=levels,
     )
 
@@ -2369,7 +2547,7 @@ def test_failed_fork_preparation_does_not_leave_control_records(
         default_model="fake-model",
     ))
     parent = service.create_session(
-        SessionCreateRequest(project_id=project.id, prompt="Prepare parent"),
+        SessionCreateRequest(workspace_mode=WorkspaceMode.worktree, project_id=project.id, prompt="Prepare parent"),
         CREDS,
         "fake",
         "fake-model",
@@ -2396,6 +2574,7 @@ def test_project_fork_keeps_every_folder_change_isolated_and_reviewable(tmp_path
     (notes / "plan.txt").write_text("base\n", encoding="utf-8")
     engine = FakeEngine()
     service = service_with(tmp_path, engine)
+    copy_folders_without_git(service.workspaces)
     project = service.projects.create(
         ProjectCreateRequest(
             name="Product",
@@ -2408,7 +2587,7 @@ def test_project_fork_keeps_every_folder_change_isolated_and_reviewable(tmp_path
         )
     )
     parent = service.create_session(
-        SessionCreateRequest(project_id=project.id, prompt="Build across both folders"),
+        SessionCreateRequest(workspace_mode=WorkspaceMode.worktree, project_id=project.id, prompt="Build across both folders"),
         CREDS,
         "fake",
         "fake-model",
@@ -2451,7 +2630,7 @@ def test_existing_task_can_adopt_commands_added_to_the_project_later(tmp_path: P
         )
     )
     early = service.create_session(
-        SessionCreateRequest(project_id=project.id, prompt="Started before any checks existed"),
+        SessionCreateRequest(workspace_mode=WorkspaceMode.worktree, project_id=project.id, prompt="Started before any checks existed"),
         CREDS,
         "fake",
         "fake-model",
@@ -2490,7 +2669,7 @@ def test_existing_task_can_adopt_commands_added_to_the_project_later(tmp_path: P
 
     # New tasks keep receiving the saved commands without any extra step.
     late = service.create_session(
-        SessionCreateRequest(project_id=project.id, prompt="Started after"),
+        SessionCreateRequest(workspace_mode=WorkspaceMode.worktree, project_id=project.id, prompt="Started after"),
         CREDS,
         "fake",
         "fake-model",
@@ -2604,6 +2783,7 @@ def test_scoped_task_validation_and_fork_use_immutable_project_snapshot(tmp_path
     )
     parent = service.create_session(
         SessionCreateRequest(
+            workspace_mode=WorkspaceMode.worktree,
             project_id=project.id,
             resource_ids=["app"],
             prompt="Work only on the app",
@@ -2649,6 +2829,7 @@ def test_project_runtime_opens_in_primary_workspace_and_keeps_other_folders_avai
     (notes / "plan.txt").write_text("base\n", encoding="utf-8")
     engine = FakeEngine()
     service = service_with(tmp_path, engine)
+    copy_folders_without_git(service.workspaces)
     project = service.projects.create(
         ProjectCreateRequest(
             name="Product",
@@ -2662,7 +2843,7 @@ def test_project_runtime_opens_in_primary_workspace_and_keeps_other_folders_avai
     )
 
     task = service.create_session(
-        SessionCreateRequest(project_id=project.id, prompt="Build across both folders"),
+        SessionCreateRequest(workspace_mode=WorkspaceMode.worktree, project_id=project.id, prompt="Build across both folders"),
         CREDS,
         "fake",
         "fake-model",
@@ -2691,7 +2872,7 @@ def test_project_delivery_is_planned_then_explicitly_publishes_a_draft_pr(tmp_pa
         )
     )
     task = service.create_session(
-        SessionCreateRequest(project_id=project.id, prompt="Prepare delivery"),
+        SessionCreateRequest(workspace_mode=WorkspaceMode.worktree, project_id=project.id, prompt="Prepare delivery"),
         CREDS,
         "fake",
         "fake-model",
@@ -2745,7 +2926,7 @@ def test_pull_request_actions_are_limited_to_deliveries_linked_to_the_task(tmp_p
         default_model="fake-model",
     ))
     task = service.create_session(
-        SessionCreateRequest(project_id=project.id, prompt="Prepare delivery"),
+        SessionCreateRequest(workspace_mode=WorkspaceMode.worktree, project_id=project.id, prompt="Prepare delivery"),
         CREDS,
         "fake",
         "fake-model",
@@ -2794,6 +2975,7 @@ def test_external_updates_are_limited_to_work_items_linked_to_the_task(tmp_path:
     ))
     task = service.create_session(
         SessionCreateRequest(
+            workspace_mode=WorkspaceMode.worktree,
             project_id=project.id,
             prompt="Implement the issue",
             source_contexts=[SourceContext(
@@ -2872,7 +3054,7 @@ def test_project_delivery_can_publish_a_selected_repository_with_its_own_copy(tm
         default_model="fake-model",
     ))
     task = service.create_session(
-        SessionCreateRequest(project_id=project.id, prompt="Prepare both repositories"),
+        SessionCreateRequest(workspace_mode=WorkspaceMode.worktree, project_id=project.id, prompt="Prepare both repositories"),
         CREDS,
         "fake",
         "fake-model",
@@ -2967,7 +3149,7 @@ def test_failed_project_setup_is_visible_to_the_agent_without_stranding_the_task
     )
 
     task = service.create_session(
-        SessionCreateRequest(project_id=project.id, prompt="Recover and finish the feature"),
+        SessionCreateRequest(workspace_mode=WorkspaceMode.worktree, project_id=project.id, prompt="Recover and finish the feature"),
         CREDS,
         "fake",
         "fake-model",
@@ -2987,6 +3169,7 @@ def test_project_task_resumes_same_workspaces_and_ports_after_service_restart(tm
     notes.mkdir()
     engine = FakeEngine()
     first = service_with(tmp_path, engine)
+    copy_folders_without_git(first.workspaces)
     project = first.projects.create(
         ProjectCreateRequest(
             name="Restart",
@@ -2999,7 +3182,7 @@ def test_project_task_resumes_same_workspaces_and_ports_after_service_restart(tm
         )
     )
     task = first.create_session(
-        SessionCreateRequest(project_id=project.id, prompt="First turn"),
+        SessionCreateRequest(workspace_mode=WorkspaceMode.worktree, project_id=project.id, prompt="First turn"),
         CREDS,
         "fake",
         "fake-model",
@@ -3012,11 +3195,12 @@ def test_project_task_resumes_same_workspaces_and_ports_after_service_restart(tm
 
     restarted_engine = FakeEngine()
     restarted = service_with(tmp_path, restarted_engine)
+    copy_folders_without_git(restarted.workspaces)
     loaded = restarted.get_session(task.id)
     restarted.submit_turn(task.id, "Continue", CREDS)
     wait_for_status(restarted, task.id, SessionStatus.completed)
     next_task = restarted.create_session(
-        SessionCreateRequest(project_id=project.id, prompt="Parallel task"),
+        SessionCreateRequest(workspace_mode=WorkspaceMode.worktree, project_id=project.id, prompt="Parallel task"),
         CREDS,
         "fake",
         "fake-model",
@@ -3063,3 +3247,55 @@ def test_a_read_only_command_does_not_continue_a_completed_task(tmp_path: Path) 
     assert len(status_events) == 1
     assert status_events[0].text.startswith("Status: completed")
     assert status_events[0].data["command"] == "status"
+
+
+def test_a_task_on_a_folder_without_git_starts_read_only_until_writes_are_allowed(tmp_path: Path) -> None:
+    folder = tmp_path / "plain-folder"
+    folder.mkdir()
+    engine = FakeEngine()
+    service = service_with(tmp_path, engine)
+    created = service.create_session(
+        SessionCreateRequest(path=str(folder), prompt="Edit a file"), CREDS, "fake", "fake-model"
+    )
+    created = wait_for_status(service, created.id, SessionStatus.completed)
+
+    assert created.writes_allowed is False
+    assert engine.configs[-1].writes_allowed is False
+    ready = next(event for event in service.events(created.id).items if event.title == "Task workspace ready")
+    assert "Until you allow writes" in (ready.text or "")
+
+    allowed = service.update_session_config(created.id, SessionUpdateRequest(writes_allowed=True))
+    assert allowed.writes_allowed is True
+    assert engine.closed == 1
+    engine.is_closed = False
+    service.submit_turn(created.id, "Edit it now", CREDS)
+    wait_for_status(service, created.id, SessionStatus.completed)
+    assert engine.configs[-1].writes_allowed is True
+
+
+def test_a_repository_without_commits_starts_read_only(tmp_path: Path) -> None:
+    repo = tmp_path / "unborn"
+    repo.mkdir()
+    git(repo, "init")
+    service = service_with(tmp_path, FakeEngine())
+    created = service.create_session(
+        SessionCreateRequest(path=str(repo), prompt="Edit a file"), CREDS, "fake", "fake-model"
+    )
+
+    assert wait_for_status(service, created.id, SessionStatus.completed).writes_allowed is False
+
+
+@pytest.mark.parametrize("mode", [WorkspaceMode.in_place, WorkspaceMode.worktree])
+def test_a_task_on_a_git_repository_keeps_write_access(tmp_path: Path, mode: WorkspaceMode) -> None:
+    repo = repository(tmp_path)
+    engine = FakeEngine()
+    service = service_with(tmp_path, engine)
+    created = service.create_session(
+        SessionCreateRequest(path=str(repo), prompt="Edit a file", workspace_mode=mode), CREDS, "fake", "fake-model"
+    )
+    created = wait_for_status(service, created.id, SessionStatus.completed)
+
+    assert created.writes_allowed is True
+    assert engine.configs[-1].writes_allowed is True
+    ready = next(event for event in service.events(created.id).items if event.title == "Task workspace ready")
+    assert "Until you allow writes" not in (ready.text or "")

@@ -1,7 +1,8 @@
 """Wire shapes of an artifact's sharing: the access a publish takes, one save
 of the Share dialog included (ArtifactAccessRequest), the access state the
 owner reads back (ArtifactAccessView) or a publish answers
-(ArtifactPublishResult), what Stop sharing answers (UnpublishResult), and the
+(ArtifactPublishResult), who anyone who may preview it sees it shared with
+(ArtifactSharedAudienceView), what Stop sharing answers (UnpublishResult), and the
 part of an artifact's card the desktop's GET /api/v1/artifacts/status answers
 (ArtifactStatusView).
 
@@ -24,6 +25,7 @@ from cowork.schemas.base import CamelRequest, CamelResponse
 from cowork.services.sharing_contract import AudienceField
 
 if TYPE_CHECKING:
+    from cowork.schemas.artifact_card import ArtifactCard
     from cowork.services.artifact_access import ArtifactRule
 
 # anton's publisher's name for the people outside the organization, by
@@ -223,6 +225,43 @@ class ArtifactAccessView(CamelResponse):
         )
 
 
+class ArtifactSharedAudienceView(CamelResponse):
+    """Who an artifact is shared with, as anyone who may preview it reads it
+    (GET .../audience): the read-only "Shared with" panel a non-owner opens.
+
+    Built from the access state the owner's GET .../access answers, less what
+    is the owner's alone: never the password (there is no field for it), nor
+    the live page's ids. ``names`` says whether the audience is listed: a
+    member of the artifact's organization sees the teams, people and
+    addresses; anyone else sees only how it is shared (the mode and the two
+    flags), with every list empty."""
+
+    access_mode: AccessMode = AccessMode.PUBLIC
+    owner_only: bool = False
+    org_allowed: bool = False
+    allowed_team_ids: list[str] = Field(default_factory=list)
+    allowed_user_ids: list[str] = Field(default_factory=list)
+    access_emails: list[str] = Field(default_factory=list)
+    names: bool = True
+
+    @classmethod
+    def of_access(cls, state: ArtifactAccessView, *, names: bool) -> ArtifactSharedAudienceView:
+        """``state``'s audience, its lists only when ``names``. A field the
+        state doesn't know (None) reads as none."""
+        listed = {
+            "allowed_team_ids": list(state.allowed_team_ids or []),
+            "allowed_user_ids": list(state.allowed_user_ids or []),
+            "access_emails": list(state.access_emails or []),
+        } if names else {}
+        return cls(
+            access_mode=state.access_mode,
+            owner_only=bool(state.owner_only),
+            org_allowed=bool(state.org_allowed),
+            names=names,
+            **listed,
+        )
+
+
 class ArtifactStatusView(CamelResponse):
     """The published, modified, and access part of an artifact's card that
     the desktop's GET /api/v1/artifacts/status answers, the read the preview
@@ -254,20 +293,32 @@ class ArtifactStatusView(CamelResponse):
     link_owner_recorded: bool | None = None
 
     @classmethod
-    def of_card(cls, card: Mapping[str, Any]) -> ArtifactStatusView:
-        """The status part of ``card``, an artifact card under the app's
-        names (cowork.services.artifacts.card_for_folder). A field the card
-        doesn't carry takes its default."""
+    def of_card(cls, card: ArtifactCard) -> ArtifactStatusView:
+        """The status part of ``card`` (cowork.services.artifacts.card_for_folder).
+        A field the card doesn't carry reads as the card model's default."""
+        return cls.of_access(card, published_url=card.published_url, modified=card.modified)
+
+    @classmethod
+    def of_access(
+        cls,
+        access: ArtifactAccessView | ArtifactCard,
+        *,
+        published_url: str,
+        modified: bool = False,
+    ) -> ArtifactStatusView:
+        """The status of a file with ``access`` state: a file with no
+        metadata.json, which has no card, is never modified. A card carries
+        the access view's fields under the same names."""
         return cls(
-            published_url=card.get("publishedUrl") or "",
-            modified=bool(card.get("modified")),
-            access_mode=card.get("accessMode") or AccessMode.PUBLIC,
-            access_protected=bool(card.get("accessProtected")),
-            access_emails=card.get("accessEmails", []),
-            org_allowed=card.get("orgAllowed", False),
-            owner_only=card.get("ownerOnly", False),
-            artifact_key=card.get("artifactKey") or "",
-            report_id=card.get("reportId") or "",
+            published_url=published_url,
+            modified=modified,
+            access_mode=access.access_mode,
+            access_protected=access.access_protected,
+            access_emails=access.access_emails,
+            org_allowed=access.org_allowed,
+            owner_only=access.owner_only,
+            artifact_key=access.artifact_key,
+            report_id=access.report_id,
         )
 
 

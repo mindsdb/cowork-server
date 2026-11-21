@@ -24,6 +24,7 @@ import pytest
 import cowork.handlers.responses as responses_mod
 from cowork.common.logger import _REQUEST_CONTEXT_FIELDS, CustomFormatter, log_context, setup_console_handler
 from cowork.handlers.responses import ResponsesHandler
+from cowork.db.scoped import LOCAL_SCOPE
 
 from _fakes import inline_run_db
 
@@ -432,6 +433,7 @@ async def test_non_streaming_direct_failure_answers_with_a_quotable_500(monkeypa
 
     handler = object.__new__(ResponsesHandler)
     handler.scoped = object()
+    handler.scope = LOCAL_SCOPE
 
     def _boom(conv_id, text, events, harness=None):
         raise RuntimeError("direct answer could not be persisted")

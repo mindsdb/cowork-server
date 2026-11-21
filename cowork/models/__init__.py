@@ -8,6 +8,7 @@ from cowork.models.channel import (  # noqa: F401
     ChannelSession,
 )
 from cowork.models.code_control import CodeControlRecord  # noqa: F401
+from cowork.models.conversation_folder import ConversationFolder  # noqa: F401
 from cowork.models.held_artifact_root import HeldArtifactRoot  # noqa: F401
 from cowork.models.custom_connector import CustomConnector  # noqa: F401
 from cowork.models.published_page import PublishedPageOwner  # noqa: F401
@@ -29,3 +30,5 @@ from cowork.models.shared_resource import (  # noqa: F401
 from cowork.models.task_object import TaskObject  # noqa: F401
 
 from cowork.models.live_app_preview import LiveAppPreview  # noqa: F401
+
+from cowork.models.content_report import ContentReport  # noqa: F401

@@ -7,10 +7,14 @@ import pytest
 from fastapi import HTTPException
 
 from cowork.api.v1.endpoints import coding
+from cowork.coding.contracts import WorkspaceReasonCode
 from cowork.coding.control_errors import ModelDiscoveryAuthenticationError, ModelDiscoveryUnavailableError, StateConflict
 from cowork.coding.run_recovery import NoEligibleComputer
 from cowork.coding.run_state import InvalidRunTransition
 from cowork.coding.workspace import GitIdentityMissingError, WorkspaceError
+from cowork.coding.workspace_mode import WorkspaceModeUnavailable
+from cowork.coding.pending_removals import PendingRemovals
+from cowork.coding import pending_removals
 
 
 @pytest.mark.parametrize(
@@ -28,6 +32,24 @@ from cowork.coding.workspace import GitIdentityMissingError, WorkspaceError
 )
 def test_http_error_separates_invalid_input_from_state_conflicts(exc: Exception, status_code: int) -> None:
     assert coding._http_error(exc).status_code == status_code
+
+
+def test_cleanup_status_and_retry_after_a_background_failure(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+    pending = PendingRemovals(tmp_path / "pending")
+    folder = tmp_path / "folder"
+    folder.mkdir()
+    remove = pending_removals.force_remove
+    monkeypatch.setattr(pending_removals, "force_remove", lambda _: None)
+    monkeypatch.setattr(coding, "_service", lambda: SimpleNamespace(
+        workspaces=SimpleNamespace(pending_removals=pending),
+    ))
+    pending.discard(folder)
+    assert pending.wait(30)
+    assert coding.workspace_cleanup().model_dump() == {"failed": 1, "running": False}
+    monkeypatch.setattr(pending_removals, "force_remove", remove)
+    coding.retry_workspace_cleanup()
+    assert pending.wait(30)
+    assert coding.workspace_cleanup().model_dump() == {"failed": 0, "running": False}
 
 
 def test_workspace_inspection_translates_typed_failures(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -187,3 +209,16 @@ def test_switching_models_clears_a_stored_effort_the_new_model_lacks(monkeypatch
         ("unlisted", None, False),
         ("gemini", None, False),
     ]
+
+
+def test_a_refused_workspace_mode_names_its_reason_and_folder() -> None:
+    error = coding._http_error(WorkspaceError(
+        "Café: This folder isn't a Git repository", reason=WorkspaceReasonCode.not_a_repository, folder="Café",
+    ))
+
+    assert error.status_code == 409
+    assert error.headers == {"X-MindsHub-Error-Code": "not_a_repository", "X-MindsHub-Error-Folder": "Caf%C3%A9"}
+    unsupported = coding._http_error(WorkspaceModeUnavailable("No", WorkspaceReasonCode.in_place_other_computer))
+    assert unsupported.status_code == 400
+    assert unsupported.headers == {"X-MindsHub-Error-Code": "in_place_other_computer"}
+    assert coding._http_error(WorkspaceError("Choose an existing local folder")).headers is None

@@ -25,7 +25,8 @@ def artifact_capabilities(
     by every member of the project (ENG-2056), so the owner is the artifact's
     recorded attribution (legacy per-conversation roots: the conversation's
     creator). Project visibility grants review, never source mutation. An
-    artifact nobody is recorded as owning says so with ``ownerUnknown``.
+    artifact nobody is recorded as owning says so with ``ownerUnknown``; one
+    whose owner is known carries it as ``ownerUserId``.
 
     With ``export_source``, ``exportFormats`` lists the formats the export
     route accepts from this caller, from ``offered_export_formats`` alone:
@@ -59,6 +60,11 @@ def artifact_capabilities(
         }
         if resolution.unknown:
             capabilities["ownerUnknown"] = True
+        elif owner_id:
+            # Lets a member's client name the owner ("Shared by ...") instead
+            # of a generic label. Every caller here is a member of the scope's
+            # org, so the owner's id is theirs to see.
+            capabilities["ownerUserId"] = str(owner_id)
     if export_source is not None:
         capabilities = with_export_formats(scope, capabilities, export_source)
     return capabilities
