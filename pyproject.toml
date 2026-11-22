@@ -244,7 +244,7 @@ packages = ["cowork"]
 # every other one, a newer candidate of the same project included. The anton
 # relock (`scripts/anton_final_lock_pr.py`) removes anton-agent's entry when it
 # locks anton's final.
-anton-agent = "2.26.11.20.1rc3"
+anton-agent = "2.26.11.22.1rc1"
 
 [dependency-groups]
 dev = [
