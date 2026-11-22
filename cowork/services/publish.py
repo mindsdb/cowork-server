@@ -1495,6 +1495,12 @@ def publish_artifact(
     )
     from cowork.services.published_page_ownership import PageClaim, publication_owner
 
+    # The revision of the files about to be bundled, read before the bundle
+    # is built so it names what goes live (ENG-4595). Never raises.
+    from cowork.services.artifact_revisions import published_head_revision_id
+
+    published_revision_id = published_head_revision_id(published_dir)
+
     with publication_owner(
         publish_target, published_dir=published_dir, publish_url=publish_url, scope=scope,
     ) as ownership:
@@ -1745,6 +1751,10 @@ def publish_artifact(
                 # cheap gate for the `modified` badge (see card_for_folder). Uses
                 # the SAME basis as the card's `mtime` so the comparison is exact.
                 "published_mtime": _content_mtime(published_dir),
+                # The revision this publish put live, so the viewer can show
+                # what a later draft changed against it (ENG-4595). None for a
+                # folder with no editable source.
+                "published_revision_id": published_revision_id,
                 "published": True,
                 **owner_side,
             }
