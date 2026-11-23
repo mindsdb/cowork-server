@@ -31,6 +31,7 @@ from cowork.db.scoped import TenantScope, get_tenant_scope
 from cowork.schemas.artifact_access import ArtifactAccessRequest
 from cowork.principal import ORG_MANAGE_ROLE, Principal
 from cowork.services import artifact_locks
+from cowork.services.artifact_metadata import ArtifactMetadata
 from cowork.services.publish import ARTIFACT_ORG_REFUSAL
 from _async_stub import awaitable
 from tests._org_sharing import (
@@ -81,7 +82,7 @@ def as_owner(monkeypatch, folder):
     monkeypatch.setattr(
         aw, "_owner_workspace",
         awaitable(lambda scope, project_ref, artifact_id: (
-            SimpleNamespace(project_id="proj-1"), folder, {"slug": "rep"}, {},
+            SimpleNamespace(project_id="proj-1"), folder, ArtifactMetadata.model_validate({"slug": "rep"}), {},
         )),
     )
     return folder
@@ -93,10 +94,15 @@ def publish_calls(monkeypatch):
 
     def fake_publish(artifact, *, artifacts_base, api_key, publish_url,
                      password=None, access=None, scope=None, project_id=None,
-                     notify=None, stored=None, owner_save=False, notices=None):
+                     notify=None, stored=None, owner_save=False, notices=None, job_budget_s=None,
+                     on_job_accepted=None):
         # publish_artifact takes the model; what it hands anton is its
         # publisher_access.
         assert isinstance(access, ArtifactAccessRequest)
+        # The thread outlives the route's wait, so its job poll must end
+        # before the live-publish lock does.
+        assert job_budget_s is not None and job_budget_s > 0
+        assert on_job_accepted is not None
         calls.append({
             "folder": artifact, "artifacts_base": artifacts_base, "api_key": api_key,
             "publish_url": publish_url, "access": access.publisher_access(), "scope": scope,
@@ -1182,3 +1188,173 @@ async def test_a_failing_push_never_fails_the_save(as_owner, publish_calls, publ
     }
     out = await aw.set_artifact_access("proj", ARTIFACT_ID, aw._AccessBody(access=access), ORG_SCOPE, _REQUEST, principal=None)
     assert out["url"] == "https://view.example/r/1"
+
+
+# GET .../audience: who the artifact is shared with, for anyone who may
+# preview it (ENG-4455). A reviewer is a member of the owner's org who is
+# not the owner.
+REVIEWER_SCOPE = TenantScope(
+    org_mode=True, org_id=ORG_SCOPE.org_id, user_id="0c0c0c0c-0000-4000-8000-000000000001"
+)
+REVIEWER = Principal(user_id=REVIEWER_SCOPE.user_id, org_id=REVIEWER_SCOPE.org_id)
+OWNER_RULE_SCOPE = TenantScope(org_mode=True, org_id=ORG_SCOPE.org_id, user_id=ORG_SCOPE.user_id)
+
+
+@pytest.fixture
+def as_reviewable(monkeypatch, folder):
+    """The folder resolves for any caller who may preview it, and its owner
+    is ORG_SCOPE's user. ``owner`` changes who is recorded."""
+    from cowork.services.artifact_ownership import OwnerResolution
+
+    state = SimpleNamespace(owner=OwnerResolution(ORG_SCOPE.user_id, "recorded"), resolved=[])
+
+    async def review(scope, project_ref, artifact_id):
+        state.resolved.append(scope)
+        return (
+            SimpleNamespace(project_id="proj-1"), folder,
+            ArtifactMetadata.model_validate({"slug": "rep"}), scope.user_id == ORG_SCOPE.user_id,
+        )
+
+    monkeypatch.setattr(aw, "review_artifact_for_request", review)
+    monkeypatch.setattr(
+        "cowork.services.artifact_ownership.resolve_artifact_owner",
+        lambda _session, _source, _slug: state.owner,
+    )
+    return state
+
+
+async def _audience(scope, principal) -> dict:
+    return (await aw.artifact_audience("proj", ARTIFACT_ID, scope, principal)).model_dump(by_alias=True, mode="json")
+
+
+async def test_a_reviewer_reads_who_the_artifact_is_shared_with_as_the_owner_sees_it(
+    as_reviewable, folder, stored_rule,
+):
+    _planted(folder)
+    stored_rule.rule = artifact_rule(org=True, teams=[TEAM_ENG], people=[BOB], emails=["a@example.com"])
+
+    out = await _audience(REVIEWER_SCOPE, REVIEWER)
+
+    assert out == {
+        "accessMode": "restricted", "ownerOnly": False, "orgAllowed": True,
+        "allowedTeamIds": [TEAM_ENG], "allowedUserIds": [BOB], "accessEmails": ["a@example.com"], "names": True,
+    }
+    # MindsHub binds the rule to its owner, so it is read as them, in the
+    # reviewer's own organization.
+    assert stored_rule.reads == [(folder, folder.parent, OWNER_RULE_SCOPE, "proj-1")]
+    assert as_reviewable.resolved == [REVIEWER_SCOPE]
+
+
+async def test_the_owner_reads_the_same_audience_as_their_access_route_less_the_password(
+    as_reviewable, as_owner, folder, stored_rule,
+):
+    _planted(folder)
+    stored_rule.rule = artifact_rule(teams=[TEAM_OPS], people=[CAROL], emails=["b@example.com"])
+    owner = Principal(user_id=ORG_SCOPE.user_id, org_id=ORG_SCOPE.org_id)
+
+    audience = await _audience(ORG_SCOPE, owner)
+    access = (await aw.artifact_access("proj", ARTIFACT_ID, ORG_SCOPE)).model_dump(by_alias=True, mode="json")
+
+    for field in ("accessMode", "ownerOnly", "orgAllowed", "allowedTeamIds", "allowedUserIds", "accessEmails"):
+        assert audience[field] == access[field]
+    assert stored_rule.reads[0][2] == ORG_SCOPE
+
+
+async def test_the_access_route_stays_owner_only_for_a_reviewer_who_may_read_the_audience(
+    as_reviewable, folder, stored_rule,
+):
+    _planted(folder)
+
+    with pytest.raises(HTTPException) as refused:
+        await aw.artifact_access("proj", ARTIFACT_ID, REVIEWER_SCOPE)
+    assert refused.value.status_code == 403
+    assert (await _audience(REVIEWER_SCOPE, REVIEWER))["accessMode"] == "restricted"
+
+
+async def test_the_audience_never_carries_the_password(as_reviewable, folder, stored_rule):
+    (folder / ".published.json").write_text(json.dumps({"report.html": {
+        "report_id": "r1", "url": "https://view.example/r/1", "mode": "password",
+        "requires_password": True, "access_password": "hunter2-secret",
+    }}))
+
+    response = await aw.artifact_audience("proj", ARTIFACT_ID, REVIEWER_SCOPE, REVIEWER)
+    out = response.model_dump(by_alias=True, mode="json")
+
+    assert out["accessMode"] == "password"
+    assert "accessPassword" not in out and "reportId" not in out and "artifactKey" not in out
+    assert "hunter2-secret" not in response.model_dump_json()
+
+
+@pytest.mark.parametrize(
+    "principal",
+    [
+        Principal(user_id=REVIEWER_SCOPE.user_id, org_id="0d0d0d0d-0000-4000-8000-000000000001"),
+        Principal(user_id=EVE, org_id=REVIEWER_SCOPE.org_id),
+        None,
+    ],
+    ids=["another_org", "another_person", "no_principal"],
+)
+async def test_a_caller_outside_the_artifacts_org_gets_how_it_is_shared_and_no_names(
+    as_reviewable, folder, stored_rule, principal,
+):
+    _planted(folder)
+    stored_rule.rule = artifact_rule(org=True, teams=[TEAM_ENG], people=[BOB], emails=["a@example.com"])
+
+    out = await _audience(REVIEWER_SCOPE, principal)
+
+    assert out == {
+        "accessMode": "restricted", "ownerOnly": False, "orgAllowed": True,
+        "allowedTeamIds": [], "allowedUserIds": [], "accessEmails": [], "names": False,
+    }
+
+
+async def test_an_unpublished_artifact_reads_as_the_state_reports_it(as_reviewable, folder, stored_rule):
+    out = await _audience(REVIEWER_SCOPE, REVIEWER)
+
+    assert (out["accessMode"], out["names"], out["accessEmails"]) == ("public", True, [])
+
+
+async def test_the_audience_read_is_a_503_or_409_as_the_owners_is(as_reviewable, folder, stored_rule):
+    from cowork.services.artifact_access import ArtifactAccessRefused, ArtifactAccessUnavailable
+
+    _planted(folder)
+    stored_rule.rule = ArtifactAccessUnavailable("Could not read who the artifact is shared with")
+    with pytest.raises(HTTPException) as unavailable:
+        await _audience(REVIEWER_SCOPE, REVIEWER)
+    assert unavailable.value.status_code == 503
+
+    stored_rule.rule = ArtifactAccessRefused("MindsHub refused the read")
+    with pytest.raises(HTTPException) as refused:
+        await _audience(REVIEWER_SCOPE, REVIEWER)
+    assert refused.value.status_code == 409
+
+
+async def test_an_artifact_nobody_is_recorded_as_owning_is_read_as_the_caller(
+    as_reviewable, folder, stored_rule,
+):
+    """No owner to read the rule as: the read goes as the caller, and the
+    publish identity it needs refuses an unknown owner (ArtifactOwnerUnknown,
+    a 503), never a guess."""
+    from cowork.services.artifact_ownership import OwnerResolution
+
+    as_reviewable.owner = OwnerResolution(None, "unknown")
+    _planted(folder)
+
+    await _audience(REVIEWER_SCOPE, REVIEWER)
+
+    assert stored_rule.reads[0][2] == REVIEWER_SCOPE
+
+
+async def test_on_the_desktop_the_audience_is_the_owners_less_the_password(
+    as_reviewable, folder, stored_rule,
+):
+    (folder / ".published.json").write_text(json.dumps({"report.html": {
+        "report_id": "r1", "url": "https://view.example/r/1", "mode": "restricted",
+        "emails": ["a@example.com"], "org_allowed": False, "owner_only": False,
+    }}))
+
+    out = await _audience(TenantScope(), None)
+
+    assert (out["accessMode"], out["accessEmails"], out["names"]) == ("restricted", ["a@example.com"], True)
+    assert "accessPassword" not in out
+    assert stored_rule.reads == [] and stored_rule.held_reads == []

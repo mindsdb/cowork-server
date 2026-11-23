@@ -214,6 +214,68 @@ async def test_proxy_keeps_a_spent_budget_apart_from_an_empty_wallet(monkeypatch
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("upstream", "scope"),
+    [
+        ({"json": {"error": {"message": "x", "code": "budget_exceeded", "budget_scope": "workspace"}}}, "workspace"),
+        ({"json": {"error": {"message": "x", "code": "budget_exceeded"}}, "headers": {"x-mindshub-budget-scope": "api_key"}}, "api_key"),
+        ({"json": {"error": {"message": "x", "code": "budget_exceeded", "budget_scope": "Bad Scope"}}}, None),
+        ({"json": {"error": {"message": "x", "code": "budget_exceeded"}}}, None),
+        (
+            {
+                "json": {"error": {"message": "x", "code": "budget_exceeded", "budget_scope": "Bad Scope"}},
+                "headers": {"x-mindshub-budget-scope": "org"},
+            },
+            "org",
+        ),
+    ],
+    ids=["body", "header", "malformed", "absent", "malformed-body-good-header"],
+)
+async def test_proxy_passes_a_spent_budgets_scope_to_codex(monkeypatch: pytest.MonkeyPatch, upstream, scope) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(402, **upstream)
+
+    real_client = httpx.AsyncClient
+    monkeypatch.setattr(
+        inference_proxy_module.httpx,
+        "AsyncClient",
+        lambda **kwargs: real_client(transport=httpx.MockTransport(handler), **kwargs),
+    )
+    request = _request([(b"content-type", b"application/json")], b'{"model": "gpt", "input": "hi"}')
+
+    response = await proxy_inference(request, "responses", EngineCredentials(minds_url="https://api.example", minds_api_key="mdb_key"))
+
+    assert json.loads(response.body)["error"].get("budget_scope") == scope
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("upstream", "period"),
+    [
+        ({"json": {"error": {"message": "x", "code": "budget_exceeded", "budget_period": "month"}}}, "month"),
+        ({"json": {"error": {"message": "x", "code": "budget_exceeded"}}, "headers": {"x-mindshub-budget-period": "day"}}, "day"),
+        ({"json": {"error": {"message": "x", "code": "budget_exceeded", "budget_period": "week"}}}, None),
+    ],
+    ids=["body", "header", "unknown"],
+)
+async def test_proxy_passes_a_spent_budgets_period_to_codex(monkeypatch: pytest.MonkeyPatch, upstream, period) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(402, **upstream)
+
+    real_client = httpx.AsyncClient
+    monkeypatch.setattr(
+        inference_proxy_module.httpx,
+        "AsyncClient",
+        lambda **kwargs: real_client(transport=httpx.MockTransport(handler), **kwargs),
+    )
+    request = _request([(b"content-type", b"application/json")], b'{"model": "gpt", "input": "hi"}')
+
+    response = await proxy_inference(request, "responses", EngineCredentials(minds_url="https://api.example", minds_api_key="mdb_key"))
+
+    assert json.loads(response.body)["error"].get("budget_period") == period
+
+
+@pytest.mark.asyncio
 async def test_proxy_streams_successful_and_retryable_responses_unchanged(monkeypatch: pytest.MonkeyPatch) -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(503, content=b"busy", headers={"retry-after": "2"})
@@ -269,7 +331,9 @@ async def _proxy(body: bytes = b"{}"):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("code", ["included_allowance_exhausted", "free_air_daily_spend_fuse_exceeded"])
+@pytest.mark.parametrize(
+    "code", ["included_allowance_exhausted", "window_allowance_exhausted", "free_air_daily_spend_fuse_exceeded"]
+)
 async def test_proxy_fails_a_reset_bound_429_terminally_without_waiting(monkeypatch: pytest.MonkeyPatch, code: str) -> None:
     upstream = httpx.Response(
         429,
@@ -286,6 +350,38 @@ async def test_proxy_fails_a_reset_bound_429_terminally_without_waiting(monkeypa
     assert response.headers["x-mindshub-upstream-status"] == "429"
     assert response.headers["x-mindshub-reset-at"] == "2026-09-26T19:00:00Z"
     assert json.loads(response.body)["error"]["code"] == code
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "upstream",
+    [
+        {"json": {"error": {"message": "Not in your plan.", "code": "model_not_in_tier"}, "required_tier": "pro"}},
+        {"json": {"error": {"message": "Not in your plan."}}, "headers": {"x-mindshub-reason": "model_not_in_tier"}},
+    ],
+    ids=["body-code", "reason-header"],
+)
+async def test_proxy_keeps_a_model_outside_the_tier_apart_from_a_rejected_credential(
+    monkeypatch: pytest.MonkeyPatch, upstream
+) -> None:
+    """Both are 403s, but the credential is fine (ENG-4186), so Codex does not tell the user to sign in again."""
+    _mock_upstream(monkeypatch, [httpx.Response(403, **upstream)])
+
+    response = await _proxy()
+
+    assert response.status_code == 400
+    assert response.headers["x-mindshub-error-code"] == "model_not_in_tier"
+    assert response.headers["x-mindshub-upstream-status"] == "403"
+    assert json.loads(response.body)["error"]["code"] == "model_not_in_tier"
+
+
+@pytest.mark.asyncio
+async def test_proxy_keeps_reading_an_unexplained_403_as_a_rejected_credential(monkeypatch: pytest.MonkeyPatch) -> None:
+    _mock_upstream(monkeypatch, [httpx.Response(403, json={"error": {"message": "Forbidden", "code": "budget_exceeded"}})])
+
+    response = await _proxy()
+
+    assert response.headers["x-mindshub-error-code"] == "model_authentication_failed"
 
 
 @pytest.mark.asyncio
@@ -408,3 +504,30 @@ async def test_proxy_returns_the_upstream_connection_however_the_stream_ends(
     await asyncio.wait_for(response(scope, receive, send), timeout=5)
 
     assert stream.closed
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("upstream", "model"),
+    [
+        ({"json": {"error": {"message": "x", "code": "budget_exceeded", "budget_model": "haiku-4-5"}}}, "haiku-4-5"),
+        ({"json": {"error": {"message": "x", "code": "budget_exceeded"}}, "headers": {"x-mindshub-budget-model": "gpt-nano"}}, "gpt-nano"),
+        ({"json": {"error": {"message": "x", "code": "budget_exceeded", "budget_model": "bad model"}}}, None),
+    ],
+    ids=["body", "header", "unknown"],
+)
+async def test_proxy_passes_a_spent_budgets_model_to_codex(monkeypatch: pytest.MonkeyPatch, upstream, model) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(402, **upstream)
+
+    real_client = httpx.AsyncClient
+    monkeypatch.setattr(
+        inference_proxy_module.httpx,
+        "AsyncClient",
+        lambda **kwargs: real_client(transport=httpx.MockTransport(handler), **kwargs),
+    )
+    request = _request([(b"content-type", b"application/json")], b'{"model": "gpt", "input": "hi"}')
+
+    response = await proxy_inference(request, "responses", EngineCredentials(minds_url="https://api.example", minds_api_key="mdb_key"))
+
+    assert json.loads(response.body)["error"].get("budget_model") == model

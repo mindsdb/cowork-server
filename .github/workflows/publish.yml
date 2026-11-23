@@ -48,6 +48,28 @@ jobs:
       security-events: write
     uses: ./.github/workflows/codeql.yml
 
+  final-release-lock:
+    # Desktop installs exactly the anton-agent this lock names. Staging may lock
+    # a release candidate to test it; production may not.
+    # The backstop behind the PR check: `release` and `build-deploy` wait for it,
+    # so a pre-release lock cuts no tag, publishes no wheel and rolls out no image.
+    permissions:
+      contents: read
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+
+      - name: Setup uv
+        uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7
+        with:
+          version: "0.11.30"
+          python-version: "3.12"
+
+      - name: Refuse a lock that pins a pre-release
+        run: python scripts/release_contract.py --check --require-final
+
   build-deploy:
     # The container image and the prod Helm rollout. Independent of the release
     # chain on purpose: a scan finding should not hold up the wheel the desktop
@@ -65,9 +87,13 @@ jobs:
     # only from a fresh attempt 1 started afterward and approved at the prod gate
     # by an eligible reviewer other than both the actor and triggering actor.
     # See README.md.
+    needs: [final-release-lock]
     if: github.ref == 'refs/heads/main'
     permissions:
       contents: read
+      id-token: write # the build's ECR role, assumed over OIDC
+      # Granted so build-deploy.yml loads; the Argo CD deploy is off here.
+      statuses: write
     uses: ./.github/workflows/build-deploy.yml
     with:
       build-environment: production
@@ -92,7 +118,7 @@ jobs:
     # GitHub Release were created, then `publish` was skipped, leaving a
     # version that exists on GitHub and not on PyPI and a tag to clean up
     # before the fixed commit could re-release.
-    needs: [unit-tests, wheels-available]
+    needs: [unit-tests, wheels-available, final-release-lock]
     # workflow_dispatch can be pointed at any ref; only main cuts a stable release.
     if: github.ref == 'refs/heads/main'
     permissions:
@@ -128,9 +154,9 @@ jobs:
 
       - name: Build package
         run: |
-          python scripts/release_contract.py --check
+          python scripts/release_contract.py --check --require-final
           uv build
-          python scripts/release_contract.py --check --dist-dir dist
+          python scripts/release_contract.py --check --require-final --dist-dir dist
 
       # Check the artifact with the same reviewed contract installers consume.
       - name: Check the built wheel resolves to wheels on every shipped platform
@@ -168,7 +194,7 @@ jobs:
     # One job covers both outcomes: a `uses:` job cannot branch on status, so
     # the aggregate result picks the failed or recovered message, and a
     # cancelled run stays silent.
-    needs: [unit-tests, build-deploy, wheels-available, release, publish]
+    needs: [unit-tests, final-release-lock, build-deploy, wheels-available, release, publish]
     if: ${{ !cancelled() && !contains(needs.*.result, 'cancelled') }}
     permissions:
       contents: read

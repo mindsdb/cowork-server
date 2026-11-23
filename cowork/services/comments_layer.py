@@ -290,6 +290,21 @@ _LAYER_CSS = (
     ".act-inwrap.act-multi::after{content:'';order:1;display:block;width:100%;"
     "border-top:0.5px solid rgba(39,39,42,0.1);}"
     ".act-inwrap.act-multi .act-send{order:2;}"
+    # Images (ENG-4410): pasted ones wait in a strip above the text, inside the
+    # box; a message's images sit under its text. Clicking one enlarges it.
+    ".act-pend{order:-1;display:flex;flex-wrap:wrap;gap:6px;align-self:stretch;}"
+    ".act-pend:empty{display:none;}"
+    ".act-pend-item{position:relative;width:48px;height:48px;}"
+    ".act-pend-item img{width:48px;height:48px;object-fit:cover;border-radius:6px;"
+    "border:0.5px solid rgba(39,39,42,0.15);display:block;}"
+    ".act-pend-x{position:absolute;top:-6px;right:-6px;width:18px;height:18px;border-radius:50%;"
+    "border:0;padding:0;background:#202021;color:#fff;font-size:12px;line-height:18px;cursor:pointer;}"
+    ".act-imgs{display:flex;flex-wrap:wrap;gap:6px;padding:6px 0 0 20px;}"
+    ".act-img{display:block;width:64px;height:64px;border-radius:6px;background:rgba(39,39,42,0.06);"
+    "overflow:hidden;cursor:zoom-in;}"
+    ".act-img img{width:100%;height:100%;object-fit:cover;display:block;}"
+    ".act-img.act-big{width:100%;height:auto;cursor:zoom-out;}"
+    ".act-img.act-big img{height:auto;max-height:320px;object-fit:contain;}"
     ".act-inwrap textarea::-webkit-scrollbar{width:6px;}"
     ".act-inwrap textarea::-webkit-scrollbar-track{background:transparent;}"
     ".act-inwrap textarea::-webkit-scrollbar-thumb{background:rgba(39,39,42,0.18);"
@@ -363,6 +378,48 @@ LAYER_JS = r"""
   function send(msg){ msg.source = 'anton-comments'; try { parent.postMessage(msg, '*'); } catch (e) {} }
   function esc(s){ return String(s == null ? '' : s).replace(/[&<>"]/g, function(c){
     return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]; }); }
+  // ── Images (ENG-4410) ────────────────────────────────────────────────────
+  // A comment names its images with marker lines the app writes
+  // (![name](cowork-image:<id>)). This layer has no credential: the app reads
+  // the images and pushes them down as Blobs ('images'), and takes the Files
+  // pasted here with 'create' / 'reply', checking and storing them itself.
+  var IMG_TYPES = ['image/png', 'image/jpeg', 'image/gif', 'image/webp'];
+  var IMG_MAX = 5 * 1024 * 1024, IMG_COUNT = 4;
+  var IMG_ID = /^[0-9a-f]{32}\.(?:png|jpg|gif|webp)$/;
+  function imgMarks(){ return /!\[[^\]\n]*\]\(cowork-image:([0-9a-f]{32}\.(?:png|jpg|gif|webp))\)/g; }
+  var imgUrls = {};  // id -> object URL of the Blob the app pushed
+  function splitText(t){
+    var ids = [], raw = String(t == null ? '' : t);
+    var body = raw.replace(imgMarks(), function(_m, id){
+      if (ids.indexOf(id) < 0) ids.push(id); return ''; });
+    return {body: ids.length ? body.replace(/\n{3,}/g, '\n\n').trim() : raw, ids: ids};
+  }
+  function marksOf(t){ return (String(t || '').match(imgMarks()) || []).join('\n'); }
+  function imgsHTML(ids){
+    if (!ids.length) return '';
+    return '<div class="act-imgs">' + ids.map(function(id){
+      return '<span class="act-img" data-img="' + esc(id) + '">'
+        + (imgUrls[id] ? '<img alt="" src="' + esc(imgUrls[id]) + '">' : '') + '</span>';
+    }).join('') + '</div>';
+  }
+  function fillImages(){
+    Array.prototype.forEach.call(document.querySelectorAll('.act-img[data-img]'), function(el){
+      var url = imgUrls[el.getAttribute('data-img')];
+      if (!url || el.firstChild) return;
+      var im = document.createElement('img'); im.alt = ''; im.src = url; el.appendChild(im);
+      clampPopV();
+    });
+  }
+  document.addEventListener('click', function(e){
+    var el = e.target && e.target.closest && e.target.closest('.act-img');
+    if (el) { el.classList.toggle('act-big'); clampPopV(); }
+  }, true);
+  function imageFiles(list){
+    return Array.prototype.filter.call(list || [], function(f){
+      return f && IMG_TYPES.indexOf(String(f.type || '').toLowerCase()) >= 0
+        && f.size > 0 && f.size <= IMG_MAX; });
+  }
+
   function displayName(a){ a = String(a || ''); var i = a.indexOf('@');
     return i > 0 ? a.slice(0, i) : (a || 'Anonymous'); }
   function initials(a){
@@ -456,6 +513,81 @@ LAYER_JS = r"""
   // section) has zero client rects; isShown() distinguishes it from a truly
   // detached/removed element.
   function isShown(el){ return !!(el && el.getClientRects().length); }
+
+  // ── Going to a comment's place (ENG-4383) ──────────────────────────────
+  // A comment can sit on a slide, tab or section that isn't showing. The
+  // page's own navigation is all there is to get there, so: an element
+  // shown but moved out of view (a transform deck) counts as hidden too;
+  // a control that points at a hidden ancestor (tab, accordion, #link) is
+  // clicked; a closed <details> is opened; and failing those, the deck is
+  // walked with the arrow keys, right then left, each step waiting for the
+  // page to react and a direction ending when a key changes nothing.
+  function inView(el){
+    if (!isShown(el)) return false;
+    var r = el.getBoundingClientRect();
+    var w = document.documentElement.clientWidth, h = document.documentElement.clientHeight;
+    // Off to the side is another slide; above or below is just a scroll away.
+    return r.right > 0 && r.left < w && (r.width > 0 || r.height > 0) && h > 0;
+  }
+  function cssId(id){ return String(id).replace(/["\\]/g, '\\$&'); }
+  function openControls(el){
+    var det = el.closest && el.closest('details');
+    while (det) { if (!det.open) det.open = true; det = det.parentElement && det.parentElement.closest('details'); }
+    if (inView(el)) return true;
+    for (var node = el; node && node !== document.body; node = node.parentElement) {
+      if (!node.id) continue;
+      var id = cssId(node.id);
+      var ctl = document.querySelector('[aria-controls="' + id + '"],a[href="#' + id + '"],'
+        + '[data-target="#' + id + '"],[data-bs-target="#' + id + '"],[data-tab="' + id + '"]');
+      if (ctl && isShown(ctl) && !(ctl.closest && ctl.closest('.act-pop,#act-mk'))) {
+        try { ctl.click(); } catch (e) {}
+        if (inView(el)) return true;
+      }
+    }
+    return false;
+  }
+  var WALK_MAX = 40, WALK_SETTLE_MS = 140;
+  function pressKey(key){
+    var code = key === 'ArrowRight' ? 39 : 37;
+    var init = {key: key, code: key, keyCode: code, which: code, bubbles: true, cancelable: true};
+    var target = document.activeElement && document.activeElement !== document.body ? document.activeElement : document.body;
+    try { target.dispatchEvent(new KeyboardEvent('keydown', init)); } catch (e) {}
+    try { target.dispatchEvent(new KeyboardEvent('keyup', init)); } catch (e) {}
+  }
+  // One step: press, then wait for the page to settle; `moved` is whether
+  // anything outside this layer changed.
+  function step(key, cb){
+    var moved = false;
+    var mo = new MutationObserver(function(list){
+      for (var i = 0; i < list.length; i++) {
+        var t = list[i].target;
+        if (!(t.closest && t.closest('.act-pop,#act-mk,.act-hl'))) { moved = true; return; }
+      }
+    });
+    mo.observe(document.body, {subtree: true, childList: true, attributes: true, characterData: true});
+    pressKey(key);
+    setTimeout(function(){ mo.disconnect(); cb(moved); }, WALK_SETTLE_MS);
+  }
+  function walk(el, key, left, done){
+    if (inView(el)) { done(true); return; }
+    if (left <= 0) { done(false); return; }
+    step(key, function(moved){
+      if (inView(el)) { done(true); return; }
+      if (!moved) { done(false); return; }
+      walk(el, key, left - 1, done);
+    });
+  }
+  var revealing = false;
+  function reveal(el, done){
+    if (inView(el) || openControls(el)) { done(true); return; }
+    if (revealing) { done(false); return; }
+    revealing = true;
+    var finish = function(found){ revealing = false; done(found); };
+    walk(el, 'ArrowRight', WALK_MAX, function(found){
+      if (found) { finish(true); return; }
+      walk(el, 'ArrowLeft', WALK_MAX * 2, finish);
+    });
+  }
 
   // ── Markers ──────────────────────────────────────────────────────────────
   // One DOM node per live anchored thread, keyed by id and repositioned via
@@ -609,6 +741,8 @@ LAYER_JS = r"""
       markerEls[k].el.classList.toggle('act-active', k === id); });
   }
   function closePop(){
+    // Closing the card any way keeps an edit in progress.
+    if (editing) editing.commit();
     closeMenu();
     if (ghost) { ghost.remove(); ghost = null; }
     pendingCreate = false;
@@ -629,6 +763,12 @@ LAYER_JS = r"""
     closePop();
     pop = document.createElement('div');
     pop.className = 'act-pop';
+    // Keys typed in the card stay in the card: a deck that moves on Space or
+    // the arrows (and swallows them) never hears them, so a comment can have
+    // spaces. Escape still reaches the layer, which closes the card with it.
+    ['keydown', 'keypress', 'keyup'].forEach(function(type){
+      pop.addEventListener(type, function(e){ if (e.key !== 'Escape') e.stopPropagation(); });
+    });
     // Doc bounds measured BEFORE appending (the popover itself would inflate them).
     var docW = document.documentElement.scrollWidth;
     pop.__docH = document.documentElement.scrollHeight;
@@ -688,10 +828,58 @@ LAYER_JS = r"""
   // Pill grows into a rounded box as the text wraps. Height comes from a
   // hidden mirror with the same text metrics — real layout, immune to
   // textarea scrollHeight quirks.
-  function wireInput(root, onSubmit){
+  // `opts.images`: the input takes pasted or dropped images, handed to
+  // onSubmit as its third argument (new comments and replies; not edits).
+  function wireInput(root, onSubmit, opts){
     var wrap = root.querySelector('.act-inwrap');
     var ta = wrap.querySelector('textarea');
     var sendBtn = wrap.querySelector('.act-send');
+    var pend = [], pendUrls = [];
+    var strip = document.createElement('div');
+    strip.className = 'act-pend';
+    wrap.insertBefore(strip, ta);
+    function hasContent(){ return !!ta.value.trim() || pend.length > 0; }
+    function renderPend(){
+      pendUrls.forEach(function(u){ URL.revokeObjectURL(u); });
+      pendUrls = pend.map(function(f){ return URL.createObjectURL(f); });
+      strip.innerHTML = pend.map(function(_f, i){
+        return '<span class="act-pend-item"><img alt="" src="' + esc(pendUrls[i])
+          + '"><button class="act-pend-x" data-i="' + i + '" aria-label="Remove image"'
+          + ' title="Remove">\u00d7</button></span>';
+      }).join('');
+      Array.prototype.forEach.call(strip.querySelectorAll('.act-pend-x'), function(b){
+        b.onclick = function(ev){ ev.stopPropagation();
+          pend.splice(+b.getAttribute('data-i'), 1); renderPend(); grow(); ta.focus(); };
+      });
+    }
+    function addFiles(list){
+      imageFiles(list).forEach(function(f){ if (pend.length < IMG_COUNT) pend.push(f); });
+      renderPend(); grow();
+    }
+    function submit(){
+      if (!hasContent()) return;
+      var images = pend.slice();
+      onSubmit(ta.value.trim(), ta, images);
+      pend = []; renderPend(); grow();
+    }
+    if (opts && opts.images) {
+      ta.addEventListener('paste', function(e){
+        var files = [];
+        Array.prototype.forEach.call((e.clipboardData && e.clipboardData.items) || [], function(it){
+          if (it.kind === 'file') { var f = it.getAsFile(); if (f) files.push(f); } });
+        if (!imageFiles(files).length) return;
+        e.preventDefault();
+        addFiles(files);
+      });
+      wrap.addEventListener('dragover', function(e){
+        if (e.dataTransfer && Array.prototype.indexOf.call(e.dataTransfer.types || [], 'Files') >= 0)
+          e.preventDefault(); });
+      wrap.addEventListener('drop', function(e){
+        if (!e.dataTransfer || !e.dataTransfer.files || !e.dataTransfer.files.length) return;
+        e.preventDefault();
+        addFiles(e.dataTransfer.files);
+      });
+    }
     var mir = document.createElement('div');
     mir.style.cssText = 'position:absolute!important;visibility:hidden!important;'
       + 'left:-9999px!important;top:0;white-space:pre-wrap!important;'
@@ -702,8 +890,8 @@ LAYER_JS = r"""
     function grow(){
       // Layout class FIRST (pill while empty, box once typing), THEN measure
       // at the textarea's live width so wraps count correctly.
-      wrap.classList.toggle('act-multi', !!ta.value.length);
-      sendBtn.classList.toggle('act-on', !!ta.value.trim());
+      wrap.classList.toggle('act-multi', !!ta.value.length || pend.length > 0);
+      sendBtn.classList.toggle('act-on', hasContent());
       mir.style.width = ta.clientWidth + 'px';
       mir.textContent = (ta.value || ' ') + '​';
       var h = Math.max(24, mir.offsetHeight);
@@ -715,16 +903,17 @@ LAYER_JS = r"""
     }
     ta.addEventListener('input', grow);
     ta.addEventListener('keydown', function(e){
-      if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault();
-        if (ta.value.trim()) onSubmit(ta.value.trim(), ta); }
+      if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); submit(); }
     });
-    sendBtn.addEventListener('click', function(){
-      if (ta.value.trim()) onSubmit(ta.value.trim(), ta); });
+    sendBtn.addEventListener('click', submit);
     grow(); ta.focus();
   }
   // m = {author, created_at, text, edited_at, mine}; rid set for replies.
   // Own replies get hover edit/delete; the root comment's actions live in
   // the header "…" menu instead.
+  // Own messages get a hover edit on their author line (ENG-4383): replies
+  // edit and delete there; the root comment edits there too, and keeps
+  // delete in the header's "…" menu with the thread's other actions.
   function msgHTML(m, rid){
     var acts = (m.mine && rid)
       ? '<span class="act-msg-acts">'
@@ -732,19 +921,32 @@ LAYER_JS = r"""
         + '" aria-label="Edit reply" title="Edit">' + ICONS.pencil + '</button>'
         + '<button class="act-m-del" data-rid="' + esc(rid)
         + '" aria-label="Delete reply" title="Delete">' + ICONS.trash + '</button></span>'
-      : '';
+      : (m.mine && !rid)
+        ? '<span class="act-msg-acts"><button class="act-m-edit-root"'
+          + ' aria-label="Edit comment" title="Edit">' + ICONS.pencil + '</button></span>'
+        : '';
     return '<div class="act-msg"' + (rid ? '' : ' data-root="1"') + '>'
       + '<div class="act-msg-head"><span class="act-msg-who">'
       + avatar(m.author) + '<span class="act-msg-name">' + esc(displayName(m.author))
       + '</span></span><span class="act-msg-date">' + esc(fmtDate(m.created_at))
       + editedMark(m.edited_at) + '</span>' + acts + '</div>'
-      + '<div class="act-msg-text">' + esc(m.text) + '</div></div>';
+      + '<div class="act-msg-text">' + esc(splitText(m.text).body) + '</div>'
+      + imgsHTML(splitText(m.text).ids) + '</div>';
   }
 
   // Inline editor: hides the message text, mounts the growing input prefilled;
   // Enter saves (no-op edits skip the PATCH), Escape cancels.
+  // The edit in progress, if any: `commit()` saves it (or drops a no-op),
+  // so a click anywhere else keeps the change instead of losing it.
+  var editing = null;
+
+  // Inline editor: hides the message text, mounts the growing input prefilled.
+  // Enter, the save button, or clicking away saves; Escape cancels; a no-op
+  // edit skips the PATCH. Saving shows the new text in place and leaves the
+  // card open (ENG-4383); the parent's next 'list' push confirms it.
   function startEdit(msgEl, oldText, onSave){
     if (!msgEl || msgEl.querySelector('.act-editbox')) return;
+    if (editing) editing.commit();
     var textEl = msgEl.querySelector('.act-msg-text');
     textEl.style.display = 'none';
     var box = document.createElement('div');
@@ -753,16 +955,37 @@ LAYER_JS = r"""
       + '<button class="act-send" title="Save">' + ICONS.arrowUp + '</button></div>';
     msgEl.appendChild(box);
     var ta = box.querySelector('textarea');
-    ta.value = oldText;
-    function cancel(){ box.remove(); textEl.style.display = ''; clampPopV(); }
-    wireInput(box, function(text){
-      if (text === oldText) { cancel(); return; }  // no-op edit: skip the PATCH
-      ta.disabled = true;
-      onSave(text);
-    });
+    // The images stay as they are: the box edits the words, and the image
+    // markers go back after them on save.
+    var words = splitText(oldText).body, marks = marksOf(oldText);
+    ta.value = words;
+    var done = false;
+    function close(){
+      done = true;
+      if (editing && editing.box === box) editing = null;
+      box.remove(); textEl.style.display = ''; clampPopV();
+    }
+    function save(text){
+      if (done) return;
+      text = String(text || '').trim();
+      if (text === words || (!text && !marks)) { close(); return; }  // no-op: skip the PATCH
+      var full = marks ? (text ? text + '\n\n' + marks : marks) : text;
+      textEl.textContent = splitText(full).body;
+      close();
+      onSave(full);
+    }
+    editing = {box: box, commit: function(){ save(ta.value); }};
+    wireInput(box, function(text){ save(text); });
     ta.dispatchEvent(new Event('input'));  // size to the prefilled text
     ta.addEventListener('keydown', function(e){
-      if (e.key === 'Escape') { e.stopPropagation(); cancel(); }
+      if (e.key === 'Escape') { e.stopPropagation(); close(); }
+    });
+    // Focus leaving the box for anything outside it (another field in the
+    // card, the page, the app) saves, as clicking away does.
+    ta.addEventListener('blur', function(){
+      setTimeout(function(){
+        if (!done && !box.contains(document.activeElement)) save(ta.value);
+      }, 0);
     });
   }
 
@@ -839,7 +1062,7 @@ LAYER_JS = r"""
       menu.querySelector('[data-act="edit"]').onclick = function(){
         closeMenu();
         startEdit(p.querySelector('[data-root="1"]'), c.text,
-          function(t){ mutate({type:'edit', id: id, text: t}); });
+          function(t){ c.text = t; send({type:'edit', id: id, text: t}); });
       };
       menu.querySelector('[data-act="del"]').onclick = function(){
         closeMenu();
@@ -847,6 +1070,13 @@ LAYER_JS = r"""
           mutate({type:'delete', id: id});
       };
       document.body.appendChild(menu);
+    };
+    // Hover edit on the root comment, beside its author and time.
+    var rootEdit = p.querySelector('.act-m-edit-root');
+    if (rootEdit) rootEdit.onclick = function(ev){
+      ev.stopPropagation();
+      startEdit(p.querySelector('[data-root="1"]'), c.text,
+        function(t){ c.text = t; send({type:'edit', id: id, text: t}); });
     };
     // Hover actions on own replies.
     Array.prototype.forEach.call(p.querySelectorAll('.act-m-edit'), function(btn){
@@ -857,7 +1087,7 @@ LAYER_JS = r"""
           return String(x.id) === String(rid); })[0];
         if (!rep) return;
         startEdit(btn.closest('.act-msg'), rep.text,
-          function(t){ mutate({type:'edit-reply', id: id, replyId: rid, text: t}); });
+          function(t){ rep.text = t; send({type:'edit-reply', id: id, replyId: rid, text: t}); });
       };
     });
     Array.prototype.forEach.call(p.querySelectorAll('.act-m-del'), function(btn){
@@ -868,10 +1098,10 @@ LAYER_JS = r"""
           mutate({type:'delete-reply', id: id, replyId: rid});
       };
     });
-    wireInput(p, function(text, ta){
+    wireInput(p, function(text, ta, images){
       // Append in place — no close/reopen flash of the popover. The parent's
-      // next 'list' push reconciles ids/timestamps.
-      send({type:'reply', id: id, text: text});
+      // next 'list' push reconciles ids/timestamps (and shows the images).
+      send({type:'reply', id: id, text: text, images: images});
       var box = p.querySelector('.act-msgs');
       box.insertAdjacentHTML('beforeend', '<div class="act-div"></div>'
         + msgHTML({author: viewerEmail(),
@@ -880,7 +1110,7 @@ LAYER_JS = r"""
       ta.value = '';
       ta.dispatchEvent(new Event('input'));
       ta.focus();
-    });
+    }, {images: true});
     var msgsEl = p.querySelector('.act-msgs');
     msgsEl.scrollTop = msgsEl.scrollHeight;
     clampPopV();
@@ -905,7 +1135,7 @@ LAYER_JS = r"""
     p.innerHTML = '<div class="act-inwrap"><textarea rows="1" '
       + 'placeholder="Add a comment"></textarea>'
       + '<button class="act-send" title="Send">' + ICONS.arrowUp + '</button></div>';
-    wireInput(p, function(text, ta){
+    wireInput(p, function(text, ta, images){
       ta.disabled = true;
       // Composer goes away immediately; the ghost pin stays with a spinner
       // until the parent confirms via the next 'list' push (then the real
@@ -913,11 +1143,11 @@ LAYER_JS = r"""
       if (pop) { pop.remove(); pop = null; }
       if (ghost) ghost.firstChild.innerHTML = '<span class="act-spin"></span>';
       pendingCreate = true;
-      send({type:'create', selector: cssPath(el), text: text});
+      send({type:'create', selector: cssPath(el), text: text, images: images});
       // Failure fallback: if no list push arrives (create failed upstream),
-      // don't leave a spinner pinned forever.
-      setTimeout(function(){ if (pendingCreate) closePop(); }, 8000);
-    });
+      // don't leave a spinner pinned forever. Images upload first, so wait longer.
+      setTimeout(function(){ if (pendingCreate) closePop(); }, images.length ? 30000 : 8000);
+    }, {images: true});
     clampPopV();
   }
 
@@ -951,6 +1181,9 @@ LAYER_JS = r"""
     if (!mode) return;
     if (e.target.closest && e.target.closest('#act-mk,.act-pop,.act-menu')) return;
     e.preventDefault(); e.stopPropagation();
+    // A click away from an edit in progress saves it; it doesn't start a
+    // new comment as well.
+    if (editing) { editing.commit(); return; }
     var el = hoverEl || e.target;
     // Gap clicks resolve like hover: containing box -> nearest sibling ->
     // the page itself. The full-page highlight makes a body pick obvious.
@@ -996,11 +1229,13 @@ LAYER_JS = r"""
     closeMenu();
   }, true);
 
-  // Outside click closes the popover.
+  // Outside click closes the popover, unless a comment is being edited
+  // there: then the click saves the edit and the card stays open.
   document.addEventListener('click', function(e){
     if (!pop) return;
     var t = e.target;
     if (t.closest && (t.closest('.act-pop') || t.closest('#act-mk'))) return;
+    if (editing) { editing.commit(); return; }
     closePop();
   });
 
@@ -1031,6 +1266,19 @@ LAYER_JS = r"""
       scheduleSync();
       send({type:'count', count: comments.length});
     }
+    else if (d.type === 'images') {
+      // Only the app's own pushes: a script in the page posting as the app
+      // must not plant pictures in someone's comment.
+      if (ev.source !== parent) return;
+      var given = d.images || {};
+      Object.keys(given).forEach(function(id){
+        var blob = given[id];
+        if (!IMG_ID.test(id) || imgUrls[id] || !(blob instanceof Blob)
+            || IMG_TYPES.indexOf(String(blob.type || '').toLowerCase()) < 0) return;
+        imgUrls[id] = URL.createObjectURL(blob);
+      });
+      fillImages();
+    }
     else if (d.type === 'markers') {
       markersVisible = !!d.visible;
       mk.classList.toggle('act-off', !markersVisible);
@@ -1045,13 +1293,16 @@ LAYER_JS = r"""
       if (!c) return;
       var el = null;
       if (c.selector) { try { el = document.querySelector(c.selector); } catch (e) {} }
-      if (el && isShown(el)) {
+      if (!el) { openThread(c.id, d.at || null); return; }  // unanchored / orphaned: notice
+      // Take the page to the comment first (another slide, a closed tab or
+      // section), then open it there; if it can't be reached, the card
+      // opens centred with the "not visible right now" notice.
+      var focusId = c.id, at = d.at || null;
+      reveal(el, function(found){
+        if (!found) { openThread(focusId, at); return; }
         el.scrollIntoView({behavior:'smooth', block:'center'});
-        setTimeout(function(){ openThread(c.id); }, 250);
-      } else {
-        // Unanchored / orphaned / hidden (on another slide): center + notice.
-        openThread(c.id, d.at || null);
-      }
+        setTimeout(function(){ openThread(focusId); }, 250);
+      });
     }
     else if (d.type === 'hl-on') {
       if (mode) return;

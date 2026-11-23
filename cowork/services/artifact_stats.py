@@ -52,9 +52,34 @@ class StatsForbidden(StatsError):
 
 
 class StatsUpgradeRequired(StatsError):
+    """The service answered 402: a plan upgrade or credits are needed.
+
+    The body passes through with its code, e.g. `upgrade_required`, or
+    `credits_required` when turning viewer analytics on with no credits.
+    """
+
     def __init__(self, body: Any) -> None:
         super().__init__("Upgrade required")
         self.body = body
+
+
+class StatsRejected(StatsError):
+    """The service answered 422 with a code, e.g. `tracking_off` when asking
+    for viewer emails while analytics are off. The body passes through."""
+
+    def __init__(self, body: Any) -> None:
+        super().__init__("Stats request rejected")
+        self.body = body
+
+
+class StatsNotFound(StatsError):
+    """The service answered 404 for something other than the report, e.g. an
+    unknown viewer on the viewer detail route."""
+
+    def __init__(self, code: str, message: str) -> None:
+        super().__init__(message)
+        self.code = code
+        self.message = message
 
 
 class PublishCredentialRejected(StatsError):
@@ -73,7 +98,10 @@ STATS_ROUTE_ERRORS = (StatsError, FileNotFoundError, ValueError, RuntimeError)
 
 
 def _stats_url(publish_url: str, report_id: str) -> str:
-    return f"{publish_url.rstrip('/')}/stats/{quote(report_id, safe='')}"
+    # Under the artifact's own route, which every host already sends to the
+    # publishing service, so stats need no routing of their own (ENG-4455).
+    # The service still answers /stats/{id}.
+    return f"{publish_url.rstrip('/')}/a/{quote(report_id, safe='')}/_stats"
 
 
 def _json_body(raw: bytes) -> Any:
@@ -115,6 +143,10 @@ def _raise_for_status(status: int, body: Any) -> None:
         raise StatsOwnedByOtherAccount()
     if status == 404 and code == "stats_unavailable":
         raise StatsUnavailable()
+    # A 404 the service answers itself carries a code or an "error"; a bare
+    # {"message": "Not Found"} is the gateway's, for a route it lacks.
+    if status == 404 and ((isinstance(code, str) and code) or message):
+        raise StatsNotFound(code if isinstance(code, str) and code else "not_found", message or "Not found.")
     if status == 409 and code == "tracking_conflict":
         raise TrackingConflict()
     if status == 403:
@@ -126,6 +158,8 @@ def _raise_for_status(status: int, body: Any) -> None:
         )
     if status == 402:
         raise StatsUpgradeRequired(body)
+    if status == 422 and isinstance(code, str) and code:
+        raise StatsRejected(body)
     if status == 401:
         raise PublishCredentialRejected()
     if status == 400:
@@ -143,18 +177,60 @@ def fetch_stats(*, publish_url: str, key: str, report_id: str) -> dict:
     return body
 
 
-def set_tracking(*, publish_url: str, key: str, report_id: str, enabled: bool) -> bool:
-    """Turn view recording on or off; returns the flag the service stored."""
+def set_tracking(
+    *,
+    publish_url: str,
+    key: str,
+    report_id: str,
+    enabled: bool | None = None,
+    require_email: bool | None = None,
+) -> dict:
+    """Change viewer analytics and the email gate; None leaves a setting as is.
+
+    Returns the stored settings, `{"tracking": bool, "require_email": bool}`.
+    The flag goes as both `tracking` (the current name) and `enabled` (the name
+    services released before viewer analytics read).
+    """
+    if enabled is None and require_email is None:
+        raise ValueError("Nothing to change")
+    payload: dict[str, bool] = {}
+    if enabled is not None:
+        payload["tracking"] = enabled
+        payload["enabled"] = enabled
+    if require_email is not None:
+        payload["require_email"] = require_email
     body = _request(
         "PUT",
         f"{_stats_url(publish_url, report_id)}/tracking",
         key=key,
-        json_body={"enabled": enabled},
+        json_body=payload,
     )
     tracking = body.get("tracking") if isinstance(body, dict) else None
     if not isinstance(tracking, bool):
         raise RuntimeError("The stats service returned an unreadable response")
-    return tracking
+    stored_email = body.get("require_email")
+    return {"tracking": tracking, "require_email": stored_email if isinstance(stored_email, bool) else False}
+
+
+def fetch_viewer(*, publish_url: str, key: str, report_id: str, viewer_id: str) -> dict:
+    """One viewer's visits with their per-section times, unchanged."""
+    # Any other id is quoted into one path segment; a dot-only one would be
+    # normalized out of the URL path.
+    if not viewer_id or len(viewer_id) > 128 or not viewer_id.strip("."):
+        raise StatsNotFound("viewer_not_found", "Viewer not found.")
+    body = _request(
+        "GET",
+        f"{_stats_url(publish_url, report_id)}/viewers/{quote(viewer_id, safe='')}",
+        key=key,
+    )
+    if not isinstance(body, dict):
+        raise RuntimeError("The stats service returned an unreadable response")
+    return body
+
+
+def delete_stats(*, publish_url: str, key: str, report_id: str) -> None:
+    """Purge every view, visit and viewer the service holds for the report."""
+    _request("DELETE", _stats_url(publish_url, report_id), key=key)
 
 
 def _report_id_from_record(published_dir: Path, published_key: str) -> str:
@@ -227,6 +303,17 @@ def stats_http_exception(exc: Exception, *, desktop: bool) -> HTTPException:
         if not (isinstance(message, str) and message):
             body["message"] = error if isinstance(error, str) and error else "Upgrade required"
         return HTTPException(402, detail=body)
+    if isinstance(exc, StatsRejected):
+        body = dict(exc.body) if isinstance(exc.body, dict) else {}
+        message, error = body.get("message"), body.get("error")
+        if not (isinstance(message, str) and message):
+            body["message"] = error if isinstance(error, str) and error else (
+                "Turn on viewer analytics first." if body.get("code") == "tracking_off"
+                else "The stats service rejected the request."
+            )
+        return HTTPException(422, detail=body)
+    if isinstance(exc, StatsNotFound):
+        return HTTPException(404, detail={"code": exc.code, "message": exc.message})
     if isinstance(exc, TrackingConflict):
         return HTTPException(409, detail={
             "code": "tracking_conflict",

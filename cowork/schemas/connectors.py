@@ -4,6 +4,8 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+from cowork.services.connectors.custom_mcp import is_custom_mcp
+
 # Method ids are free-form per-connector strings (e.g. "personal-api-key",
 # "service-account", "browser_oauth_builtin") — over a hundred distinct
 # values across existing specs, not a fixed vocabulary, so this only
@@ -18,6 +20,9 @@ _METHOD_ID_PATTERN = re.compile(r"^[a-z][a-z0-9_-]*$")
 # rewritten. No hyphen: the vault joins "{engine}-{name}" into one file name.
 _ENGINE_ID_PATTERN = re.compile(r"[a-z][a-z0-9_]{1,63}")
 _SYNTHESIZED_FORM_ID_PATTERN = re.compile(r"fm_[0-9a-f]+")
+# Characters of a custom connection's trimmed name. Mirrors auth's ``MAX_NAME_LENGTH``
+# (``auth/datavault/custom_api_contract.py``); both change in one release.
+CUSTOM_CONNECTION_NAME_MAX = 128
 
 
 class InvalidConnectorIdError(ValueError):
@@ -47,6 +52,10 @@ def validate_engine_id(value: Any) -> str:
         raise InvalidConnectorIdError(
             f"Invalid connector id {value!r}: that is a generated form id, not a "
             "connector. Set `engine` to the service's name (e.g. 'linkedin')."
+        )
+    if is_custom_mcp(value):
+        raise InvalidConnectorIdError(
+            f"Invalid connector id {value!r}: it is reserved for MCP servers the user adds in the app."
         )
     return value
 
@@ -107,6 +116,10 @@ class OAuthConfig(BaseModel):
     # False means "skip this behavior silently," never a faked success.
     supports_refresh: bool = True
     supports_revoke: bool = True
+    # A refreshing provider whose code exchange may still omit the
+    # refresh_token (Notion, sometimes). The connect then saves anyway and
+    # the connection asks to reconnect once the access token expires.
+    refresh_token_optional: bool = False
     # Client authentication method at the token endpoint. Most providers
     # accept credentials in the form body; Supabase Management API OAuth uses
     # HTTP Basic authentication.
@@ -144,6 +157,41 @@ class CloudMethod(BaseModel):
     engine: str | None = None
 
 
+class ConnectorTestStep(BaseModel):
+    """One HTTP request of a custom connector's connection test, as data.
+
+    ``{{name}}`` placeholders stand for the member's values; the server fills
+    them in when it runs the step (cowork/services/connectors/connector_test_run.py).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    method: Literal["GET", "POST"]
+    url: str
+    headers: dict[str, str] = {}
+    #: Two placeholders, user then password, sent as HTTP Basic auth.
+    basic_auth: list[str] | None = Field(default=None, min_length=2, max_length=2)
+    #: A form-encoded body. At most one of ``form`` and ``json_body``.
+    form: dict[str, str] | None = None
+    json_body: Any = None
+
+
+class ConnectorTokenStep(ConnectorTestStep):
+    """The step that fetches a token; ``token_field`` names it in the JSON answer."""
+
+    token_field: str = Field(min_length=1, max_length=64)
+
+
+class ConnectorTestRequest(BaseModel):
+    """How the server tests a custom connector: an optional token step, then
+    the data step whose answer the member is shown before anything is saved."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    token: ConnectorTokenStep | None = None
+    data: ConnectorTestStep
+
+
 class ConnectorMethod(BaseModel):
     id: str
     label: str
@@ -159,6 +207,7 @@ class ConnectorMethod(BaseModel):
     # Field(s) a saved connection is named after; read from the raw spec by
     # cowork/services/connectors/identity.py.
     name_from: str | list[str] | None = None
+    test_request: ConnectorTestRequest | None = None
 
     @field_validator("id")
     @classmethod
@@ -178,6 +227,8 @@ class ConnectorForm(BaseModel):
     logo_color: str | None = None
     methods: list[ConnectorMethod] | None = None
     fields: list[ConnectorField] | None = None
+    #: A single-method form's test request; a multi-method form puts one on each method.
+    test_request: ConnectorTestRequest | None = None
 
 
 class ConnectorMetadataResponse(BaseModel):
@@ -202,10 +253,16 @@ class ConnectorMetadataResponse(BaseModel):
     # Built in Cowork and stored per org (or per local install), not shipped
     # in the static registry.
     custom: bool = False
+    # A custom connector saved before connection tests existed, which cannot
+    # be connected until the agent builds it again.
+    needs_rebuild: bool = False
+    # Connects with a typed key or token, the kind a custom connector can
+    # stand in for: not a database, and not only a sign-in redirect.
+    api_key: bool = False
 
 
 class CustomConnectorUpdate(BaseModel):
-    """Changes an admin makes to a custom connector; omitted fields stay as they are."""
+    """Changes to a custom connector; omitted fields stay as they are."""
 
     label: str | None = Field(default=None, min_length=1, max_length=255)
     description: str | None = None
@@ -214,9 +271,31 @@ class CustomConnectorUpdate(BaseModel):
     spec: dict[str, Any] | None = None
 
 
+class ConnectorCheck(BaseModel):
+    """How a custom connector tests its credentials: a GET of ``path`` on the address the member types.
+
+    The template's auth section places the values. There is no host: the
+    member supplies it.
+    """
+
+    path: str
+
+
+class ConnectorAuthSummary(BaseModel):
+    """Where a custom connector puts the member's values: its auth type and the
+    header or query parameter names that carry one. Never a template's text."""
+
+    type: Literal["header", "basic", "query"]
+    names: list[str] = []
+
+
 class ConnectorSpecResponse(ConnectorMetadataResponse):
     keywords: list[str] = []
     form: ConnectorForm
+    # Custom connectors only; None for every built-in and for a template saved without one.
+    check: ConnectorCheck | None = None
+    # Custom connectors only, and only beside a usable check.
+    auth_summary: ConnectorAuthSummary | None = None
     # Agent-facing notes on using this connector's API once connected: traps,
     # efficient endpoints, auth quirks. The chat agent sees them only when a
     # connection of this engine exists; the credential prober sees them while
@@ -231,6 +310,46 @@ class ConnectorSpecResponse(ConnectorMetadataResponse):
     # Describe per-method differences by field name (`app_password`,
     # `access_token`), not by env var name.
     usage_notes: str | None = Field(default=None, exclude=True)
+
+
+class CustomConnectionResponse(BaseModel):
+    """A member's stored custom API connection, as auth lists it: never a value."""
+
+    id: int
+    connector_id: str
+    name: str
+    secure_keys: list[str] = []
+    status: str
+    credential_version: int
+    created_at: datetime | None = None
+    updated_at: datetime | None = None
+    # The member deleted the template this connection was made from; it can
+    # still be deleted, but not connected again.
+    template_missing: bool = False
+
+
+class CustomConnectRequest(BaseModel):
+    """Connect a member's own custom connector: a name, the API address they type, and the field values."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str = Field(min_length=1)
+    address: str = Field(min_length=1, max_length=300)
+    values: dict[str, Any] = Field(default_factory=dict, repr=False)
+
+    @field_validator("name")
+    @classmethod
+    def _name_trimmed(cls, value: str) -> str:
+        """Store the name trimmed: a chat's toggle and the producer match it exactly, and the form trims.
+
+        Measured after trimming, as auth measures it, so a name auth would refuse is refused here.
+        """
+        trimmed = value.strip()
+        if not trimmed:
+            raise ValueError("name must not be blank")
+        if len(trimmed) > CUSTOM_CONNECTION_NAME_MAX:
+            raise ValueError(f"name must be at most {CUSTOM_CONNECTION_NAME_MAX} characters")
+        return trimmed
 
 
 class CustomConnectorAvailability(BaseModel):
@@ -517,3 +636,13 @@ class DatasourceConnectionResponse(BaseModel):
     validation_code: str | None = None
     created_at: datetime | None = None
     updated_at: datetime | None = None
+
+
+class ConnectorTestAnswer(BaseModel):
+    """The member's answer to a waiting custom connector test: the id of the
+    approval or confirmation it answers, exactly one of the two."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    approval_id: str | None = Field(default=None, min_length=1, max_length=64)
+    confirm_id: str | None = Field(default=None, min_length=1, max_length=64)

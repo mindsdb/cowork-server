@@ -48,6 +48,8 @@ from cowork.common.settings.app_settings import get_app_settings
 from cowork.db.personal_resources import PersonalResource
 from cowork.models.artifact_owner_choice import AccessMode
 from cowork.schemas.artifact_access import ArtifactAccessView, ArtifactStatusView
+from cowork.schemas.artifact_card import ArtifactCard
+from cowork.services.artifact_metadata import ArtifactMetadata, lenient_text
 from anton.core.artifacts.internal_files import (
     NON_CONTENT_NAMES,
     REVISIONS_DIRNAME,
@@ -318,16 +320,16 @@ def _scan_artifact_dirs(*, scope: TenantScope | None) -> list[Path]:
     return list(dirs.values())
 
 
-def _load_metadata(folder: Path) -> dict | None:
+def _load_metadata(folder: Path) -> ArtifactMetadata | None:
     path = folder / "metadata.json"
     try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
+        return ArtifactMetadata.parse(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
         logger.warning("Skipping artifact with unreadable metadata: %s", path, exc_info=True)
         return None
 
 
-def origin_conversation_id(meta: dict | None) -> str:
+def origin_conversation_id(meta: ArtifactMetadata | None) -> str:
     """The conversation that first created this artifact, from its metadata
     `provenance` (written by the shared ArtifactStore for every harness) — the
     creating conversation is the first entry. Empty when unknown: artifacts
@@ -337,13 +339,8 @@ def origin_conversation_id(meta: dict | None) -> str:
     Takes the already-parsed metadata so the card builder does not read
     `metadata.json` a second time; `task_objects` passes what it loaded.
     """
-    provenance = (meta or {}).get("provenance") or []
-    if not isinstance(provenance, list) or not provenance:
-        return ""
-    first = provenance[0]
-    if not isinstance(first, dict):
-        return ""
-    return str(first.get("conversation") or "")
+    first = meta.provenance[0] if meta is not None and meta.provenance else None
+    return (first.conversation if first is not None else None) or ""
 
 
 def _user_files_with_mtimes(folder: Path) -> list[tuple[Path, int]]:
@@ -524,7 +521,9 @@ def _published_url_for(
         # have no `published` field; a url means they're live.
         if not entry.get("published", True):
             return ""
-        return entry.get("url", "") or ""
+        # The record sits in the agent-writable folder: only text the card
+        # can carry counts as a link.
+        return lenient_text(entry.get("url")) or ""
     return ""
 
 
@@ -1084,20 +1083,43 @@ def _unpublish_folder(
             )
             continue
         if not (folder / name).is_file():
-            # The path-based unpublish needs the file present, so this record
-            # cannot be cleared upstream — and once the folder is gone there is
-            # nothing left pointing at the remote copy. No metrics backend
-            # exists here, so this log line is the metric; keep the prefix.
-            logger.warning(
-                "orphaned_publish identifier=%s url=%s reason=primary_missing",
-                entry.get("report_id") or entry.get("last_md5"),
-                entry.get("url", ""),
+            # The path-based unpublish needs the file present. Take the page
+            # down by its recorded id instead: once the folder is gone nothing
+            # is left pointing at the remote copy, and its viewers' analytics
+            # go with it upstream.
+            _unpublish_missing_primary(
+                folder, name, entry, api_key=api_key, publish_url=publish_url, scope=scope,
             )
             continue
         unpublish_artifact(
             folder / name, artifacts_base=artifacts_base,
             api_key=api_key, publish_url=publish_url, scope=scope,
         )
+
+
+def _unpublish_missing_primary(
+    folder: Path, name: str, entry: dict, *, api_key: str, publish_url: str,
+    scope: TenantScope | None,
+) -> None:
+    """Take down a recorded page whose primary file is gone, by its recorded
+    id. On a protected publisher only an id the owner record ties to this
+    page is sent (`_unpublish_protected_pages` does the same)."""
+    from cowork.services.published_page_ownership import publication_owner
+
+    with publication_owner(
+        folder / name, published_dir=folder, publish_url=publish_url, scope=scope,
+    ) as ownership:
+        identifier = entry.get("report_id") or entry.get("last_md5")
+        if ownership is not None:
+            identifier = ownership.checked_report_id(entry.get("report_id"), url=entry.get("url", ""))
+        if not identifier:
+            return
+        logger.info(
+            "published_page_take_down identifier=%s url=%s reason=primary_missing",
+            identifier,
+            entry.get("url", ""),
+        )
+        _unpublish_identifier(str(identifier), entry, api_key=api_key, publish_url=publish_url)
 
 
 def _unpublish_identifier(
@@ -1146,9 +1168,10 @@ class _PageToTakeDown(NamedTuple):
 
 
 def _pages_to_take_down(*, folder: PinnedDir, published_map: dict) -> list[_PageToTakeDown]:
-    """The pages ``published_map`` records as live whose primary is still a
-    regular file in ``folder``. A page whose primary name is invalid or whose
-    primary is gone is logged as an orphaned publish and left up."""
+    """The pages ``published_map`` records as live. A page whose primary name
+    is invalid is logged as an orphaned publish and left up. A page whose
+    primary is gone is listed too: it comes down by its recorded id, which
+    needs no file, so deleting the folder leaves no live page behind."""
     pages: list[_PageToTakeDown] = []
     for name, entry in published_map.items():
         if not isinstance(entry, dict) or entry.get("published") is False:
@@ -1168,12 +1191,11 @@ def _pages_to_take_down(*, folder: PinnedDir, published_map: dict) -> list[_Page
         except OSError:
             primary_stat = None
         if primary_stat is None or not stat.S_ISREG(primary_stat.st_mode):
-            logger.warning(
-                "orphaned_publish identifier=%s url=%s reason=primary_missing",
+            logger.info(
+                "published_page_take_down identifier=%s url=%s reason=primary_missing",
                 identifier,
                 entry.get("url", ""),
             )
-            continue
         pages.append(_PageToTakeDown(name, str(identifier), entry))
     return pages
 
@@ -1414,8 +1436,13 @@ async def delete_artifact_from_source(
     publish_url: str,
     scope: TenantScope,
     deadline: bool = True,
+    remove: bool = True,
 ) -> None:
     """Delete one direct artifact child through pinned directory descriptors.
+
+    Without ``remove`` it only takes the folder's pages down, the same way,
+    and leaves the folder: a project delete takes down every artifact's
+    pages before it removes the project's files (`take_down_artifact_pages`).
 
     The older :func:`delete_artifact` remains the desktop/path-oriented public
     helper. HTTP deletion has stronger information: an authorized
@@ -1461,8 +1488,44 @@ async def delete_artifact_from_source(
     finally:
         if pinned:
             await run_efs(
-                partial(_finish_delete, pinned=pinned[0], remove=taken_down), scope=scope, deadline=False,
+                partial(_finish_delete, pinned=pinned[0], remove=taken_down and remove),
+                scope=scope,
+                deadline=False,
             )
+
+
+def has_live_pages(folder: Path) -> bool:
+    """Whether ``folder``'s publish record names a page that is still up.
+    A cheap first look, path-based: the take-down pins the folder itself."""
+    return any(
+        isinstance(entry, dict)
+        and entry.get("published") is not False
+        and bool(entry.get("report_id") or entry.get("last_md5"))
+        for entry in _load_published_map(folder).values()
+    )
+
+
+async def take_down_artifact_pages(
+    *,
+    source: ProjectArtifacts,
+    folder_name: str,
+    api_key: str,
+    publish_url: str,
+    scope: TenantScope,
+) -> None:
+    """Take down every live page of one artifact and keep its folder: the
+    artifact delete's take-down (`delete_artifact_from_source`), recorded in
+    its publish record the same way. Raises as that does when a page fails to
+    come down, with the pages already down recorded."""
+    await delete_artifact_from_source(
+        source=source,
+        folder_name=folder_name,
+        expected_artifact_id=None,
+        api_key=api_key,
+        publish_url=publish_url,
+        scope=scope,
+        remove=False,
+    )
 
 
 def reveal_in_file_manager(path: Path) -> None:
@@ -1498,7 +1561,7 @@ def draft_url_for(*, project_id: str | None, artifact_id: str, rel_path: str) ->
 class _PreparedArtifactCard:
     """Pure card result plus the inputs needed for its modified badge."""
 
-    card: dict
+    card: ArtifactCard
     io_folder: Path
     io_root: Path | None
     primary: Path | None
@@ -1510,7 +1573,7 @@ def _prepare_artifact_card(
     idx: int = 0,
     *,
     artifact_id: str,
-    meta: dict,
+    meta: ArtifactMetadata,
     published_map: dict,
     project_id: str | None,
     project_name: str,
@@ -1535,7 +1598,7 @@ def _prepare_artifact_card(
     primary = _pick_primary(
         io_folder,
         files,
-        primary_hint=meta.get("primary"),
+        primary_hint=meta.primary,
         preserve_folder_path=pinned_folder is not None,
     )
     logical_primary = None
@@ -1546,7 +1609,7 @@ def _prepare_artifact_card(
             primary = None
     primary_path = str(logical_primary) if logical_primary is not None else str(logical_folder)
     primary_ext = logical_primary.suffix.lower() if logical_primary is not None else ""
-    artifact_type = meta.get("type") or "mixed"
+    artifact_type = meta.type or "mixed"
     kind = KIND_BY_TYPE.get(artifact_type) or KIND_BY_EXT.get(primary_ext, "File")
     is_live = False
     if primary is not None:
@@ -1561,65 +1624,67 @@ def _prepare_artifact_card(
     # — already sorted mtime desc, so this is its first entry.
     mtime_seconds = (files_with_mtimes[0][1] // 1_000_000_000) if files_with_mtimes else 0
 
-    card = {
+    from cowork.services.artifact_identity import artifact_key
+
+    access = published_access_view(io_folder, primary, published_map=published_map)
+    # Left out here, at the one card builder, so inline chat cards are covered
+    # too. In org mode the owner reads the password and the emails from GET
+    # .../access, which can tell owner from co-member. `accessMode` stays:
+    # ArtifactStatus draws its badge from it.
+    access_fields = access.model_dump(
+        exclude={"access_password", "access_emails"} if _org_mode() else None
+    )
+    # Drafts and every published version share this key. A legacy
+    # `.published.json` key is intentionally overridden here so comments do not
+    # fork when an artifact is re-published under a different report URL.
+    access_fields["artifact_key"] = artifact_key(artifact_id)
+    card = ArtifactCard(
         # The one identity: drafts, published versions, revisions, comments
         # and the workspace API all key off it.
-        "id": artifact_id,
-        "slug": meta.get("slug") or folder.name,
-        "title": meta.get("name") or folder.name,
-        "description": meta.get("description") or "",
-        "type": artifact_type,
-        "kind": kind,
-        "ext": primary_ext,
-        "updated": _human_mtime(mtime_seconds),
-        "mtime": mtime_seconds,
-        "live": is_live,
-        "bg": BG_CYCLE[idx % len(BG_CYCLE)],
-        "fileCount": len(files),
+        id=artifact_id,
+        slug=meta.slug or folder.name,
+        title=meta.name or folder.name,
+        description=meta.description or "",
+        type=artifact_type,
+        kind=kind,
+        ext=primary_ext,
+        updated=_human_mtime(mtime_seconds),
+        mtime=mtime_seconds,
+        live=is_live,
+        bg=BG_CYCLE[idx % len(BG_CYCLE)],
+        file_count=len(files),
         # `folder`/`path` stay in the payload even in org mode: the renderer uses
         # `path` as an opaque state key (the in-flight `busyPaths` set, live-row
         # matching, title fallbacks), and it is no secret — a client of its own
         # organization already knows `<root>/<org_id>`. Isolation comes from
         # `projectId` plus the server-side scope, not from hiding the path.
-        "folder": str(logical_folder),
-        "path": primary_path,
-        "primary": meta.get("primary") or None,
-        "projectId": project_id,
+        folder=str(logical_folder),
+        path=primary_path,
+        primary=meta.primary or None,
+        project_id=project_id,
         # What the card shows. The serve URL below carries `project_name`
         # instead, because serve_artifact_file resolves that segment by name
         # (_project_artifacts_base).
-        "projectName": project_label or project_name,
+        project_name=project_label or project_name,
         # The conversation that produced the artifact, so a comment addressed
         # with the agent from the artifacts list resumes that chat instead of
         # opening a fresh one. Empty for artifacts written before provenance —
         # the client then falls back to a new conversation. Whether the chat is
         # still reachable is the client's call: it already knows its own
         # conversations and can fetch the rest.
-        "originConversationId": origin_conversation_id(meta),
-        "publishedUrl": _published_url_for(
-            io_folder, primary, published_map=published_map
-        ),
-        # Filled by one of the two callers below. Keeping the slot here preserves
-        # the canonical response shape and key order.
-        "modified": False,
-        # Owner-side access state (lock badge + eye-reveal). accessPassword
-        # is the plaintext, returned only to the owner's own session.
-        **_published_access_for(
-            io_folder, primary, published_map=published_map
-        ),
-        "serveUrl": serve_url_for(
+        origin_conversation_id=origin_conversation_id(meta),
+        published_url=_published_url_for(io_folder, primary, published_map=published_map),
+        # Set explicitly so `to_json()` (exclude_unset) keeps the key for a caller
+        # that doesn't assign it.
+        modified=False,
+        **access_fields,
+        serve_url=serve_url_for(
             primary_path,
             scope=scope,
             artifacts_base=artifacts_base,
             project_name=project_name,
         ),
-    }
-    from cowork.services.artifact_identity import artifact_key
-
-    # Drafts and every published version share this key. A legacy
-    # `.published.json` key is intentionally overridden here so comments do not
-    # fork when an artifact is re-published under a different report URL.
-    card["artifactKey"] = artifact_key(artifact_id)
+    )
     if primary is not None:
         # macOS commonly exposes the same temporary directory through both
         # ``/var`` and ``/private/var``. Canonicalize both sides before deriving
@@ -1636,18 +1701,9 @@ def _prepare_artifact_card(
         except ValueError:
             logger.warning("Artifact primary resolves outside its folder: %s", folder)
         else:
-            card["draftUrl"] = draft_url_for(
+            card.draft_url = draft_url_for(
                 project_id=project_id, artifact_id=artifact_id, rel_path=rel
             )
-    if _org_mode():
-        # Dropped at the single card builder so inline chat cards are covered
-        # too: they call this function as well, and a filter applied only at the
-        # list endpoint would still hand the plaintext password to the chat.
-        # In org mode the owner reads the password and the emails from GET
-        # .../access, which can tell owner from co-member, so the card carries
-        # neither. `accessMode` stays: ArtifactStatus draws its badge from it.
-        card.pop("accessPassword", None)
-        card.pop("accessEmails", None)
     return _PreparedArtifactCard(
         card=card,
         io_folder=io_folder,
@@ -1668,7 +1724,7 @@ def card_for_folder(
     _pinned_folder: PinnedDir | None = None,
     _pinned_root: PinnedDir | None = None,
     artifacts_base: Path | None = None,
-) -> dict | None:
+) -> ArtifactCard | None:
     """Build one card, retaining legacy metadata and publish-map self-heals.
 
     Inline chat cards and status refreshes historically migrate legacy ids and
@@ -1710,7 +1766,7 @@ def card_for_folder(
     )
     if prepared is None:
         return None
-    prepared.card["modified"] = _is_modified(
+    prepared.card.modified = _is_modified(
         prepared.io_folder,
         prepared.primary,
         prepared.mtime_seconds,
@@ -1730,7 +1786,7 @@ def _listed_card_for_pinned_folder(
     pinned_folder: PinnedDir,
     pinned_root: PinnedDir,
     artifacts_base: Path,
-) -> dict | None:
+) -> ArtifactCard | None:
     """Build one list card through a call graph containing no artifact writes.
 
     The caller names the card's artifacts root, so its serve URL is built from
@@ -1764,7 +1820,7 @@ def _listed_card_for_pinned_folder(
     )
     if prepared is None:
         return None
-    prepared.card["modified"] = _is_modified_read_only(
+    prepared.card.modified = _is_modified_read_only(
         prepared.io_folder,
         prepared.primary,
         prepared.mtime_seconds,
@@ -1793,6 +1849,19 @@ def _pinned_directory_path(directory: PinnedDir | None) -> Path | None:
         return None
 
 
+def loose_file_status(
+    folder: Path, file: Path, *, published_map: dict | None = None
+) -> ArtifactStatusView:
+    """The status of a file with no metadata.json, from its folder's publish
+    record, read once."""
+    if published_map is None:
+        published_map = _load_published_map(folder)
+    return ArtifactStatusView.of_access(
+        published_access_view(folder, file, published_map=published_map),
+        published_url=_published_url_for(folder, file, published_map=published_map),
+    )
+
+
 def artifact_status_for_resolved(artifact: Path, *, scope: TenantScope | None) -> ArtifactStatusView:
     """Fresh owner-side status for an already resolved artifact path.
 
@@ -1817,15 +1886,9 @@ def artifact_status_for_resolved(artifact: Path, *, scope: TenantScope | None) -
     if card is None:
         # Loose / legacy file (no metadata.json anywhere up to the artifacts
         # container root).
-        card = {
-            "publishedUrl": _published_url_for(folder, artifact),
-            "modified": False,
-            **_published_access_for(folder, artifact),
-        }
-    # One response shape for BOTH branches: explicitly the published /
-    # modified / access subset, and NEVER `accessPassword` — that owner-only
-    # plaintext (which `_published_access_for` and the card both carry) must
-    # not leave this endpoint. ArtifactStatusView has no field for it.
+        return loose_file_status(folder, artifact)
+    # ArtifactStatusView has no field for the owner-only plaintext password,
+    # so it never leaves this endpoint.
     return ArtifactStatusView.of_card(card)
 
 
@@ -1866,11 +1929,11 @@ class ListedCards(NamedTuple):
     that fails to open, or whose card build raises, is skipped and is in
     neither field."""
 
-    cards: list[dict]
+    cards: list[ArtifactCard]
     no_card: tuple[ListCandidate, ...]
 
 
-def list_artifacts(sources: list[ProjectArtifacts]) -> list[dict]:
+def list_artifacts(sources: list[ProjectArtifacts]) -> list[ArtifactCard]:
     """Every artifact under the given roots, newest first, capped at
     LIST_CARDS.
 
@@ -1952,7 +2015,7 @@ def cards_for_candidates(candidates: Iterable[ListCandidate]) -> ListedCards:
     )
 
     ordered = sorted(candidates, key=lambda item: (-item.sort_time, item.source_index, item.name))
-    cards: list[dict] = []
+    cards: list[ArtifactCard] = []
     no_card: list[ListCandidate] = []
     # One root open per source, not per surviving candidate: opening a root
     # costs an openat+stat per path component, so re-opening it per card
@@ -2098,10 +2161,7 @@ async def mount_preview(path: Path, *, scope: TenantScope | None) -> dict:
     metadata_path = root / "metadata.json"
     if metadata_path.is_file():
         try:
-            meta = json.loads(metadata_path.read_text(encoding="utf-8"))
-            raw_port = meta.get("port")
-            if isinstance(raw_port, int) and 0 < raw_port < 65536:
-                backend_port = raw_port
+            backend_port = ArtifactMetadata.parse(metadata_path.read_text(encoding="utf-8")).port
         except Exception:
             backend_port = None
 
@@ -2254,7 +2314,8 @@ def _publishable_in_folder(
         and REVISIONS_DIRNAME not in path.relative_to(folder).parts
     ]
     meta = _load_metadata(folder) if (folder / "metadata.json").is_file() else None
-    if (meta or {}).get("type") not in fullstack_types:
+    meta = meta or ArtifactMetadata.empty()
+    if meta.type not in fullstack_types:
         return [
             _PublishableCandidate(st.st_mtime_ns, path, st.st_size, path.parent, _humanize(path.stem))
             for path, st in pages
@@ -2263,7 +2324,7 @@ def _publishable_in_folder(
     # Fullstack apps are found by their metadata, not by having a page, so an
     # app whose primary is not HTML/Markdown is still listed.
     newest = max(pages, key=lambda page: page[1].st_mtime_ns, default=None)
-    primary = meta.get("primary")
+    primary = meta.primary
     entry_path = folder / primary if primary else None
     if entry_path is None or not entry_path.is_file() or is_non_content_path(entry_path, container):
         entry_path = newest[0] if newest else None
@@ -2274,7 +2335,7 @@ def _publishable_in_folder(
     except OSError:
         return []
     mtime_ns = newest[1].st_mtime_ns if newest else st.st_mtime_ns
-    title = meta.get("name") or _humanize(folder.name)
+    title = meta.name or _humanize(folder.name)
     return [_PublishableCandidate(mtime_ns, entry_path, st.st_size, folder, title)]
 
 
@@ -2483,6 +2544,17 @@ async def _ensure_backend_running(
         )
 
 
+def _record_backend_port(artifact_dir: Path, port: int) -> None:
+    """Write the relaunched backend's port into metadata.json, changing only
+    that key. Backends launch only with the sandbox off, so the file is
+    written as on the desktop: in place, through a metadata.json the project
+    links. The encoding is metadata.json's own (ArtifactMetadata.encoded), so
+    on Windows the file gets LF line ends."""
+    meta_path = artifact_dir / "metadata.json"
+    latest = ArtifactMetadata.parse(meta_path.read_text(encoding="utf-8"))
+    meta_path.write_bytes(latest.with_value("port", port).encoded())
+
+
 async def _launch_backend_locked(
     artifact_dir: Path, *, project_root: Path, scope: TenantScope | None
 ) -> BackendStatus:
@@ -2514,8 +2586,8 @@ async def _launch_backend_locked(
     # explicit env mapping and let the launcher merge it for the spawn.
     extra_env: dict[str, str] = {}
     try:
-        meta = _load_metadata(artifact_dir) or {}
-        datasources = meta.get("datasources") or []
+        meta = _load_metadata(artifact_dir) or ArtifactMetadata.empty()
+        datasources = meta.datasources
         if datasources:
             from cowork.services.connectors.persist import turn_vault_for_scope
 
@@ -2526,7 +2598,7 @@ async def _launch_backend_locked(
 
             comparison_side = path_in_comparison_sandbox(project_root)
             for ds in datasources:
-                engine, name = ds.get("engine"), ds.get("name")
+                engine, name = ds.engine, ds.name
                 if not engine or not name:
                     continue
                 if comparison_side:
@@ -2587,13 +2659,7 @@ async def _launch_backend_locked(
     # dialing the stale port even though the backend is healthy on a
     # different one.
     try:
-        meta_path = artifact_dir / "metadata.json"
-        meta = json.loads(meta_path.read_text(encoding="utf-8"))
-        meta["port"] = new_port
-        meta_path.write_text(
-            json.dumps(meta, indent=2, ensure_ascii=False) + "\n",
-            encoding="utf-8",
-        )
+        _record_backend_port(artifact_dir, new_port)
     except Exception as exc:
         # Metadata write failure shouldn't abort an otherwise-working
         # relaunch — the backend is up and we return the new port. But

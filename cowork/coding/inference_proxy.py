@@ -9,6 +9,7 @@ from fastapi import HTTPException, Request
 from starlette.responses import Response, StreamingResponse
 from starlette.types import Receive, Scope, Send
 
+from cowork.coding.context import BUDGET_MODEL_PATTERN, BUDGET_PERIOD_ADJECTIVES, BUDGET_SCOPE_PATTERN
 from cowork.coding.engines.base import EngineCredentials
 from cowork.coding.inference_trace import trace_headers
 
@@ -27,12 +28,22 @@ TERMINAL_UPSTREAM_CODES = {
     404: "model_unavailable",
 }
 
-# MindsHub answers 429 for three different denials. An exhausted allowance or a
-# tripped free-serving fuse holds until a reset hours away, so retrying cannot
-# succeed and they fail terminally like the codes above. A velocity limit clears
-# within seconds, so the proxy waits out Retry-After itself: Codex's one
-# immediate retry would land inside the same window and fail the turn.
-TERMINAL_RATE_LIMIT_CODES = frozenset({"included_allowance_exhausted", "free_air_daily_spend_fuse_exceeded"})
+# MindsHub answers 429 for four different denials. An exhausted allowance, a
+# spent subscription window (ENG-4186) or a tripped free-serving fuse holds
+# until a reset hours away, so retrying cannot succeed and they fail terminally
+# like the codes above. A velocity limit clears within seconds, so the proxy
+# waits out Retry-After itself: Codex's one immediate retry would land inside
+# the same window and fail the turn.
+TERMINAL_RATE_LIMIT_CODES = frozenset(
+    {"included_allowance_exhausted", "window_allowance_exhausted", "free_air_daily_spend_fuse_exceeded"}
+)
+
+# Terminal statuses whose upstream code names a decision of its own rather than
+# the status's generic one, so the rewrite keeps it. A spent budget is a 402,
+# but credits do not lift it. A model outside the plan's tier (ENG-4186) is a
+# 403, but the credential is fine: read as the status's generic code it would
+# tell the user to sign in again.
+KEPT_UPSTREAM_CODES = {402: frozenset({"budget_exceeded"}), 403: frozenset({"model_not_in_tier"})}
 RATE_LIMIT_RETRIES = 3
 RATE_LIMIT_DEFAULT_WAIT_SECONDS = 2.0
 # Codex holds the request open while the proxy waits, so the total wait stays
@@ -113,20 +124,74 @@ def upstream_error_code(body: bytes) -> str:
     return code if isinstance(code, str) else ""
 
 
-def terminal_rejection(status_code: int, body: bytes, code: str | None = None) -> tuple[str, bytes] | None:
+def upstream_budget_scope(body: bytes, header: str | None = None) -> str:
+    """Whose budget a ``budget_exceeded`` rejection names, from ``error.budget_scope`` or the header."""
+    try:
+        payload = json.loads(body[:MAX_REJECTION_BODY_BYTES])
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        payload = None
+    error = payload.get("error") if isinstance(payload, dict) else None
+    scope = error.get("budget_scope") if isinstance(error, dict) else None
+    # The first well-formed value wins, so a bad body value can't hide a good header.
+    for candidate in (scope, header):
+        if isinstance(candidate, str) and BUDGET_SCOPE_PATTERN.fullmatch(candidate):
+            return candidate
+    return ""
+
+
+def upstream_budget_period(body: bytes, header: str | None = None) -> str:
+    """The spent budget's period a ``budget_exceeded`` rejection names, from the body or the header."""
+    try:
+        payload = json.loads(body[:MAX_REJECTION_BODY_BYTES])
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        payload = None
+    error = payload.get("error") if isinstance(payload, dict) else None
+    period = error.get("budget_period") if isinstance(error, dict) else None
+    for candidate in (period, header):
+        if isinstance(candidate, str) and candidate in BUDGET_PERIOD_ADJECTIVES:
+            return candidate
+    return ""
+
+
+def upstream_budget_model(body: bytes, header: str | None = None) -> str:
+    """A per-model ``budget_exceeded`` rejection's model alias, from the body or the header."""
+    try:
+        payload = json.loads(body[:MAX_REJECTION_BODY_BYTES])
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        payload = None
+    error = payload.get("error") if isinstance(payload, dict) else None
+    model = error.get("budget_model") if isinstance(error, dict) else None
+    for candidate in (model, header):
+        if isinstance(candidate, str) and BUDGET_MODEL_PATTERN.fullmatch(candidate):
+            return candidate
+    return ""
+
+
+def terminal_rejection(
+    status_code: int,
+    body: bytes,
+    code: str | None = None,
+    budget_scope: str = "",
+    budget_period: str = "",
+    budget_model: str = "",
+) -> tuple[str, bytes] | None:
     """Return the (code, body) of a non-retryable 400 for a deterministic upstream rejection."""
     code = code or TERMINAL_UPSTREAM_CODES.get(status_code)
     if code is None:
         return None
-    payload = {
-        "error": {
-            "message": upstream_error_message(body) or f"MindsHub inference rejected the request ({status_code})",
-            "type": "invalid_request_error",
-            "code": code,
-            "upstream_status": status_code,
-        }
+    error = {
+        "message": upstream_error_message(body) or f"MindsHub inference rejected the request ({status_code})",
+        "type": "invalid_request_error",
+        "code": code,
+        "upstream_status": status_code,
     }
-    return code, json.dumps(payload, ensure_ascii=False).encode()
+    if budget_scope:
+        error["budget_scope"] = budget_scope
+    if budget_period:
+        error["budget_period"] = budget_period
+    if budget_model:
+        error["budget_model"] = budget_model
+    return code, json.dumps({"error": error}, ensure_ascii=False).encode()
 
 
 def retry_after_seconds(value: str | None) -> float:
@@ -185,12 +250,12 @@ async def proxy_inference(request: Request, path: str, credentials: EngineCreden
             raw = await _read_bounded(upstream, MAX_REJECTION_BODY_BYTES)
         finally:
             await upstream.aclose()
-        # A spent budget is a 402 too, but credits do not lift it, so it keeps its own code.
-        budget = upstream.status_code == 402 and "budget_exceeded" in (
-            upstream_error_code(raw),
-            upstream.headers.get("x-mindshub-reason", ""),
+        kept = KEPT_UPSTREAM_CODES.get(upstream.status_code, frozenset())
+        code = next(
+            (c for c in (upstream_error_code(raw), upstream.headers.get("x-mindshub-reason", "")) if c in kept),
+            None,
         )
-        return _terminal_response(upstream, raw, "budget_exceeded" if budget else None)
+        return _terminal_response(upstream, raw, code)
     return _UpstreamStreamingResponse(upstream)
 
 
@@ -259,7 +324,12 @@ def _response_headers(upstream: httpx.Response) -> dict[str, str]:
 
 
 def _terminal_response(upstream: httpx.Response, raw: bytes, code: str | None = None) -> Response:
-    rejection = terminal_rejection(upstream.status_code, raw, code)
+    scope = period = budget_model = ""
+    if code == "budget_exceeded":
+        scope = upstream_budget_scope(raw, upstream.headers.get("x-mindshub-budget-scope"))
+        period = upstream_budget_period(raw, upstream.headers.get("x-mindshub-budget-period"))
+        budget_model = upstream_budget_model(raw, upstream.headers.get("x-mindshub-budget-model"))
+    rejection = terminal_rejection(upstream.status_code, raw, code, scope, period, budget_model)
     assert rejection is not None
     code, body = rejection
     headers = _response_headers(upstream)

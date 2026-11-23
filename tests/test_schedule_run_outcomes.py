@@ -78,7 +78,7 @@ def turns(monkeypatch):
     import cowork.handlers.responses as responses_mod
 
     started: list[str] = []
-    ending = SimpleNamespace(reason="completed", acted=True)
+    ending = SimpleNamespace(reason="completed", acted=True, stopped_by=None, handed_over=None)
 
     class CountingHandler:
         def __init__(self, *, principal=None, interactive=True, schedule_id=None):
@@ -94,7 +94,9 @@ def turns(monkeypatch):
             return stream()
 
     async def evidence(_conversation_id):
-        return scheduler._TurnEvidence(reason=ending.reason, acted=ending.acted)
+        return scheduler._TurnEvidence(
+            reason=ending.reason, acted=ending.acted, stopped_by=ending.stopped_by, handed_over=ending.handed_over,
+        )
 
     monkeypatch.setattr(responses_mod, "ResponsesHandler", CountingHandler)
     monkeypatch.setattr(scheduler, "_turn_evidence", evidence)
@@ -151,6 +153,74 @@ async def test_a_turn_records_its_outcome_and_consumes_its_slot(schedule_id, tur
     assert run.outcome == outcome
     assert ensure_utc(_schedule(schedule_id).next_run_at) > SLOT
     assert _poll(schedule_id) == []
+
+
+@pytest.mark.parametrize(
+    ("stopped_by", "setting"),
+    [
+        ("round_cap", "Max Steps per Task"),
+        ("spend_ceiling", "Max Tokens per Task"),
+        ("handback_budget", "Max Auto-Continues"),
+    ],
+)
+async def test_a_turn_that_stops_at_a_limit_is_not_a_success(schedule_id, turns, stopped_by, setting):
+    turns.ending.stopped_by = stopped_by
+    (first,) = _poll(schedule_id)
+    await _run(first)
+
+    (run,) = _runs(schedule_id)
+    assert (run.status, run.outcome) == (RunStatus.failed, AttemptOutcome.stopped_at_limit)
+    assert setting in run.error
+    schedule = _schedule(schedule_id)
+    assert schedule.last_error == run.error
+    # The slot is used up, and the run counts toward the failure streak: a
+    # task that stops at its limit every time would keep spending otherwise.
+    assert ensure_utc(schedule.next_run_at) > SLOT
+    assert (schedule.consecutive_failures, schedule.auto_paused_at) == (1, None)
+
+
+async def test_a_task_that_keeps_stopping_at_a_limit_pauses_itself(schedule_id, turns):
+    session = get_open_session()
+    try:
+        schedule = ScheduleService(ScopedSession(session, SYSTEM_SCOPE)).get_schedule(schedule_id)
+        schedule.consecutive_failures = 2
+        session.add(schedule)
+        session.commit()
+    finally:
+        session.close()
+    turns.ending.stopped_by = "round_cap"
+    (first,) = _poll(schedule_id)
+    await _run(first)
+
+    schedule = _schedule(schedule_id)
+    assert schedule.consecutive_failures == 3
+    assert schedule.auto_paused_at is not None
+
+
+async def test_a_turn_that_handed_its_browser_over_is_not_a_success(schedule_id, turns):
+    # ENG-4340: a disconnected Gmail sent the agent to Google's sign-in page.
+    turns.ending.handed_over = "Sign in to Gmail to read the newest email."
+    (first,) = _poll(schedule_id)
+    await _run(first)
+
+    (run,) = _runs(schedule_id)
+    assert (run.status, run.outcome) == (RunStatus.failed, AttemptOutcome.failed_during_execution)
+    assert "Sign in to Gmail to read the newest email." in run.error
+    schedule = _schedule(schedule_id)
+    assert schedule.last_error == run.error
+    # A task that needs a sign-in every time fails every time: it counts
+    # toward auto-pause.
+    assert ensure_utc(schedule.next_run_at) > SLOT
+    assert schedule.consecutive_failures == 1
+
+
+async def test_a_hand_back_that_is_not_a_limit_stays_completed(schedule_id, turns):
+    turns.ending.stopped_by = "handback_stuck"
+    (first,) = _poll(schedule_id)
+    await _run(first)
+
+    (run,) = _runs(schedule_id)
+    assert (run.status, run.outcome) == (RunStatus.success, AttemptOutcome.completed)
 
 
 async def test_a_setup_failure_before_the_turn_consumes_its_slot(schedule_id, turns, monkeypatch):
@@ -519,6 +589,78 @@ def test_a_turn_acted_when_its_stream_holds_more_than_its_start_and_failure(tmp_
     asyncio.run(fill())
     monkeypatch.setattr(scheduler, "registry", SimpleNamespace(get=lambda _cid: SimpleNamespace(buffer=buffer)))
     assert asyncio.run(scheduler._turn_activity("c1"))[0] is acted
+
+
+@pytest.mark.parametrize(
+    ("response", "stopped_by"),
+    [
+        ({"status": "incomplete", "incomplete_details": {"reason": "round_cap"}}, "round_cap"),
+        ({"status": "completed", "incomplete_details": None}, None),
+    ],
+)
+def test_a_turn_says_why_it_stopped_early_in_its_final_response(tmp_path, monkeypatch, response, stopped_by):
+    buffer = FileStreamBuffer(tmp_path / "turn.jsonl")
+
+    async def fill():
+        await buffer.append("sse", {"sse": _sse("response.created")})
+        await buffer.append("sse", {"sse": _sse("response.completed", {"response": response})})
+        await buffer.close("completed")
+
+    asyncio.run(fill())
+    monkeypatch.setattr(scheduler, "registry", SimpleNamespace(get=lambda _cid: SimpleNamespace(buffer=buffer)))
+    assert asyncio.run(scheduler._turn_stopped_by("c1")) == stopped_by
+    assert asyncio.run(scheduler._turn_evidence("c1")).stopped_by == stopped_by
+
+
+def _tool_frames(call_id: str, name: str, call: dict | str) -> list[str]:
+    """A tool call's frames as the stream formatter writes them: its name, its
+    input, then its result."""
+    import json
+
+    content = call if isinstance(call, str) else json.dumps(call)
+    return [
+        _sse("response.in_progress", {"thought_role": "thought.progress", "content": name, "tool_use_id": call_id}),
+        _sse("response.in_progress", {"thought_role": "thought.progress", "content": content, "tool_use_id": call_id}),
+        _sse("response.in_progress", {"thought_role": "thought.scratchpad_result", "content": "ok", "tool_use_id": call_id}),
+    ]
+
+
+@pytest.mark.parametrize(
+    ("frames", "handed_over"),
+    [
+        (_tool_frames("t1", "browser", {"action": "open", "url": "https://mail.google.com"}), None),
+        (
+            _tool_frames("t1", "browser", {"action": "open", "url": "https://mail.google.com"})
+            + _tool_frames("t2", "browser", {"action": "hand_to_user", "reason": "Sign in  to\nGmail."}),
+            "Sign in to Gmail.",
+        ),
+        (_tool_frames("t1", "browser", {"action": "hand_to_user"}), "This step needs you."),
+        # Another tool's input that names the action is not a hand-over.
+        (_tool_frames("t1", "scratchpad", {"action": "hand_to_user"}), None),
+        (_tool_frames("t1", "browser", "not json"), None),
+    ],
+)
+def test_a_turn_says_when_it_handed_its_browser_over(tmp_path, monkeypatch, frames, handed_over):
+    buffer = FileStreamBuffer(tmp_path / "turn.jsonl")
+
+    async def fill():
+        await buffer.append("sse", {"sse": _sse("response.created")})
+        for frame in frames:
+            await buffer.append("sse", {"sse": frame})
+        await buffer.append("sse", {"sse": _sse("response.completed", {"response": {"status": "completed"}})})
+        await buffer.close("completed")
+
+    asyncio.run(fill())
+    monkeypatch.setattr(scheduler, "registry", SimpleNamespace(get=lambda _cid: SimpleNamespace(buffer=buffer)))
+    assert asyncio.run(scheduler._turn_handed_over("c1")) == handed_over
+    assert asyncio.run(scheduler._turn_evidence("c1")).handed_over == handed_over
+
+
+def test_a_hand_over_outranks_a_finished_turn_but_not_a_failure():
+    handed = scheduler._classify(scheduler._TurnEvidence(reason="completed", acted=True, handed_over="Sign in."))
+    assert handed.outcome == AttemptOutcome.failed_during_execution
+    failed = scheduler._classify(scheduler._TurnEvidence(reason="error", acted=True, handed_over="Sign in."))
+    assert failed.outcome == AttemptOutcome.failed_during_execution
 
 
 def test_a_turn_with_no_buffer_counts_as_having_acted(monkeypatch):

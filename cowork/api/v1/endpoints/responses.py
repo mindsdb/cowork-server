@@ -530,6 +530,13 @@ async def _extend_turn_key_window(correlation_id: str) -> bool:
         if await extend_turn_key(
             instance_id=correlation_id, ttl_seconds=settings.turn_key_lifetime_seconds, settings=settings,
         ):
+            # The decisions proxy knows the key as long as auth does.
+            from cowork.services import decisions_proxy
+            from cowork.turnqueue.redis_client import get_redis
+
+            await decisions_proxy.extend(
+                get_redis(), correlation_id=correlation_id, ttl_seconds=settings.turn_key_lifetime_seconds,
+            )
             return True
     logger.error(
         "turn key extension failed twice; answering Stop here instead of Keep going: correlation_id=%s",
@@ -552,6 +559,8 @@ async def answer_question(req: AnswerRequest, scope: TenantScopeDep):
     verdict (turnqueue/answers.py).
     """
     _require_streaming_scope(scope)
+    from cowork.services.content_safety import check_content
+    await check_content("\n".join([req.text or "", *(req.values or [])]), purpose="input", scope=scope)
     # Keyed off the backend setting rather than local-registry presence (the
     # way /cancel and /tail check first): on the replica that owns this turn a
     # registry handle exists, but the broker it would submit to never holds a
@@ -669,6 +678,8 @@ async def add_to_running_turn(req: AddonRequest, scope: TenantScopeDep):
     if not valid_text(req.text):
         return JSONResponse(status_code=400, content={"status": "invalid_text"})
     text = req.text.strip()
+    from cowork.services.content_safety import check_content
+    await check_content(text, purpose="input", scope=scope)
     if not text:
         return queued("empty")
     if not settings.addon_routing_enabled:

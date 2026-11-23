@@ -26,9 +26,11 @@ ORG_A = "8f14e45f-ceea-467e-adde-3fb5ba9302f0"
 class FakeHarness:
     def __init__(self):
         self.calls: list[dict] = []
+        self.called = asyncio.Event()
 
     async def stream_response(self, *, conversation, input, channel_context=None, trace_metadata=None):
         self.calls.append({"conversation": conversation, "channel_context": channel_context})
+        self.called.set()
         if False:
             yield
 
@@ -173,7 +175,9 @@ def test_discord_gateway_message_in_org_mode_gets_a_reply(monkeypatch, org_mode)
             await sync_channel_ingress(manager, adapters, "discord", ORG_A)
             assert manager.is_running("discord", ORG_A)
 
-            await asyncio.wait_for(_until_called(fake_harness), 1.0)
+            # A ceiling, not a speed check: under coverage on a loaded runner
+            # the turn takes over a second to reach the harness.
+            await asyncio.wait_for(fake_harness.called.wait(), 30.0)
             await drain_background_tasks()
 
         asyncio.run(flow())
@@ -208,11 +212,6 @@ def test_discord_gateway_message_in_org_mode_gets_a_reply(monkeypatch, org_mode)
         _delete_channel_events("discord:message:55")
         _delete_binding_and_its_rows("discord", "D1", ORG_A)
         _delete_installation("discord", ORG_A)
-
-
-async def _until_called(fake_harness, poll_interval: float = 0.02) -> None:
-    while not fake_harness.calls:
-        await asyncio.sleep(poll_interval)
 
 
 def test_a_second_orgs_manager_cannot_also_run_the_same_orgs_gateway(monkeypatch, org_mode):

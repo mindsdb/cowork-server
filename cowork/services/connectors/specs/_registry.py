@@ -4,12 +4,36 @@ import json
 import re
 from collections.abc import Iterable
 from pathlib import Path
+
+from cowork.common.settings.app_settings import OAuthSettings
 from cowork.schemas.connectors import (
     ConnectorMetadataResponse,
     ConnectorSpecResponse,
     MatchCandidate,
     MatchResponse,
 )
+
+
+_NOT_API_CATEGORIES = frozenset({"database", "vector-db"})
+
+
+def _takes_api_key(c: dict) -> bool:
+    """Whether a raw spec connects with a typed key or token.
+
+    True when its category is not a database kind and one of its form methods
+    is not an OAuth launch and asks for a secret or password field.
+    """
+    if c.get("category") in _NOT_API_CATEGORIES:
+        return False
+    form = c.get("form")
+    methods = form.get("methods") if isinstance(form, dict) else None
+    for method in methods or []:
+        if not isinstance(method, dict) or method.get("submit_action") == "oauth_launch":
+            continue
+        for field in method.get("fields") or []:
+            if isinstance(field, dict) and (field.get("secret") or field.get("type") == "password"):
+                return True
+    return False
 
 
 def connector_metadata(c: dict) -> ConnectorMetadataResponse:
@@ -26,7 +50,25 @@ def connector_metadata(c: dict) -> ConnectorMetadataResponse:
         featured=c.get("featured", False),
         notice=c.get("notice"),
         custom=c.get("custom", False),
+        needs_rebuild=c.get("needs_rebuild", False),
+        api_key=_takes_api_key(c),
     )
+
+
+def _without_slack_mcp(form: dict) -> dict:
+    """Slack's form while its `mcp` method is switched off, as it was before
+    that method: `mcp` hidden, the bot token the default, and the
+    bring-your-own-app `oauth` method visible again."""
+    methods = []
+    for method in form.get("methods") or []:
+        if isinstance(method, dict) and method.get("id") == "mcp":
+            method = {**method, "hidden": True, "recommended": False}
+        elif isinstance(method, dict) and method.get("id") == "bot-token":
+            method = {**method, "recommended": True}
+        elif isinstance(method, dict) and method.get("id") == "oauth":
+            method = {**method, "hidden": False}
+        methods.append(method)
+    return {**form, "methods": methods}
 
 
 class ConnectorSpecRegistry:
@@ -73,12 +115,26 @@ class ConnectorSpecRegistry:
                 notes[engine] = text
         return notes
 
+    def mcp_engines(self) -> frozenset[str]:
+        """Engines whose spec offers an ``mcp`` connect method."""
+        return frozenset(
+            engine
+            for engine, spec in self.get_connectors().items()
+            if any(
+                isinstance(method, dict) and method.get("id") == "mcp"
+                for method in ((spec.get("form") or {}).get("methods") or [])
+            )
+        )
+
     def list_connectors(self) -> list[ConnectorMetadataResponse]:
         items = [connector_metadata(c) for c in self.get_connectors().values()]
         items.sort(key=lambda x: (x.label or "").lower())
         return items
 
     def _to_connector_spec_response(self, c: dict) -> ConnectorSpecResponse:
+        form = c.get("form", {})
+        if c.get("id") == "slack" and not OAuthSettings().slack_connector_enabled:
+            form = _without_slack_mcp(form)
         return ConnectorSpecResponse(
             id=c.get("id"),
             label=c.get("label", c.get("id", "")),
@@ -91,8 +147,12 @@ class ConnectorSpecRegistry:
             featured=c.get("featured", False),
             notice=c.get("notice"),
             custom=c.get("custom", False),
+            needs_rebuild=c.get("needs_rebuild", False),
+            api_key=_takes_api_key(c),
             keywords=c.get("keywords", []),
-            form=c.get("form", {}),
+            form=form,
+            check=c.get("check"),
+            auth_summary=c.get("auth_summary"),
         )
 
     def reload(self) -> None:

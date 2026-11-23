@@ -146,6 +146,15 @@ deployment:
   # must be in the scratchpad image before an environment turns grants on; an
   # environment opts out with "false" in its own values file.
   datasourceLabelsEnabled: "true"
+  # Lets cloud turns build custom connector templates a member saves from a card
+  # (COWORK_TURN_CONNECTOR_DRAFTS_ENABLED). On everywhere; an environment opts
+  # out with "false" in its own values file.
+  connectorDraftsEnabled: "true"
+  # Gives a member's org-mode turns the custom API connections they connected
+  # (COWORK_TURN_CUSTOM_API_ENABLED). Off in the base; an environment turns it on
+  # in its own values file once auth, the inference gateway and the pod's anton
+  # there serve those connections. tests/test_chart_values.py pins which are on.
+  customApiTurnsEnabled: "false"
 
   # The draft-preview host name and the one page allowed to frame a draft. The
   # draft Ingress and the COWORK_DRAFT_* variables below are templated from
@@ -158,8 +167,7 @@ deployment:
   webOrigin: ""
 
   image:
-    # The build-push-ecr action derives the ECR repo name from the GitHub repo
-    # slug, so this must track the GitHub repo name (cowork-server).
+    # The module-name the build-image step in build-deploy.yml pushes to.
     repository: 168681354662.dkr.ecr.us-east-1.amazonaws.com/mindsdb-cowork-server
     # No command or args here: the image's CMD (Dockerfile) owns the uvicorn
     # command, one worker per pod, scaled with replicas. That includes
@@ -516,6 +524,10 @@ deployment:
       value: '{{ $.Values.datasourceTurnsEnabled }}'
     - name: COWORK_TURN_DATASOURCE_LABELS_ENABLED
       value: '{{ $.Values.datasourceLabelsEnabled }}'
+    - name: COWORK_TURN_CONNECTOR_DRAFTS_ENABLED
+      value: '{{ $.Values.connectorDraftsEnabled }}'
+    - name: COWORK_TURN_CUSTOM_API_ENABLED
+      value: '{{ $.Values.customApiTurnsEnabled }}'
     - name: COWORK_TURN_DATASOURCE_PRODUCER_KEY_ID
       valueFrom:
         secretKeyRef:

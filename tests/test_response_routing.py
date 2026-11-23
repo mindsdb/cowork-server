@@ -1,5 +1,6 @@
 import asyncio
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -1016,10 +1017,20 @@ async def test_router_binding_mints_per_turn_key_in_hosted_org_mode(monkeypatch)
     import cowork.turnqueue.producer as producer
     from cowork.common.settings.user_settings import Provider
 
+    import cowork.handlers.response_routing as routing
+
     handler = _routing_handler(monkeypatch)
+    # This test checks key minting and tracing, not the gate's latency
+    # budgets. The first streamed event goes through a real OpenAI client and
+    # can miss the 2s production budget on a loaded CI runner, which falls back
+    # to `delegated_agentic` and fails the route assertion below.
+    monkeypatch.setattr(routing, "_GATE_FIRST_EVENT_SECONDS", 30.0)
+    monkeypatch.setattr(routing, "_GATE_IDLE_SECONDS", 30.0)
+    monkeypatch.setattr(routing, "_GATE_TOTAL_SECONDS", 60.0)
     monkeypatch.setattr(
         responses, "TurnQueueSettings",
-        lambda: SimpleNamespace(backend="remote", is_remote=True, turn_key_ttl_seconds=1200, datasource_enabled=False),
+        lambda: SimpleNamespace(backend="remote", is_remote=True, turn_key_ttl_seconds=1200, datasource_enabled=False,
+                                needs_turn_key_id=False),
     )
     monkeypatch.setattr(
         responses, "get_user_settings",
@@ -1078,7 +1089,7 @@ async def test_router_binding_mints_per_turn_key_in_hosted_org_mode(monkeypatch)
     assert binding.label == "minds_cloud"
     assert binding.model == "mindshub_air"
     assert type(binding.provider).__name__ == "OpenAIProvider"
-    assert decision.route == DIRECT_CONTEXT
+    assert decision.route == DIRECT_CONTEXT, decision
     assert len(requests) == 1
     assert requests[0].headers["Langfuse-Session-Id"] == "conv-router"
     # Exercise the installed Anton: assigning the attribute alone also passes
@@ -1102,7 +1113,8 @@ async def test_router_binding_omits_workspace_id_when_none_picked(monkeypatch):
     handler = _routing_handler(monkeypatch)
     monkeypatch.setattr(
         responses, "TurnQueueSettings",
-        lambda: SimpleNamespace(backend="remote", is_remote=True, turn_key_ttl_seconds=1200, datasource_enabled=False),
+        lambda: SimpleNamespace(backend="remote", is_remote=True, turn_key_ttl_seconds=1200, datasource_enabled=False,
+                                needs_turn_key_id=False),
     )
     monkeypatch.setattr(
         responses, "get_user_settings",
@@ -1139,7 +1151,8 @@ async def test_router_binding_hands_the_key_prefix_to_the_turn_when_datasources_
     handler = _routing_handler(monkeypatch)
     monkeypatch.setattr(
         responses, "TurnQueueSettings",
-        lambda: SimpleNamespace(backend="remote", is_remote=True, turn_key_ttl_seconds=1200, datasource_enabled=True),
+        lambda: SimpleNamespace(backend="remote", is_remote=True, turn_key_ttl_seconds=1200, datasource_enabled=True,
+                                needs_turn_key_id=True),
     )
     monkeypatch.setattr(
         responses, "get_user_settings",
@@ -1166,6 +1179,34 @@ async def test_router_binding_hands_the_key_prefix_to_the_turn_when_datasources_
     assert turn_llm["turn_key_id"] == "mdb_gate"
     # The workspace a person picked binds the key whether or not datasources are on.
     assert minted["workspace_id"] == "ws-picked"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("datasource", "custom_api", "prefixed"), [
+    ("false", "true", True), ("true", "false", True), ("false", "false", False),
+])
+async def test_the_gate_mints_a_prefixed_key_when_either_setting_needs_one(monkeypatch, datasource, custom_api, prefixed):
+    """Custom API grants bind to the prefix as datasource grants do, so the gate mints it for either."""
+    import cowork.handlers.responses as responses
+    import cowork.turnqueue.producer as producer
+    from cowork.common.settings.user_settings import Provider
+
+    handler = _routing_handler(monkeypatch)
+    monkeypatch.setenv("COWORK_TURN_BACKEND", "remote")
+    monkeypatch.setenv("COWORK_TURN_DATASOURCE_ENABLED", datasource)
+    monkeypatch.setenv("COWORK_TURN_CUSTOM_API_ENABLED", custom_api)
+    monkeypatch.setattr(
+        responses, "get_user_settings",
+        lambda scope: SimpleNamespace(resolved_router_provider=Provider.MINDS_CLOUD, resolved_router_model="kimi",
+                                      resolved_gate_model="mindshub_air", hub_workspace_id=""),
+    )
+    block = {"provider": "minds-cloud", "api_key": "mdb_gate.secret", "base_url": "http://gw/v1"}
+    monkeypatch.setattr(producer, "_mint_llm_block_with_turn_key_id", AsyncMock(return_value=(block, "mdb_gate")))
+    monkeypatch.setattr(producer, "mint_llm_block", AsyncMock(return_value=block))
+
+    _, turn_llm = await handler._router_binding()
+
+    assert turn_llm.get("turn_key_id") == ("mdb_gate" if prefixed else None)
 
 
 @pytest.mark.asyncio
@@ -1808,7 +1849,9 @@ def _gate_warnings(caplog):
 
 
 @pytest.mark.asyncio
-async def test_router_unavailable_logs_the_refusal_without_its_message(monkeypatch, caplog, owned_logger):
+async def test_router_unavailable_logs_the_refusal_without_its_message(
+    monkeypatch, caplog, owned_logger, router_wire_budget,
+):
     """OpenAI refuses the gate's function tool on chat completions when the
     router model reasons. The failure line names that refusal by class and
     status. Provider text can quote the request or echo a credential."""
@@ -1951,7 +1994,9 @@ async def test_router_unavailable_drops_arbitrary_status_and_provider_body_field
 
 
 @pytest.mark.asyncio
-async def test_router_unavailable_logs_the_status_under_antons_own_error(monkeypatch, caplog):
+async def test_router_unavailable_logs_the_status_under_antons_own_error(
+    monkeypatch, caplog, router_wire_budget,
+):
     """anton raises its own error from the SDK's for the statuses it names, so
     the line reads only the status from that cause. Here,
     an Azure deployment that doesn't exist."""

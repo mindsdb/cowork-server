@@ -20,6 +20,8 @@ endpoints.
 """
 from __future__ import annotations
 
+from urllib.parse import quote
+
 import httpx
 from fastapi import HTTPException, Request, status
 
@@ -135,6 +137,18 @@ async def proxy_connection_detail(engine: str, name: str, request: Request, sett
     return await _relay("GET", f"/v1/oauth/{engine}/{name}", request=request, settings=settings)
 
 
+async def proxy_remove_picked_file(
+    engine: str, name: str, file_id: str, project: str, request: Request, settings: OAuthSettings,
+) -> list[dict]:
+    """Untag one picked file from `project` in auth's Data Vault, dropping
+    it once no project is left. auth supports this for Notion pages only."""
+    result = await _relay(
+        "DELETE", f"/v1/oauth/{engine}/{name}/picked-files/{quote(file_id, safe='')}",
+        request=request, settings=settings, params={"project": project},
+    )
+    return result.get("files", [])
+
+
 async def proxy_delete(engine: str, name: str, request: Request, settings: OAuthSettings) -> None:
     """Disconnect a connection via auth's Data Vault (org mode has no local
     vault of its own to delete from). auth 404s on an unknown connection,
@@ -217,4 +231,22 @@ async def proxy_datasource_retry(connection_id: int, request: Request, settings:
     return await _relay(
         "POST", f"/v1/datasources/{connection_id}/validation-retry",
         request=request, settings=settings, keep_code=True,
+    )
+
+
+# Custom API connections. A member lists and deletes their own here, on the same
+# forwarded bearer; nobody creates one through this relay: cowork-server does,
+# on auth's internal route, only after the connection's check passed.
+
+
+async def proxy_custom_connection_list(request: Request, settings: OAuthSettings) -> list[dict]:
+    """auth answers with {"items": [...]}; callers here want the rows."""
+    result = await _relay("GET", "/v1/custom-connections", request=request, settings=settings, keep_code=True)
+    items = result.get("items", [])
+    return items if isinstance(items, list) else []
+
+
+async def proxy_custom_connection_delete(connection_id: int, request: Request, settings: OAuthSettings) -> None:
+    await _relay(
+        "DELETE", f"/v1/custom-connections/{connection_id}", request=request, settings=settings, keep_code=True,
     )

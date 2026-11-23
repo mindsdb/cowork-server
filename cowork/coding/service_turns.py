@@ -4,6 +4,8 @@ import dataclasses
 import logging
 import threading
 import uuid
+from collections.abc import Iterable
+from pathlib import Path
 
 from cowork.coding.commands import CommandIntent
 from cowork.coding.connector_capabilities import ConnectorCapability
@@ -17,6 +19,7 @@ from cowork.coding.contracts import (
     SessionCreateRequest,
     SessionStatus,
     TaskCapability,
+    WorkspaceMode,
 )
 from cowork.coding.control_errors import StateConflict
 from cowork.coding.control_models import TERMINAL_RUN_STATUSES, RunStatus, RuntimeCommand, RuntimeEvent, TaskRun
@@ -24,10 +27,27 @@ from cowork.coding.engines.base import EngineCredentials, EngineInputReference, 
 from cowork.coding.reasoning import ModelLevels
 from cowork.coding.session_factory import PendingLocalSession
 from cowork.coding.turns import RunningTurn, fail_turn, mark_running
+from cowork.coding.workspace import WorkspaceError
 from cowork.services.skills import CodeSkillService
 
 
 logger = logging.getLogger(__name__)
+
+
+IN_PLACE_BUSY = (
+    "Another task is working in this folder. Wait for it to finish, or choose Worktree to run them side by side"
+)
+FOLDER_BEING_UPDATED = "Another task is changing files in this folder. Try again when it finishes"
+
+
+def _overlaps(left: Iterable[Path], right: Iterable[Path]) -> bool:
+    """Whether any folder in ``left`` is, contains, or is inside one in ``right``."""
+    right = tuple(right)
+    return any(
+        first == second or first in second.parents or second in first.parents
+        for first in left
+        for second in right
+    )
 
 
 def _await_first_turn(current: CodingSession) -> None:
@@ -49,6 +69,11 @@ class CodingTurnOperations:
         model_levels: ModelLevels | None = None,
     ) -> CodingSession:
         """Record a task and return it; a local task prepares in the background."""
+
+        def folder_busy(roots: set[Path]) -> bool:
+            with self._lock:
+                return self._shared_folder_conflict("", roots) is not None
+
         begun = self.session_factory.begin(
             request,
             credentials,
@@ -56,6 +81,7 @@ class CodingTurnOperations:
             default_model,
             code_skills,
             model_levels=model_levels,
+            folder_busy=folder_busy,
         )
         if isinstance(begun, CodingSession):
             intent = self._validated_command_intent(begun, request.prompt, request.attachments)
@@ -64,6 +90,11 @@ class CodingTurnOperations:
         try:
             self._validated_command_intent(self.get_session(begun.session_id), request.prompt, request.attachments)
             require_attachments_exist(request.attachments)
+            in_place_roots = (
+                self.session_factory.in_place_roots(begun.project, request.resource_ids, request.path)
+                if begun.workspace_mode == WorkspaceMode.in_place
+                else set()
+            )
             thread = threading.Thread(
                 target=self._prepare_and_start,
                 args=(begun, credentials),
@@ -71,6 +102,9 @@ class CodingTurnOperations:
                 daemon=True,
             )
             with self._lock:
+                busy = self._shared_folder_conflict(begun.session_id, in_place_roots)
+                if busy:
+                    raise RuntimeError(busy)
                 self._running[begun.session_id] = RunningTurn(engine=None, turn_id="", thread=thread, preparing=True)
             thread.start()
         except Exception:
@@ -89,13 +123,19 @@ class CodingTurnOperations:
                 running = self._running.get(session_id)
                 return running is not None and running.cancel_requested
 
+        # Project rollback checks this event while holding its workspace lock.
+        with self._lock:
+            deleted = self._running[session_id].delete_requested.is_set
+
         try:
-            prepared = self.session_factory.complete(pending, cancelled)
+            prepared = self.session_factory.complete(pending, cancelled, deleted=deleted)
         except Exception as exc:
             with self._lock:
                 preparing = self._running.pop(session_id, None)
-            if preparing is not None and preparing.delete_requested:
-                # ``complete`` has already released what it made.
+            if preparing is not None and deleted():
+                # Rollback has finished, so it cannot recreate recovery files
+                # after this removal (including partial preparation failures).
+                self._discard_deleted_recovery(session_id)
                 return
             logger.warning("Coding task %s could not prepare its workspace", session_id, exc_info=True)
             message = f"The task workspace could not be prepared: {exc}"
@@ -110,8 +150,11 @@ class CodingTurnOperations:
         self.workspace_usage.invalidate()
         with self._lock:
             preparing = self._running.pop(session_id, None)
-            if preparing is not None and preparing.delete_requested:
-                self.session_factory.release(prepared, request)
+            if preparing is not None and deleted():
+                try:
+                    self.session_factory.release(prepared, request)
+                finally:
+                    self._discard_deleted_recovery(session_id)
                 return
             if preparing is None or preparing.cancel_requested:
                 self._emit(
@@ -230,6 +273,61 @@ class CodingTurnOperations:
     ) -> RuntimeCommand:
         return self.remote.acknowledge_command(run_id, command_id, computer_id, lease_id, epoch, result, error)
 
+    def _shared_folder_conflict(self, session_id: str, roots: Iterable[Path]) -> str | None:
+        """Why ``session_id`` may not change ``roots`` now, or None if it may.
+
+        Folders another task can work in are changed by one task at a time:
+        an active in-place turn (including one still preparing) or a
+        maintenance operation such as discard, commit or apply holds every
+        folder it works in, and any overlapping folder, parent or child, is
+        refused to everyone else. Call with ``self._lock`` held so two starts
+        cannot both pass. Changes made outside Cowork, such as in an editor or
+        a task terminal, are not coordinated.
+        """
+        targets = {root.resolve() for root in roots}
+        if not targets:
+            return None
+        for other_id, other_roots in self._maintenance_roots.items():
+            if other_id != session_id and _overlaps(targets, other_roots):
+                return FOLDER_BEING_UPDATED
+        for other_id in self._running:
+            if other_id == session_id:
+                continue
+            try:
+                other = self.store.load_session(other_id)
+            except (FileNotFoundError, KeyError, ValueError):
+                continue
+            if other.workspace_mode != WorkspaceMode.in_place:
+                continue
+            try:
+                if _overlaps(targets, self._in_place_roots(other)):
+                    return IN_PLACE_BUSY
+            except (KeyError, WorkspaceError):
+                continue
+        return None
+
+    def _shared_roots(self, session: CodingSession, *, touches_source: bool = False) -> frozenset[Path]:
+        """Folders outside the task's own workspace that changing it may change."""
+        roots: set[Path] = set()
+        if session.workspace_mode == WorkspaceMode.in_place:
+            roots |= self._in_place_roots(session)
+        if touches_source:
+            sources = [item.source_path for item in session.workspaces] or [session.source_path]
+            roots |= {Path(source).resolve() for source in sources if source}
+        return frozenset(roots)
+
+    def _in_place_roots(self, session: CodingSession) -> set[Path]:
+        """The repositories an in-place task works in."""
+        if session.workspaces:
+            return {Path(item.workspace_path).resolve() for item in session.workspaces}
+        if session.workspace_path:
+            return {Path(session.workspace_path).resolve()}
+        # Still preparing: its folders resolve to the repositories its
+        # workspaces will be.
+        project = self.projects.get(session.project_id) if session.project_id else None
+        resource_ids = None if session.scope_all_project_resources else session.resource_ids
+        return {root.resolve() for root in self.session_factory.in_place_roots(project, resource_ids, session.source_path)}
+
     def _is_remote(self, session: CodingSession) -> bool:
         return self.remote.is_remote(session)
 
@@ -274,6 +372,9 @@ class CodingTurnOperations:
                 raise RuntimeError("This coding task already has a running turn")
             if not session.workspace_path:
                 raise RuntimeError("This task did not start because its workspace could not be prepared. Start a new task.")
+            busy = self._shared_folder_conflict(session_id, self._shared_roots(session))
+            if busy:
+                raise RuntimeError(busy)
             engine_attachments = validate_references(session, attachments)
             # Mode changes must finish preflight before allocating a new run.
             if continue_completed:

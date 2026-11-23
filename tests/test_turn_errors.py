@@ -1087,6 +1087,8 @@ def _byok_failure(status_code, message="Server returned an upstream error"):
     [
         (402, "wallet_empty", te.TOKEN_LIMIT_CODE),
         (429, "included_allowance_exhausted", te.ALLOWANCE_EXHAUSTED_CODE),
+        (429, "window_allowance_exhausted", te.WINDOW_ALLOWANCE_EXHAUSTED_CODE),
+        (403, "model_not_in_tier", te.MODEL_NOT_IN_TIER_CODE),
         (429, "free_air_daily_spend_fuse_exceeded", te.FREE_SERVING_PAUSED_CODE),
         (402, "budget_exceeded", te.BUDGET_EXCEEDED_CODE),
         (429, "rate_limited", te.RATE_LIMITED_CODE),
@@ -1271,6 +1273,126 @@ def test_a_spent_budget_maps_to_budget_exceeded_not_out_of_credits(failure):
 
 def test_a_budget_stop_carries_no_reset_instant():
     assert te.BUDGET_EXCEEDED_CODE not in te.RESET_AT_CODES
+
+
+_SCOPED_BUDGET_MESSAGES = {
+    "org": "Your organization's spending budget is used up. An owner or admin can raise it in Budgets.",
+    "workspace": "This workspace's spending budget is used up. An administrator can raise it in Budgets.",
+    "api_key": "This API key's spending budget is used up. An administrator can raise it in Budgets.",
+}
+
+
+def _scoped_budget_via_header(scope):
+    exc = _gateway_failure(402, reason="budget_exceeded")
+    exc.__cause__.response.headers["X-MindsHub-Budget-Scope"] = scope
+    return exc
+
+
+def _scoped_budget_via_body(scope):
+    exc = _budget_via_body_code()
+    exc.__cause__.body["error"]["budget_scope"] = scope
+    return exc
+
+
+def _scoped_budget_via_type(scope):
+    stop = te.BudgetExceededError("Server returned 402: budget used up.", reason="budget_exceeded", status_code=402)
+    stop.budget_scope = scope
+    return stop
+
+
+@pytest.mark.parametrize("carrier", [_scoped_budget_via_header, _scoped_budget_via_body, _scoped_budget_via_type])
+@pytest.mark.parametrize("scope", sorted(_SCOPED_BUDGET_MESSAGES))
+def test_a_spent_budget_names_its_scope(carrier, scope):
+    failure = carrier(scope)
+    assert te.friendly_turn_error(failure) == (te.BUDGET_EXCEEDED_CODE, _SCOPED_BUDGET_MESSAGES[scope])
+    assert te.gate_budget_scope(failure) == scope
+
+
+@pytest.mark.parametrize(
+    ("scope", "lead"),
+    [
+        ("team", "Your team's spending budget is used up. An administrator"),
+        ("user", "Your spending budget is used up. An administrator"),
+        ("all_members", "Your spending budget is used up. An administrator"),
+    ],
+)
+def test_team_and_member_budgets_are_named(scope, lead):
+    code, message = te.friendly_turn_error(_scoped_budget_via_header(scope))
+    assert code == te.BUDGET_EXCEEDED_CODE
+    assert message.startswith(lead)
+
+
+@pytest.mark.parametrize(
+    ("scope", "period", "message"),
+    [
+        ("org", "month", "Your organization's monthly spending budget is used up. An owner or admin can raise it in Budgets."),
+        ("workspace", "day", "This workspace's daily spending budget is used up. An administrator can raise it in Budgets."),
+        ("user", "year", "Your yearly spending budget is used up. An administrator can raise it in Budgets."),
+        ("guild", "day", "A daily spending budget is used up. An administrator can raise it in Budgets."),
+        ("org", "week", "Your organization's spending budget is used up. An owner or admin can raise it in Budgets."),
+    ],
+)
+def test_a_spent_budget_names_its_period(scope, period, message):
+    exc = _scoped_budget_via_header(scope)
+    exc.__cause__.response.headers["X-MindsHub-Budget-Period"] = period
+    assert te.friendly_turn_error(exc) == (te.BUDGET_EXCEEDED_CODE, message)
+    assert te.gate_budget_period(exc) == (period if period != "week" else None)
+
+
+def test_the_period_is_read_from_the_body_and_the_typed_error():
+    exc = _scoped_budget_via_body("workspace")
+    exc.__cause__.body["error"]["budget_period"] = "month"
+    assert te.gate_budget_period(exc) == "month"
+    typed = _scoped_budget_via_type("org")
+    typed.budget_period = "year"
+    assert te.gate_budget_period(typed) == "year"
+
+
+def test_the_failed_payload_carries_the_budget_period_only_when_set():
+    assert te.response_failed_payload("m", te.BUDGET_EXCEEDED_CODE, budget_period="day")["budget_period"] == "day"
+    assert "budget_period" not in te.response_failed_payload("m", te.BUDGET_EXCEEDED_CODE)
+
+
+def test_a_remote_budget_stop_names_scope_and_period():
+    code, message = te.remote_turn_error("BudgetExceededError: x", "team", "month")
+    assert (code, message) == (
+        te.BUDGET_EXCEEDED_CODE,
+        "Your team's monthly spending budget is used up. An administrator can raise it in Budgets.",
+    )
+
+
+@pytest.mark.parametrize("scope", ["guild", "Not A Scope!", "x" * 33])
+def test_a_scope_the_copy_does_not_know_reads_as_neutral(scope):
+    code, message = te.friendly_turn_error(_scoped_budget_via_header(scope))
+    assert (code, message) == (te.BUDGET_EXCEEDED_CODE, te.BUDGET_EXCEEDED_USER_MESSAGE)
+    assert message.startswith("A spending budget is used up.")
+
+
+def test_only_a_well_formed_scope_is_forwarded():
+    assert te.gate_budget_scope(_scoped_budget_via_header("team")) == "team"
+    assert te.gate_budget_scope(_scoped_budget_via_header("Not A Scope!")) is None
+    assert te.gate_budget_scope(_gateway_failure(402, reason="budget_exceeded")) is None
+
+
+@pytest.mark.parametrize("name", ["X-MindsHub-Budget-Scope", "x-mindshub-budget-scope", "X-Mindshub-Budget-Scope"])
+def test_a_plain_dict_header_is_read_in_any_casing(name):
+    class Denied(Exception):
+        headers = {name: "team", name.replace("Scope", "Period").replace("scope", "period"): "day"}
+
+    assert te.gate_budget_scope(Denied()) == "team"
+    assert te.gate_budget_period(Denied()) == "day"
+
+
+def test_the_failed_payload_carries_the_budget_scope_only_when_set():
+    assert te.response_failed_payload("m", te.BUDGET_EXCEEDED_CODE, budget_scope="workspace")["budget_scope"] == "workspace"
+    assert "budget_scope" not in te.response_failed_payload("m", te.BUDGET_EXCEEDED_CODE)
+
+
+@pytest.mark.parametrize("scope", sorted(_SCOPED_BUDGET_MESSAGES))
+def test_a_remote_budget_stop_names_the_scope_the_worker_sent(scope):
+    error = "BudgetExceededError: Server returned 402: budget used up."
+    assert te.remote_turn_error(error, scope) == (te.BUDGET_EXCEEDED_CODE, _SCOPED_BUDGET_MESSAGES[scope])
+    assert te.remote_turn_error(error) == (te.BUDGET_EXCEEDED_CODE, te.BUDGET_EXCEEDED_USER_MESSAGE)
 
 
 def test_fuse_header_maps_to_free_serving_paused_not_out_of_credits():
@@ -1541,6 +1663,7 @@ def test_velocity_rate_limit_maps_from_the_body_code_when_the_header_is_lost():
 
 @pytest.mark.parametrize("code", [
     "wallet_empty", "rate_limited", "included_allowance_exhausted",
+    "window_allowance_exhausted", "model_not_in_tier",
     "free_air_daily_spend_fuse_exceeded", "budget_exceeded",
 ])
 def test_a_third_party_body_cannot_select_a_billing_verdict(code):
@@ -2515,6 +2638,13 @@ def test_wire_code_inventory_matches_the_renderer_contract():
         "rate_limited",
         # ENG-1537 — the spent free allowance, split off the credits card.
         "included_allowance_exhausted",
+        # ENG-4186 — a spent Plus/Pro window, and a model outside the plan's
+        # tier. Split off the free-allowance and credits cards because waiting
+        # for the window or upgrading the plan lifts them as well as credits.
+        # The renderer branches land in mindsdb/cowork's ChatView.jsx + its
+        # turnFailureCards list.
+        "window_allowance_exhausted",
+        "model_not_in_tier",
         # ENG-1992 — a content-shaped rejection the server already repaired;
         # distinct copy from image_format (no re-upload needed).
         "content_recovery",
@@ -2605,6 +2735,8 @@ def test_no_return_emits_a_literal_code():
         # The rung the ticket's headline case takes.
         (402, "wallet_empty", te.TOKEN_LIMIT_CODE),
         (429, "included_allowance_exhausted", te.ALLOWANCE_EXHAUSTED_CODE),
+        (429, "window_allowance_exhausted", te.WINDOW_ALLOWANCE_EXHAUSTED_CODE),
+        (403, "model_not_in_tier", te.MODEL_NOT_IN_TIER_CODE),
         (429, "free_air_daily_spend_fuse_exceeded", te.FREE_SERVING_PAUSED_CODE),
         (402, "budget_exceeded", te.BUDGET_EXCEEDED_CODE),
         (429, "rate_limited", te.RATE_LIMITED_CODE),
@@ -2926,6 +3058,8 @@ def test_responses_emits_model_for_every_model_unavailable_code():
 @pytest.mark.parametrize("reason,forbidden_code", [
     ("wallet_empty", "token_limit"),
     ("included_allowance_exhausted", "included_allowance_exhausted"),
+    ("window_allowance_exhausted", "window_allowance_exhausted"),
+    ("model_not_in_tier", "model_not_in_tier"),
     ("free_air_daily_spend_fuse_exceeded", "free_serving_paused"),
     ("budget_exceeded", "budget_exceeded"),
     ("rate_limited", "rate_limited"),
@@ -3217,6 +3351,8 @@ _PROBE_RESET_AT = "2026-09-25T00:00:00Z"
         (429, "rate_limited", None),
         (429, "free_air_daily_spend_fuse_exceeded", _PROBE_RESET_AT),
         (429, "included_allowance_exhausted", _PROBE_RESET_AT),
+        (429, "window_allowance_exhausted", _PROBE_RESET_AT),
+        (403, "model_not_in_tier", None),
         (402, "wallet_empty", None),
         (402, "budget_exceeded", None),
         (503, "policy_unavailable", None),
@@ -3257,3 +3393,157 @@ def test_gateway_denial_reads_the_body_code_only_from_the_gateway_host():
 
 def test_gateway_denial_is_none_for_a_plain_exception():
     assert te.gateway_denial(exc=Exception("boom")) is None
+
+
+def test_a_per_model_budget_names_the_model_by_its_catalog_label(monkeypatch):
+    import cowork.services.providers as providers
+
+    monkeypatch.setattr(providers, "cached_minds_model_label", lambda m: {"haiku-4-5": "Claude Haiku"}.get(m))
+    exc = _scoped_budget_via_header("workspace")
+    exc.__cause__.response.headers["X-MindsHub-Budget-Period"] = "day"
+    exc.__cause__.response.headers["X-MindsHub-Budget-Model"] = "haiku-4-5"
+    assert te.gate_budget_model(exc) == "haiku-4-5"
+    assert te.friendly_turn_error(exc) == (
+        te.BUDGET_EXCEEDED_CODE,
+        "This workspace's daily spending budget for Claude Haiku is used up. Other models still work. "
+        "An administrator can raise it in Budgets.",
+    )
+
+
+def test_a_model_the_catalog_does_not_know_falls_back_to_its_alias(monkeypatch):
+    import cowork.services.providers as providers
+
+    monkeypatch.setattr(providers, "cached_minds_model_label", lambda m: None)
+    assert te.budget_exceeded_message("org", "month", "gpt-nano") == (
+        "Your organization's monthly spending budget for gpt-nano is used up. Other models still work. "
+        "An owner or admin can raise it in Budgets."
+    )
+
+
+@pytest.mark.parametrize("model", [None, "", "bad model", "x\r\ny", 7])
+def test_only_a_header_safe_model_is_kept(model):
+    assert te.clean_budget_model(model) is None
+
+
+def test_the_model_is_read_from_the_body_and_the_typed_error():
+    exc = _scoped_budget_via_body("team")
+    exc.__cause__.body["error"]["budget_model"] = "haiku-4-5"
+    assert te.gate_budget_model(exc) == "haiku-4-5"
+    typed = _scoped_budget_via_type("org")
+    typed.budget_model = "sonnet-4-5"
+    assert te.gate_budget_model(typed) == "sonnet-4-5"
+
+
+def test_the_failed_payload_carries_the_budget_model_only_when_set():
+    assert te.response_failed_payload("m", te.BUDGET_EXCEEDED_CODE, budget_model="haiku-4-5")["budget_model"] == (
+        "haiku-4-5"
+    )
+    assert "budget_model" not in te.response_failed_payload("m", te.BUDGET_EXCEEDED_CODE)
+
+
+def test_a_remote_per_model_budget_stop_names_the_model(monkeypatch):
+    import cowork.services.providers as providers
+
+    monkeypatch.setattr(providers, "cached_minds_model_label", lambda m: "Claude Haiku")
+    code, message = te.remote_turn_error("BudgetExceededError: x", "team", "month", "haiku-4-5")
+    assert message == (
+        "Your team's monthly spending budget for Claude Haiku is used up. Other models still work. "
+        "An administrator can raise it in Budgets."
+    )
+
+
+# ── ENG-4186: the plan-window and model-tier fields ──────────────────────
+
+
+class _Body(Exception):
+    def __init__(self, body=None, response=None, **attrs):
+        super().__init__("denied")
+        self.body = body
+        self.response = response
+        for name, value in attrs.items():
+            setattr(self, name, value)
+
+
+class _JsonResponse:
+    def __init__(self, payload):
+        self._payload = payload
+
+    def json(self):
+        if isinstance(self._payload, Exception):
+            raise self._payload
+        return self._payload
+
+
+@pytest.mark.parametrize(
+    "exc",
+    [
+        pytest.param(_Body(window="7d"), id="anton_attribute"),
+        pytest.param(_Body(body={"window": "7d"}), id="body_top_level"),
+        pytest.param(_Body(body={"error": {"window": "7d"}}), id="body_envelope"),
+        # The OpenAI SDK keeps only the `error` envelope as `body`; the gateway's
+        # top-level field survives on the response alone.
+        pytest.param(
+            _Body(body={"code": "window_allowance_exhausted"}, response=_JsonResponse({"window": "7d"})),
+            id="response_json",
+        ),
+    ],
+)
+def test_gate_window_reads_every_carrier(exc):
+    wrapped = ConnectionError("denied")
+    wrapped.__cause__ = exc
+    assert te.gate_window(wrapped) == "7d"
+
+
+@pytest.mark.parametrize("value", ["1d", "", 5, None, "5H"])
+def test_gate_window_drops_anything_but_the_two_windows(value):
+    assert te.gate_window(_Body(body={"window": value}, response=_JsonResponse({"window": value}))) is None
+
+
+def test_gate_window_never_raises_on_an_unreadable_response():
+    assert te.gate_window(_Body(response=_JsonResponse(ValueError("not json")))) is None
+
+
+@pytest.mark.parametrize(("value", "expected"), [("plus", "plus"), ("pro", "pro"), ("free", None), ("x", None)])
+def test_gate_required_tier_keeps_only_a_tier_a_model_can_require(value, expected):
+    assert te.gate_required_tier(_Body(response=_JsonResponse({"required_tier": value}))) == expected
+
+
+def test_a_spent_plan_window_carries_its_reset_instant():
+    assert te.WINDOW_ALLOWANCE_EXHAUSTED_CODE in te.RESET_AT_CODES
+    assert te.MODEL_NOT_IN_TIER_CODE not in te.RESET_AT_CODES
+
+
+def test_both_plan_reasons_are_probe_denials():
+    assert {"window_allowance_exhausted", "model_not_in_tier"} <= te.PROBE_DENIAL_REASONS
+
+
+@pytest.mark.parametrize(
+    ("error", "expected"),
+    [
+        (
+            "WindowAllowanceExhaustedError: anything the pod said",
+            (te.WINDOW_ALLOWANCE_EXHAUSTED_CODE, te.WINDOW_ALLOWANCE_EXHAUSTED_USER_MESSAGE),
+        ),
+        (
+            "ModelNotInTierError: anything the pod said",
+            (te.MODEL_NOT_IN_TIER_CODE, te.MODEL_NOT_IN_TIER_USER_MESSAGE),
+        ),
+    ],
+)
+def test_remote_plan_stops_map_by_type_name_and_drop_the_pod_text(error, expected):
+    assert te.remote_turn_error(error) == expected
+    assert te.remote_error_label(error=error) == error.partition(":")[0]
+
+
+def test_the_failure_frame_carries_the_plan_fields_only_when_set():
+    payload = te.response_failed_payload(
+        "x", te.WINDOW_ALLOWANCE_EXHAUSTED_CODE, reset_at="2026-11-19T18:00:00Z", window="5h",
+    )
+    assert payload["window"] == "5h"
+    assert payload["reset_at"] == "2026-11-19T18:00:00Z"
+    assert "required_tier" not in payload
+
+    payload = te.response_failed_payload("x", te.MODEL_NOT_IN_TIER_CODE, required_tier="pro")
+    assert payload["required_tier"] == "pro"
+    assert "window" not in payload
+    assert "window" not in te.response_failed_payload("x", te.TOKEN_LIMIT_CODE)

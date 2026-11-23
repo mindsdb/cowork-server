@@ -15,6 +15,7 @@ from cowork.db.scoped import LOCAL_SCOPE, ScopedSession
 from cowork.db.session import get_engine
 from cowork.services import task_objects as t
 from cowork.services.artifact_identity import ensure_full_id
+from cowork.services.artifact_metadata import ArtifactMetadata
 from cowork.services.artifact_revisions import capture_agent_revision, current_source, list_revisions
 from cowork.services.conversations import ConversationService
 from cowork.services.revision_summaries import (
@@ -134,7 +135,7 @@ def artifact(tmp_path):
             "name": "Sales", "type": "html-app", "primary": "index.html"}
     (folder / "metadata.json").write_text(json.dumps(meta))
     (folder / "index.html").write_text("<h1>v1</h1>")
-    artifact_id, meta = ensure_full_id(folder, meta)
+    artifact_id, meta = ensure_full_id(folder, ArtifactMetadata.model_validate(meta))
     return folder, meta, artifact_id
 
 
@@ -200,7 +201,7 @@ def test_each_artifact_a_turn_changed_gets_its_own_label(conv, tmp_path):
         (folder / "metadata.json").write_text(json.dumps({"slug": slug, "type": "document", "primary": "a.md"}))
         (folder / "a.md").write_text("v1")
         meta = json.loads((folder / "metadata.json").read_text())
-        artifact_id, meta = ensure_full_id(folder, meta)
+        artifact_id, meta = ensure_full_id(folder, ArtifactMetadata.model_validate(meta))
         current_source(folder, meta, artifact_id)
     before, before_mtimes = t.snapshot_artifact_state(base)
     for slug in ("sales", "costs"):

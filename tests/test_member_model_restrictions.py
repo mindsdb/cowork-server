@@ -45,7 +45,7 @@ def _listing(*, restricted: bool, flags: bool = True) -> MindsModelListing:
     """The catalog one caller gets: ``PINNED`` restricted for them or not."""
     enabled = {MINDS_FREE_MODEL: True, PINNED: not restricted} if flags else {}
     reasons = {PINNED: "model_restricted"} if restricted and flags else {}
-    return MindsModelListing([MINDS_FREE_MODEL, PINNED], {}, enabled, {}, {}, {}, {}, reasons)
+    return MindsModelListing([MINDS_FREE_MODEL, PINNED], {}, enabled, {}, {}, {}, {}, reasons, {}, {})
 
 
 def _mode(monkeypatch, mode: str) -> None:
@@ -197,7 +197,7 @@ def test_org_refresh_scope_forces_the_catalog_and_scopes_the_custom_endpoint(
 
     async def fake_fetch(base_url, api_key, force_refresh=False, tenant_key=None, **kw):
         seen["overlay"] = (force_refresh, kw.get("mindshub", False))
-        return MindsModelListing(["local-llama"], {}, {}, {}, {}, {}, {}, {})
+        return MindsModelListing(["local-llama"], {}, {}, {}, {}, {}, {}, {}, {}, {})
 
     monkeypatch.setattr(ep, "fetch_org_model_catalog", fake_org_catalog)
     monkeypatch.setattr(ep, "fetch_minds_models", fake_fetch)

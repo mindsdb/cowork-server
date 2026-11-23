@@ -32,6 +32,8 @@ deployment:
   # release gate. Rollback removes both lines; see the chart README.
   datasourceTurnsEnabled: "true"
   datasourceCapabilities: '{"manifest_version": 1, "enabled": ["mysql:host-password", "postgres:host-port"]}'
+  # Members' custom API connections on their turns. Rollback removes this line.
+  customApiTurnsEnabled: "true"
 
   ingress:
     enabled: true
@@ -78,6 +80,11 @@ deployment:
     # Shows the organization picker. The expected-organization boundary refuses
     # a mismatched tab whatever this says; see README.md.
     - name: COWORK_ORGANIZATION_SWITCH_ENABLED
+      value: "true"
+
+    # Offers Slack's In-Browser Connect. Unset (prod), Slack shows only the
+    # bot-token method: the Slack app is internal to one workspace for now.
+    - name: SLACK_CONNECTOR_ENABLED
       value: "true"
 
     # The agent's browser on the web: the browser router, served on this host

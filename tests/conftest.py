@@ -14,7 +14,9 @@ import pkgutil
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Literal
+from unittest.mock import AsyncMock
 
 # Resolved: macOS links /var to /private/var, and a COWORK_HOME under that
 # link takes branches a Linux run doesn't, so the blocking guard
@@ -152,7 +154,7 @@ def app_settings_rebuilt_after_a_test_replaced_them():
 @pytest.fixture(autouse=True)
 def close_coding_services():
     yield
-    from coding_service_fakes import close_services
+    from tests.support.coding.service_fakes import close_services
 
     close_services()
 
@@ -504,6 +506,24 @@ def managed_postgres_service():
 
 
 @pytest.fixture
+def empty_decisions_proxy_records(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
+    """Return an empty-record lookup and patch the Redis factory for one test."""
+    # Application imports must follow bootstrap's blocking-guard installation.
+    from cowork.turnqueue import redis_client
+
+    client = SimpleNamespace(get=AsyncMock(return_value=None))
+    monkeypatch.setattr(redis_client, "get_redis", lambda: client)
+    return client
+
+
+@pytest.fixture
+def router_wire_budget(monkeypatch) -> None:
+    """Give real SDK wire checks setup headroom; deadline tests override their own bounds."""
+    monkeypatch.setattr("cowork.handlers.response_routing._GATE_FIRST_EVENT_SECONDS", 10.0)
+    monkeypatch.setattr("cowork.handlers.response_routing._GATE_TOTAL_SECONDS", 15.0)
+
+
+@pytest.fixture
 def openai_compatible_api(monkeypatch):
     """Set COWORK_OPENAI_COMPATIBLE_API for one test, or unset it with None.
 
@@ -654,11 +674,59 @@ def blocking_work_guard():
         )
 
 
+@pytest.fixture(autouse=True)
+def pinned_responses_released():
+    """Fail a test that leaves a PinnedStreamingResponse's descriptors open.
+
+    Only the response's ASGI call releases them. A test that reads
+    ``body_iterator`` or only the headers leaves the artifact folder's
+    descriptors to the garbage collector, and a later collection can close
+    them on the event loop of whichever test is running then, which the
+    blocking guard pins on that innocent test. The leak is closed here, off
+    the loop, so it fails only the test that made it.
+
+    It patches by hand, not with ``monkeypatch``: an autouse fixture that asks
+    for ``monkeypatch`` sets it up first, so a test's own patches would then
+    be undone after every other fixture's teardown has run against them.
+    """
+    from cowork.api.v1.pinned_response import PinnedStreamingResponse
+
+    made: list[PinnedStreamingResponse] = []
+    init = PinnedStreamingResponse.__init__
+
+    def recording_init(self, *args, **kwargs):
+        init(self, *args, **kwargs)
+        made.append(self)
+
+    PinnedStreamingResponse.__init__ = recording_init
+    try:
+        yield
+    finally:
+        PinnedStreamingResponse.__init__ = init
+    open_ones = [response for response in made if response._resources._exit_callbacks]
+    for response in open_ones:
+        response._resources.close()
+    if open_ones:
+        pytest.fail(
+            f"{len(open_ones)} PinnedStreamingResponse(s) never released their descriptors: "
+            "send the response through its ASGI call (tests/support/pinned_responses.py "
+            "served_body) instead of reading body_iterator",
+            pytrace=False,
+        )
+
+
 def pytest_sessionstart(session):
     session.config.pluginmanager.register(
         _blocking_guard.StaleEntryCheck(tests_dir=Path(__file__).parent, reached=_GUARD_REACHED),
         "cowork-blocking-guard-stale-entries",
     )
+
+
+@pytest.fixture()
+def self_hosted_probe(monkeypatch):
+    """The probe handler as self-hosted runs it: a custom connector still goes
+    to the model probe there, until self-hosted gets its own test requests."""
+    monkeypatch.setattr("cowork.handlers.probe.tenant_scope_required", lambda: True)
 
 
 @pytest.fixture

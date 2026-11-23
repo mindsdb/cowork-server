@@ -13,7 +13,7 @@ from _fakes import FakeRequest
 
 def _listing(
     ids, efforts=None, enabled=None, labels=None, providers=None, families=None, role_defaults=None,
-    disabled_reasons=None,
+    disabled_reasons=None, image_models=None, covered_by_tier=None,
 ):
     """A MindsModelListing with everything a test doesn't care about left empty.
 
@@ -32,6 +32,8 @@ def _listing(
         families or {},
         role_defaults or {},
         disabled_reasons or {},
+        image_models or {},
+        covered_by_tier or {},
     )
 
 
@@ -682,7 +684,8 @@ def test_org_catalog_cache_is_scoped_by_caller_within_one_org(monkeypatch):
     calls = []
 
     async def fake_get(url, headers=None, **kw):
-        calls.append(headers.get("Authorization"))
+        if "?kind=" not in url:  # the image half of the same fetch
+            calls.append(headers.get("Authorization"))
         restricted = headers["Authorization"].startswith("Bearer tok-member")
 
         class R:
@@ -758,6 +761,50 @@ def test_recommended_models_relays_why_a_minds_model_is_locked(monkeypatch):
         assert result["modelEnabled"] == {"mindshub_air": True, "opus": False, "gpt": False}
     finally:
         _delete_settings(session, "minds_api_key", "minds_url", "minds_model_enabled")
+        session.close()
+
+
+def test_model_covered_by_tier_is_passed_through(monkeypatch):
+    """ENG-4186: each MindsHub model's covering tier reaches the picker as `modelCoveredByTier`."""
+    from cowork.api.v1.endpoints import settings as settings_endpoint
+    from cowork.api.v1.endpoints.settings import recommended_models
+    from cowork.db.session import get_open_session
+
+    async def fake_fetch(base_url, api_key, force_refresh=False, tenant_key=None, **_kw):
+        return _listing(
+            ["mindshub_air", "kimi-k3", "opus"],
+            enabled={"mindshub_air": True, "kimi-k3": True, "opus": False},
+            disabled_reasons={"opus": "model_not_in_tier"},
+            covered_by_tier={"mindshub_air": "free", "kimi-k3": "plus", "opus": "pro"},
+        )
+
+    monkeypatch.setattr(settings_endpoint, "fetch_minds_models", fake_fetch)
+
+    session = get_open_session()
+    try:
+        _set_settings(session, minds_api_key="mdb_free", minds_url="https://api.mindshub.ai")
+        _delete_settings(session, "providers_json")
+
+        result = asyncio.run(recommended_models(FakeRequest(), LOCAL_SCOPE))
+
+        assert result["modelCoveredByTier"] == {"mindshub_air": "free", "kimi-k3": "plus", "opus": "pro"}
+        assert result["modelDisabledReasons"] == {"opus": "model_not_in_tier"}
+    finally:
+        _delete_settings(session, "minds_api_key", "minds_url", "minds_model_enabled")
+        session.close()
+
+
+def test_model_covered_by_tier_is_empty_without_mindshub():
+    """No MindsHub key, no tiers: a custom endpoint can never say which plan covers a model."""
+    from cowork.api.v1.endpoints.settings import recommended_models
+    from cowork.db.session import get_open_session
+
+    session = get_open_session()
+    try:
+        _delete_settings(session, "minds_api_key", "minds_url", "providers_json")
+        result = asyncio.run(recommended_models(FakeRequest(), LOCAL_SCOPE))
+        assert result["modelCoveredByTier"] == {}
+    finally:
         session.close()
 
 
@@ -859,3 +906,42 @@ def test_an_unknown_refresh_scope_refreshes_everything(monkeypatch):
     # A newer client's scope must not fail the refresh.
     forced = _forced_by_url(monkeypatch, "everything")
     assert forced == {"https://api.mindshub.ai": (True, True), "https://llm.local/v1": (True, False)}
+
+
+def test_settings_say_the_organizations_model_picks_browser_steps_only_where_it_reaches_them(monkeypatch):
+    """`routing.decisions` follows what the browser asks: Jev on MindsHub on a
+    desktop whose anton predates the host's own decision model, and the
+    organization's model once anton takes it. `routing.mode`, the turn
+    gate's, is the organization's model either way."""
+    from anton.core.browser import config as anton_config
+
+    from cowork.api.v1.endpoints import settings as settings_endpoint
+    from cowork.api.v1.endpoints.settings import recommended_models
+    from cowork.db.session import get_open_session
+
+    async def fake_fetch(base_url, api_key, force_refresh=False, tenant_key=None, **_kw):
+        return _listing(["mindshub_air"], enabled={"mindshub_air": True})
+
+    monkeypatch.setattr(settings_endpoint, "fetch_minds_models", fake_fetch)
+
+    session = get_open_session()
+    try:
+        _set_settings(
+            session, minds_api_key="mdb_free", minds_url="https://api.mindshub.ai",
+            decision_model_url="https://decide.example.test/v1/systemone", decision_model_api_key="own-key",
+        )
+        _delete_settings(session, "providers_json", "jev_decisions_enabled")
+
+        monkeypatch.delattr(anton_config, "DecisionsTarget", raising=False)
+        routing = asyncio.run(recommended_models(FakeRequest(), LOCAL_SCOPE))["routing"]
+        assert (routing["mode"], routing["decisions"]) == ("own", "mindshub")
+
+        # Only whether anton has it matters to this check.
+        monkeypatch.setattr(anton_config, "DecisionsTarget", object, raising=False)
+        routing = asyncio.run(recommended_models(FakeRequest(), LOCAL_SCOPE))["routing"]
+        assert (routing["mode"], routing["decisions"]) == ("own", "own")
+    finally:
+        _delete_settings(
+            session, "minds_api_key", "minds_url", "minds_model_enabled", "decision_model_url", "decision_model_api_key",
+        )
+        session.close()

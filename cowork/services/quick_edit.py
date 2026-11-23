@@ -8,8 +8,8 @@ artifact's chat as a normal agent turn, which the app sends itself.
 
 This module holds what the route needs around that:
 
-* ``anton_quick_edit()``: the installed anton's router and quick editor, or
-  None. Imported lazily and feature-detected, so the server keeps working with
+* ``anton_quick_edit()``: the installed anton's router and quick editor (and,
+  when it has one, its quick reply), or None. Imported lazily and feature-detected, so the server keeps working with
   an anton that has neither; the route then answers 501 and the capability
   ``canQuickEdit`` is false.
 * ``quick_edit_available()``: the setting and the anton support together.
@@ -56,6 +56,7 @@ __all__ = [
     "record_quick_edit_in_conversation",
     "record_undo_in_conversation",
     "resolve_backend",
+    "with_request_images",
 ]
 
 #: The ``harness`` the conversation note's messages are saved under, as a
@@ -85,6 +86,17 @@ class AntonQuickEdit:
     # which. None when this anton has neither: decisions are then unavailable.
     decisions_available: Callable[..., Any] | None = None
     decisions_config: Callable[..., Any] | None = None
+    # reply.answer_request(message, *, llm, name, description, data, outline,
+    # recent_changes, history, chat) -> str: a short answer in the bar for a
+    # message routed ``reply``, "" to hand it to the agent. None when this
+    # anton has none.
+    answer_request: Callable[..., Any] | None = None
+
+    @property
+    def can_reply(self) -> bool:
+        """Whether the router may answer ``reply``: only when this anton's
+        route_request takes ``allow_reply`` and it has answer_request."""
+        return self.answer_request is not None and "allow_reply" in self.route_extras
 
 
 def anton_quick_edit() -> AntonQuickEdit | None:
@@ -131,11 +143,27 @@ def anton_quick_edit() -> AntonQuickEdit | None:
         route_extras=frozenset(params & ROUTE_EXTRAS),
         decisions_available=_callable(router, "decisions_available"),
         decisions_config=_callable(router, "decisions_config"),
+        answer_request=_answer_request(),
     )
 
 
+def _answer_request() -> Callable[..., Any] | None:
+    """anton's quick reply (``artifact_editor.reply.answer_request``), or None."""
+    try:
+        import anton.core.artifact_editor.reply  # noqa: F401
+
+        reply = sys.modules["anton.core.artifact_editor.reply"]
+    except Exception:
+        return None
+    return _callable(reply, "answer_request") if reply is not None else None
+
+
 #: route_request's optional context, passed only when this anton takes it.
-ROUTE_EXTRAS = frozenset({"name", "description", "data", "outline", "history", "recent_changes", "chat"})
+ROUTE_EXTRAS = frozenset({
+    "name", "description", "data", "outline", "history", "recent_changes", "chat", "allow_reply",
+})
+#: The router's context answer_request reads too.
+REPLY_CONTEXT = ("name", "description", "data", "outline", "recent_changes", "history", "chat")
 #: From describe_artifact(folder).
 DESCRIBED_EXTRAS = ("name", "description", "data", "outline")
 #: The artifact's latest revision summaries the router reads.
@@ -452,6 +480,106 @@ async def _minted_backend(
     except BaseException:
         await backend.close()
         raise
+
+
+class RequestImagesLLM:
+    """The editor's LLM, with the bar's images beside the request (ENG-4410).
+
+    anton's editor takes the request as text only. Every call it makes goes
+    through ``plan_stream`` / ``code_stream``, so the images are added there,
+    to a copy of the user message that holds the request, as the editor adds
+    its own screenshots. Anything else is the wrapped client's.
+
+    A model that takes no images refuses the first call that carries them:
+    that call is made again without them, and so is every call after it, so
+    the edit still runs on the text.
+    """
+
+    def __init__(self, llm: Any, *, request: str, images: list[tuple[str, str]]) -> None:
+        self._llm = llm
+        self._request = request.strip()
+        self._images = list(images)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._llm, name)
+
+    def _blocks(self) -> list[dict]:
+        return [
+            {"type": "image", "source": {"type": "base64", "media_type": media_type, "data": data}}
+            for data, media_type in self._images
+        ]
+
+    def _with_images(self, messages: list[dict]) -> list[dict]:
+        out = list(messages)
+        for i, message in enumerate(out):
+            if not isinstance(message, dict) or message.get("role") != "user":
+                continue
+            content = message.get("content")
+            blocks = [{"type": "text", "text": content}] if isinstance(content, str) else content
+            if not isinstance(blocks, list):
+                continue
+            at = next((
+                j for j, block in enumerate(blocks)
+                if isinstance(block, dict) and block.get("type") == "text"
+                and self._request in str(block.get("text") or "")
+            ), None)
+            if at is None:
+                continue
+            out[i] = {**message, "content": [*blocks[: at + 1], *self._blocks(), *blocks[at + 1:]]}
+            return out
+        # The request was not found as written: the first user message carries them.
+        for i, message in enumerate(out):
+            if isinstance(message, dict) and message.get("role") == "user":
+                content = message.get("content")
+                blocks = [{"type": "text", "text": content}] if isinstance(content, str) else list(content or [])
+                out[i] = {**message, "content": [*blocks, *self._blocks()]}
+                break
+        return out
+
+    async def _stream(self, name: str, messages: list[dict], kwargs: dict):
+        from anton.core.llm.provider import is_image_refusal
+
+        stream_fn = getattr(self._llm, name)
+        if not self._images:
+            stream = stream_fn(messages=messages, **kwargs)
+        else:
+            stream = stream_fn(messages=self._with_images(messages), **kwargs)
+        sent = False
+        try:
+            try:
+                async for event in stream:
+                    sent = True
+                    yield event
+                return
+            except Exception as exc:
+                if sent or not self._images or not is_image_refusal(exc):
+                    raise
+                logger.info("The quick edit's model takes no images; editing on the text alone")
+                self._images = []
+            await _close(stream)
+            stream = stream_fn(messages=messages, **kwargs)
+            async for event in stream:
+                yield event
+        finally:
+            await _close(stream)
+
+    def plan_stream(self, *, messages: list[dict], **kwargs: Any):
+        return self._stream("plan_stream", messages, kwargs)
+
+    def code_stream(self, *, messages: list[dict], **kwargs: Any):
+        return self._stream("code_stream", messages, kwargs)
+
+
+async def _close(stream: Any) -> None:
+    closer = getattr(stream, "aclose", None)
+    if closer is not None:
+        await closer()
+
+
+def with_request_images(llm: Any, *, request: str, images: list[tuple[str, str]]) -> Any:
+    """``llm``, sending ``images`` (``(base64, media type)`` pairs) with the
+    request; ``llm`` itself when there are none."""
+    return RequestImagesLLM(llm, request=request, images=images) if images else llm
 
 
 # ── the conversation's record of quick edits ──────────────────────────────

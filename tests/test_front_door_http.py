@@ -188,7 +188,7 @@ def test_enforce_mode_boots_quietly(monkeypatch, caplog):
     assert [r.message for r in caplog.records if "identity_enforce" in r.message] == []
 
 
-# ── the six desktop-only routes that answered a loopback caller in org mode ──
+# ── the seven desktop-only routes that answered a loopback caller in org mode ──
 
 #: What a forged request carries. Inside the pod uvicorn reads only
 #: X-Forwarded-For. CF-Connecting-IP and X-Forwarded-Host are what an
@@ -242,6 +242,16 @@ SECRET_ROUTES = [
             404,
         ),
         id="token",
+    ),
+    pytest.param(
+        SecretRoute(
+            "PUT",
+            "/api/v1/connectors/connections/no-such-engine/no-such-name/app-held",
+            {"access_mode": "read"},
+            # The handler's own answer while the desktop has set no app secret.
+            409,
+        ),
+        id="app-held",
     ),
     pytest.param(
         SecretRoute("GET", "/api/v1/connectors/oauth/no-such-engine/credentials", None, 404), id="credentials"
