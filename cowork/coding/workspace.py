@@ -12,12 +12,13 @@ import tempfile
 import threading
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
-from typing import IO
+from typing import IO, TYPE_CHECKING
 
 from cowork.coding.contracts import (
     DiffFile,
     GitIdentity,
     GitState,
+    PermissionMode,
     WorkspaceInspection,
     WorkspaceKind,
     WorkspaceReasonCode,
@@ -28,6 +29,9 @@ from cowork.coding.pending_removals import PendingRemovals
 from cowork.coding.workspace_key import managed_key
 from cowork.common.paths import O_NOFOLLOW, open_fd
 from cowork.common.settings.app_settings import get_app_settings
+
+if TYPE_CHECKING:
+    from cowork.coding.check_sandbox import CheckPolicy
 
 logger = logging.getLogger(__name__)
 
@@ -672,7 +676,13 @@ class WorkspaceManager:
                 return resolved.stdout.strip()
         return None
 
-    def commit(self, workspace_path: str, message: str) -> GitState:
+    def commit(self, workspace_path: str, message: str, checks: CheckPolicy | None = None) -> GitState:
+        """Commit everything in the workspace.
+
+        The repository's hooks are code the agent may have written, so Git
+        runs none of them itself. With ``checks``, the supported ones run
+        inside the task's sandbox first; without it, none run.
+        """
         with self._mutation_lock:
             root = Path(workspace_path)
             if not message.strip():
@@ -681,8 +691,58 @@ class WorkspaceManager:
             # here without the project-level preflight.
             self.check_git_identity(str(root))
             self.git.run(root, "add", "--all")
-            self.git.run(root, "commit", "-m", message.strip())
+            with tempfile.TemporaryDirectory(prefix="cowork-commit-", ignore_cleanup_errors=True) as scratch:
+                message_file = Path(scratch) / "COMMIT_EDITMSG"
+                message_file.write_text(message.strip() + "\n", encoding="utf-8")
+                if checks is not None:
+                    self._run_commit_hooks(root, message_file, checks)
+                no_hooks = Path(scratch) / "no-hooks"
+                no_hooks.mkdir()
+                self.git.run(
+                    root, "-c", f"core.hooksPath={no_hooks}", "commit", "--no-verify", "--file", str(message_file),
+                )
             return self.git_state(str(root), str(root))
+
+    def _run_commit_hooks(self, root: Path, message_file: Path, checks: CheckPolicy) -> None:
+        from cowork.coding import check_sandbox
+
+        hooks = {name: check_sandbox.hook_path(self.git.run, root, name) for name in check_sandbox.SUPPORTED_COMMIT_HOOKS}
+        if not any(hooks.values()):
+            return
+        index = self.git.run(root, "rev-parse", "--git-path", "index").stdout.strip()
+        environment = check_sandbox.check_environment(os.environ, cache_root=checks.cache_root)
+        environment.update({"GIT_INDEX_FILE": str((root / index).resolve()), "GIT_EDITOR": ":"})
+        directories = check_sandbox.git_directories(self.git.run, root)
+        for name, path in hooks.items():
+            if path is None:
+                continue
+            arguments = (str(message_file),) if name == "commit-msg" else ()
+            try:
+                result = check_sandbox.run_sandboxed(
+                    check_sandbox.hook_argv(path, *arguments),
+                    cwd=root,
+                    policy=checks,
+                    environment=environment,
+                    writable=[root, message_file.parent],
+                    git=directories,
+                )
+            except subprocess.TimeoutExpired as exc:
+                raise WorkspaceError(f"The {name} hook did not finish in time") from exc
+            except OSError as exc:
+                raise WorkspaceError(f"The {name} hook could not run: {exc}") from exc
+            if result.returncode != 0:
+                output = "\n".join(part.strip() for part in (result.stdout, result.stderr) if part.strip())
+                raise WorkspaceError((f"The {name} hook failed" + (f":\n{output}" if output else ""))[:4_000])
+
+    def check_policy(self, owner_id: str, permission_mode: PermissionMode, network_access: bool) -> CheckPolicy:
+        from cowork.coding.check_sandbox import CheckPolicy
+
+        return CheckPolicy.for_task(
+            permission_mode,
+            network_access,
+            cache_root=self.root / "check-caches" / managed_key(owner_id),
+            sandbox_home=self.root / "check-sandbox",
+        )
 
     def check_git_identity(self, workspace_path: str) -> None:
         """Raise GitIdentityMissingError unless Git can name an author for this repository.

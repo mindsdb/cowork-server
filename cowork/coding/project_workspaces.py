@@ -11,7 +11,14 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from cowork.coding.contracts import DiffFile, GitState, TaskWorkspace, WorkspaceKind, WorkspaceReasonCode
+from cowork.coding.check_sandbox import (
+    CheckPolicy,
+    check_environment,
+    git_metadata,
+    sandbox_environment,
+    sandboxed_argv,
+)
+from cowork.coding.contracts import DiffFile, GitState, PermissionMode, TaskWorkspace, WorkspaceKind, WorkspaceReasonCode
 from cowork.coding.control_models import ExecutionWorkspace, WorkspaceStatus
 from cowork.coding.git_transport import validate_git_source
 from cowork.coding.project_models import (
@@ -121,18 +128,29 @@ class ProjectCommandRunner:
         on_start: Callable[[ProjectCommand, TaskWorkspace], None] | None = None,
         on_result: Callable[[CommandResult], None] | None = None,
         stop: Callable[[], bool] | None = None,
+        policy: CheckPolicy | None = None,
     ) -> list[CommandResult]:
         """Run a phase's commands in order, reporting each as it starts and ends.
 
         ``stop`` is checked before each command, so a cancelled task skips the
-        rest of its commands.
+        rest of its commands. With a ``policy`` the commands run inside the
+        task's sandbox, since they run code the agent may have written.
         """
         if _org_mode():
             raise WorkspaceError("Local Code Project commands are not available on this deployment")
         by_id = {workspace.folder_id: workspace for workspace in workspaces}
-        environment = os.environ.copy()
-        environment.update(project.environment.variables)
-        environment.update({name: str(value) for name, value in ports.items()})
+        if policy is None:
+            environment = os.environ.copy()
+            environment.update(project.environment.variables)
+            environment.update({name: str(value) for name, value in ports.items()})
+        else:
+            environment = check_environment(
+                os.environ,
+                variables=project.environment.variables,
+                ports=ports,
+                cache_root=policy.cache_root,
+            )
+        writable = [Path(workspace.workspace_path) for workspace in workspaces]
         results: list[CommandResult] = []
         for folder in project.folders:
             workspace = by_id[folder.id]
@@ -141,17 +159,29 @@ class ProjectCommandRunner:
                     return results
                 if on_start is not None:
                     on_start(command, workspace)
-                result = self._run_one(command, workspace, environment)
+                result = self._run_one(command, workspace, environment, policy, writable)
                 results.append(result)
                 if on_result is not None:
                     on_result(result)
         return results
 
     @staticmethod
-    def _run_one(command: ProjectCommand, workspace: TaskWorkspace, environment: dict[str, str]) -> CommandResult:
+    def _run_one(
+        command: ProjectCommand,
+        workspace: TaskWorkspace,
+        environment: dict[str, str],
+        policy: CheckPolicy | None = None,
+        writable: list[Path] | None = None,
+    ) -> CommandResult:
+        argv = list(command.argv)
+        if policy is not None:
+            roots = writable or [Path(workspace.workspace_path)]
+            protected = [path for root in roots for path in git_metadata(root)]
+            argv = sandboxed_argv(argv, policy, roots, read_only=protected)
+            environment = sandbox_environment(environment, policy)
         try:
             completed = subprocess.run(
-                command.argv,
+                argv,
                 cwd=workspace.workspace_path,
                 env=environment,
                 text=True,
@@ -541,8 +571,13 @@ class ProjectWorkspaceManager:
         on_start: Callable[[ProjectCommand, TaskWorkspace], None] | None = None,
         on_result: Callable[[CommandResult], None] | None = None,
         stop: Callable[[], bool] | None = None,
+        policy: CheckPolicy | None = None,
     ) -> list[CommandResult]:
-        return self.commands.run(project, tuple(workspaces), phase, ports, on_start, on_result, stop)
+        return self.commands.run(project, tuple(workspaces), phase, ports, on_start, on_result, stop, policy)
+
+    def check_policy(self, owner_id: str, permission_mode: PermissionMode, network_access: bool) -> CheckPolicy:
+        """The sandbox for a task's checks and hooks, with a cache per project."""
+        return self.workspaces.check_policy(owner_id, permission_mode, network_access)
 
     def diff(self, workspaces: list[TaskWorkspace]) -> list[DiffFile]:
         files: list[DiffFile] = []
@@ -562,7 +597,12 @@ class ProjectWorkspaceManager:
             for workspace in workspaces
         ]
 
-    def commit(self, workspaces: list[TaskWorkspace], message: str) -> list[GitState]:
+    def commit(
+        self,
+        workspaces: list[TaskWorkspace],
+        message: str,
+        policy: CheckPolicy | None = None,
+    ) -> list[GitState]:
         repositories = [workspace for workspace in workspaces if is_git_workspace(workspace)]
         # A missing author identity would fail every repository; ask for it
         # before touching any of them rather than after a rolled-back attempt.
@@ -576,7 +616,7 @@ class ProjectWorkspaceManager:
                 if state.dirty:
                     checkpoint = self.workspaces.commit_checkpoint(workspace.workspace_path)
                     checkpoints.append((workspace, checkpoint))
-                    state = self.workspaces.commit(workspace.workspace_path, message)
+                    state = self.workspaces.commit(workspace.workspace_path, message, policy)
                 states.append(state.model_copy(update={"folder_id": workspace.folder_id, "folder_name": workspace.folder_name}))
             return states
         except Exception as exc:

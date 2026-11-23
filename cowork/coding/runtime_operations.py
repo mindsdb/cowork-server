@@ -141,7 +141,7 @@ class RuntimeWorkspaceOperations:
         message = str(payload.get("message") or "").strip()
         if not message:
             raise WorkspaceError("A commit message is required")
-        states = self.manager.commit(list(self.prepared.workspaces), message)
+        states = self.manager.commit(list(self.prepared.workspaces), message, self._check_policy())
         if not states:
             raise WorkspaceError("This task does not contain a Git repository")
         return states[0].model_dump(mode="json")
@@ -152,8 +152,16 @@ class RuntimeWorkspaceOperations:
             list(self.prepared.workspaces),
             "validate",
             self.prepared.ports,
+            policy=self._check_policy(),
         )
         return {"items": [asdict(item) for item in results]}
+
+    def _check_policy(self):
+        return self.manager.check_policy(
+            self.project.id,
+            self.lease.execution.permission_mode,
+            self.lease.execution.network_access,
+        )
 
     def _refresh_project(self, payload: dict[str, object]) -> dict[str, object]:
         """Adopt commands the control plane copied onto the task after this lease began.

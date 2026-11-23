@@ -46,7 +46,10 @@ def operation(index: int, payload: dict[str, object]) -> RuntimeCommand:
 
 def test_refresh_project_hands_validate_the_new_commands_without_touching_workspaces() -> None:
     seen: list[CodeProject] = []
-    manager = SimpleNamespace(run_commands=lambda project, workspaces, phase, ports: seen.append(project) or [])
+    manager = SimpleNamespace(
+        run_commands=lambda project, workspaces, phase, ports, policy=None: seen.append(project) or [],
+        check_policy=lambda *_args: None,
+    )
     prepared = SimpleNamespace(workspaces=[SimpleNamespace(folder_id="repo")], ports={})
     operations = RuntimeWorkspaceOperations(lease(), manager, prepared, object())
     check = {"id": "check", "label": "Check", "argv": ["npm", "test"], "phase": "validate"}
