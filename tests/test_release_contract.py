@@ -182,11 +182,11 @@ def test_production_check_reads_optional_dependencies():
     assert release.unreleased_requirements(pyproject) == ["slack-sdk>=3.27.0rc1"]
 
 
-def run_check(tmp_path, monkeypatch, export, dependencies, *flags):
+def run_check(tmp_path, monkeypatch, export, dependencies, *flags, allowance=""):
     contract = tmp_path / "requirements.txt"
     contract.write_text(export)
     pyproject = tmp_path / "pyproject.toml"
-    pyproject.write_text(project(dependencies))
+    pyproject.write_text(project(dependencies) + allowance)
     monkeypatch.setattr(release, "CONTRACT", contract)
     monkeypatch.setattr(release, "PYPROJECT", pyproject)
     monkeypatch.setattr(release.subprocess, "run", lambda *a, **kw: SimpleNamespace(returncode=0, stdout=export))
@@ -218,3 +218,48 @@ def test_require_final_accepts_a_final_lock_and_floor(tmp_path, monkeypatch):
 def test_staging_check_accepts_a_candidate_lock_and_floor(tmp_path, monkeypatch):
     export = "anton-agent==2.26.11.20.1rc3\n"
     assert run_check(tmp_path, monkeypatch, export, ["anton-agent>=2.26.11.20.1rc3,<3"]) == 0
+
+
+ALLOW_RC3 = '[tool.cowork.release.allow-prerelease]\nanton-agent = "2.26.11.20.1rc3"\n'
+
+
+def test_an_allowed_pre_release_passes_in_the_lock_and_the_floor(tmp_path, monkeypatch, capsys):
+    export = "anton-agent==2.26.11.20.1rc3\n"
+    floor = ["anton-agent>=2.26.11.20.1rc3,<3"]
+    assert run_check(tmp_path, monkeypatch, export, floor, "--require-final", allowance=ALLOW_RC3) == 0
+    assert "allows these pre-releases in a production release:\n  anton-agent==2.26.11.20.1rc3\n" in capsys.readouterr().err
+
+
+def test_an_allowance_names_one_exact_version(tmp_path, monkeypatch, capsys):
+    export = "anton-agent==2.26.11.20.1rc4\n"
+    floor = ["anton-agent>=2.26.11.20.1rc4,<3"]
+    assert run_check(tmp_path, monkeypatch, export, floor, "--require-final", allowance=ALLOW_RC3) == 1
+    err = capsys.readouterr().err
+    assert "The lock pins:\n  anton-agent==2.26.11.20.1rc4\n" in err
+    assert "pyproject.toml requires:\n  anton-agent>=2.26.11.20.1rc4,<3\n" in err
+
+
+def test_an_allowance_covers_only_its_own_project(tmp_path, monkeypatch, capsys):
+    export = "anton-agent==2.26.11.20.1rc3\nfixture==2.26.11.20.1rc3\n"
+    dependencies = ["anton-agent>=2.26.11.20.1rc3,<3", "fixture>=2.26.11.20.1rc3"]
+    assert run_check(tmp_path, monkeypatch, export, dependencies, "--require-final", allowance=ALLOW_RC3) == 1
+    err = capsys.readouterr().err
+    assert "The lock pins:\n  fixture==2.26.11.20.1rc3\n" in err
+    assert "pyproject.toml requires:\n  fixture>=2.26.11.20.1rc3\n" in err
+
+
+def test_allowance_names_compare_as_pep503_names():
+    text = project(["Anton_Agent>=1.0rc1"]) + '[tool.cowork.release.allow-prerelease]\n"anton.agent" = "1.0rc1"\n'
+    assert release.allowed_prereleases(text) == {"anton-agent": "1.0rc1"}
+    assert release.unreleased_requirements(text) == []
+    assert release.unreleased_pins("anton-agent==1.0rc1\n", release.allowed_prereleases(text)) == []
+
+
+def test_an_allowance_must_name_one_version():
+    text = project([]) + '[tool.cowork.release.allow-prerelease]\nanton-agent = ["1.0rc1"]\n'
+    with pytest.raises(ValueError, match="must name one version"):
+        release.allowed_prereleases(text)
+
+
+def test_no_allowance_table_allows_nothing():
+    assert release.allowed_prereleases(project(["anton-agent>=1.0rc1"])) == {}

@@ -1363,6 +1363,12 @@ newer pre-releases from PyPI, so it is refused like a pre-release pin. Staging
 may still lock and require release candidates, and the anton relock raises a
 candidate floor to the final it locks.
 
+`[tool.cowork.release.allow-prerelease]` in `pyproject.toml` lets a production
+release name one exact pre-release of a project, as `anton-agent =
+"2.26.11.20.1rc3"`. The check prints each allowance it applies and still refuses
+any other pre-release, a newer candidate of the same project included. The anton
+relock removes anton-agent's entry when it locks a final.
+
 A repository administrator must also require the `final-release-lock` GitHub
 Actions status check on `main`. This is a branch-rule setting, not something
 merging this workflow enables. Preserve existing protections when adding it.
