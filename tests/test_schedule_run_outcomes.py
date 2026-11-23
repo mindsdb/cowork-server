@@ -560,6 +560,15 @@ async def test_run_now_gives_its_place_back_when_the_run_ends(schedule_id, turns
     assert shown["outcome"] == "completed"
 
 
+async def test_a_run_lists_the_slot_it_was_for(schedule_id, turns):
+    # The run list sets it beside the start time, so a late run shows.
+    await scheduler.execute_schedule(schedule_id, slot_at=SLOT)
+
+    async with _client() as client:
+        (shown,) = (await client.get(f"/api/v1/schedules/{schedule_id}/runs")).json()["runs"]
+    assert datetime.fromisoformat(shown["slotAt"]) == SLOT
+
+
 # --- What counts as the agent acting ----------------------------------------
 
 
