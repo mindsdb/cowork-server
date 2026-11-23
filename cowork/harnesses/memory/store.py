@@ -2,6 +2,7 @@
 This module defines the memory stores for canonical slot files on disk.
 """
 
+import errno
 import os
 import re
 import stat
@@ -243,12 +244,23 @@ class MemoryStore:
 
         # O_NOFOLLOW as for the slot itself. Opened for writing because flock
         # on NFS (EFS) is emulated with a write lock, which needs a writable fd.
-        lock_fd = dir_open(
-            root,
-            writer_lock_name(name),
-            os.O_WRONLY | os.O_CREAT | os.O_APPEND | O_NOFOLLOW,
-            0o600,
-        )
+        try:
+            lock_fd = dir_open(
+                root,
+                writer_lock_name(name),
+                os.O_WRONLY | os.O_CREAT | os.O_APPEND | O_NOFOLLOW,
+                0o600,
+            )
+        except OSError as exc:
+            if exc.errno == errno.ELOOP:
+                # A symlink squatting the lock name: the caller's own concern
+                # (test_a_link_at_the_lock_name_is_refused), not a busy lock.
+                raise
+            # ENOSPC/EMFILE/etc: the same "unavailable" the caller sees when
+            # the lock is held, not an unhandled 500.
+            raise MemorySlotBusyError(
+                "This memory is being rewritten; try again in a moment"
+            ) from exc
         try:
             deadline = time.monotonic() + MEMORY_SLOT_LOCK_TIMEOUT
             while True:

@@ -43,7 +43,7 @@ from cowork.harnesses.memory.registry import SLOT_REGISTRY, MemorySlot
 from cowork.harnesses.memory.store import GlobalMemoryStore
 from cowork.principal import Principal
 from cowork.services.memory import apply_project_compaction, project_slots_to_compact
-from cowork.turnqueue.producer import mint_llm_block
+from cowork.turnqueue.producer import mint_llm_block, revoke_turn_key_quietly
 from cowork.turnqueue.redis_client import get_redis
 
 logger = logging.getLogger(__name__)
@@ -301,10 +301,11 @@ async def _plan_files(
     # Its own id, led by the turn's: auth hands out one key per id, and a key
     # under the turn's own id is revoked with the turn. The plain turn TTL,
     # not a time-limited turn's hours: the deadline below is cut from it.
+    compact_correlation_id = f"{turn_correlation_id}:compact-{uuid4().hex[:8]}"
     block = await mint_llm_block(
         org_id=scope.org_id,
         user_id=scope.user_id,
-        correlation_id=f"{turn_correlation_id}:compact-{uuid4().hex[:8]}",
+        correlation_id=compact_correlation_id,
         settings=turn_settings,
         workspace_id=settings.hub_workspace_id or None,
         ttl_seconds=turn_settings.turn_key_ttl_seconds,
@@ -327,6 +328,10 @@ async def _plan_files(
         return plans
     finally:
         await llm.aclose()
+        # Its id is derived from the turn's, not equal to it: auth revokes by
+        # exact match, so the turn's own end-of-turn revoke never reaches this
+        # key. It would otherwise live to the full turn TTL.
+        await revoke_turn_key_quietly(compact_correlation_id)
 
 
 async def _apply(

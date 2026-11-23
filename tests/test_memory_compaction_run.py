@@ -66,6 +66,7 @@ def world(monkeypatch, redis_client, tmp_path):
     state = SimpleNamespace(
         settings=SimpleNamespace(memory_enabled=True, memory_mode="autopilot", hub_workspace_id="ws-1"),
         mints=[],
+        revokes=[],
         model=_Model(),
         root=tmp_path / "memory",
         redis=redis_client,
@@ -75,8 +76,12 @@ def world(monkeypatch, redis_client, tmp_path):
         state.mints.append(kwargs)
         return {"provider": "minds-cloud", "api_key": "turn-key", "base_url": "http://minds", "coding_model": "m"}
 
+    async def revoke(correlation_id):
+        state.revokes.append(correlation_id)
+
     monkeypatch.setattr(memory_compaction, "get_user_settings", lambda scope: state.settings)
     monkeypatch.setattr(memory_compaction, "mint_llm_block", mint)
+    monkeypatch.setattr(memory_compaction, "revoke_turn_key_quietly", revoke)
     monkeypatch.setattr(memory_compaction, "LLMClient", lambda **kwargs: state.model)
     return state
 
@@ -109,6 +114,7 @@ async def test_a_due_tier_is_compacted_and_its_count_stored(world):
     assert await world.redis.get(COUNT_KEY) == "1"
     assert await world.redis.get(LOCK_KEY) is None
     assert world.model.closed is True
+    assert world.revokes == [world.mints[0]["correlation_id"]]
 
 
 async def test_a_tier_that_is_not_due_mints_nothing(world):
@@ -144,6 +150,7 @@ async def test_a_failed_model_call_keeps_the_file_and_counts_the_attempt(world, 
     assert hc._lessons_path.read_bytes() == before
     assert await world.redis.get(COUNT_KEY) == "25"
     assert not any("Fact number" in record.getMessage() for record in caplog.records)
+    assert world.revokes == [world.mints[0]["correlation_id"]]
 
 
 async def test_a_failed_mint_keeps_the_file_and_counts_the_attempt(world, monkeypatch, caplog):

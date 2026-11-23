@@ -139,3 +139,30 @@ async def test_a_busy_slot_answers_503(monkeypatch, call):
             )
 
     assert raised.value.status_code == 503
+
+
+@pytest.mark.parametrize("change", ["write", "delete"])
+def test_a_lock_file_open_failure_answers_busy_not_500(tmp_path, monkeypatch, change):
+    """ENOSPC/EMFILE etc. from creating the lock file must not reach the caller
+    as a bare, unhandled OSError."""
+    store = GlobalMemoryStore(root=tmp_path)
+    store.write(MemorySlot.RULES, "# Rules\n- Kept\n")
+
+    from cowork.common import paths as paths_mod
+
+    real_dir_open = paths_mod.dir_open
+
+    def failing_dir_open(root, name, flags, mode=0o600):
+        if name.endswith(".lock"):
+            raise OSError(24, "Too many open files")
+        return real_dir_open(root, name, flags, mode)
+
+    monkeypatch.setattr(store_mod, "dir_open", failing_dir_open)
+
+    with pytest.raises(MemorySlotBusyError):
+        if change == "write":
+            store.write(MemorySlot.RULES, "# Rules\n")
+        else:
+            store.delete(MemorySlot.RULES)
+
+    assert store.read(MemorySlot.RULES) == "# Rules\n- Kept\n"
