@@ -476,11 +476,6 @@ deployment:
     - name: COWORK_TURN_BACKEND
       value: "remote"
 
-    # TEMPORARY, for the PR environment test only. Revert before merge: this
-    # base list reaches every environment.
-    - name: COWORK_REMOTE_DOCS
-      value: "true"
-
     # Populated by the redis-auth ExternalSecret (terraform-custom-*-redis-auth).
     # Listed before the URL so Kubernetes can expand $(REDIS_PASSWORD) into it.
     - name: REDIS_PASSWORD
