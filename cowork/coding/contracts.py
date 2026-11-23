@@ -4,7 +4,7 @@ from datetime import UTC, datetime
 from enum import Enum
 from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, Field, StringConstraints, field_validator, model_validator
+from pydantic import AliasChoices, BaseModel, Field, StringConstraints, field_validator, model_validator
 
 from cowork.coding.redaction import redact_text, sanitize
 from cowork.coding.questions import PendingQuestion
@@ -33,11 +33,71 @@ class WorkspaceKind(str, Enum):
     direct_folder = "direct_folder"
 
 
+class WorkspaceMode(str, Enum):
+    """How a task's workspace relates to the user's folder.
+
+    The mode is the user's choice; ``WorkspaceKind`` is what preparation
+    produced for it. ``in_place`` works in the user's own folder and maps to
+    ``direct_folder``; ``worktree`` isolates the task in a ``git_worktree``
+    and needs a Git repository with a commit. ``local_copy`` remains only for
+    tasks created before folders stopped being copied.
+    """
+
+    in_place = "in_place"
+    worktree = "worktree"
+
+
+class WorkspaceReasonCode(str, Enum):
+    """Why a workspace mode is refused, stable so a client can word it in its own language."""
+
+    not_a_repository = "not_a_repository"
+    no_commits = "no_commits"
+    in_place_unsupported_platform = "in_place_unsupported_platform"
+    in_place_other_computer = "in_place_other_computer"
+    no_local_checkout = "no_local_checkout"
+    shared_repository = "shared_repository"
+
+
+class WorkspaceModeOptions(BaseModel):
+    """The modes a new task could run in, and the one it gets if it asks for none."""
+
+    supported: list[WorkspaceMode]
+    # ``None`` when no mode is possible for the folder, for example a folder
+    # without Git where working in place is not offered.
+    default: WorkspaceMode | None
+    # Why working in the original folder is not offered, when it is not.
+    in_place_unavailable_reason: str | None = None
+    # Why a worktree is not offered for the folder, when it is not.
+    worktree_unavailable_reason: str | None = None
+    # The reasons above as codes, with the project folder each names, if any.
+    # The English text stays for clients that predate the codes.
+    in_place_unavailable_code: WorkspaceReasonCode | None = None
+    in_place_unavailable_folder: str | None = None
+    worktree_unavailable_code: WorkspaceReasonCode | None = None
+    worktree_unavailable_folder: str | None = None
+    # The folder isn't a Git repository and could be made one here.
+    can_initialize_git: bool = False
+
+
+class InitializeGitRequest(BaseModel):
+    path: str = Field(min_length=1, max_length=32_768)
+
+
 class PermissionMode(str, Enum):
     read_only = "read_only"
     supervised = "supervised"
     workspace = "workspace"
     full_access = "full_access"
+
+
+# The names people see for each mode, matching the pickers in the app. Read
+# only is no longer offered for new work, but saved projects and tasks keep it.
+PERMISSION_LABELS: dict[PermissionMode, str] = {
+    PermissionMode.read_only: "Read only",
+    PermissionMode.supervised: "Ask for approval",
+    PermissionMode.workspace: "Approve for me",
+    PermissionMode.full_access: "Full access",
+}
 
 
 # A reasoning effort is the model gateway's word for a level, advertised per
@@ -368,6 +428,10 @@ class CodingSession(BaseModel):
     network_access: bool = False
     web_search: bool = False
     additional_dirs: list[str] = Field(default_factory=list)
+    # A task working in a folder with no starting commit has no review and no
+    # undo, so it starts with a read-only sandbox until the user allows writes.
+    # Full access ignores it. Tasks saved before this field keep writing.
+    writes_allowed: bool = True
     status: SessionStatus = SessionStatus.ready
     # Compatibility projection of the durable control-plane records. The
     # session remains the existing renderer/runtime contract while Task and
@@ -399,6 +463,9 @@ class CodingSession(BaseModel):
     source_path: str
     workspace_path: str
     workspace_kind: WorkspaceKind
+    # ``None`` identifies tasks created before the mode was recorded; they
+    # were all isolated, so treat them as ``worktree``.
+    workspace_mode: WorkspaceMode | None = None
     workspaces: list[TaskWorkspace] = Field(default_factory=list)
     repository_root: str | None = None
     base_revision: str | None = None
@@ -536,7 +603,21 @@ class SessionCreateRequest(BaseModel):
     web_search: bool = False
     additional_dirs: list[str] = Field(default_factory=list, max_length=16)
     attachments: list[InputReference] = Field(default_factory=list, max_length=20)
-    allow_direct_folder: bool = False
+    # ``None`` lets the server choose from the project and the computer.
+    workspace_mode: WorkspaceMode | None = None
+    # True when the client filled ``workspace_mode`` from a default (the
+    # project's, its remembered last choice or the server's) rather than a
+    # choice made for this task. A default is a preference the server may
+    # override, for example to isolate a task from one already working in
+    # the folder; an explicit choice is honoured or refused.
+    workspace_mode_is_default: bool = False
+    # Ignored: folders are no longer copied. A folder without Git runs in
+    # place, and Worktree needs a repository. Still accepted, also as
+    # ``allow_direct_folder``, so older clients' requests validate.
+    allow_folder_copy: bool = Field(
+        default=False,
+        validation_alias=AliasChoices("allow_folder_copy", "allow_direct_folder"),
+    )
     source_contexts: list[SourceContext] = Field(default_factory=list, max_length=12)
 
     @model_validator(mode="after")
@@ -552,6 +633,11 @@ class SessionCreateRequest(BaseModel):
     def unique_resources(cls, value: list[str] | None) -> list[str] | None:
         return list(dict.fromkeys(value)) if value is not None else None
 
+    @property
+    def explicit_workspace_mode(self) -> WorkspaceMode | None:
+        """The mode chosen for this task, which must be honoured or refused."""
+        return None if self.workspace_mode_is_default else self.workspace_mode
+
 
 class SessionUpdateRequest(BaseModel):
     model: str | None = Field(default=None, min_length=1, max_length=256)
@@ -562,6 +648,7 @@ class SessionUpdateRequest(BaseModel):
     network_access: bool | None = None
     web_search: bool | None = None
     additional_dirs: list[str] | None = Field(default=None, max_length=16)
+    writes_allowed: bool | None = None
 
 
 class SessionRecoverRequest(BaseModel):
@@ -597,6 +684,11 @@ class CommitRequest(BaseModel):
 
 class RenameSessionRequest(BaseModel):
     title: str = Field(min_length=1, max_length=200)
+
+
+class WorkspaceCleanupStatus(BaseModel):
+    failed: int = 0
+    running: bool = False
 
 
 class WorkspaceUsageItem(BaseModel):

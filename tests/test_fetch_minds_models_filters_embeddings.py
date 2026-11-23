@@ -59,7 +59,7 @@ def test_fetch_minds_models_drops_embedding_rows(monkeypatch):
     monkeypatch.setattr(providers.httpx, "AsyncClient", _FakeClient)
     providers._minds_models_cache.clear()
 
-    listing = asyncio.run(fetch_minds_models("https://api.mindshub.ai", "mdb_test"))
+    listing = asyncio.run(fetch_minds_models("https://api.mindshub.ai", "mdb_test", mindshub=True))
     ids, efforts, enabled, labels = listing.ids, listing.efforts, listing.enabled, listing.labels
 
     assert ids == ["mindshub_air", "sonnet"]
@@ -72,15 +72,19 @@ def test_fetch_minds_models_drops_embedding_rows(monkeypatch):
     assert labels == {"sonnet": "Claude Sonnet 4.6"}
 
 
-@pytest.mark.parametrize("model_id", ["jev", "jev-1.13.0", "other-decision-model"])
+@pytest.mark.parametrize(("model_id", "kind"), [
+    ("jev", "decision"), ("jev-1.13.0", "decision"), ("other-decision-model", "decision"),
+    # Live voice models (auth's voice kind) aren't chat models either.
+    ("gpt-live-1", "voice"),
+])
 @pytest.mark.parametrize("embedding_fields", [{}, {"embedding": False}])
-def test_decision_models_are_excluded_from_picker_and_cached_catalog(monkeypatch, model_id, embedding_fields):
+def test_decision_models_are_excluded_from_picker_and_cached_catalog(monkeypatch, model_id, kind, embedding_fields):
     rows = [
         {"id": "mindshub_air"},  # Older catalogs do not declare a kind.
         {"id": "sonnet", "kind": "chat"},
         {
             "id": model_id,
-            "kind": "decision",
+            "kind": kind,
             "enabled": True,
             "label": "Decision model",
             "provider": "typesafe",
@@ -91,7 +95,7 @@ def test_decision_models_are_excluded_from_picker_and_cached_catalog(monkeypatch
     monkeypatch.setattr(providers.httpx, "AsyncClient", _client_returning(rows))
     providers._minds_models_cache.clear()
 
-    listing = asyncio.run(fetch_minds_models("https://api.mindshub.ai", "mdb_test"))
+    listing = asyncio.run(fetch_minds_models("https://api.mindshub.ai", "mdb_test", mindshub=True))
 
     assert listing.ids == ["mindshub_air", "sonnet"]
     assert listing.enabled == {}
@@ -147,3 +151,65 @@ def test_chat_models_are_not_dropped_by_a_coincidental_name(monkeypatch):
     ids = asyncio.run(fetch_minds_models("https://byo.example", "sk-test")).ids
 
     assert ids == ["bge-large", "gte-base", "e5-mistral", "embedded-agent-v1"]
+
+
+def _label_key(base_url, *, chat_only=False, tenant="org-1", user="u-1"):
+    return providers._listing_cache_key(
+        base_url=base_url, api_key="", tenant_key=tenant, user_id=user, chat_only=chat_only
+    )
+
+
+def _trusted_base():
+    return providers.minds_chat_base_url(providers._org_catalog_url())
+
+
+def test_a_cached_listing_answers_a_models_label_from_any_mindshub_caller():
+    from types import SimpleNamespace
+
+    providers._minds_models_cache.clear()
+    try:
+        base = _trusted_base()
+        providers._minds_models_cache[_label_key(base, user="u-1")] = (
+            0.0, SimpleNamespace(labels={"sonnet-4-5": "Claude Sonnet"}),
+        )
+        providers._minds_models_cache[_label_key(base, user="u-2")] = (
+            0.0, SimpleNamespace(labels={"haiku-4-5": "Claude Haiku"}),
+        )
+        assert providers.cached_minds_model_label("haiku-4-5") == "Claude Haiku"
+        assert providers.cached_minds_model_label("sonnet-4-5") == "Claude Sonnet"
+        assert providers.cached_minds_model_label("gpt-nano") is None
+        assert providers.budget_model_label("gpt-nano") == "gpt-nano"
+    finally:
+        providers._minds_models_cache.clear()
+
+
+def test_a_custom_endpoint_listing_never_names_a_mindshub_model():
+    from types import SimpleNamespace
+
+    providers._minds_models_cache.clear()
+    try:
+        # A user's own OpenAI-compatible endpoint, fetched chat-only and on its own URL.
+        providers._minds_models_cache[_label_key("https://byo.example/v1", chat_only=True, tenant="org-x")] = (
+            0.0, SimpleNamespace(labels={"sonnet": "Spoofed"}),
+        )
+        # A non-chat-only entry on a foreign URL is not trusted either.
+        providers._minds_models_cache[_label_key("https://other.example/v1", tenant="org-x")] = (
+            0.0, SimpleNamespace(labels={"sonnet": "Also spoofed"}),
+        )
+        assert providers.cached_minds_model_label("sonnet") is None
+        assert providers.budget_model_label("sonnet") == "sonnet"
+        providers._minds_models_cache[_label_key(_trusted_base())] = (
+            0.0, SimpleNamespace(labels={"sonnet": "Claude Sonnet"}),
+        )
+        assert providers.cached_minds_model_label("sonnet") == "Claude Sonnet"
+    finally:
+        providers._minds_models_cache.clear()
+
+
+def test_a_failed_fetch_entry_has_no_label():
+    providers._minds_models_cache.clear()
+    try:
+        providers._minds_models_cache[_label_key(_trusted_base())] = (0.0, None)
+        assert providers.cached_minds_model_label("haiku-4-5") is None
+    finally:
+        providers._minds_models_cache.clear()

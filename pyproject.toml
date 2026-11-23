@@ -52,9 +52,24 @@ dependencies = [
     # `slots_full` and `slots_available` (mindsdb/anton#646), which shared
     # live-app slots admit each person's launch through.
     # 2.26.11.9.1 is the first final release that carries all of the above.
+    # 2.26.11.15.1 is the first final release with the asynchronous publish
+    # job (`PUBLISH_JOB_BUDGET_S`, `PublishJobFailed`, `PublishJobTimeout`,
+    # mindsdb/anton#481), which publishing imports unguarded. It also carries
+    # Notion's MCP server URL and `McpTokenRejected` (mindsdb/anton#549, first
+    # in 2.26.11.12.1rc4), which the Notion connector reads.
+    # 2.26.11.18.1rc1 is the first with custom MCP servers' URL check, guarded
+    # sessions and `list_custom_server_tools` (mindsdb/anton#814), which the
+    # custom MCP routes import.
+    # 2.26.11.19.1rc3 is the first with Slack's MCP server and tool access
+    # tiers (mindsdb/anton#820), which Slack's In-Browser Connect needs.
+    # 2.26.11.20.1rc3 tags the budget-refusal link with from=budget_denial
+    # (mindsdb/anton#819), so the console counts those visits.
+    # 2.26.11.22.1rc1 asks Jev on the MindsHub the person is signed in to, not
+    # only api.mindshub.ai (mindsdb/anton#837), so the artifact bar edits
+    # directly on staging too (quickEditDirect).
     # Desktop installs the anton this lock names, so a production release
     # names a final anton, never a release candidate.
-    "anton-agent>=2.26.11.15.1,<3",
+    "anton-agent>=2.26.11.23.1,<3",
     # Floor for GHSA-8bx3-mgpq-m8m9 (IDNA 2003 vs IDNA 2009 host-name encoding
     # mismatch in TLSStream/connect_tcp() lets a hijacked connection to an
     # internationalized domain present a certificate that validates against
@@ -222,6 +237,13 @@ fallback-version = "0.0.0-dev"
 
 [tool.hatch.build.targets.wheel]
 packages = ["cowork"]
+
+[tool.cowork.release.allow-prerelease]
+# The exact pre-releases a production release may still name, in the lock and
+# in the bounds above. `scripts/release_contract.py --require-final` refuses
+# every other one, a newer candidate of the same project included. The anton
+# relock (`scripts/anton_final_lock_pr.py`) removes anton-agent's entry when it
+# locks anton's final.
 
 [dependency-groups]
 dev = [

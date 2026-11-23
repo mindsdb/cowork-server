@@ -7,7 +7,7 @@ and `AntonHarness._stamp_message` (per-message timestamp prefix).
 from __future__ import annotations
 
 import os
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from uuid import uuid4
 
@@ -177,6 +177,13 @@ class TestStampMessage:
         assert AntonHarness._stamp_message(m) == {
             "role": "user", "content": "[2026-08-18 17:41] who are you?",
         }
+
+    def test_converts_an_aware_timestamp_to_utc(self):
+        local = datetime(2026, 11, 12, 11, 48, tzinfo=timezone(timedelta(hours=-8)))
+        m = self._msg("user", "refresh every hour", local)
+        assert AntonHarness._stamp_message(m)["content"] == (
+            "[2026-11-12 19:48] refresh every hour"
+        )
 
     def test_does_not_stamp_an_assistant_message(self):
         """The regression: an assistant reply replayed back to Anton must

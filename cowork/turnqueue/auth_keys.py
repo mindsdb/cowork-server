@@ -15,6 +15,8 @@ import httpx
 from cowork.services.mindshub_workspaces import forget_stale_mindshub_workspace
 from cowork.services.product_permissions import ProductPermissionDenied, ProductPermissionUnavailable
 
+KeyPurpose = Literal["execution", "artifact_publish", "connector_token"]
+
 logger = logging.getLogger(__name__)
 
 
@@ -35,7 +37,7 @@ class MintedTurnKey:
 
 async def _request_turn_key(*, user_id: str, org_id: str, correlation_id: str,
                             ttl_seconds: int, settings,
-                            purpose: Literal["execution", "artifact_publish"],
+                            purpose: KeyPurpose,
                             workspace_id: str | None = None) -> dict:
     expiry = (datetime.now(timezone.utc) + timedelta(seconds=ttl_seconds)).isoformat()
     # Cluster-only route: turn-key mint is secret-only (no Bearer factor), so
@@ -79,7 +81,7 @@ async def _request_turn_key(*, user_id: str, org_id: str, correlation_id: str,
 
 
 async def mint_turn_key(*, user_id: str, org_id: str, correlation_id: str,
-                        ttl_seconds: int, settings, purpose: Literal["execution", "artifact_publish"] = "execution",
+                        ttl_seconds: int, settings, purpose: KeyPurpose = "execution",
                         workspace_id: str | None = None) -> str:
     result = await _request_turn_key(
         user_id=user_id,
@@ -95,7 +97,7 @@ async def mint_turn_key(*, user_id: str, org_id: str, correlation_id: str,
 
 async def mint_turn_key_details(*, user_id: str, org_id: str, correlation_id: str,
                                 ttl_seconds: int, settings,
-                                purpose: Literal["execution", "artifact_publish"] = "execution",
+                                purpose: KeyPurpose = "execution",
                                 workspace_id: str | None = None) -> MintedTurnKey:
     result = await _request_turn_key(
         user_id=user_id,
@@ -185,6 +187,74 @@ async def register_datasource_grants(
     try:
         async with httpx.AsyncClient(timeout=5.0, follow_redirects=False) as client:
             resp = await client.post(url, json=body, headers=headers)
+            resp.raise_for_status()
+            result = resp.json()
+    except (httpx.HTTPError, TimeoutError, ValueError) as exc:
+        raise ProductPermissionUnavailable() from exc
+    if not isinstance(result, dict):
+        raise ProductPermissionUnavailable()
+    return result
+
+
+def _producer_headers(settings) -> dict[str, str]:
+    """The datasource producer role's credential, which auth's custom API routes also take."""
+    return {
+        "X-Datasource-Service-Key-Id": settings.datasource_producer_key_id,
+        "X-Datasource-Service-Key": settings.datasource_producer_key,
+    }
+
+
+async def list_custom_api_connections(*, org_id: str, user_id: str, turn_key_id: str, settings) -> list[dict]:
+    """List the turn key owner's verified custom API connections, metadata only.
+
+    Auth derives the member from the live turn key named by ``turn_key_id``;
+    the ids are cross-checks. Raises ``ProductPermissionUnavailable`` on any
+    failure, an unconfigured producer key included.
+    """
+    if not settings.datasource_producer_key_id or not settings.datasource_producer_key:
+        raise ProductPermissionUnavailable()
+    url = f"{settings.auth_internal_base_url.rstrip('/')}/internal/custom-connections/"
+    params = {"organization_id": org_id, "user_id": user_id, "turn_key_id": turn_key_id}
+    try:
+        async with httpx.AsyncClient(timeout=5.0, follow_redirects=False) as client:
+            resp = await client.get(url, params=params, headers=_producer_headers(settings))
+            resp.raise_for_status()
+            result = resp.json()
+    except (httpx.HTTPError, TimeoutError, ValueError) as exc:
+        raise ProductPermissionUnavailable() from exc
+    if not isinstance(result, dict) or not isinstance(result.get("items"), list):
+        raise ProductPermissionUnavailable()
+    return result["items"]
+
+
+async def register_custom_api_grants(
+    *,
+    user_id: str,
+    org_id: str,
+    correlation_id: str,
+    turn_key_id: str,
+    connection_ids: list[int],
+    settings,
+) -> dict:
+    """Bind grants for these custom API connections to the existing turn key, for the gateway to resolve.
+
+    Auth fixes the audience and purpose itself (``custom-api``, ``fetch``) and
+    issues each grant at the connection's current credential version. Raises
+    ``ProductPermissionUnavailable`` on any refusal or failure.
+    """
+    if not settings.datasource_producer_key_id or not settings.datasource_producer_key:
+        raise ProductPermissionUnavailable()
+    url = f"{settings.auth_internal_base_url.rstrip('/')}/internal/custom-connections/turn-grants/"
+    body = {
+        "user_id": user_id,
+        "organization_id": org_id,
+        "correlation_id": correlation_id,
+        "turn_key_id": turn_key_id,
+        "connection_ids": connection_ids,
+    }
+    try:
+        async with httpx.AsyncClient(timeout=5.0, follow_redirects=False) as client:
+            resp = await client.post(url, json=body, headers=_producer_headers(settings))
             resp.raise_for_status()
             result = resp.json()
     except (httpx.HTTPError, TimeoutError, ValueError) as exc:

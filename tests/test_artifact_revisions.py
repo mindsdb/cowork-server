@@ -12,6 +12,7 @@ from cowork.services.artifact_identity import (
     ensure_full_id,
     resolve_artifact_folder,
 )
+from cowork.services.artifact_metadata import ArtifactMetadata
 from cowork.services.artifacts import ProjectArtifacts
 from cowork.services.artifact_revisions import (
     RepairAlreadyPending,
@@ -50,7 +51,7 @@ def artifact(tmp_path):
     }
     (folder / "metadata.json").write_text(json.dumps(metadata), encoding="utf-8")
     (folder / "brief.md").write_text("# First\n", encoding="utf-8")
-    artifact_id, metadata = ensure_full_id(folder, metadata)
+    artifact_id, metadata = ensure_full_id(folder, ArtifactMetadata.model_validate(metadata))
     return folder, metadata, artifact_id
 
 
@@ -74,10 +75,10 @@ def test_widening_matches_antons_in_memory_derivation(artifact):
 
     folder, metadata, artifact_id = artifact
     legacy = {
-        **metadata,
+        **metadata.to_document(),
         "id": "a1b2c3d4",
         "description": "",
-        "updatedAt": metadata["createdAt"],
+        "updatedAt": metadata.createdAt,
     }
 
     assert Artifact.model_validate(legacy).id == artifact_id
@@ -92,11 +93,11 @@ def test_persisted_stable_id_is_adopted_as_the_artifact_id(tmp_path):
     metadata = {"id": "a1b2c3d4", "createdAt": "2026-08-25", "stableId": minted}
     (folder / "metadata.json").write_text(json.dumps(metadata), encoding="utf-8")
 
-    artifact_id, merged = ensure_full_id(folder, metadata)
+    artifact_id, merged = ensure_full_id(folder, ArtifactMetadata.model_validate(metadata))
 
     assert artifact_id == _full_id(minted)
-    assert merged["id"] == artifact_id
-    assert "stableId" not in merged
+    assert merged.id == artifact_id
+    assert "stableId" not in merged.to_document()
     assert "stableId" not in json.loads(
         (folder / "metadata.json").read_text(encoding="utf-8")
     )
@@ -112,10 +113,10 @@ def test_id_less_metadata_widens_from_its_long_slug(tmp_path):
     metadata = {"slug": folder.name, "createdAt": "2026-08-25", "name": "Q3"}
     (folder / "metadata.json").write_text(json.dumps(metadata), encoding="utf-8")
 
-    artifact_id, merged = ensure_full_id(folder, metadata)
+    artifact_id, merged = ensure_full_id(folder, ArtifactMetadata.model_validate(metadata))
 
     assert UUID(artifact_id).hex == artifact_id
-    assert merged["id"] == artifact_id
+    assert merged.id == artifact_id
     # Same value on a second, independent read.
     assert ensure_full_id(folder)[0] == artifact_id
 
@@ -127,7 +128,7 @@ def test_invalid_identity_fails_closed_without_rewriting(tmp_path):
     (folder / "metadata.json").write_text(json.dumps(metadata), encoding="utf-8")
 
     with pytest.raises(ValueError, match="identity is invalid"):
-        ensure_full_id(folder, metadata)
+        ensure_full_id(folder, ArtifactMetadata.model_validate(metadata))
 
     assert json.loads((folder / "metadata.json").read_text(encoding="utf-8")) == metadata
 
@@ -139,11 +140,11 @@ def test_legacy_identity_widening_merges_latest_metadata(tmp_path):
     latest = {**stale, "name": "After", "description": "Concurrent update"}
     (folder / "metadata.json").write_text(json.dumps(latest), encoding="utf-8")
 
-    artifact_id, merged = ensure_full_id(folder, stale)
+    artifact_id, merged = ensure_full_id(folder, ArtifactMetadata.model_validate(stale))
 
-    assert merged["id"] == artifact_id
-    assert merged["name"] == "After"
-    assert merged["description"] == "Concurrent update"
+    assert merged.id == artifact_id
+    assert merged.name == "After"
+    assert merged.description == "Concurrent update"
 
 
 def test_legacy_identity_widening_preserves_metadata_mtime(tmp_path):
@@ -161,7 +162,7 @@ def test_legacy_identity_widening_preserves_metadata_mtime(tmp_path):
     past_ns = path.stat().st_mtime_ns - 3_600_000_000_000  # one hour ago
     os.utime(path, ns=(past_ns, past_ns))
 
-    artifact_id, _merged = ensure_full_id(folder, metadata)
+    artifact_id, _merged = ensure_full_id(folder, ArtifactMetadata.model_validate(metadata))
 
     assert path.stat().st_mtime_ns == past_ns
     assert json.loads(path.read_text(encoding="utf-8"))["id"] == artifact_id
@@ -202,7 +203,7 @@ def test_widening_does_not_retimestamp_a_symlink_target(tmp_path):
     # Metadata supplied by the caller, so the read is skipped and the write path
     # runs against the link — the shape this guard is about.
     try:
-        ensure_full_id(folder, metadata)
+        ensure_full_id(folder, ArtifactMetadata.model_validate(metadata))
     except (OSError, ValueError):
         pass
 
@@ -255,7 +256,7 @@ def test_identity_revalidation_receives_the_server_index_value(monkeypatch, tmp_
 
     def revalidate(_source, indexed_id):
         seen.append(indexed_id)
-        return ((folder, {"id": server_id}),)
+        return ((folder, ArtifactMetadata.model_validate({"id": server_id})),)
 
     monkeypatch.setattr(identity_service, "_indexed_artifacts", revalidate)
 
@@ -577,7 +578,7 @@ def test_superseded_ready_repair_stops_blocking_but_stays_decidable(artifact):
 
 def test_repair_whose_primary_drifted_is_finished_not_stranded(artifact):
     """capture_agent_revision reconciles against the primary it resolves now.
-    If metadata["primary"] moved after the handoff was minted, the repair sits
+    If metadata.primary moved after the handoff was minted, the repair sits
     on a path this capture will never look at, and nothing else can finish it."""
     folder, metadata, artifact_id = artifact
     initial = current_source(folder, metadata, artifact_id)
@@ -595,7 +596,7 @@ def test_repair_whose_primary_drifted_is_finished_not_stranded(artifact):
 
     # The turn repoints the artifact at a different editable file.
     (folder / "summary.md").write_text("# Summary\n", encoding="utf-8")
-    moved = {**metadata, "primary": "summary.md"}
+    moved = {**metadata.to_document(), "primary": "summary.md"}
     (folder / "metadata.json").write_text(json.dumps(moved), encoding="utf-8")
 
     capture_agent_revision(folder, conversation_id="conversation-1")
@@ -1354,7 +1355,7 @@ def test_auto_pick_skips_store_housekeeping_files(tmp_path):
     for name in ("README.md", "metadata.json", "index.html"):
         (tmp_path / name).write_text("x", encoding="utf-8")
 
-    target, rel = revision_service.resolve_source(tmp_path, {})
+    target, rel = revision_service.resolve_source(tmp_path, ArtifactMetadata.empty())
 
     assert rel == "index.html"
     assert target == (tmp_path / "index.html").resolve()
@@ -1364,7 +1365,7 @@ def test_auto_pick_skips_generation_inputs(tmp_path):
     for name in ("prd.md", "report.md"):
         (tmp_path / name).write_text("x", encoding="utf-8")
 
-    _, rel = revision_service.resolve_source(tmp_path, {})
+    _, rel = revision_service.resolve_source(tmp_path, ArtifactMetadata.empty())
 
     assert rel == "report.md"
 
@@ -1375,7 +1376,7 @@ def test_auto_pick_skips_nested_journal_files(tmp_path):
     (journal / "a.html").write_text("x", encoding="utf-8")
     (tmp_path / "b.html").write_text("x", encoding="utf-8")
 
-    _, rel = revision_service.resolve_source(tmp_path, {})
+    _, rel = revision_service.resolve_source(tmp_path, ArtifactMetadata.empty())
 
     assert rel == "b.html"
 
@@ -1388,7 +1389,7 @@ def test_auto_pick_skips_a_symlinked_source(tmp_path):
     (folder / "a.md").symlink_to(outside)
     (folder / "b.html").write_text("<p>ok</p>", encoding="utf-8")
 
-    target, rel = revision_service.resolve_source(folder, {})
+    target, rel = revision_service.resolve_source(folder, ArtifactMetadata.empty())
 
     assert rel == "b.html"
     assert target.name == "b.html"
@@ -1416,6 +1417,114 @@ def test_agent_repair_prompt_says_how_to_find_the_artifact(artifact):
     # The desktop chat reads `Label: value` lines of this prompt into a card;
     # the hint must not look like one.
     assert ":" not in hint.split(" ", 1)[0]
+
+
+def test_agent_repair_prompt_points_the_agent_at_the_thread_s_images(artifact):
+    """ENG-4410: the app attaches a thread's images to the repair message."""
+    folder, metadata, artifact_id = artifact
+    initial = current_source(folder, metadata, artifact_id)
+    image = "0" * 32 + ".png"
+
+    def prompt(thread):
+        return create_agent_repair(
+            folder, metadata, artifact_id,
+            expected_revision_id=initial["revision"]["id"],
+            comment_thread_id="thread-1", selector=None, thread=thread,
+            conversation_id="conversation-1",
+        )
+
+    with_images = prompt([{"text": f"Like this\n\n![shot.png](cowork-image:{image})"}])
+    cancel_agent_repair(folder, with_images["repair"]["id"])
+    without = prompt([{"text": "Fix the title"}])["prompt"]
+
+    lines = with_images["prompt"].splitlines()
+    images = next(line for line in lines if line.startswith("Images: "))
+    assert "1 `cowork-image:` reference(s)" in images
+    assert lines.index(images) < lines.index("Complete comment thread:")
+    assert "Images: " not in without
+
+
+def _repair_prompt(folder, metadata, artifact_id, *, selector):
+    initial = current_source(folder, metadata, artifact_id)
+    return create_agent_repair(
+        folder,
+        metadata,
+        artifact_id,
+        expected_revision_id=initial["revision"]["id"],
+        comment_thread_id="thread-1",
+        selector=selector,
+        thread=[{"text": "Rename this to Harbor and Pines"}],
+        conversation_id="conversation-1",
+    )["prompt"]
+
+
+def _html_artifact(folder, metadata, html):
+    (folder / "index.html").write_text(html, encoding="utf-8")
+    raw = metadata.model_dump(mode="json", exclude_none=True) if isinstance(metadata, ArtifactMetadata) else metadata
+    raw = {**raw, "type": "html-app", "primary": "index.html"}
+    (folder / "metadata.json").write_text(json.dumps(raw), encoding="utf-8")
+    return ArtifactMetadata.model_validate(raw)
+
+
+def test_agent_repair_prompt_routes_the_fix_through_edit_artifact(artifact):
+    """A comment fix takes the chat edit's route (ENG-4386): one edit_artifact
+    call on this folder, not a list_artifacts round and a scratchpad patch."""
+    folder, metadata, artifact_id = artifact
+    prompt = _repair_prompt(folder, metadata, artifact_id, selector=None)
+
+    lines = prompt.splitlines()
+    hint = lines[next(i for i, line in enumerate(lines) if line.startswith("Source path: ")) + 1]
+    assert hint.startswith("Make the change with one `edit_artifact` call")
+    assert f"pass `{folder.name}` as `slug`" in hint
+    # The old route stays only as the fallback for an anton without the editor.
+    assert hint.index("edit_artifact") < hint.index("list_artifacts")
+    assert "verify the artifact still renders" not in prompt
+    assert "Anchor: the artifact as a whole (brief.md)" in lines
+
+
+def test_agent_repair_prompt_anchors_an_element_comment_in_the_source(artifact):
+    folder, metadata, artifact_id = artifact
+    metadata = _html_artifact(folder, metadata, (
+        "<html><body><header><h1 class=\"title hero\">Old title</h1></header>"
+        "<section><h2>Revenue</h2></section><section><h2>Costs\n  by month</h2></section>"
+        "</body></html>"
+    ))
+    prompt = _repair_prompt(folder, metadata, artifact_id, selector="section:nth-of-type(2) > h2")
+
+    anchor = next(line for line in prompt.splitlines() if line.startswith("Anchor: "))
+    assert anchor == (
+        "Anchor: the element matching the CSS selector `section:nth-of-type(2) > h2` in index.html, "
+        "which the source writes as: <h2> with the text \u201cCosts by month\u201d"
+    )
+    # The thread's JSON is still the prompt's last bracketed block, which the
+    # desktop's chat card parses.
+    assert prompt.rindex("]") > prompt.index("Complete comment thread:")
+
+
+def test_agent_repair_prompt_keeps_a_selector_the_source_does_not_have(artifact):
+    """A page that builds the element in script has no match in its source:
+    the selector alone is passed on, never a guess at another element."""
+    folder, metadata, artifact_id = artifact
+    metadata = _html_artifact(folder, metadata, "<html><body><div id=\"root\"></div></body></html>")
+    prompt = _repair_prompt(folder, metadata, artifact_id, selector="#root > div:nth-of-type(3)")
+
+    assert (
+        "Anchor: the element matching the CSS selector `#root > div:nth-of-type(3)` in index.html\n"
+        in prompt
+    )
+
+
+def test_agent_repair_prompt_anchors_a_text_comment_by_its_quote(artifact):
+    folder, metadata, artifact_id = artifact
+    selector = json.dumps({
+        "type": "text-quote",
+        "path": "brief.md",
+        "quote": "First\nline",
+        "revisionId": None,
+    })
+    prompt = _repair_prompt(folder, metadata, artifact_id, selector=selector)
+
+    assert "Anchor: the text \u201cFirst line\u201d in brief.md\n" in prompt
 
 
 def _refresh(folder, text, *, schedule_id="schedule-1", conversation_id="run-1"):

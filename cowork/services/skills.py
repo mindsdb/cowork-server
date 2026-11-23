@@ -1,17 +1,19 @@
 from __future__ import annotations
 
+import hashlib
 import io
 import json
 import logging
 import os
 import shutil
+import stat
 import tempfile
 import zipfile
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
-from functools import cached_property
+from functools import cached_property, lru_cache
 from pathlib import Path
 from typing import TYPE_CHECKING, NamedTuple
 from uuid import uuid4
@@ -26,10 +28,15 @@ from anton.core.tools.skill_format import (
 
 from cowork import shared_skills
 from cowork.common.paths import (
+    O_NOFOLLOW,
+    dir_atomic_write,
+    dir_open,
     dir_rename,
     dir_replace,
     dir_rmtree,
+    dir_scandir,
     dir_unlink,
+    opened_subdir_nofollow,
     pinned_dir,
     safe_join,
 )
@@ -131,7 +138,7 @@ _TURN_SKILL_FILE_MAX = 200_000
 # Desktop seeding (unkeyed store, DB sentinel) lives in migrations.py and shares
 # this version; org seeding (per-org store, file marker) is a SkillService method.
 BUILTIN_SKILLS_DIR = Path(__file__).parent.parent / "skills_builtin"
-BUILTIN_SKILLS_VERSION = 2
+BUILTIN_SKILLS_VERSION = 3
 # Versioned identity manifest. Authorization must not depend on the packaged
 # directory being readable: an incomplete image must not make an existing
 # shared-volume copy mutable.
@@ -151,6 +158,67 @@ BUILTIN_SKILL_SLUGS = frozenset(
 #: Org-mode version marker, a file in the org's own store. See
 #: ``SkillService.ensure_builtin_skills`` for why this is not a Setting row.
 BUILTIN_SKILLS_MARKER = ".builtins_seeded"
+
+#: Every version of each packaged builtin we have shipped, as fingerprints, and
+#: the BUILTIN_SKILLS_VERSION each one first shipped in. Regenerated from git
+#: history by ``scripts/builtin_skills_shipped.py``; a test fails when a packaged
+#: skill's current content is missing from it.
+BUILTIN_SKILLS_SHIPPED = BUILTIN_SKILLS_DIR / "shipped.json"
+
+#: Written into a skill's folder at run time (anton's usage counters), so it is
+#: left out of a fingerprint and carried over when a builtin is updated.
+BUILTIN_RUNTIME_SIDECAR = "stats.json"
+
+
+def fingerprint_skill_files(files: dict[str, bytes]) -> str:
+    """One fingerprint for a skill's files, keyed by POSIX path in the skill folder."""
+    digest = hashlib.sha256()
+    for rel in sorted(files):
+        if rel == BUILTIN_RUNTIME_SIDECAR:
+            continue
+        digest.update(rel.encode("utf-8") + b"\0" + hashlib.sha256(files[rel]).hexdigest().encode() + b"\n")
+    return digest.hexdigest()
+
+
+def builtin_fingerprint(skill_dir: Path) -> str | None:
+    """The fingerprint of a skill folder on disk, or None if it holds a link or
+    anything but regular files and folders (never treated as a shipped copy)."""
+    files: dict[str, bytes] = {}
+    for dirpath, dirnames, filenames in os.walk(skill_dir, followlinks=False):
+        base = Path(dirpath)
+        for name in dirnames:
+            if (base / name).is_symlink():
+                return None
+        for name in filenames:
+            path = base / name
+            if path.is_symlink() or not path.is_file():
+                return None
+            files[path.relative_to(skill_dir).as_posix()] = path.read_bytes()
+    return fingerprint_skill_files(files)
+
+
+def _is_skill_write_temp(name: str) -> bool:
+    """A temp file a skill write leaves beside SKILL.md if it is interrupted."""
+    return name.startswith(f".{SKILL_FILE}.") and name.endswith((".tmp", ".restore"))
+
+
+@lru_cache(maxsize=1)
+def _builtin_skills_shipped() -> dict:
+    try:
+        return json.loads(BUILTIN_SKILLS_SHIPPED.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        logger.warning("Could not read %s; packaged builtins will not be updated", BUILTIN_SKILLS_SHIPPED)
+        return {}
+
+
+def shipped_builtin_fingerprints(slug: str) -> frozenset[str]:
+    return frozenset(_builtin_skills_shipped().get(slug, {}).get("shipped", ()))
+
+
+def builtin_introduced_in(slug: str) -> int:
+    """The BUILTIN_SKILLS_VERSION a packaged builtin first shipped in. A slug the
+    manifest doesn't know counts as new, so it is still seeded."""
+    return int(_builtin_skills_shipped().get(slug, {}).get("introduced", 1 << 30))
 
 # Skills in this set belong to the coding product, not the general Cowork
 # assistant. They remain packaged beside the other builtins for now, but are
@@ -2202,6 +2270,49 @@ class SkillService:
             raise
 
     # ── builtin seeding ──────────────────────────────────────────────────────
+    def _refresh_builtin_skill(self, src: Path) -> bool:
+        """Replace a store's copy of a packaged builtin with the packaged one,
+        only when that copy is exactly a version we shipped.
+
+        Every builtin is one SKILL.md, so the update is one atomic file
+        replace: the new text is written to a temp file beside SKILL.md and
+        renamed over it, and the skill is never missing or half written. The
+        folder is opened without following links and the rename replaces the
+        name itself, so a link anywhere in the copy is never written through.
+        A copy someone edited, one holding anything but SKILL.md and the usage
+        sidecar, and one holding a link are all left alone.
+        """
+        slug = src.name
+        shipped = shipped_builtin_fingerprints(slug)
+        packaged = [p for p in src.rglob("*") if not p.is_dir()]
+        if not shipped or [p.name for p in packaged] != [SKILL_FILE] or packaged[0].is_symlink():
+            return False
+        entry = self._skill_entry(slug)
+        if entry.is_symlink() or not entry.is_dir():
+            return False
+        new_body = packaged[0].read_bytes()
+        with opened_subdir_nofollow(self.root, entry.name) as skill_dir:
+            names = set()
+            for child in dir_scandir(skill_dir):
+                if _is_skill_write_temp(child.name):
+                    continue  # left by an interrupted write; not part of the skill
+                if child.is_symlink() or not child.is_file(follow_symlinks=False):
+                    return False
+                names.add(child.name)
+            if names - {BUILTIN_RUNTIME_SIDECAR} != {SKILL_FILE}:
+                return False
+            fd = dir_open(skill_dir, SKILL_FILE, os.O_RDONLY | O_NOFOLLOW)
+            with os.fdopen(fd, "rb") as handle:
+                current = handle.read()
+            current_print = fingerprint_skill_files({SKILL_FILE: current})
+            if current_print not in shipped or current == new_body:
+                return False
+            dir_atomic_write(
+                skill_dir, SKILL_FILE, content=new_body,
+                mode=stat.S_IMODE(packaged[0].stat().st_mode),
+            )
+        return True
+
     def _copy_builtin_skill(self, src: Path) -> bool:
         """Copy one packaged builtin without replacing an existing skill."""
         dest = self._skill_dir(src.name)
@@ -2216,11 +2327,16 @@ class SkillService:
             shutil.copy2(child, target)
         return True
 
-    def _copy_builtin_skills(self) -> int:
-        """Copy packaged builtins into this store, skipping slugs it already has.
+    def _copy_builtin_skills(self, seeded_version: int = 0) -> int:
+        """Bring this store's packaged builtins up to the packaged versions.
 
-        Returns how many were copied. Never overwrites, so a skill the user
-        edited or deleted stays as they left it.
+        ``seeded_version`` is the version this store was last seeded at (0 for
+        never). A builtin the store lacks is copied only if it is new since
+        then, so a builtin someone deleted stays deleted. A builtin the store
+        has is replaced only when it is exactly a version we shipped, so a
+        skill someone edited stays as they left it.
+
+        Returns how many were copied or updated.
         """
         builtin_dir = self.builtin_skills_dir
         if not builtin_dir.exists():
@@ -2232,22 +2348,33 @@ class SkillService:
                 continue
             if not self.includes_packaged_builtin(src.name):
                 continue
+            slug = src.name
             try:
-                if not self._copy_builtin_skill(src):
-                    continue  # keep the user-editable copy untouched
+                if os.path.lexists(self._skill_entry(slug)):
+                    if not self._refresh_builtin_skill(src):
+                        continue  # current already, or edited: leave it
+                elif seeded_version and builtin_introduced_in(slug) <= seeded_version:
+                    continue  # it was seeded before and has been deleted since
+                elif not self._copy_builtin_skill(src):
+                    continue
             except ValueError:
-                # Either the slug resolves outside the store, or safe_join rejected a
-                # destination. The agent writes into its own org's tree on shared
-                # storage, so it can plant a symlink under `dest` between the exists()
-                # check above and the write. Skip this builtin: propagating would 500
-                # every skills read and every turn for the org, which a tenant must
-                # not be able to do to itself.
+                # The slug resolves outside the store, or safe_join rejected a
+                # destination. Turn pods don't mount the skill store, so only
+                # this server writes here; the checks stay so a planted link is
+                # refused rather than followed. Skip this builtin: propagating
+                # would fail every skills read and every turn for the org.
                 logger.warning(
                     "Skipping builtin %r: it does not resolve inside %s",
                     src.name,
                     self.root,
                     exc_info=True,
                 )
+                continue
+            except OSError as exc:
+                # A locked or unreadable file (Windows antivirus, say) costs
+                # this one builtin, never the boot or the request. Its old copy
+                # is still a shipped version, so the next version bump retries.
+                logger.warning("Could not update builtin %r: %s", slug, type(exc).__name__)
                 continue
             copied += 1
         return copied
@@ -2298,7 +2425,7 @@ class SkillService:
                     self.root,
                 )
                 return False
-            copied = self._copy_builtin_skills()
+            copied = self._copy_builtin_skills(current)
             marker.write_text(f"{self.builtin_skills_version}\n", encoding="utf-8")
         except OSError:
             logger.warning(

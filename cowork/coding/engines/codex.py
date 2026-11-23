@@ -172,7 +172,8 @@ class CodexEngine:
         for row in payload.get("data", []) if isinstance(payload, dict) else []:
             if not isinstance(row, dict) or not isinstance(row.get("id"), str):
                 continue
-            if row.get("kind") == "decision" or row.get("embedding") is True:
+            # Image models share the listing too and cannot run a coding task.
+            if row.get("kind") in ("decision", "image") or row.get("embedding") is True:
                 continue
             # Discovery describes what the MindsHub Responses API can run, not
             # what the current wallet can start right now. Keep disabled rows
@@ -244,6 +245,7 @@ class CodexEngineSession:
         self._service_tier = config.service_tier
         self._personality = config.personality
         self._approval_policy = launch.approval_policy
+        self._approvals_reviewer = launch.approvals_reviewer
         self._sandbox_policy = launch.sandbox_policy
         self._secrets = tuple(value for value in (credentials.minds_api_key,) if value)
         # The MCP servers Codex runs for this thread; they live under the
@@ -270,13 +272,20 @@ class CodexEngineSession:
                 client_config.config_overrides += (
                     f"model_catalog_json={codex_config.toml_string(str(catalog_path))}",
                 )
+            elif self._approvals_reviewer == "auto_review":
+                # The catalog is what points the reviewer at a model MindsHub
+                # serves. Without it every review would fail and deny, so ask
+                # the person instead.
+                logger.warning("No Codex model catalog for %s; approvals go to the person, not the reviewer", config.model)
+                self._approvals_reviewer = "user"
+            thread_params = {**launch.thread_params, "approvalsReviewer": self._approvals_reviewer}
             self._client.start()
             self._client.initialize()
             self._register_skill_roots()
             if existing_session_id:
-                response = self._client.thread_resume(existing_session_id, launch.thread_params)
+                response = self._client.thread_resume(existing_session_id, thread_params)
             else:
-                response = self._client.thread_start(launch.thread_params)
+                response = self._client.thread_start(thread_params)
         except Exception:
             try:
                 self._client.close()
@@ -314,7 +323,7 @@ class CodexEngineSession:
                 "serviceTier": self._service_tier,
                 "personality": self._personality,
                 "approvalPolicy": self._approval_policy,
-                "approvalsReviewer": "user",
+                "approvalsReviewer": self._approvals_reviewer,
                 "sandboxPolicy": self._sandbox_policy,
                 "summary": "concise",
                 "collaborationMode": {
@@ -623,7 +632,7 @@ class CodexEngineSession:
                 "cwd": workspace,
                 "model": self._model,
                 "approvalPolicy": self._approval_policy,
-                "approvalsReviewer": "user",
+                "approvalsReviewer": self._approvals_reviewer,
                 "sandboxPolicy": sandbox_policy,
             },
         )

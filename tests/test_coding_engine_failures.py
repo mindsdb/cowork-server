@@ -39,6 +39,8 @@ def test_a_rewritten_credit_rejection_is_classified_from_its_error_code() -> Non
         ('unexpected status 400 Bad Request: {"error": {"code": "included_allowance_exhausted", "message": "x"}}', "included_allowance_exhausted"),
         ('unexpected status 400 Bad Request: {"error": {"code": "free_air_daily_spend_fuse_exceeded", "message": "x"}}', "free_air_daily_spend_fuse_exceeded"),
         ('unexpected status 400 Bad Request: {"error": {"code": "budget_exceeded", "message": "x"}}', "budget_exceeded"),
+        ('unexpected status 400 Bad Request: {"error": {"code": "window_allowance_exhausted", "message": "x"}}', "window_allowance_exhausted"),
+        ('unexpected status 400 Bad Request: {"error": {"code": "model_not_in_tier", "message": "x"}}', "model_not_in_tier"),
     ],
 )
 def test_status_line_and_embedded_json_shapes_are_classified(message: str, code: str) -> None:
@@ -47,6 +49,49 @@ def test_status_line_and_embedded_json_shapes_are_classified(message: str, code:
     assert failure.code == code
     assert failure.detail == message
     assert failure.message != message
+
+
+@pytest.mark.parametrize(
+    ("scope", "message", "event_scope"),
+    [
+        ("workspace", "This workspace's spending budget is used up.", "workspace"),
+        ("api_key", "This API key's spending budget is used up.", "api_key"),
+        ("org", "Your organization's spending budget is used up.", "org"),
+        ("team", "Your team's spending budget is used up.", "team"),
+        ("user", "Your spending budget is used up.", "user"),
+        ("guild", "A spending budget is used up.", "guild"),
+        ("Bad Scope", "A spending budget is used up.", None),
+    ],
+)
+def test_a_spent_budget_names_its_scope(scope: str, message: str, event_scope: str | None) -> None:
+    raw = f'unexpected status 400 Bad Request: {{"error": {{"code": "budget_exceeded", "budget_scope": "{scope}"}}}}'
+    failure = classify_engine_failure(raw, CREDS)
+
+    assert failure.code == "budget_exceeded"
+    assert failure.message.startswith(message)
+    assert failure.event_data().get("budget_scope") == event_scope
+    # Only an org budget names owners; workspace and key budgets may be managed below the org.
+    who = "An owner or admin" if scope == "org" else "An administrator"
+    assert f"{who} can raise it in Budgets, or choose a model that is still available." in failure.message
+
+
+@pytest.mark.parametrize(
+    ("period", "message", "event_period"),
+    [
+        ("day", "This workspace's daily spending budget is used up.", "day"),
+        ("year", "This workspace's yearly spending budget is used up.", "year"),
+        ("week", "This workspace's spending budget is used up.", None),
+    ],
+)
+def test_a_spent_budget_names_its_period(period: str, message: str, event_period: str | None) -> None:
+    raw = (
+        'unexpected status 400 Bad Request: {"error": {"code": "budget_exceeded", '
+        f'"budget_scope": "workspace", "budget_period": "{period}"}}}}'
+    )
+    failure = classify_engine_failure(raw, CREDS)
+
+    assert failure.message.startswith(message)
+    assert failure.event_data().get("budget_period") == event_period
 
 
 def test_unrelated_failures_keep_their_redacted_text_and_no_code() -> None:
@@ -80,3 +125,31 @@ def test_transient_upstream_failures_get_plain_copy_without_the_proxy_url(messag
     assert "127.0.0.1" not in failure.detail
     assert failure.detail.startswith("unexpected status 50")
     assert failure.model == "gpt"
+
+
+def test_a_per_model_budget_names_the_model_by_label(monkeypatch) -> None:
+    import cowork.services.providers as providers
+
+    monkeypatch.setattr(providers, "cached_minds_model_label", lambda m: {"haiku-4-5": "Claude Haiku"}.get(m))
+    raw = (
+        'unexpected status 400 Bad Request: {"error": {"code": "budget_exceeded", '
+        '"budget_scope": "workspace", "budget_period": "day", "budget_model": "haiku-4-5"}}'
+    )
+    failure = classify_engine_failure(raw, CREDS)
+
+    assert failure.message == (
+        "This workspace's daily spending budget for Claude Haiku is used up. Other models still work. "
+        "An administrator can raise it in Budgets, or choose a model that is still available."
+    )
+    assert failure.event_data()["budget_model"] == "haiku-4-5"
+
+
+def test_a_malformed_budget_model_is_dropped() -> None:
+    raw = (
+        'unexpected status 400 Bad Request: {"error": {"code": "budget_exceeded", '
+        '"budget_scope": "org", "budget_model": "bad model"}}'
+    )
+    failure = classify_engine_failure(raw, CREDS)
+
+    assert "budget_model" not in failure.event_data()
+    assert "Other models still work" not in failure.message

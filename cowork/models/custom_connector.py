@@ -16,8 +16,8 @@ class CustomConnector(BaseSQLModel, table=True):
     """
 
     __tablename__ = "custom_connectors"
-    # One definition per connector id per org (or one local definition when
-    # org_id is NULL). Mirrors channel_installations' partial-index split.
+    # One local definition per connector id (org_id NULL). In an org, one per
+    # connector id per builder, since a member's definition is theirs alone.
     __table_args__ = (
         sa.Index(
             "uq_custom_connectors_connector_id_global",
@@ -27,12 +27,13 @@ class CustomConnector(BaseSQLModel, table=True):
             postgresql_where=sa.text("org_id IS NULL"),
         ),
         sa.Index(
-            "uq_custom_connectors_connector_id_org",
+            "uq_custom_connectors_connector_id_org_builder",
             "connector_id",
             "org_id",
+            "created_by",
             unique=True,
-            sqlite_where=sa.text("org_id IS NOT NULL"),
-            postgresql_where=sa.text("org_id IS NOT NULL"),
+            sqlite_where=sa.text("org_id IS NOT NULL AND created_by IS NOT NULL"),
+            postgresql_where=sa.text("org_id IS NOT NULL AND created_by IS NOT NULL"),
         ),
     )
 
@@ -46,6 +47,16 @@ class CustomConnector(BaseSQLModel, table=True):
         description="Validated connection form plus how_to and help_url",
     )
     usage_notes: str | None = Field(default=None, description="Agent-facing notes for using the connector")
+    connection_check: dict[str, Any] | None = Field(
+        default=None,
+        sa_column=sa.Column(sa.JSON, nullable=True),
+        description="The template's check, {path}, as anton's parser accepted it; never a host",
+    )
+    connection_auth: dict[str, Any] | None = Field(
+        default=None,
+        sa_column=sa.Column(sa.JSON, nullable=True),
+        description="How the member's values go on a request, as anton's parser accepted it; slots, never a value",
+    )
     featured: bool = Field(default=True, description="Shown in the picker's Featured section")
     org_id: str | None = Field(default=None, index=True, max_length=36, description="Owning organization; NULL on local/desktop rows")
     created_by: str | None = Field(default=None, max_length=36, description="User who created the row; NULL on local/desktop rows")

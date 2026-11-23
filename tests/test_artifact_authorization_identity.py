@@ -19,6 +19,7 @@ from fastapi.testclient import TestClient
 import httpx
 from pydantic import BaseModel, Field
 import pytest
+from sqlalchemy.exc import IntegrityError
 from sqlmodel import Session, select
 import yaml
 
@@ -35,6 +36,7 @@ from cowork.services import (
 )
 from cowork.services.artifact_access import ArtifactAccessUnavailable
 from cowork.services.artifact_identity import artifact_key
+from cowork.services.artifact_metadata import ArtifactMetadata
 from cowork.services.publish import publish_artifact
 from tests._org_sharing import TEAM_ELSEWHERE, TEAM_ENG, TEAM_OPS, TEAM_QA, member_request, mindshub_sharing_answers
 from tests.anton_minds_fake import fake_minds_requests
@@ -280,13 +282,52 @@ def test_unavailable_auth_preserves_pending_nonce_for_retry(issuer, scope, local
 
 
 def test_concurrent_first_use_reuses_one_durable_allocation_nonce(
-    issuer, scope, local_id
+    issuer, scope, local_id, monkeypatch
 ):
+    """Two genuine absent reads race their inserts and reuse the winner after rollback."""
+    reads = Barrier(2)
+    state_lock = Lock()
+    initial_sessions = set()
+    collisions = []
+    real_row = identities._row
+    real_commit = ScopedSession.commit
+
+    def simultaneous_absent_reads(session, artifact_id, *, lock=False):
+        """Rendezvous only the two real initial reads, leaving retry/locking reads untouched."""
+        row = real_row(session, artifact_id, lock=lock)
+        with state_lock:
+            initial = row is None and not lock and session not in initial_sessions
+            if initial:
+                initial_sessions.add(session)
+        if initial:
+            reads.wait(timeout=5)
+        return row
+
+    def observe_commit(session):
+        """Observe a real unique-constraint failure and preserve the production retry path."""
+        try:
+            return real_commit(session)
+        except IntegrityError as error:
+            with state_lock:
+                collisions.append(error)
+            raise
+
+    monkeypatch.setattr(identities, "_row", simultaneous_absent_reads)
+    monkeypatch.setattr(ScopedSession, "commit", observe_commit)
     issuer.barrier = Barrier(2)
     with ThreadPoolExecutor(max_workers=2) as executor:
         results = list(executor.map(lambda _: _ensure(local_id, scope), range(2)))
     assert results[0] == results[1]
     assert len(issuer.allocations) == 1
+    assert len(initial_sessions) == 2
+    assert len(collisions) == 1
+    with identities.authorization_session(scope) as session:
+        rows = session.exec(session.select(identities.ArtifactIdentity).where(
+            identities.ArtifactIdentity.local_artifact_id == UUID(local_id).hex
+        )).all()
+        assert len(rows) == 1
+        assert issuer.allocations == {str(rows[0].id): results[0]}
+        assert rows[0].canonical_artifact_id == results[0]
 
 
 def test_lost_allocation_reply_retries_the_same_issued_identity(
@@ -459,7 +500,7 @@ async def test_live_editor_sync_preserves_canonical_identity_and_refuses_peer(
         scope=scope,
         project_id=str(project.id),
     )
-    metadata = json.loads((folder / "metadata.json").read_text())
+    metadata = ArtifactMetadata.parse((folder / "metadata.json").read_text())
     initial = current_source(folder, metadata, local_id)
     body = artifact_workspace._SourceUpdateBody(
         content="<html>Updated owner bytes</html>",
@@ -1015,7 +1056,7 @@ async def test_an_autopublish_never_publishes_over_a_restricted_rule_after_an_ag
     with caplog.at_level(logging.WARNING, logger="cowork.services.publish"):
         published = await ap._publish_one(
             folder.parent, folder.name, "key", "https://view.test", 30.0, scope,
-            ap._access_for(decision), project_id=str(project.id),
+            ap._access_for(decision), project_id=str(project.id), job_budget_s=30.0,
         )
 
     assert published is False
@@ -1049,7 +1090,7 @@ async def test_an_autopublish_with_the_metadata_removed_and_the_entry_key_blanke
     with caplog.at_level(logging.WARNING, logger="cowork.services.publish"):
         published = await ap._publish_one(
             folder.parent, folder.name, "key", "https://view.test", 30.0, scope,
-            ap._access_for(decision), project_id=str(project.id),
+            ap._access_for(decision), project_id=str(project.id), job_budget_s=30.0,
         )
 
     assert published is False
@@ -1485,7 +1526,7 @@ async def test_a_page_in_a_subfolder_its_owner_made_public_keeps_syncing(
             decision = ap.PublishDecision("changed", published_entry=entry)
             saved = await ap._publish_one(
                 folder.parent, folder.name, "key", "https://view.test", 30.0, scope,
-                ap._access_for(decision), project_id=str(project.id),
+                ap._access_for(decision), project_id=str(project.id), job_budget_s=30.0,
             )
 
     assert saved is True, [record.reason for record in _mode_changed_records(caplog)]
@@ -1614,7 +1655,7 @@ async def _autopublish_once(folder, scope, project):
     decision = ap.PublishDecision("changed", published_entry=_entry(folder))
     return await ap._publish_one(
         folder.parent, folder.name, "key", "https://view.test", 30.0, scope,
-        ap._access_for(decision), project_id=str(project.id),
+        ap._access_for(decision), project_id=str(project.id), job_budget_s=30.0,
     )
 
 
@@ -2375,3 +2416,37 @@ def test_the_share_email_link_is_left_to_mindshubs_allowlist(tmp_path):
     too_long = "https://view.mindshub.ai/r/" + "a" * 2048
     for url in ("http://view.mindshub.ai/r/1", "https:///r/1", too_long, ""):
         assert link(url) == ""
+
+
+@pytest.mark.asyncio
+async def test_a_member_who_may_review_reads_the_owners_audience_without_the_password(
+    issuer, scope, local_id, owned_artifact, monkeypatch
+):
+    """GET .../audience (ENG-4455): a co-member the owner granted review reads
+    who the artifact is shared with from the rule MindsHub binds to the
+    owner, while GET .../access stays the owner's."""
+    from cowork.principal import Principal
+
+    session, project, _conversation, folder = owned_artifact
+    await artifact_workspace.enable_artifact_comments(str(project.id), local_id, session.scope)
+    run, _uploads = _org_publisher(issuer, folder, scope, project, monkeypatch)
+    run({"mode": "restricted", "emails": ["a@else.com"], "org_allowed": True, "allowed_team_ids": [TEAM_ENG]},
+        owner_save=True)
+    peer = TenantScope(org_mode=True, org_id=scope.org_id, user_id=str(uuid4()))
+    member = Principal(user_id=peer.user_id, org_id=peer.org_id)
+
+    with Session(get_engine(get_app_settings().database.uri)) as raw:
+        peer_scope = ScopedSession(raw, peer).scope
+        with pytest.raises(HTTPException) as refused:
+            await artifact_workspace.artifact_access(str(project.id), local_id, peer_scope)
+        assert refused.value.status_code == 403
+        audience = (
+            await artifact_workspace.artifact_audience(str(project.id), local_id, peer_scope, member)
+        ).model_dump(by_alias=True, mode="json")
+
+    assert audience == {
+        "accessMode": "restricted", "ownerOnly": False, "orgAllowed": True,
+        "allowedTeamIds": [TEAM_ENG], "allowedUserIds": [], "accessEmails": ["a@else.com"], "names": True,
+    }
+    reads = [body for path, body in issuer.calls if path.endswith("/read/")]
+    assert reads and all(body["owner_keycloak_id"] == scope.user_id for body in reads)

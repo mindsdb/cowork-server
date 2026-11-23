@@ -32,6 +32,7 @@ class CodexLaunchConfig:
     """Fully resolved Codex policy at the engine-adapter boundary."""
 
     approval_policy: str
+    approvals_reviewer: str
     sandbox_policy: dict[str, Any]
     config_overrides: tuple[str, ...]
     thread_params: dict[str, Any]
@@ -69,17 +70,36 @@ def turn_input(
     prompt: str,
     attachments: tuple[EngineInputReference, ...],
 ) -> list[dict[str, str]]:
+    # Codex's ``mention`` input names an app, connector or skill, and a file
+    # path sent that way never reaches the model. Files and folders are listed
+    # as text instead, so the agent can read them from their paths.
     items: list[dict[str, str]] = [{"type": "text", "text": prompt}]
-    for item in attachments:
-        if item.kind == "local_image":
-            items.append({"type": "localImage", "path": item.path})
-        else:
-            items.append({"type": "mention", "name": item.name, "path": item.path})
+    references = [item for item in attachments if item.kind != "local_image"]
+    if references:
+        items.append({"type": "text", "text": _references_text(references)})
+    items.extend({"type": "localImage", "path": item.path} for item in attachments if item.kind == "local_image")
     return items
 
 
+def _references_text(references: list[EngineInputReference]) -> str:
+    lines = ["Attached files and folders. Read them from these paths:"]
+    for item in references:
+        span = f", lines {item.line_start}-{item.line_end}" if item.line_start and item.line_end else ""
+        lines.append(f"- {item.name}{span}: {item.path}")
+    return "\n".join(lines)
+
+
 def approval_policy(permission_mode: PermissionMode) -> str:
-    return "on-request" if permission_mode in {PermissionMode.read_only, PermissionMode.supervised} else "never"
+    return "never" if permission_mode == PermissionMode.full_access else "on-request"
+
+
+def approvals_reviewer(permission_mode: PermissionMode) -> str:
+    """Who answers a request to leave the sandbox: the person, or Codex's reviewer.
+
+    Approve for me keeps the workspace sandbox and hands each request to the
+    reviewer agent, which allows or denies it without opening a card.
+    """
+    return "auto_review" if permission_mode == PermissionMode.workspace else "user"
 
 
 def sandbox_mode(permission_mode: PermissionMode) -> str:
@@ -209,6 +229,13 @@ def prepare_launch(config: EngineSessionConfig, workspace: Path, endpoint: str) 
     """Translate Cowork runtime controls into one consistent Codex launch policy."""
     permission = PermissionMode.read_only if config.task_mode == "plan" else config.permission_mode
     resolved_approval = "never" if config.task_mode == "plan" else approval_policy(permission)
+    resolved_reviewer = approvals_reviewer(permission)
+    if not config.writes_allowed and permission != PermissionMode.full_access:
+        # Like Codex on a folder it does not track: the sandbox reads only, and
+        # each write still asks the person. The automatic reviewer would grant
+        # those writes on its own, which is what holding them back prevents.
+        permission = PermissionMode.read_only
+        resolved_reviewer = "user"
     resolved_sandbox = sandbox_mode(permission)
     resolved_policy = sandbox_policy(
         permission,
@@ -258,7 +285,7 @@ def prepare_launch(config: EngineSessionConfig, workspace: Path, endpoint: str) 
         "model": config.model,
         "modelProvider": "mindshub",
         "approvalPolicy": resolved_approval,
-        "approvalsReviewer": "user",
+        "approvalsReviewer": resolved_reviewer,
         "sandbox": resolved_sandbox,
         "serviceTier": config.service_tier,
         "personality": config.personality,
@@ -267,6 +294,7 @@ def prepare_launch(config: EngineSessionConfig, workspace: Path, endpoint: str) 
         thread_params["developerInstructions"] = config.developer_instructions
     return CodexLaunchConfig(
         approval_policy=resolved_approval,
+        approvals_reviewer=resolved_reviewer,
         sandbox_policy=resolved_policy,
         config_overrides=tuple(overrides),
         thread_params=thread_params,

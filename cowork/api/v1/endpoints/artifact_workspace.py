@@ -21,7 +21,7 @@ from fastapi.concurrency import run_in_threadpool
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.routing import APIRoute
-from pydantic import BaseModel, Field, StrictBool
+from pydantic import BaseModel, Field, StrictBool, model_validator
 from anton.core.artifacts.internal_files import NON_CONTENT_NAMES
 
 from cowork.api.v1.artifact_preview import wants_comment_layer, wants_download
@@ -50,13 +50,16 @@ from cowork.services.artifact_permissions import (
     with_export_formats,
 )
 from cowork.services import artifact_files
+from cowork.services.artifact_autopublish import job_budget_for, lock_ttl_for
 from cowork.services.preview_html import prepare_preview_html
 from cowork.services.quick_edit import direct_edit_available, quick_edit_available
 from cowork.services.artifact_identity import opened_artifact_folder
+from cowork.services.artifact_metadata import ArtifactMetadata
 from cowork.schemas.artifact_export import ExportRequest, ExportResult
 from cowork.schemas.artifact_access import (
     ArtifactAccessRequest,
     ArtifactAccessView,
+    ArtifactSharedAudienceView,
     access_refusal,
 )
 from cowork.schemas.base import CamelResponse
@@ -108,7 +111,7 @@ _DRAFT_RESPONSE_HEADERS = {
     "X-Content-Type-Options": "nosniff",
 }
 _LIVE_PUBLISH_TIMEOUT_S = 60.0
-_LIVE_PUBLISH_LOCK_TTL_S = _LIVE_PUBLISH_TIMEOUT_S * 3
+_LIVE_PUBLISH_LOCK_TTL_S = lock_ttl_for(_LIVE_PUBLISH_TIMEOUT_S)
 # The stats tracking toggle waits only briefly for an in-flight publish:
 # the full publish wait would freeze the switch for a minute.
 _STATS_TRACKING_LOCK_TIMEOUT_S = 5.0
@@ -138,7 +141,7 @@ def _editable_source_selector(source, folder: Path, requested: str | None) -> st
     """Translate a request-supplied source path into the folder's own spelling.
 
     ``None`` (or blank) leaves the choice to the service, which falls back to
-    ``metadata["primary"]``. That is not a trusted value either: it is read
+    ``metadata.primary``. That is not a trusted value either: it is read
     from `metadata.json` inside the artifact folder, which is pod-writable on
     shared storage, so what makes the fallback safe is the inner gate's own
     containment, symlink and extension checks rather than where it came from.
@@ -196,12 +199,12 @@ def _editable_source_selector(source, folder: Path, requested: str | None) -> st
     return "/".join(disk_parts)
 
 
-def _recorded_source_selector(source, folder: Path, metadata: dict) -> str | None:
+def _recorded_source_selector(source, folder: Path, metadata: ArtifactMetadata) -> str | None:
     """The folder's own spelling of the source `metadata` records.
 
     Without this the two routes disagree: the request path is translated to
     the disk spelling while an absent one leaves the service reporting
-    `metadata["primary"]` verbatim, and the revision journal is keyed by
+    `metadata.primary` verbatim, and the revision journal is keyed by
     whichever string arrived. A read under one spelling and a write under the
     other then answer 409 rather than the 404 a case-exact boundary gave.
 
@@ -213,8 +216,8 @@ def _recorded_source_selector(source, folder: Path, metadata: dict) -> str | Non
     therefore about not adding a second, earlier failure for the same cause,
     not about rescuing stale metadata.
     """
-    recorded = metadata.get("primary")
-    if not isinstance(recorded, str) or not recorded.strip():
+    recorded = metadata.primary
+    if not recorded or not recorded.strip():
         return None
     try:
         return _editable_source_selector(source, folder, recorded)
@@ -300,7 +303,7 @@ def _draft_selectors(project_ref: str, artifact_id: str) -> tuple[str, str]:
     return project_selector, artifact_selector
 
 
-def _draft_file_parts(rel_path: str, metadata: dict) -> tuple[str, ...]:
+def _draft_file_parts(rel_path: str, metadata: ArtifactMetadata) -> tuple[str, ...]:
     """Validate a draft file path against the artifact it is read from.
 
     Shared by the authenticated ``/drafts`` route, the draft-link route and the
@@ -317,11 +320,9 @@ def _draft_file_parts(rel_path: str, metadata: dict) -> tuple[str, ...]:
         ) from exc
     if parts[0] in _PRIVATE_DRAFT_ENTRIES:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Artifact file not found")
-    if str(metadata.get("type") or "").startswith("fullstack-"):
+    if (metadata.type or "").startswith("fullstack-"):
         try:
-            primary_parts = artifact_files.relative_file_parts(
-                str(metadata.get("primary") or "static/index.html")
-            )
+            primary_parts = artifact_files.relative_file_parts(metadata.primary or "static/index.html")
         except ValueError:
             primary_parts = ()
         public_parts = primary_parts[:-1]
@@ -509,7 +510,7 @@ async def _sync_live_artifact(
         publish_artifact,
         published_artifact_access,
     )
-    from cowork.services.artifact_locks import release
+    from cowork.services.artifact_locks import refresh, release
 
     artifacts_base = folder.parent
     if not await _acquire_live_publish_lock(folder, scope):
@@ -560,6 +561,8 @@ async def _sync_live_artifact(
                     access=access,
                     scope=scope,
                     project_id=project_id,
+                    job_budget_s=job_budget_for(_LIVE_PUBLISH_LOCK_TTL_S),
+                    on_job_accepted=lambda _job: refresh(folder.parent, folder.name),
                 ),
                 timeout=_LIVE_PUBLISH_TIMEOUT_S,
             )
@@ -663,7 +666,7 @@ async def _current_capabilities(scope: TenantScope, capabilities: dict) -> dict:
     return current
 
 
-def _selected_source(source, folder: Path, metadata: dict, requested: str | None) -> str | None:
+def _selected_source(source, folder: Path, metadata: ArtifactMetadata, requested: str | None) -> str | None:
     """The source file a workspace read or write addresses: the request's own
     path when it names an editable file, else the one the folder records."""
     selected = _editable_source_selector(source, folder, requested)
@@ -685,7 +688,7 @@ class _WorkspaceState(NamedTuple):
 def _workspace_state(
     source,
     folder: Path,
-    metadata: dict,
+    metadata: ArtifactMetadata,
     artifact_id: str,
     requested: str | None,
     *,
@@ -696,6 +699,7 @@ def _workspace_state(
     progress, and the export source."""
     selected = _selected_source(source, folder, metadata, requested)
     result = current_workspace(folder, metadata, artifact_id, selected)
+    result = {**result, "publishedRevision": _published_revision(folder, metadata, result.get("path"))}
     repair = active_agent_repair(folder, result.get("path"))
     export_source = (
         primary_export_source(folder=folder, metadata=metadata)
@@ -705,10 +709,28 @@ def _workspace_state(
     return _WorkspaceState(result, repair, export_source)
 
 
+def _published_revision(folder: Path, metadata: ArtifactMetadata, rel_path: str | None) -> dict | None:
+    """The revision of *rel_path* the live page shows (ENG-4595), for the
+    viewer's "Review changes": None when unpublished or unknown. Never raises,
+    so the workspace still loads without it."""
+    from cowork.services.artifact_revisions import published_revision
+    from cowork.services.artifacts import load_published_map
+
+    try:
+        primary = _artifact_primary(folder, metadata)
+        if primary is None:
+            return None
+        entry = load_published_map(folder).get(primary.name)
+        return published_revision(folder, entry, rel_path)
+    except Exception:
+        logger.debug("Could not tell which revision is published", exc_info=True)
+        return None
+
+
 def _save_selected_source(
     source,
     folder: Path,
-    metadata: dict,
+    metadata: ArtifactMetadata,
     artifact_id: str,
     requested: str | None,
     *,
@@ -905,7 +927,7 @@ async def artifact_revisions(
     return {"revisions": await run_efs(partial(list_revisions, folder, rel_path=path), scope=scope)}
 
 
-def _current_revision(folder: Path, metadata: dict, artifact_id: str) -> dict | None:
+def _current_revision(folder: Path, metadata: ArtifactMetadata, artifact_id: str) -> dict | None:
     """The revision comments anchor to, or None for an artifact with no
     editable source."""
     try:
@@ -1197,19 +1219,19 @@ def _owner_publish_context(scope: TenantScope, folder: Path):
         _publish_url(scope),
         PublishKey(
             str(scope.user_id), str(scope.org_id),
-            min_ttl_s=_LIVE_PUBLISH_TIMEOUT_S + 60.0,
+            min_ttl_s=_LIVE_PUBLISH_LOCK_TTL_S + 60.0,
             workspace_id=_active_workspace_id(scope),
         ),
     )
 
 
-def _artifact_primary(folder: Path, metadata: dict | None):
+def _artifact_primary(folder: Path, metadata: ArtifactMetadata | None):
     from cowork.services.artifacts import _pick_primary, _user_files
 
-    return _pick_primary(folder, _user_files(folder), primary_hint=(metadata or {}).get("primary"))
+    return _pick_primary(folder, _user_files(folder), primary_hint=metadata.primary if metadata is not None else None)
 
 
-def _access_state(folder: Path, metadata: dict) -> ArtifactAccessView:
+def _access_state(folder: Path, metadata: ArtifactMetadata) -> ArtifactAccessView:
     """The access state of the folder's primary file, in one file store hop;
     404 when the folder has no publishable file."""
     from cowork.services.artifacts import published_access_view
@@ -1233,7 +1255,7 @@ class _AccessRead(NamedTuple):
 
 
 def _access_read(
-    folder: Path, metadata: dict, *, scope: TenantScope, project_id: str | None
+    folder: Path, metadata: ArtifactMetadata, *, scope: TenantScope, project_id: str | None
 ) -> _AccessRead:
     """_access_state, and in MindsHub mode the rule's keys: those
     stored_artifact_rule reads for a restricted entry, else those
@@ -1277,28 +1299,113 @@ async def artifact_access(
     file store with the access state, in one call on its threads (run_efs),
     and MindsHub is asked on one of anyio's default threads.
     """
+    source, folder, metadata, _capabilities = await _owner_workspace(
+        scope, project_ref, artifact_id
+    )
+    return await _read_access_state(scope, folder, metadata, project_id=source.project_id)
+
+
+async def _read_access_state(
+    scope: TenantScope,
+    folder: Path,
+    metadata: ArtifactMetadata,
+    *,
+    project_id: str | None,
+    rule_scope: TenantScope | None = None,
+) -> ArtifactAccessView:
+    """The artifact's access state as GET .../access answers it (see there):
+    503 while MindsHub's rule can't be read, 409 when it refuses the read.
+
+    ``rule_scope`` is who the rule is read as, the caller's scope by default.
+    MindsHub binds an artifact's rule to its owner, so a read for anyone else
+    (GET .../audience) passes the owner's: the same organization, the owner's
+    user id."""
     from cowork.models.artifact_owner_choice import AccessMode
     from cowork.services.artifact_access import ArtifactAccessRefused, ArtifactAccessUnavailable
     from cowork.services.publish import held_rule_under, stored_rule_under
 
-    source, folder, metadata, _capabilities = await _owner_workspace(
-        scope, project_ref, artifact_id
-    )
+    rule_scope = scope if rule_scope is None else rule_scope
     try:
         state, keys = await run_efs(
-            partial(_access_read, folder, metadata, scope=scope, project_id=source.project_id), scope=scope
+            partial(_access_read, folder, metadata, scope=rule_scope, project_id=project_id), scope=scope
         )
         if not scope.org_mode:
             return state
         rule_under: Callable[[list[str], TenantScope], ArtifactRule | None] = (
             stored_rule_under if state.access_mode is AccessMode.RESTRICTED else held_rule_under
         )
-        rule = await run_in_threadpool(rule_under, keys, scope)
+        rule = await run_in_threadpool(rule_under, keys, rule_scope)
     except ArtifactAccessUnavailable as exc:
         raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(exc)) from exc
     except ArtifactAccessRefused as exc:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
     return state if rule is None else state.restricted_to(rule)
+
+
+def _member_of_artifact_org(scope: TenantScope, principal: Principal | None) -> bool:
+    """True when the caller belongs to the organization the artifact lives in.
+
+    Outside org mode there is one person behind the scope (the desktop, or a
+    personal partition on a trusted-identity deployment), who is the owner.
+    In org mode an artifact is only ever resolved inside the scope's own
+    organization, and the scope is built from the request's principal
+    (cowork.db.scoped.scope_from_principal), so every caller who reaches this
+    is a member; the check is kept so a scope that doesn't come from the
+    request's own principal never sees names."""
+    if not scope.org_mode:
+        return True
+    return (
+        isinstance(principal, Principal)
+        and bool(scope.org_id)
+        and principal.org_id == scope.org_id
+        and principal.user_id == scope.user_id
+    )
+
+
+@router.get(
+    "/workspace/{project_ref}/{artifact_id}/audience",
+    response_model=ArtifactSharedAudienceView,
+)
+async def artifact_audience(
+    project_ref: str,
+    artifact_id: ArtifactIdDep,
+    scope: ScopeDep,
+    principal: Annotated[Principal | None, Depends(get_principal)],
+) -> ArtifactSharedAudienceView:
+    """Who the artifact is shared with, for anyone who may preview it: the
+    read-only "Shared with" panel a non-owner opens from the viewer.
+
+    Resolved the way the review route resolves it (a caller with no grant
+    gets 404), never through `_owner_workspace`, and read the way GET
+    .../access reads it (`_read_access_state`, 503 and 409 alike), so a
+    member sees the audience the owner sees. In org mode the rule is read as
+    the artifact's recorded owner, since MindsHub binds it to them; an owner
+    nobody is recorded as fails closed there with 503 once a rule must be
+    read. Never the password, nor the live page's ids. A caller outside the
+    artifact's organization gets how it is shared and no names
+    (`_member_of_artifact_org`).
+    """
+    from dataclasses import replace
+
+    from cowork.services.artifact_ownership import resolve_artifact_owner
+
+    source, folder, metadata, _is_own = await review_artifact_for_request(
+        scope, project_ref, artifact_id
+    )
+    rule_scope = scope
+    if scope.org_mode:
+        resolution = await run_db(
+            lambda unit: resolve_artifact_owner(unit, source, folder.name), scope=scope
+        )
+        owner_id = resolution.owner_user_id
+        if owner_id and not resolution.unknown and str(owner_id) != str(scope.user_id):
+            rule_scope = replace(scope, user_id=str(owner_id))
+    state = await _read_access_state(
+        scope, folder, metadata, project_id=source.project_id, rule_scope=rule_scope
+    )
+    return ArtifactSharedAudienceView.of_access(
+        state, names=_member_of_artifact_org(scope, principal)
+    )
 
 
 def _push_share(scope, principal: Principal | None, notices: list) -> None:
@@ -1338,10 +1445,6 @@ async def set_artifact_access(
     every turn, with the owner's selection in place of the first-publish default.
     """
     await require_product_permission(scope, "artifact.manage")
-    from cowork.services.publish import PublishRejected, PublisherUnavailable, ShareOrgRequired
-    from cowork.services.publish import publish_artifact as _publish_bundle
-    from cowork.services.artifact_access import ArtifactAccessRefused, ArtifactAccessUnavailable
-
     source, folder, metadata, _capabilities = await _owner_workspace(
         scope, project_ref, artifact_id
     )
@@ -1372,6 +1475,43 @@ async def set_artifact_access(
         )
         return await run_in_threadpool(stored_rule_under, keys, scope)
 
+    async def plan() -> tuple[ArtifactAccessRequest, ArtifactRule | None]:
+        # Checked under the lock, so no other publish of this artifact writes
+        # its rule between the check's read and this publish, which plans
+        # against the rule the check read rather than reading it again.
+        checked = await _checked_team_audience(
+            access, request=request, scope=scope, principal=principal, stored_rule=stored_rule
+        )
+        return checked.access, checked.stored
+
+    return await _publish_live(
+        scope, source, folder, artifact_id,
+        plan=plan, notify=notify or None, owner_save=True, principal=principal,
+        failure_log="Could not change access for artifact %s",
+    )
+
+
+async def _publish_live(
+    scope: TenantScope,
+    source,
+    folder: Path,
+    artifact_id: str,
+    *,
+    plan: Callable[[], Awaitable[tuple[ArtifactAccessRequest, ArtifactRule | None]]],
+    notify,
+    owner_save: bool,
+    principal: Principal | None,
+    failure_log: str,
+):
+    """Publish *folder* now, under its live publish lock, as the owner asked:
+    the access and stored rule come from *plan*, run under the lock. Shared by
+    the Share dialog's save and Publish changes (ENG-4595), with the same
+    refusals mapped to the same statuses."""
+    from cowork.services.publish import PublishRejected, PublisherUnavailable, ShareOrgRequired
+    from cowork.services.publish import publish_artifact as _publish_bundle
+    from cowork.services.artifact_access import ArtifactAccessRefused, ArtifactAccessUnavailable
+    from cowork.services.artifact_locks import refresh
+
     if not await _acquire_live_publish_lock(folder, scope):
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -1383,12 +1523,7 @@ async def set_artifact_access(
     publish_abandoned = False
     publish_started = False
     try:
-        # Checked under the lock, so no other publish of this artifact writes
-        # its rule between the check's read and this publish, which plans
-        # against the rule the check read rather than reading it again.
-        checked = await _checked_team_audience(
-            access, request=request, scope=scope, principal=principal, stored_rule=stored_rule
-        )
+        planned_access, planned_stored = await plan()
         artifacts_base, publish_url, key = await run_on_unit_threads(partial(_owner_publish_context, scope, folder))
         api_key = await key.get()
         if not api_key:
@@ -1406,12 +1541,14 @@ async def set_artifact_access(
                     artifacts_base=artifacts_base,
                     api_key=api_key,
                     publish_url=publish_url,
-                    access=checked.access,
+                    access=planned_access,
                     scope=scope,
                     project_id=source.project_id,
-                    notify=notify or None,
-                    stored=checked.stored,
-                    owner_save=True,
+                    notify=notify,
+                    stored=planned_stored,
+                    owner_save=owner_save,
+                    job_budget_s=job_budget_for(_LIVE_PUBLISH_LOCK_TTL_S),
+                    on_job_accepted=lambda _job: refresh(folder.parent, folder.name),
                     notices=notices,
                 ),
                 timeout=_LIVE_PUBLISH_TIMEOUT_S,
@@ -1448,7 +1585,7 @@ async def set_artifact_access(
     except (RuntimeError, OSError) as exc:
         # A local failure's text can name shared-storage paths, so only the log
         # gets it. Not every such error passed publish_artifact's own log.
-        logger.warning("Could not change access for artifact %s", artifact_id, exc_info=True)
+        logger.warning(failure_log, artifact_id, exc_info=True)
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,
             detail="Publishing failed. Try again in a moment.",
@@ -1469,6 +1606,59 @@ router.add_api_route(
     methods=["PUT"],
     route_class_override=_AccessSaveRoute,
 )
+
+
+@router.post("/workspace/{project_ref}/{artifact_id}/republish")
+async def republish_artifact(
+    project_ref: str,
+    artifact_id: ArtifactIdDep,
+    scope: ScopeDep,
+    principal: Principal | None = Depends(get_principal),
+):
+    """Publish changes: put the draft live at the same link, with the access
+    it already has. Owner-only (ENG-4595).
+
+    Desktop's Update, for every deployment: in MindsHub mode the viewer had
+    no way to publish a draft that moved past its page. The access is the
+    stored one (`published_artifact_access`, as autopublish re-publishes), so
+    nobody gains or loses access and nobody is notified. 404 when nothing is
+    published.
+    """
+    await require_product_permission(scope, "artifact.manage")
+    from cowork.services.publish import published_artifact_access
+
+    source, folder, metadata, _capabilities = await _owner_workspace(
+        scope, project_ref, artifact_id
+    )
+    if await run_efs(partial(_artifact_primary, folder, metadata), scope=scope) is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="This artifact has no publishable file.",
+        )
+
+    async def plan() -> tuple[ArtifactAccessRequest, ArtifactRule | None]:
+        # Read under the lock, so the access kept is the one the last publish
+        # wrote, not one a concurrent save is replacing.
+        try:
+            kept = await run_efs(
+                partial(
+                    published_artifact_access, folder,
+                    artifacts_base=folder.parent, org_mode=bool(scope.org_mode),
+                ),
+                scope=scope,
+            )
+        except FileNotFoundError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="This artifact isn't shared yet, so there is nothing to update.",
+            ) from exc
+        return kept, None
+
+    return await _publish_live(
+        scope, source, folder, artifact_id,
+        plan=plan, notify=None, owner_save=False, principal=principal,
+        failure_log="Could not publish changes for artifact %s",
+    )
 
 
 class CommentsAccessResponse(CamelResponse):
@@ -1514,7 +1704,16 @@ async def _call_stats_service(scope: TenantScope, folder: Path, call: Callable[.
 
 
 class _StatsTrackingBody(BaseModel):
-    enabled: StrictBool
+    """At least one setting; an omitted one stays as it is."""
+
+    enabled: StrictBool | None = None
+    require_email: StrictBool | None = None
+
+    @model_validator(mode="after")
+    def _one_setting(self):
+        if self.enabled is None and self.require_email is None:
+            raise ValueError("Send enabled, require_email or both")
+        return self
 
 
 @router.get("/workspace/{project_ref}/{artifact_id}/stats")
@@ -1544,7 +1743,8 @@ async def set_artifact_stats_tracking(
     body: _StatsTrackingBody,
     scope: ScopeDep,
 ):
-    """Turn view recording on or off for this published artifact. Owner-only.
+    """Turn viewer analytics, or the email gate, on or off for this published
+    artifact. Owner-only. Returns `{"tracking": bool, "require_email": bool}`.
 
     The publishing service rewrites the artifact's metadata file to store the
     flag, so the request holds the publish lock: a live sync or autopublish
@@ -1566,8 +1766,10 @@ async def set_artifact_stats_tracking(
             detail="Publishing is busy right now. Try again in a moment.",
         )
     try:
-        tracking = await _call_stats_service(
-            scope, folder, partial(stats.set_tracking, enabled=body.enabled),
+        settings = await _call_stats_service(
+            scope,
+            folder,
+            partial(stats.set_tracking, enabled=body.enabled, require_email=body.require_email),
         )
     finally:
         # Shielded for the same reason: an unreleased lock blocks publishing
@@ -1576,12 +1778,52 @@ async def set_artifact_stats_tracking(
             await run_efs(
                 partial(release, folder.parent, folder.name), scope=scope, deadline=False
             )
-    return {"tracking": tracking}
+    return settings
+
+
+@router.get("/workspace/{project_ref}/{artifact_id}/stats/viewers/{viewer_id}")
+async def read_artifact_stats_viewer(
+    project_ref: str,
+    artifact_id: ArtifactIdDep,
+    viewer_id: str,
+    scope: ScopeDep,
+):
+    """One viewer's visits and per-section times, as the publishing service
+    returns them. Owner-only, like the stats themselves."""
+    await require_product_permission(scope, "artifact.manage")
+    from cowork.services import artifact_stats as stats
+
+    _source, folder, _metadata, _capabilities = await _owner_workspace(
+        scope, project_ref, artifact_id
+    )
+    return await _call_stats_service(
+        scope, folder, partial(stats.fetch_viewer, viewer_id=viewer_id)
+    )
+
+
+@router.delete(
+    "/workspace/{project_ref}/{artifact_id}/stats",
+    status_code=status.HTTP_204_NO_CONTENT,
+)
+async def delete_artifact_stats(
+    project_ref: str,
+    artifact_id: ArtifactIdDep,
+    scope: ScopeDep,
+):
+    """Delete this artifact's viewer analytics (views, visits, viewers). Owner-only."""
+    await require_product_permission(scope, "artifact.manage")
+    from cowork.services import artifact_stats as stats
+
+    _source, folder, _metadata, _capabilities = await _owner_workspace(
+        scope, project_ref, artifact_id
+    )
+    await _call_stats_service(scope, folder, stats.delete_stats)
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
 def _open_comments(
     folder: Path,
-    metadata: dict,
+    metadata: ArtifactMetadata,
     artifact_id: str,
     *,
     review_scope: TenantScope | None,
@@ -1700,7 +1942,7 @@ async def artifact_revision(
 
 def _restore_revision(
     folder: Path,
-    metadata: dict,
+    metadata: ArtifactMetadata,
     artifact_id: str,
     revision_id: str,
     *,
@@ -1953,7 +2195,7 @@ def _primary_rel_path(folder: Path, primary: Path | None) -> str:
         ) from exc
 
 
-def _draft_link_file_parts(folder: Path, metadata: dict) -> tuple[str, ...]:
+def _draft_link_file_parts(folder: Path, metadata: ArtifactMetadata) -> tuple[str, ...]:
     """Name the draft's primary file for the link.
 
     Blocking (path resolution on the file store), so the endpoint runs it in
@@ -1961,7 +2203,7 @@ def _draft_link_file_parts(folder: Path, metadata: dict) -> tuple[str, ...]:
     """
     from cowork.services.artifacts import _pick_primary
 
-    hint = metadata.get("primary")
+    hint = metadata.primary
     # A recorded primary that resolves needs no walk of the artifact tree.
     primary = _pick_primary(folder, [], primary_hint=hint) if hint else None
     if primary is None:

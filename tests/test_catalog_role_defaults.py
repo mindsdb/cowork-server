@@ -302,7 +302,7 @@ def _stub_listing(monkeypatch, *, ids, enabled=None, role_defaults=None):
     from cowork.services.providers import MindsModelListing
 
     async def fake_fetch(base_url, api_key, force_refresh=False, tenant_key=None, **_kw):
-        return MindsModelListing(ids, {}, enabled or {}, {}, {}, {}, role_defaults or {}, {})
+        return MindsModelListing(ids, {}, enabled or {}, {}, {}, {}, role_defaults or {}, {}, {}, {})
 
     monkeypatch.setattr(endpoint, "fetch_minds_models", fake_fetch)
 
@@ -700,7 +700,10 @@ def test_settings_are_told_which_gate_decides_turns(monkeypatch):
     with _Endpoint() as endpoint:
         payload = endpoint.call()
 
-    assert payload["routing"] == {"mode": "jev", "routerProvider": "minds-cloud"}
+    # `decisions`: what picks the shared browser's steps.
+    assert payload["routing"] == {
+        "mode": "jev", "routerProvider": "minds-cloud", "decisions": "mindshub", "canSetDecisionModel": True,
+    }
     # Kept for UIs that predate `routing`.
     assert "gate" in payload
 

@@ -1,6 +1,7 @@
 import asyncio
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from functools import partial
 import inspect
 import os
@@ -53,6 +54,8 @@ from cowork.models.conversation import Conversation
 from cowork.harnesses.anton_harness.scratchpad_cell_replay import SCRATCHPAD_REPLAY_ROLES, extract_scratchpad_cells
 from cowork.harnesses.anton_harness.settings import AntonHarnessSettings
 from cowork.services.connectors.connections import service
+from cowork.services.connectors.notion_pages import describe_project_pages
+from cowork.services.conversation_folders import ConversationFolderService, folder_refusal
 from cowork.services.conversations import read_earlier_answers
 from cowork.services.live_apps import (
     TurnLiveApps,
@@ -74,10 +77,21 @@ if TYPE_CHECKING:
     from anton.core.browser.config import BrowserConfig
     from anton.core.session import ChatSession
 
+    from cowork.schemas.artifact_card import ArtifactCard
     from cowork.services.conversations import ReplayHistory
 
 
 logger = get_logger(__name__)
+
+# Anton stamps live input in UTC but older versions omit its offset. Keep this
+# interpretation cache-stable and shared by live turns and persisted history.
+_MESSAGE_TIME_CONTEXT = (
+    "\n\nMESSAGE TIMES: Message send-time prefixes are UTC, including live and "
+    "historical prefixes formatted as [YYYY-MM-DD HH:MM] without a timezone label. "
+    "Use the latest message timestamp as the current time, and convert that instant "
+    "to the user's timezone before reasoning about local dates or scheduling. "
+    "Never attach a local UTC offset to the unchanged UTC clock reading."
+)
 
 
 def _anton_mcp_wiring():
@@ -216,8 +230,19 @@ def _overlay_user_settings(anton_settings, user) -> list[str]:
     """
     applied: list[str] = []
     limits = effective_turn_limits(user)._asdict()
-    for attr in _OVERLAID_SETTINGS:
-        db_val = limits[attr] if attr in limits else getattr(user, attr, None)
+    values = [
+        (attr, limits[attr] if attr in limits else getattr(user, attr, None))
+        for attr in _OVERLAID_SETTINGS
+    ]
+    # anton's `image_model` (ANTON_IMAGE_MODEL), which its generate_image tool
+    # and scratchpad helper draw with. Resolved rather than raw: the planning and
+    # coding pins are corrected afterwards from the built client
+    # (_apply_client_models), and nothing corrects this one, so a pin MindsHub no
+    # longer serves or the wallet cannot pay for is swapped here (ENG-1632).
+    # None where no image model can be served, so anton offers no image tool
+    # (UserSettings.image_model_for_agent).
+    values.append(("image_model", getattr(user, "image_model_for_agent", None)))
+    for attr, db_val in values:
         if db_val is None:
             continue
         if not hasattr(anton_settings, attr):
@@ -241,6 +266,11 @@ def _overlay_user_settings(anton_settings, user) -> list[str]:
     if getattr(user, "jev_decisions_enabled", True) is False and hasattr(anton_settings, "verifier_jev"):
         anton_settings.verifier_jev = "off"
         applied.append("verifier_jev")
+    # The same pattern for classify(): only ever turns it off. An anton that
+    # predates the setting has no classify() to turn off.
+    if getattr(user, "jev_classify_enabled", True) is False and hasattr(anton_settings, "classify_jev"):
+        anton_settings.classify_jev = "off"
+        applied.append("classify_jev")
     return applied
 
 
@@ -409,8 +439,12 @@ def _inside_project(base: Path, *, folder: Path) -> Path:
 settings = AntonHarnessSettings()
 
 
-def build_elicitor(conversation_id: str):
-    """The question strategy for this conversation, or None when disabled.
+def build_elicitor(conversation_id: str, *, interactive: bool = True):
+    """The question strategy for this conversation, or None when disabled or
+    when nobody watches the turn (``interactive`` False: a scheduled run).
+    Unattended, a question or a browser hand-over would only wait out its
+    timeout; without an elicitor the agent learns at once that nobody can
+    answer, as a pod turn without ``interactive`` does.
 
     Returning None is the kill switch: anton only registers `ask_user` when
     an elicitor supports "choice", so the model reverts to asking in plain
@@ -420,7 +454,7 @@ def build_elicitor(conversation_id: str):
     CLIElicitor (which does support "choice"), silently reopening the
     switch. See tests/test_ask_user_flag.py for the guard.
     """
-    if not get_app_settings().ask_user_enabled:
+    if not interactive or not get_app_settings().ask_user_enabled:
         return None
     from cowork.harnesses.anton_harness.elicitor import CoworkElicitor
     from cowork.streaming.answers import broker
@@ -1029,6 +1063,91 @@ def _attachment_context_for(rows: list[_AttachedFile] | None, *, conversation) -
     )
 
 
+def _stored_folder_paths(session: ScopedSession, *, conversation_id: UUID) -> list[str]:
+    _conversation, rows = ConversationFolderService(session).list_folders(conversation_id)
+    return [row.path for row in rows]
+
+
+_FOLDER_CHECK_TIMEOUT_S = 5.0
+
+
+def _usable_folder_paths(paths: list[str], project_path: str | None) -> list[str]:
+    """The stored folder paths that still pass the working-folder rules. Touches the filesystem."""
+    return [path for path in paths if folder_refusal(path, project_path) is None]
+
+
+async def _working_folder_paths(conversation, channel_context: ChannelContext | None) -> list[str]:
+    """The chat's working folders the agent may use this turn, as absolute paths.
+
+    Read in a database unit of its own, since the harness gets the conversation
+    detached. Empty for a channel turn: the people in a Slack or Telegram chat
+    are not the desktop user who added the folders. Each folder is checked
+    again, so one that vanished or now resolves into Cowork's own data is left
+    out. Fails closed: an error offers no folders and is logged. A wait for a
+    connection that runs out is the turn's failure, so it propagates.
+    """
+    if channel_context is not None:
+        return []
+    try:
+        scope = _units_scope()
+        if scope.org_mode:
+            return []
+        paths = await run_db(
+            partial(_stored_folder_paths, conversation_id=conversation.id), scope=scope,
+        )
+        project_path = conversation.project.path if conversation.project else None
+        # Each check stats the folder, which can hang on a network share that stopped
+        # answering; a timeout offers no folders, through the handler below.
+        return await asyncio.wait_for(
+            asyncio.to_thread(_usable_folder_paths, paths, project_path),
+            timeout=_FOLDER_CHECK_TIMEOUT_S,
+        )
+    except PoolTimeoutError:
+        raise
+    except Exception:
+        logger.warning(
+            "Failed to load working folders for conversation %s; none are offered this turn",
+            getattr(conversation, "id", "<unknown>"),
+            exc_info=True,
+        )
+        return []
+
+
+def _file_access_rules(folder_paths: list[str], *, sandboxed: bool) -> str:
+    """The prompt sentences that say which files outside the project are allowed.
+
+    Without working folders this is _other_files_rule's text, so a chat that
+    never adds one sends an unchanged prompt.
+    """
+    if not folder_paths:
+        return _other_files_rule(sandboxed=sandboxed)
+    return (
+        "The only other files that you are allowed to access are any items that are attached to the conversation "
+        "and the files in the working folders below. "
+        "Access to any files not attached to the conversation and located outside both the project and the "
+        "working folders is strictly forbidden. "
+    )
+
+
+def _working_folders_context(paths: list[str]) -> str:
+    """Prompt fragment granting the agent the chat's working folders, or "" for none."""
+    if not paths:
+        return ""
+    listed = "\n".join(f"  - {path}" for path in paths)
+    return (
+        " The user has also added these working folders to THIS conversation:\n"
+        + listed
+        + "\nYou may read and write files in them through the scratchpad, using these absolute paths."
+        " Before you change, move or delete any file in a working folder, ask the user for permission first."
+        " Keep creating artifacts in the project as usual."
+        " Leave any .anton/ directory inside a working folder alone."
+        " To find or read a file in a working folder, list, search and read it in the scratchpad;"
+        " do not use read_text_file or select_path for it, because they cannot open working-folder files."
+        " When the user names a file without saying which folder, search the project and every working folder"
+        " before saying it is missing. If it is not found, say so and ask; never answer about a different file instead."
+    )
+
+
 @register
 class AntonHarness:
     id: str = "anton"
@@ -1128,7 +1247,7 @@ class AntonHarness:
         skill_drafts_base = project_path / ".anton" / "skill_drafts"
         before_drafts = snapshot_skill_drafts(skill_drafts_base)
         before_strays = snapshot_stray_skills(project_path / "skills")
-        cards: list[dict] = []
+        cards: list[ArtifactCard] = []
         skill_drafts: list[dict] = []
         new_slugs: list[str] = []
         touched_slugs: set[str] = set()
@@ -1390,7 +1509,15 @@ class AntonHarness:
         directly against fake messages, same reasoning as _seed_history.
         """
         om = scrubbed_openai_dump(m)
-        ts = m.created_at.strftime("%Y-%m-%d %H:%M") if getattr(m, "created_at", None) else None
+        created_at = getattr(m, "created_at", None)
+        # Naive database timestamps are UTC; aware timestamps must be converted.
+        if created_at is not None:
+            created_at = (
+                created_at.replace(tzinfo=timezone.utc)
+                if created_at.tzinfo is None else created_at.astimezone(timezone.utc)
+            )
+        # Same bytes as anton's live stamp, so the replayed message keeps the prompt cache.
+        ts = created_at.strftime("%Y-%m-%d %H:%M") if created_at else None
         if m.role == "user" and ts and isinstance(om.get("content"), str) and om["content"]:
             om["content"] = f"[{ts}] {om['content']}"
         return om
@@ -1544,6 +1671,13 @@ class AntonHarness:
                     "type": "text",
                     "text": f"[Attached file '{block['filename']}' is at: {block['path']}]",
                 })
+        # Anton stamps plain strings, but leaves image/file block lists alone.
+        # Put the clock on this turn too, so a resumed chat cannot mistake the
+        # last historical message's timestamp for now. Keep it out of the
+        # system prompt so the settled prompt prefix remains cache-stable.
+        if anton_blocks:
+            stamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+            anton_blocks.insert(0, {"type": "text", "text": f"[{stamp}]"})
         return anton_blocks
         
     async def _build_chat_session(
@@ -1677,7 +1811,7 @@ class AntonHarness:
         _overlay_user_settings(anton_settings, user)
 
         RECALL_HISTORY_TOOL = self._recall_history_tool(conversation, user)
-        elicitor = build_elicitor(str(conversation.id))
+        elicitor = build_elicitor(str(conversation.id), interactive=interactive)
         # Asks the user's open preview whether an edited artifact runs. Only
         # where the cowork app tails the turn: a scheduled run or a channel
         # bot has no preview to answer, and would only wait out the timeout.
@@ -1771,6 +1905,8 @@ class AntonHarness:
             partial(_replay_history, conversation_id=conversation.id), scope=_units_scope(),
         )
         ordered_messages = history.messages
+        # Landlock grants agent code no working folder, so a sandboxed turn offers none.
+        folder_paths = [] if sandboxed else await _working_folder_paths(conversation, channel_context)
 
         # App backends are refused under the code sandbox (`sandboxed`), so
         # the agent is never told to build one, unless live apps run them in
@@ -1794,6 +1930,13 @@ class AntonHarness:
             backends_rule = _SANDBOXED_BACKENDS_RULE
         else:
             backends_rule = "For a service that must keep running, build a full-stack artifact and start it with `launch_backend`."
+        # The desktop app's own browser, when it registered one and the
+        # person turned the browser on: anton registers its `browser` tool
+        # only then. Never for a channel turn.
+        turn_browser = await _browser_config(
+            user, channel_context=channel_context,
+            conversation_id=str(conversation.id), project_id=conversation.project_id,
+        )
         project_context = (
             # Conversational only. The next line hands the agent the real path,
             # so the name here never has to resolve to anything (ENG-1676).
@@ -1804,7 +1947,7 @@ class AntonHarness:
             "Everything else in .anton/ is off limits. Do not mention the .anton/ directory in your responses. "
             "You can perform operations on these files via the scratchpad. "
             + _project_file_actions_rule(anton_settings.act_first)
-            + _other_files_rule(sandboxed=sandboxed)
+            + _file_access_rules(folder_paths, sandboxed=sandboxed)
             + "Read text files with `read_text_file` (`end_line=-1` returns the whole file), several in one step. Read in the scratchpad only data that goes straight into scratchpad code or a file that needs special parsing: printed scratchpad output stops at 10,000 characters. Use the scratchpad for everything else you do with files. "
             f"Your scratchpad's working directory is {str(base)} — bare relative paths like `open('data.csv')` resolve from the project root."
             # Each turn's scratchpad processes are killed when the turn ends
@@ -1812,7 +1955,17 @@ class AntonHarness:
             " Processes and threads a scratchpad cell starts are stopped when your reply ends: "
             "variables carry over to the next turn, running servers do not. "
             + backends_rule
+            # Only a turn with a browser hears about it. Where no listed
+            # element fits, a step by position is the way in; whether a step
+            # waits for the person is the browser tool's own prompt's to say.
+            + (
+                " In the browser, when no listed element fits (a slider, a map, a date grid, a canvas, a drag "
+                "handle), click or drag by position (x, y) right away instead of reading the page again."
+                if turn_browser is not None
+                else ""
+            )
             + attachment_context
+            + _working_folders_context(folder_paths)
         )
         output_context = (
             # Artifacts live under `<base>/.anton/artifacts/<slug>/`, one
@@ -1856,8 +2009,9 @@ class AntonHarness:
         data_vault = None
         turn_scratch_dir: Path | None = None
         if LocalDataVault is not None:
+            from cowork.services.connectors import app_held
             from cowork.services.connectors.layered_vault import FilteredDataVault
-            from cowork.services.connectors.persist import turn_vault_for_scope
+            from cowork.services.connectors.persist import own_vault_root, turn_vault_for_scope
 
             # The asker's own connections, with the operator's managed ones
             # over them and the ones others share with the asker after them,
@@ -1874,6 +2028,9 @@ class AntonHarness:
                 )
             else:
                 data_vault = source_vault
+            data_vault = app_held.turn_vault(
+                data_vault, source_vault=source_vault, root=own_vault_root(current_settings_scope())
+            )
             # Registers this turn's DS_* names and values for scrubbing, and
             # touches no process state, so a concurrent turn's are left alone.
             from anton.utils.datasources import restore_namespaced_env
@@ -1920,6 +2077,10 @@ class AntonHarness:
                 # `data_vault` is already filtered by `disabled_connections`.
                 connector_usage_notes = await scope_usage_notes(
                     c["engine"] for c in vault_connections
+                )
+
+                integration_guidance += describe_project_pages(
+                    service.picked_files_by_project(data_vault, conversation.project.name, engine="notion")
                 )
 
             cells = extract_scratchpad_cells(history.events)
@@ -2119,6 +2280,7 @@ class AntonHarness:
                     runtime_context=build_runtime_context(anton_settings),
                     suffix=(
                         _turn_style_context(channel_context)
+                        + _MESSAGE_TIME_CONTEXT
                         + f"{project_context}"
                         + f"{output_context}"
                         + f"{skill_output_context}"
@@ -2164,14 +2326,9 @@ class AntonHarness:
                 # check (ENG-4207). Dropped by an anton without the field,
                 # whose editor then has no preview check at all.
                 **preview_checker_kwargs(ChatSessionConfig, preview_checker),
-                # The desktop app's own browser, when it registered one and the
-                # person turned the browser on: anton registers its `browser`
-                # tool only then. Never for a channel turn. Passed directly:
+                # Read above, with the prompt line it brings. Passed directly:
                 # every anton the floor admits has the field.
-                browser=await _browser_config(
-                    user, channel_context=channel_context,
-                    conversation_id=str(conversation.id), project_id=conversation.project_id,
-                ),
+                browser=turn_browser,
                 proactive_dashboards=anton_settings.proactive_dashboards,
                 act_first=anton_settings.act_first,
                 # Hosted web search stays off when COWORK_OPENAI_COMPATIBLE_API
@@ -2255,19 +2412,30 @@ async def _browser_config(
 
     None for a channel turn: it comes from a chat where people other than the
     desktop's owner can write, and the browser holds the owner's sign-ins.
-    None when the person turned the browser off, when the app registered no
-    browser, which is always the case where more than one person shares this
-    process (cowork.common.settings.runtime_credential.get_browser_host), and
-    when a signed-in desktop's organization turned the browser off, read
-    before each turn (cowork.services.browser.desktop_organization_off).
+    None when the person turned the browser off or there is no decisions
+    model to pick its steps (cowork.services.browser.browser_runs), when the
+    app registered no browser, which is always the case where more than one
+    person shares this process
+    (cowork.common.settings.runtime_credential.get_browser_host), and when a
+    signed-in desktop's organization turned the browser off, read before each
+    turn (cowork.services.browser.desktop_organization_off).
     The web's browser never reaches an in-process turn: web turns run
     remotely, and the producer gives them the router.
-    """
-    if channel_context is not None or not getattr(user, "browser_enabled", False):
-        return None
-    from cowork.services.browser import desktop_browser_config, desktop_organization_off
 
-    config = desktop_browser_config(conversation_id=conversation_id, project_id=project_id)
+    The organization's own decision model, when it set one up, goes with the
+    config: anton then asks it for the browser's steps rather than Jev on
+    MindsHub, as the route gate does (jev_route.gate_mode).
+    """
+    from cowork.services.browser import browser_runs, desktop_browser_config, desktop_organization_off
+
+    if channel_context is not None or not browser_runs(user):
+        return None
+    from cowork.common.settings.app_settings import TurnQueueSettings
+    from cowork.handlers.jev_route import own_decision_target
+
+    target = own_decision_target(user)
+    decisions = (target, user.decision_model or TurnQueueSettings().jev_route_model) if target else None
+    config = desktop_browser_config(conversation_id=conversation_id, project_id=project_id, decisions=decisions)
     if config is None or await desktop_organization_off():
         return None
     return config

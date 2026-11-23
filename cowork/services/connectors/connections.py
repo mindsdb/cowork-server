@@ -6,6 +6,8 @@ from anton.core.datasources.data_vault import is_secret_key
 
 from cowork.db.scoped import TenantScope
 from cowork.schemas.connectors import ConnectionDetailResponse, ConnectionSummaryResponse
+from cowork.services.connectors import app_held
+from cowork.services.connectors.custom_mcp import is_custom_mcp
 from cowork.services.connectors.identity import (
     VAULT_KEEP_SENTINEL as _SENTINEL,
     connection_display_name,
@@ -101,6 +103,8 @@ class ConnectionsService:
             record = self._read_record(vault, engine, name)
             fields = (record or {}).get("fields") if record else {}
             fields = fields or {}
+            if is_custom_mcp(engine):
+                fields = self._held_custom_fields(name)
             user_label = str(fields.get("_user_label", "")).strip() or str(fields.get("_label", "")).strip() or None
             result.append(ConnectionSummaryResponse(
                 engine=engine,
@@ -118,13 +122,38 @@ class ConnectionsService:
             ))
         return result
 
+    def _held_custom_fields(self, name: str) -> dict[str, str]:
+        """A custom MCP connection's fields as the list and detail show them:
+        its method and the label held in memory, nothing from the vault file,
+        which agent code can write."""
+        fields = {"_method": "mcp"}
+        label = app_held.held_custom(own_vault_root(self.scope), name).get("label")
+        if label:
+            fields["_label"] = label
+        return fields
+
+    def mcp_access_token(self, engine: str, name: str) -> str | None:
+        """The stored access token of an MCP-method connection, for a server-side
+        tool call on the user's behalf; None for any other connection."""
+        record = self._read_record(self._vault(), engine, name)
+        fields = (record or {}).get("fields") or {}
+        if fields.get("_method") != "mcp":
+            return None
+        fields = app_held.overlay(own_vault_root(self.scope), engine, name, fields, keys=("access_token",))
+        return fields.get("access_token") or None
+
     def get(self, engine: str, name: str) -> ConnectionDetailResponse | None:
         vault = self._vault()
         record = self._read_record(vault, engine, name)
         if record is None:
             return None
 
-        fields: dict = dict(record.get("fields") or {})
+        if is_custom_mcp(engine):
+            fields: dict = self._held_custom_fields(name)
+        else:
+            fields = app_held.overlay(
+                own_vault_root(self.scope), engine, name, dict(record.get("fields") or {}), keys=("access_mode",)
+            )
         # Mask secrets. Prefer the record's explicit secure_keys; fall back to the
         # name heuristic so records saved before secure_keys was persisted don't
         # leak their secret values through this endpoint.
@@ -177,7 +206,10 @@ class ConnectionsService:
         record = self._read_record(self._vault(), engine, name)
         if record is None:
             return None
-        return dict(record.get("fields") or {})
+        # An MCP connection's token may be held in memory only, not in the file.
+        return app_held.overlay(
+            own_vault_root(self.scope), engine, name, dict(record.get("fields") or {}), keys=("access_token",)
+        )
 
     def patch_token(self, engine: str, name: str, updates: dict) -> bool:
         """Merge ``updates`` into an existing vault entry's fields.
@@ -272,6 +304,10 @@ class ConnectionsService:
         being told about the file for this project); does not revoke
         Google's own server-side record of it.
 
+        A Notion page is dropped once its last project goes: Notion pages are
+        only ever added to projects, and an untagged entry would read as
+        connection-wide and reach every project's prompt.
+
         Returns the resulting list, or None if the connection doesn't exist.
         """
         vault = self._vault()
@@ -288,26 +324,34 @@ class ConnectionsService:
             for f in existing:
                 if isinstance(f, dict) and f.get("id") == file_id:
                     f = {**f, "projects": [p for p in (f.get("projects") or []) if p != project]}
+                    if engine == "notion" and not f["projects"]:
+                        continue
                 remaining.append(f)
 
             fields["_picked_files"] = json.dumps(remaining)
             vault.save(engine, name, fields, secure_keys=secure_keys)
             return remaining
 
-    def picked_files_by_project(self, data_vault, project_name: str) -> dict[str, list[dict]]:
-        """Google-Picker-granted files visible to `project_name`, keyed by
-        connection name. Callers (the Anton harness, once per chat turn) use
-        this to tell the agent about files a plain files.list()/files.search()
-        call won't return — the google_drive connector's drive.file scope only
-        covers files the app created plus these specifically granted ones.
+    def picked_files_by_project(
+        self, data_vault, project_name: str, engine: str = "google_drive",
+    ) -> dict[str, list[dict]]:
+        """Picked files of `engine`'s connections visible to `project_name`,
+        keyed by connection name. Callers (the Anton harness, once per chat
+        turn) use this to tell the agent about them: for google_drive, files a
+        plain files.list()/files.search() call won't return, since the
+        drive.file scope only covers files the app created plus these
+        specifically granted ones; for notion, pages the user added to the
+        project, which nothing else would point the agent at.
 
-        A file is visible if it's untagged (picked with no project context —
-        a connection-wide grant meant to be usable everywhere, same as the
-        connection's other credentials) or explicitly tagged to `project_name`.
-        A file tagged to OTHER projects only is excluded — that's the scoping
-        leak this closes. Only the Project files rail's display (a UI list,
-        not the agent's access) hides untagged files outside every project;
-        the agent must still be able to use them anywhere.
+        A file is visible if it's explicitly tagged to `project_name`, or, for
+        google_drive only, untagged (picked with no project context — a
+        connection-wide grant meant to be usable everywhere, same as the
+        connection's other credentials). A file tagged to OTHER projects only
+        is excluded — that's the scoping leak this closes. Only the Project
+        files rail's display (a UI list, not the agent's access) hides
+        untagged Drive files outside every project; the agent must still be
+        able to use them anywhere. A Notion page is only ever added to a
+        project, so an untagged one reaches no project.
 
         Takes `data_vault` rather than using `self._vault()` so callers that
         run under a filtered/temp vault (e.g. disabled connections) get
@@ -315,13 +359,14 @@ class ConnectionsService:
         """
         picked_by_connection: dict[str, list[dict]] = {}
         for conn in data_vault.list_connections():
-            engine, name = conn["engine"], conn["name"]
-            if engine != "google_drive":
+            if conn["engine"] != engine:
                 continue
+            name = conn["name"]
             fields = data_vault.load(engine, name) or {}
             scoped = [
                 f for f in self._load_picked_files(fields)
-                if isinstance(f, dict) and (not f.get("projects") or project_name in f["projects"])
+                if isinstance(f, dict)
+                and (project_name in (f.get("projects") or []) or (engine != "notion" and not f.get("projects")))
             ]
             if scoped:
                 picked_by_connection[name] = scoped
@@ -330,7 +375,38 @@ class ConnectionsService:
     def delete(self, engine: str, name: str) -> bool:
         deleted = self._vault().delete(engine, name)
         discard_lock(vault_root=own_vault_root(self.scope), engine=engine, name=name)
+        app_held.release(own_vault_root(self.scope), engine, name)
         return deleted
+
+    def method(self, engine: str, name: str) -> str | None:
+        """The connection's ``_method``; raises LookupError when it doesn't exist."""
+        record = self._read_record(self._vault(), engine, name)
+        if record is None:
+            raise LookupError(f"{engine}/{name}")
+        return (record.get("fields") or {}).get("_method")
+
+    def hold_app_held(self, engine: str, name: str, values: dict) -> dict[str, str]:
+        """Merge app-held values (app_held.VAULT_FIELD keys) into server memory."""
+        return app_held.hold(own_vault_root(self.scope), engine, name, values)
+
+    def strip_app_held(self, engine: str, name: str) -> bool:
+        """Once memory holds both the token and the access mode, remove them
+        from the vault file. Returns whether the file is now without them."""
+        entry = app_held.held(own_vault_root(self.scope), engine, name)
+        if not (entry.get("access_token") and entry.get("access_mode")):
+            return False
+        vault = self._vault()
+        stripped_fields = ("access_token", "_access_mode")
+        with self._lock(engine, name):
+            record = self._read_record(vault, engine, name)
+            if record is None:
+                return False
+            fields = dict(record.get("fields") or {})
+            if any(key in fields for key in stripped_fields):
+                for key in stripped_fields:
+                    fields.pop(key, None)
+                vault.save(engine, name, fields, secure_keys=record.get("secure_keys"))
+            return True
 
 
 # LOCAL-MODE-ONLY convenience singleton (unscoped, so scoped_storage_root

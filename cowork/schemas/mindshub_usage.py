@@ -1,8 +1,34 @@
-"""Wire shape for the desktop's usage read: free tokens, balance, auto top up."""
+"""Wire shape for the desktop's usage read: free tokens, plan, balance, auto top up."""
 
-from typing import Optional
+from typing import Literal, Optional, TypeGuard, get_args
 
 from cowork.schemas.base import CamelResponse
+
+# The plan values, spelled once. Every other module that checks one imports the
+# set derived from it below, so a new tier or window is one edit here. Keep this
+# module free of heavy imports: the services and the turn-failure mapping all
+# import it, and a heavy one would make a cycle.
+PaidPlanTier = Literal["plus", "pro"]
+PlanTier = Literal["free", PaidPlanTier]
+PlanStatus = Literal["active", "past_due", "canceled"]
+PlanWindowName = Literal["5h", "7d"]
+
+PLAN_TIERS: frozenset[str] = frozenset(get_args(PlanTier))
+# The tiers a model can require: the ones above Free.
+PAID_PLAN_TIERS: frozenset[str] = frozenset(get_args(PaidPlanTier))
+PLAN_STATUSES: frozenset[str] = frozenset(get_args(PlanStatus))
+PLAN_WINDOWS: frozenset[str] = frozenset(get_args(PlanWindowName))
+
+
+def is_one_of(value: object, allowed: frozenset[str]) -> TypeGuard[str]:
+    """True when ``value`` is a string in ``allowed``.
+
+    The type is checked first. These values come from untrusted JSON, and a
+    list or an object raises ``TypeError`` (unhashable) in a bare ``in`` test.
+    Every check against the sets above goes through here, so no caller can
+    leave the type check out.
+    """
+    return isinstance(value, str) and value in allowed
 
 
 class MindsHubFreeTokens(CamelResponse):
@@ -59,6 +85,35 @@ class MindsHubCreditSpend(CamelResponse):
     period_end: Optional[str] = None
 
 
+class MindsHubPlanWindow(CamelResponse):
+    """One rolling allowance window of a paid plan, as a proportion (ENG-4186).
+
+    Never dollars: auth publishes how much of the window is used, not its size.
+    """
+
+    # "5h" or "7d".
+    window: PlanWindowName
+    # An integer 0-100, as auth sends it.
+    percent_used: int
+    # When the window frees up, as auth's opaque ISO string. None when nothing
+    # in the window has been counted yet.
+    resets_at: Optional[str] = None
+
+
+class MindsHubPlan(CamelResponse):
+    """The organization's subscription tier and its allowance windows (ENG-4186).
+
+    Free orgs get ``tier`` "free" and no windows; their allowance stays in
+    ``freeTokens``.
+    """
+
+    tier: PlanTier
+    status: PlanStatus
+    renews_at: Optional[str] = None
+    cancel_at_period_end: bool = False
+    windows: list[MindsHubPlanWindow] = []
+
+
 class MindsHubUsageView(CamelResponse):
     """Everything the usage surfaces need, in one round trip.
 
@@ -70,6 +125,9 @@ class MindsHubUsageView(CamelResponse):
     reachable: bool = False
     is_billing_owner: bool = False
     free_tokens: Optional[MindsHubFreeTokens] = None
+    # None when auth sent no plan block (an auth that predates subscriptions,
+    # or the subscriptions gate is off), or sent one that does not parse.
+    plan: Optional[MindsHubPlan] = None
     balance: Optional[MindsHubBalance] = None
     auto_top_up: Optional[MindsHubAutoTopUp] = None
     credit_spend: Optional[MindsHubCreditSpend] = None

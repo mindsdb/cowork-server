@@ -15,7 +15,6 @@ import stat
 import threading
 import time
 import unicodedata
-from collections import deque
 from collections.abc import Callable, Iterator
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass, field
@@ -79,6 +78,7 @@ from cowork.schemas.project_files import (
     ProjectUploadResult,
 )
 from cowork.schemas.shared_resources import MutableResourceCapabilities
+from cowork.services import folder_listing
 from cowork.schemas.sharepoint import (
     SharePointImportedFile,
     SharePointImportResponse,
@@ -656,81 +656,6 @@ def _safe_relpath(rel: str | _ValidatedProjectPath, base: Path) -> Path:
     except ValueError as exc:
         raise HTTPException(status_code=400, detail="invalid path") from exc
     return candidate
-
-
-#: A project directory Cowork allocated holds the agent's own output, so its
-#: size is bounded by what the agent wrote. A folder the user chose can be a
-#: repository or a home directory, and one request used to materialise every
-#: path beneath it with a stat and a resolve each before returning anything.
-_MAX_LISTED_FILES = 2000
-
-#: Entries examined, as opposed to returned. The cap above counts files the
-#: caller may actually see, so on its own an unreadable subtree could still be
-#: walked without limit before any of them were found.
-_MAX_EXAMINED_ENTRIES = 50_000
-
-
-@dataclass
-class _WalkBudget:
-    """Whether the entry ceiling, rather than the file cap, stopped the walk."""
-
-    exhausted: bool = False
-
-
-def _iter_project_files(base: Path, budget: _WalkBudget) -> Iterator[Path]:
-    """Candidate files under `base`, breadth-first, bounded by entries seen.
-
-    Breadth-first so a truncated listing shows the user's own top-level files
-    instead of whatever a depth-first walk reached inside the first large
-    subdirectory it happened to enter.
-
-    A symlinked directory is neither descended into nor listed, which is what
-    `Path.rglob` did: it yielded the link itself and the caller skipped it as a
-    directory. Every desktop project has `skills/<slug>` directory symlinks
-    from `reconcile_project`, so descending would spend the budget on trees
-    whose entries `_file_meta` then discards for resolving outside `base`.
-    """
-    queue: deque[Path] = deque([base])
-    examined = 0
-    while queue:
-        try:
-            entries = sorted(queue.popleft().iterdir())
-        except OSError:
-            continue
-        for entry in entries:
-            examined += 1
-            if examined > _MAX_EXAMINED_ENTRIES:
-                budget.exhausted = True
-                return
-            try:
-                if entry.is_symlink():
-                    if entry.is_dir():
-                        continue
-                elif entry.is_dir():
-                    queue.append(entry)
-                    continue
-            except OSError:
-                continue
-            yield entry
-
-
-def _file_meta(p: Path, base: Path) -> dict[str, Any] | None:
-    try:
-        st = p.stat()
-    except FileNotFoundError:
-        return None
-    try:
-        resolved = p.resolve()
-        rel = resolved.relative_to(base.resolve())
-    except ValueError:
-        return None
-    return {
-        "path": str(rel).replace("\\", "/"),
-        "name": p.name,
-        "size": st.st_size,
-        "modified": st.st_mtime,
-        "is_dir": p.is_dir(),
-    }
 
 
 def _conversation_workspace_ok(
@@ -1597,16 +1522,16 @@ def _list_project_files(
     base = _project_dir(project_name, scoped)
     files: list[dict[str, Any]] = []
     _conv_cache: dict = {}
-    budget = _WalkBudget()
+    budget = folder_listing.WalkBudget()
     truncated = False
-    for p in _iter_project_files(base, budget):
-        meta = _file_meta(p, base)
+    for p in folder_listing.iter_folder_files(base, budget):
+        meta = folder_listing.file_meta(p, base)
         if not (meta and _conversation_workspace_ok(meta["path"], scoped, _conv_cache)):
             continue
         # Counted after the filters, not before: budgeting candidates let a
         # subtree the caller cannot see (another member's conversation
         # workspace) spend the whole listing on rows that are then dropped.
-        if len(files) >= _MAX_LISTED_FILES:
+        if len(files) >= folder_listing.MAX_LISTED_FILES:
             truncated = True
             break
         files.append(meta)
@@ -1620,7 +1545,7 @@ def _list_project_files(
     # Resolved from disk, not from the capped walk: a truncated listing would
     # otherwise report a real anton.md as synthetic with size 0.
     if truncated and not any(f["path"] == anton_rel for f in files):
-        instructions_meta = _file_meta(_anton_md_path(base), base)
+        instructions_meta = folder_listing.file_meta(_anton_md_path(base), base)
         if instructions_meta:
             files.append(instructions_meta)
     if not any(f["path"] == anton_rel for f in files):
@@ -1665,9 +1590,12 @@ async def read_project_file(
     scope: ScopeDep,
     principal: Principal | None = Depends(get_principal),
 ):
-    return await run_efs_unit(
+    result = await run_efs_unit(
         partial(_read_project_file, project_name=project_name, path=path, principal=principal), scope=scope
     )
+    from cowork.services.content_safety import check_content
+    await check_content(result['content'], purpose='output', scope=scope)
+    return result
 
 
 def _read_project_file(
@@ -1976,6 +1904,8 @@ async def write_project_file(
     scope: ScopeDep,
     principal: Principal | None = Depends(get_principal),
 ):
+    from cowork.services.content_safety import check_content
+    await check_content(req.content, purpose='input', scope=scope)
     return await run_efs_unit(
         partial(_write_project_file, project_name=project_name, path=path, req=req, principal=principal), scope=scope
     )
@@ -2163,7 +2093,25 @@ async def upload_project_files(
     # threads. Each upload is read there from its own spool, one at a time and
     # only once the project is found, so a request holds at most one file's
     # bytes in memory.
-    return await run_efs_unit(partial(_write_uploads, project_name=project_name, uploads=files), scope=scope)
+    from cowork.services.content_safety import ContentSafetySettings, MAX_FILE_BYTES, check_file_bytes
+    if not ContentSafetySettings().required:
+        return await run_efs_unit(partial(_write_uploads, project_name=project_name, uploads=files), scope=scope)
+    from io import BytesIO
+    approved = []
+    total = 0
+    try:
+        for upload in files:
+            data = await upload.read(MAX_FILE_BYTES + 1)
+            total += len(data)
+            if total > MAX_FILE_BYTES:
+                raise HTTPException(413, 'These files are too large for a safety check.')
+            await check_file_bytes(data, content_type=upload.content_type or '', purpose='input', scope=scope)
+            # The writer gets exactly the checked bytes, not the mutable spool.
+            approved.append(UploadFile(BytesIO(data), filename=upload.filename, headers=upload.headers))
+        return await run_efs_unit(partial(_write_uploads, project_name=project_name, uploads=approved), scope=scope)
+    finally:
+        for upload in approved:
+            await upload.close()
 
 
 def _write_uploads(scoped: ScopedSession, *, project_name: str, uploads: list[UploadFile]) -> ProjectUploadResponse:

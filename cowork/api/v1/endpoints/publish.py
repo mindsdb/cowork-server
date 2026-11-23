@@ -7,8 +7,8 @@ from __future__ import annotations
 from typing import Annotated, Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
-from fastapi.responses import JSONResponse
-from pydantic import BaseModel, StrictBool
+from fastapi.responses import JSONResponse, Response
+from pydantic import BaseModel, StrictBool, model_validator
 
 from cowork.api.v1.permissions import DesktopOnly, require
 from cowork.db.scoped import TenantScope, get_tenant_scope
@@ -72,8 +72,17 @@ class _ActivateBody(BaseModel):
 
 
 class _StatsTrackingBody(BaseModel):
+    """At least one setting; an omitted one stays as it is."""
+
     path: str
-    enabled: StrictBool
+    enabled: StrictBool | None = None
+    require_email: StrictBool | None = None
+
+    @model_validator(mode="after")
+    def _one_setting(self):
+        if self.enabled is None and self.require_email is None:
+            raise ValueError("Send enabled, require_email or both")
+        return self
 
 
 @router.get("/")
@@ -224,9 +233,41 @@ def set_stats_tracking_endpoint(req: _StatsTrackingBody, scope: ScopeDep):
     api_key, publish_url = _stats_credential()
     try:
         report_id = _stats.report_id_for_path(req.path, scope=scope)
-        tracking = _stats.set_tracking(
-            publish_url=publish_url, key=api_key, report_id=report_id, enabled=req.enabled,
+        return _stats.set_tracking(
+            publish_url=publish_url, key=api_key, report_id=report_id,
+            enabled=req.enabled, require_email=req.require_email,
         )
     except _stats.STATS_ROUTE_ERRORS as e:
         raise _stats.stats_http_exception(e, desktop=True) from e
-    return {"tracking": tracking}
+
+
+@router.get("/stats/viewers/{viewer_id}")
+def artifact_stats_viewer_endpoint(
+    viewer_id: str,
+    scope: ScopeDep,
+    path: str = Query(..., description="Absolute path to the published artifact"),
+):
+    """One viewer's visits and per-section times, as the publishing service returns them."""
+    api_key, publish_url = _stats_credential()
+    try:
+        report_id = _stats.report_id_for_path(path, scope=scope)
+        return _stats.fetch_viewer(
+            publish_url=publish_url, key=api_key, report_id=report_id, viewer_id=viewer_id,
+        )
+    except _stats.STATS_ROUTE_ERRORS as e:
+        raise _stats.stats_http_exception(e, desktop=True) from e
+
+
+@router.delete("/stats", status_code=status.HTTP_204_NO_CONTENT)
+def delete_artifact_stats_endpoint(
+    scope: ScopeDep,
+    path: str = Query(..., description="Absolute path to the published artifact"),
+):
+    """Delete the artifact's viewer analytics: views, visits and viewers."""
+    api_key, publish_url = _stats_credential()
+    try:
+        report_id = _stats.report_id_for_path(path, scope=scope)
+        _stats.delete_stats(publish_url=publish_url, key=api_key, report_id=report_id)
+    except _stats.STATS_ROUTE_ERRORS as e:
+        raise _stats.stats_http_exception(e, desktop=True) from e
+    return Response(status_code=status.HTTP_204_NO_CONTENT)

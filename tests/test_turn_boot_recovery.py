@@ -113,6 +113,19 @@ def test_skips_a_turn_whose_reply_already_landed(svc, conv, session, tmp_path):
     assert messages[1].content == "already answered"
 
 
+def test_leaves_a_stopped_reply_stopped(svc, conv, session, tmp_path):
+    # ENG-4345: a Stop saves its own terminal. The process died before the
+    # buffer recorded the Stop, so boot must not mark the reply lost.
+    svc.save_user_message(conv.id, "hello", pending=True)
+    svc.finalize_pending(conv.id)
+    svc.save_assistant_turn(conv.id, "partial", [{"type": "response.cancelled", "at_ms": 1}])
+    _write_orphan_buffer(tmp_path, conv.id, 0, [DELTA.format("partial")])
+
+    assert seal_orphan_turns_in_history(ScopedSession(session, SYSTEM_SCOPE), tmp_path) == 0
+    messages = svc.get_ordered_messages(conv.id)
+    assert [e.event_data["type"] for e in _events_for(session, messages[1].id)] == ["response.cancelled"]
+
+
 def test_skips_a_turn_with_no_question_row(svc, conv, session, tmp_path):
     # Crashed before even the pending question was committed — nothing to
     # attach an answer to.
