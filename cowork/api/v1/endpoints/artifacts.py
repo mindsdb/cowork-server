@@ -23,10 +23,9 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import FileResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 from sqlmodel import Session
 
-from cowork.services.artifact_share_links import legacy_share_ref
 from cowork.services.product_permissions import require_product_permission
 from cowork.db.scoped import (
     ScopedSession,
@@ -44,7 +43,7 @@ from cowork.api.v1.artifact_preview import (
     wants_html_preview,
 )
 from cowork.api.v1.artifact_scope import (
-    review_artifact_and_read, review_indexed_artifact_and_read, scoped_project_id_for_request,
+    review_artifact_and_read, scoped_project_id_for_request,
 )
 from cowork.db.units import FilesystemBusy, run_db, run_efs, run_on_unit_threads
 from cowork.common.logger import log_context
@@ -870,11 +869,7 @@ class _SharedArtifactRef(BaseModel):
     artifact_id: UUID
 
 
-class _LegacyShareLink(BaseModel):
-    url: str = Field(min_length=1, max_length=2048, pattern=r"^https://")
-
-
-def _shared_preview_card(found, *, artifact_id: str, url: str | None):
+def _shared_preview_card(found, *, artifact_id: str):
     from cowork.services.artifact_identity import _opened_child_directory, opened_artifact_root
     from cowork.services.artifacts import _listed_card_for_pinned_folder
 
@@ -884,7 +879,7 @@ def _shared_preview_card(found, *, artifact_id: str, url: str | None):
             found.folder, 0, project_id=source.project_id, project_name=source.project_name,
             pinned_folder=folder, pinned_root=root, artifacts_base=source.base,
         )
-    if card is None or card.id != artifact_id or not card.draft_url or (url and card.published_url != url):
+    if card is None or card.id != artifact_id or not card.draft_url:
         raise HTTPException(404, "Artifact not found")
     # The notification opens a read-only preview. Owner controls and sharing
     # settings belong to the ordinary workspace, not this response.
@@ -896,24 +891,15 @@ def _shared_preview_card(found, *, artifact_id: str, url: str | None):
 
 
 @router.post("/shared-preview", dependencies=[Depends(require(AuthenticatedInOrgMode))])
-async def shared_artifact_preview(body: _SharedArtifactRef | _LegacyShareLink, scope: ScopeDep):
+async def shared_artifact_preview(body: _SharedArtifactRef, scope: ScopeDep):
     """Resolve a notification with the same authorization as the draft bytes."""
     if not scope.org_mode:
         raise HTTPException(404, "Artifact not found")
-    url = None
-    if isinstance(body, _LegacyShareLink):
-        url = body.url
-        ref = await run_db(lambda unit: legacy_share_ref(unit, url), scope=scope)
-        if ref is None:
-            raise HTTPException(404, "Artifact not found")
-        project_ref, artifact_id = ref
-    else:
-        project_ref, artifact_id = str(body.project_id), body.artifact_id.hex
+    artifact_id = body.artifact_id.hex
     try:
-        review = review_indexed_artifact_and_read if url else review_artifact_and_read
-        reviewed = await review(
-            scope, project_ref, artifact_id,
-            read=partial(_shared_preview_card, artifact_id=artifact_id, url=url),
+        reviewed = await review_artifact_and_read(
+            scope, str(body.project_id), artifact_id,
+            read=partial(_shared_preview_card, artifact_id=artifact_id),
         )
     except FileNotFoundError:
         raise HTTPException(404, "Artifact not found") from None

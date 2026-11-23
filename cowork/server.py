@@ -508,8 +508,7 @@ def _artifact_backfill_wait(session: ScopedSession) -> int | None:
     (held_artifact_roots.read_sentinel,
     artifact_sort_times.read_sort_sentinel), and
     ARTIFACT_BACKFILL_UNREAD_RETRY_SECONDS while either sentinel lists an
-    unread project. A pending location/link index also schedules a retry."""
-    from cowork.services.artifact_location_backfill import location_index_ready
+    unread project. None once both exist and list none: the task ends."""
     from cowork.services.artifact_sort_times import read_sort_sentinel
     from cowork.services.held_artifact_roots import read_sentinel
 
@@ -518,8 +517,6 @@ def _artifact_backfill_wait(session: ScopedSession) -> int | None:
         return ARTIFACT_BACKFILL_RETRY_SECONDS
     if held.unread or sort.unread:
         return ARTIFACT_BACKFILL_UNREAD_RETRY_SECONDS
-    if not location_index_ready(session):
-        return ARTIFACT_BACKFILL_RETRY_SECONDS
     return None
 
 

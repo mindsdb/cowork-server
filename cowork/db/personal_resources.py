@@ -92,7 +92,6 @@ MODEL_RESOURCE: dict[str, PersonalResource] = {
     "artifact_owner_choices": PersonalResource.PROJECTS,
     # Written and read only in org mode, where every resource is partitioned,
     # so this entry decides nothing in a personal scope.
-    "artifact_share_links": PersonalResource.PROJECTS,
     "artifact_locations": PersonalResource.PROJECTS,
     # Written and read only in org mode, as artifact_locations are.
     "held_artifact_roots": PersonalResource.PROJECTS,

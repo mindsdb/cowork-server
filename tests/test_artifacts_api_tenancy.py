@@ -133,19 +133,14 @@ async def test_list_returns_own_org_artifacts(session, tmp_path, org_mode):
     assert "dash" in [c["slug"] for c in cards]
 
 
-async def test_shared_preview_finds_an_older_image_by_ref_and_legacy_link(session, tmp_path, org_mode, monkeypatch):
-    from cowork.api.v1 import artifact_scope
+async def test_shared_preview_finds_an_older_image_by_reference_over_http(session, tmp_path, org_mode):
     from cowork.server import create_app
-    from cowork.services.artifact_location_backfill import LocationBackfillSummary, _walk_project
-    from cowork.services.artifact_roots import ProjectRow
     from cowork.services.artifact_draft_review import disable_draft_review, enable_draft_review
 
     row, folder = _project_with_artifact(session, tmp_path, name="charts", org_id=ORG_A, slug="old-image")
     (folder / "index.html").unlink()
     (folder / "chart.png").write_bytes(b"png")
     (folder / "metadata.json").write_text(json.dumps({"slug": "old-image", "name": "Old chart", "type": "file"}))
-    url = "https://view.example/a/old-chart/"
-    (folder / ".published.json").write_text(json.dumps({"chart.png": {"url": url}}))
     artifact_id, _ = ensure_full_id(folder)
     for index in range(ep.LIST_CARDS):
         newer = folder.parent / f"newer-{index}"
@@ -155,54 +150,25 @@ async def test_shared_preview_finds_an_older_image_by_ref_and_legacy_link(sessio
     owner = TenantScope(org_mode=True, org_id=ORG_A, user_id=USER_A)
     recent = await ep.list_artifacts(owner, project_id=None, project_path=None)
     assert len(recent) == ep.LIST_CARDS and artifact_id not in [card["id"] for card in recent]
-    # Simulate the rollout with a pre-existing publish and no URL index row.
-    project = ProjectRow(id=row.id, name=row.name, path=row.path, external=False)
-    assert _walk_project(
-        session.get_bind(), project=project, org_id=ORG_A, shared_root=tmp_path,
-        summary=LocationBackfillSummary(), stop=None,
-    )
     client = TestClient(create_app())
     path = "/api/v1/artifacts/shared-preview"
     headers = {"X-Organization-Id": ORG_A, "X-User-Id": USER_A2}
     other_org = {**headers, "X-Organization-Id": ORG_B}
     ref = {"project_id": str(row.id), "artifact_id": artifact_id}
-    legacy = {"url": url}
-    for body in (ref, legacy):
-        assert client.post(path, json=body).status_code == 401
-        assert client.post(path, headers=headers, json=body).status_code == 404
-    assert client.post(path, headers=headers, json={"url": "relative"}).status_code == 422
+    assert client.post(path, json=ref).status_code == 401
+    assert client.post(path, headers=headers, json=ref).status_code == 404
+    assert client.post(path, headers=headers, json={"url": "https://view.example/a/old/"}).status_code == 422
 
     enable_draft_review(folder, org_id=ORG_A, enabled_by=USER_A)
-    for body in (ref, legacy):
-        response = client.post(path, headers=headers, json=body)
-        assert response.status_code == 200, response.text
-        preview = response.json()
-        assert preview["id"] == artifact_id and preview["capabilities"]["canEdit"] is False
-        assert preview["ext"] == ".png" and preview["draftUrl"].endswith("/chart.png")
-        assert client.post(path, headers=other_org, json=body).status_code == 404
+    response = client.post(path, headers=headers, json=ref)
+    assert response.status_code == 200, response.text
+    preview = response.json()
+    assert preview["id"] == artifact_id and preview["capabilities"]["canEdit"] is False
+    assert preview["ext"] == ".png" and preview["draftUrl"].endswith("/chart.png")
+    assert client.post(path, headers=other_org, json=ref).status_code == 404
 
     assert disable_draft_review(folder)
     assert client.post(path, headers=headers, json=ref).status_code == 404
-    # No project or organization walk, even on a revoked, stale or unknown URL.
-    def unexpected_scan(*args, **kwargs):
-        pytest.fail("URL-only notifications must use a recorded folder")
-
-    monkeypatch.setattr(artifact_scope, "_scan_found", unexpected_scan)
-    monkeypatch.setattr("cowork.services.artifact_roots.discover_roots", unexpected_scan)
-    assert client.post(path, headers=headers, json=legacy).status_code == 404
-    assert client.post(path, headers=headers, json={"url": url + "unknown"}).status_code == 404
-    enable_draft_review(folder, org_id=ORG_A, enabled_by=USER_A)
-    assert client.post(path, headers=headers, json=legacy).status_code == 200
-    (folder / ".published.json").write_text("{}")
-    assert client.post(path, headers=headers, json=legacy).status_code == 404
-
-    from cowork.services.artifact_share_links import record_share_link
-
-    # A second target for the same URL must never send the recipient to the wrong draft.
-    (folder / ".published.json").write_text(json.dumps({"chart.png": {"url": url}}))
-    record_share_link(_scoped(session, ORG_A), row.id, uuid.uuid4().hex, url)
-    assert client.post(path, headers=headers, json=legacy).status_code == 404
-    assert client.post(path, headers=headers, json=ref).status_code == 200
 
 
 async def test_list_hides_other_org_artifacts(session, tmp_path, org_mode):

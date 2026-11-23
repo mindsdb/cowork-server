@@ -1056,7 +1056,6 @@ def _startup_passes(monkeypatch, project_ids) -> list[str]:
         return real_sort(project_ids=project_ids, stop=stop)
 
     monkeypatch.setattr(artifact_location_backfill, "run_artifact_location_backfill", location)
-    monkeypatch.setattr(artifact_location_backfill, "location_index_ready", lambda _session: True)
     monkeypatch.setattr(held_artifact_roots, "run_held_root_backfill", held)
     monkeypatch.setattr(artifact_sort_times, "run_sort_time_backfill", sort)
     return passes
