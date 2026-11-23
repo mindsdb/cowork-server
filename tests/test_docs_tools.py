@@ -111,6 +111,28 @@ def test_read_doc_returns_editable_ids_and_the_rev(tools):
     assert "task [x]" in outline
 
 
+def test_the_edit_report_names_words_the_person_typed_after_the_agent_read_the_doc(tools, monkeypatch):
+    """The ops apply to the doc as it is under the lock; the report reads that doc, not the one read before."""
+    from cowork.docs import service
+    from cowork.docs import tools as doc_tools
+
+    defs, session, _ = tools
+    _call(defs, session, "create_doc", title="Plan", markdown="Ship the beta.")
+    full = _text(_call(defs, session, "read_doc", doc="Plan"))
+    para = re.search(r"\[(b_[a-z0-9]{8})\] paragraph", full).group(1)
+    real_apply = service.apply
+
+    def person_types_first(folder, ops, **kw):
+        service.apply(folder, [{"op": "update", "id": para, "set": {"text": "Ship the beta. Call legal first."}}],
+                      by="user")
+        return real_apply(folder, ops, **kw)
+
+    monkeypatch.setattr(doc_tools, "apply", person_types_first)
+    out = _text(_call(defs, session, "edit_doc", doc="Plan", ops=[
+        {"op": "replace", "target": para, "markdown": "Ship the beta on Monday."}]))
+    assert "Words this edit took out: “Call legal first.”" in out
+
+
 def test_an_edit_that_rewrites_a_block_names_the_words_it_took_out(tools):
     defs, session, _ = tools
     _call(defs, session, "create_doc", title="Hiring", markdown=(

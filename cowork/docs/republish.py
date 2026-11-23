@@ -40,19 +40,23 @@ def schedule(
     On an org deployment every doc goes through the Redis queue
     (cowork.docs.publish_queue), shared or not: an unshared doc is published
     for its owner alone. Elsewhere a shared page republishes DELAY_S after the
-    last write, in this process.
+    last write, in this process; an unshared one's wait ends with nothing sent.
     """
     if get_app_settings().tenancy_mode == "org":
         return _schedule_org(folder, scope=scope, project_id=project_id, artifact_id=artifact_id)
-    if (scope is not None and scope.org_mode) or not is_shared(folder):
+    if scope is not None and scope.org_mode:
         return False
     page = str(folder / DOC_HTML)
 
     def republish() -> None:
-        # Asked again when it runs, under the page's publish lock, which Stop
-        # sharing (unpublish_artifact) holds while it takes the page down: an
-        # unshare can't land between the check and the upload and see the page
-        # put back up. The lock is re-entrant, so the publish inside takes it too.
+        # Whether the page is shared is read here, on the debounce thread, not
+        # in the caller: writes come from the event loop, and the read is a file.
+        if not is_shared(folder):
+            return
+        # Asked again under the page's publish lock, which Stop sharing
+        # (unpublish_artifact) holds while it takes the page down: an unshare
+        # can't land between the check and the upload and see the page put back
+        # up. The lock is re-entrant, so the publish inside takes it too.
         _api_key, publish_url = desktop_publish_credential()
         with publication_owner(folder / DOC_HTML, published_dir=folder, publish_url=publish_url, scope=scope):
             if is_shared(folder):

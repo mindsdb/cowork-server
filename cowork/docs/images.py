@@ -13,7 +13,7 @@ from __future__ import annotations
 import hashlib
 import re
 from collections.abc import Callable
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from typing import Any
 
 from .markdown import _IMAGE
@@ -69,13 +69,22 @@ def store_image(folder: Path, data: bytes) -> str:
     return src
 
 
-def _local_path(src: str) -> Path | None:
+def _unbracketed(src: str) -> str:
+    """A Markdown destination without the <…> that lets it hold spaces."""
     s = (src or "").strip()
+    return s[1:-1].strip() if s.startswith("<") and s.endswith(">") else s
+
+
+def _local_path(src: str) -> Path | None:
+    s = _unbracketed(src)
     if s.startswith("file://"):
         s = s[len("file://"):]
+        if PureWindowsPath(s[1:]).is_absolute():  # file:///C:/…
+            s = s[1:]
     if s.startswith("~"):
         s = str(Path(s).expanduser())
-    return Path(s) if s.startswith("/") else None
+    # A Windows path (C:\…, \\server\share\…) as well: the desktop app runs there too.
+    return Path(s) if s.startswith("/") or PureWindowsPath(s).is_absolute() else None
 
 
 def _read_allowed(path: Path, allowed: Callable[[Path], bool]) -> bytes | None:
@@ -117,7 +126,7 @@ def localize_images(
     def fix_markdown(md: str) -> str:
         def line(m: re.Match[str]) -> str:
             src = m.group(2)
-            return m.group(0) if image_src_ok(src) else m.group(0).replace(src, fix_src(src), 1)
+            return m.group(0) if image_src_ok(_unbracketed(src)) else m.group(0).replace(src, fix_src(src), 1)
         return _IMAGE_LINE.sub(line, md)
 
     def walk(v: Any) -> Any:

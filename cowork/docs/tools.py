@@ -372,10 +372,14 @@ async def _edit(ctx: DocToolContext, tc_input: dict, emit_step: EmitStep, *, art
             ctx.owner_check(folder)
         local_ops, images = localize_images(ops, ctx.may_use_image, reader=ctx.image_reader)
         write_images(folder, images)
-        doc, result = apply(folder, local_ops, tab=tc_input.get("tab"), by="agent", if_rev=if_rev, turn=ctx.turn)
+        # The report compares against the doc the ops replaced, read under the
+        # lock: the person may have written since `before` was read.
+        replaced: list[Doc] = []
+        doc, result = apply(folder, local_ops, tab=tc_input.get("tab"), by="agent", if_rev=if_rev, turn=ctx.turn,
+                            replaced=replaced)
         if on_written is not None:
             on_written(folder.name, "edit_doc")
-        return doc, result, _edit_report(before, doc, result, ops)
+        return doc, result, _edit_report(replaced[-1] if replaced else before, doc, result, ops)
 
     try:
         doc, result, text = await ctx.run_in_thread(edit)

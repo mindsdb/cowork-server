@@ -280,15 +280,18 @@ def test_a_shared_doc_republishes_itself_after_edits_settle(client, doc, monkeyp
     edit = lambda text: client.post(_url(doc, "/ops"), json={"ops": [  # noqa: E731
         {"op": "update", "id": lead["id"], "set": {"text": text}}]})
 
+    # Other tests' docs may still be waiting in the shared debouncer: watch this page's key.
+    waiting = lambda: str(page) in republish.pending()  # noqa: E731
     edit("Not shared yet.")
-    assert not republish.pending() and not _wait_for(lambda: calls, timeout=0.4)
+    assert not _wait_for(lambda: calls, timeout=0.4)
+    assert _wait_for(lambda: not waiting())
 
     (page.parent / ".published.json").write_text(json.dumps(
         {"doc.html": {"url": "https://view.example/abc", "report_id": "abc", "published": True}}))
     for text in ("One", "Two", "Three"):  # a burst of typing is one republish
         assert edit(text).status_code == 200
     assert _wait_for(lambda: calls)
-    assert _wait_for(lambda: not republish.pending())
+    assert _wait_for(lambda: not waiting())
     assert calls == [str(page)]
 
     (page.parent / ".published.json").write_text(json.dumps(
@@ -311,7 +314,7 @@ def test_a_republish_waiting_when_sharing_stops_does_not_put_the_page_back(tmp_p
     published.write_text(json.dumps({"doc.html": {"url": "https://view.example/abc", "published": True}}))
     assert republish.schedule(tmp_path) is True
     published.write_text(json.dumps({"doc.html": {"url": "https://view.example/abc", "published": False}}))
-    assert _wait_for(lambda: not republish.pending())
+    assert _wait_for(lambda: str(tmp_path / "doc.html") not in republish.pending())
     assert not _wait_for(lambda: calls, timeout=0.3)
 
 
