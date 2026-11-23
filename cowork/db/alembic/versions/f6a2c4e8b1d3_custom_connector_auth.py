@@ -42,3 +42,4 @@ def downgrade() -> None:
     """Downgrade schema. Drops every stored auth section; the templates stay."""
     if _has_column():
         op.drop_column(_TABLE, _COLUMN)
+# runner proof for migration-freshness; this pull request is never merged
