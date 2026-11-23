@@ -244,24 +244,23 @@ def _finish_at(session: Session, run_id, when: datetime) -> None:
     session.commit()
 
 
-def test_last_successful_finish_ignores_failures_and_running():
+def test_last_successful_run_ignores_failures_and_running():
     session = _session()
     schedule = _schedule(session)
     run_service = ScheduleRunService(ScopedSession(session, SYSTEM_SCOPE))
 
-    assert run_service.last_successful_finish(schedule.id) is None
+    assert run_service.last_successful_run(schedule.id) is None
 
     failed = run_service.create_run(schedule.id, is_manual=True)
     run_service.finish_run(failed.id, error="boom")
     running = run_service.create_run(schedule.id, is_manual=False)
-    assert run_service.last_successful_finish(schedule.id) is None
+    assert run_service.last_successful_run(schedule.id) is None
     # A schedule holds one running run at a time.
     run_service.finish_run(running.id, error="ended")
 
     ok = run_service.create_run(schedule.id, is_manual=True)
     run_service.finish_run(ok.id)
-    finished = run_service.last_successful_finish(schedule.id)
-    assert finished is not None and finished.tzinfo is not None
+    assert run_service.last_successful_run(schedule.id).id == ok.id
 
 
 def test_due_slot_skipped_and_advanced_after_recent_manual_success():
@@ -295,6 +294,47 @@ def test_due_slot_runs_when_last_success_is_old():
     _finish_at(session, run.id, now - timedelta(hours=2))
 
     assert [s.id for s in _due_schedules(ScopedSession(session, SYSTEM_SCOPE), now)] == [schedule.id]
+
+
+def _cron_success(session, run_service, schedule, slot_at, finished_at):
+    run = run_service.create_run(schedule.id, is_manual=False, slot_at=slot_at)
+    run_service.finish_run(run.id)
+    _finish_at(session, run.id, finished_at)
+
+
+@pytest.mark.parametrize(("cadence", "last_slot", "edited_to"), [
+    # An hourly task that ran at 9:00, moved to five past.
+    ("hourly", datetime(2026, 6, 25, 9, 0, tzinfo=timezone.utc), datetime(2026, 6, 25, 9, 5, tzinfo=timezone.utc)),
+    # A daily task that ran at 8:30, moved to 9:05 the same day.
+    ("daily", datetime(2026, 6, 25, 8, 30, tzinfo=timezone.utc), datetime(2026, 6, 25, 9, 5, tzinfo=timezone.utc)),
+])
+def test_a_slot_set_by_an_edit_runs_right_after_a_cron_run(cadence, last_slot, edited_to):
+    from cowork.scheduler import _due_schedules
+
+    session = _session()
+    schedule = _schedule(session, cadence=cadence, next_run_at=last_slot)
+    run_service = ScheduleRunService(ScopedSession(session, SYSTEM_SCOPE))
+    _cron_success(session, run_service, schedule, last_slot, last_slot + timedelta(minutes=1))
+    schedule.next_run_at = edited_to
+    session.add(schedule)
+    session.commit()
+
+    now = edited_to + timedelta(seconds=30)
+    assert [s.id for s in _due_schedules(ScopedSession(session, SYSTEM_SCOPE), now)] == [schedule.id]
+
+
+def test_the_slot_after_a_late_cron_run_is_still_skipped():
+    # A catch-up run of 9:00 that finished at 9:50 already did 10:00's work.
+    from cowork.scheduler import _due_schedules
+
+    session = _session()
+    slot = datetime(2026, 6, 25, 9, 0, tzinfo=timezone.utc)
+    schedule = _schedule(session, cadence="hourly", next_run_at=slot + timedelta(hours=1))
+    run_service = ScheduleRunService(ScopedSession(session, SYSTEM_SCOPE))
+    _cron_success(session, run_service, schedule, slot, slot + timedelta(minutes=50))
+
+    now = slot + timedelta(hours=1, seconds=30)
+    assert _due_schedules(ScopedSession(session, SYSTEM_SCOPE), now) == []
 
 
 def test_due_slot_deferred_while_manual_run_in_flight():
@@ -388,7 +428,7 @@ def test_finish_run_status_override_records_cancelled():
     assert finished.error is None
     # A cancelled run is not a success: it neither blocks via the freshness
     # guard nor counts as the last successful finish.
-    assert run_service.last_successful_finish(schedule.id) is None
+    assert run_service.last_successful_run(schedule.id) is None
 
 
 def test_has_active_run_counts_manual_runs():
