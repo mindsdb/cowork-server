@@ -208,6 +208,24 @@ ALLOWLIST = (
         "shell-free local Code Project commands, refused before execution in org mode",
     ),
     (
+        "coding/check_sandbox.py",
+        "<module>",
+        "subprocess",
+        "import backing desktop-only sandboxed Code Project checks and commit hooks",
+    ),
+    (
+        "coding/check_sandbox.py",
+        "git_metadata",
+        "subprocess.run(git)",
+        "read-only Git directory lookup for a local Code Project folder, refused by _org_mode()",
+    ),
+    (
+        "coding/check_sandbox.py",
+        "run_sandboxed",
+        "subprocess.run",
+        "shell-free commit hook inside the task's Codex sandbox, refused by _org_mode()",
+    ),
+    (
         "coding/workspace.py",
         "<module>",
         "subprocess",

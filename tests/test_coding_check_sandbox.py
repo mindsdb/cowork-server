@@ -85,16 +85,22 @@ def test_sandboxed_checks_follow_the_task_network_setting(tmp_path: Path, networ
 
 
 def test_hooks_may_stage_but_not_change_what_makes_git_run_programs(tmp_path: Path) -> None:
-    common = tmp_path / "repo" / ".git"
+    repo = repository(tmp_path / "repo")
+    worktree = tmp_path / "task"
+    git(repo, "worktree", "add", "-q", "-b", "task", str(worktree))
+    common = (repo / ".git").resolve()
     private = common / "worktrees" / "task"
-    dirs = GitDirectories(common=common, private=private, branch_ref="refs/heads/task")
-    grants = dirs.grants()
+    grants = GitDirectories(common=common, private=private).grants()
+
     assert grants[common] == "read"
     assert grants[private] == "write"
-    assert grants[private / "HEAD"] == "read"
-    assert grants[private / "gitdir"] == "read"
-    assert common / "refs/heads/task" not in grants
-    assert dirs.grants(committing=True)[common / "refs/heads/task"] == "write"
+    assert grants[common / "objects"] == "write"
+    assert grants[common / "refs"] == "write"
+    assert grants[common / "refs" / "heads"] == "read"
+    for read_only in (private / "HEAD", private / "gitdir", private / "commondir"):
+        assert grants[read_only] == "read"
+    # Missing paths are never listed: the Linux sandbox would create stand-ins.
+    assert all(path.exists() for path, access in grants.items() if access == "read")
 
 
 def test_commit_without_checks_runs_no_repository_hook(tmp_path: Path) -> None:
@@ -218,26 +224,53 @@ def test_commit_hooks_run_sandboxed_and_may_restage_and_edit_the_message(
     assert subprocess.run(["git", "config", "core.fsmonitor"], cwd=repo, capture_output=True).returncode != 0
 
 
-@requires_sandbox
-def test_staging_and_commit_use_the_task_sandbox(tmp_path: Path, checks: CheckPolicy, monkeypatch) -> None:
+def test_git_itself_commits_on_the_host_with_hooks_off(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # Signing and credential helpers need the person's own environment, and
+    # plain Git runs no code the agent controls once hooks are off.
     repo = repository(tmp_path / "repo")
     (repo / "README.md").write_text("changed\n", encoding="utf-8")
-    monkeypatch.setenv("INTERNAL_AUTH_HEADER", "test-only")
     calls = []
     real_run = subprocess.run
 
     def record(argv, **kwargs):
-        if "add" in argv or "commit" in argv:
-            calls.append((argv, kwargs["env"]))
+        if "commit" in argv:
+            calls.append(argv)
         return real_run(argv, **kwargs)
 
     monkeypatch.setattr(subprocess, "run", record)
-    WorkspaceManager(tmp_path / "root").commit(str(repo), "Change", checks)
-    assert len(calls) == 2
-    for argv, env in calls:
-        assert argv[1] == "sandbox"
-        assert f"core.hooksPath={os.devnull}" in argv
-        assert "INTERNAL_AUTH_HEADER" not in env
+    manager = WorkspaceManager(tmp_path / "root")
+    manager.commit(str(repo), "Change", manager.check_policy("project", PermissionMode.workspace, False))
+
+    [argv] = calls
+    assert argv[0] == "git" and "--no-verify" in argv
+    assert any(part.startswith("core.hooksPath=") for part in argv)
+
+
+def test_a_read_only_task_cannot_commit(tmp_path: Path) -> None:
+    repo = repository(tmp_path / "repo")
+    (repo / "README.md").write_text("changed\n", encoding="utf-8")
+    manager = WorkspaceManager(tmp_path / "root")
+
+    with pytest.raises(WorkspaceError, match="read-only"):
+        manager.commit(str(repo), "Change", manager.check_policy("project", PermissionMode.read_only, False))
+
+    assert git(repo, "log", "-1", "--format=%s") == "base"
+
+
+@requires_sandbox
+def test_a_hook_that_plants_git_configuration_stops_the_commit(tmp_path: Path, checks: CheckPolicy) -> None:
+    repo = repository(tmp_path / "repo")
+    worktree = tmp_path / "task"
+    git(repo, "worktree", "add", "-q", "-b", "task", str(worktree))
+    private = (repo / ".git" / "worktrees" / "task").resolve()
+    hook(repo, "pre-commit", f"printf '[core]\\n\\tfsmonitor = planted\\n' > '{private}/config.worktree'\n")
+    (worktree / "README.md").write_text("changed\n", encoding="utf-8")
+
+    with pytest.raises(WorkspaceError, match="tried to change Git's configuration"):
+        WorkspaceManager(tmp_path / "root").commit(str(worktree), "Change", checks)
+
+    assert not (private / "config.worktree").exists()
+    assert git(worktree, "log", "-1", "--format=%s") == "base"
 
 
 @requires_sandbox

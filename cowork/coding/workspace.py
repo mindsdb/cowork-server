@@ -10,8 +10,6 @@ import subprocess
 import sys
 import tempfile
 import threading
-from contextlib import contextmanager
-from contextvars import ContextVar
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import IO, TYPE_CHECKING
@@ -33,7 +31,7 @@ from cowork.common.paths import O_NOFOLLOW, open_fd
 from cowork.common.settings.app_settings import get_app_settings
 
 if TYPE_CHECKING:
-    from cowork.coding.check_sandbox import CheckPolicy, GitDirectories
+    from cowork.coding.check_sandbox import CheckPolicy
 
 logger = logging.getLogger(__name__)
 
@@ -176,16 +174,6 @@ def _platform_config_args() -> tuple[str, ...]:
     return ()
 
 
-@dataclass(frozen=True)
-class CommitGitScope:
-    root: Path
-    policy: CheckPolicy
-    directories: GitDirectories
-
-
-_commit_scope: ContextVar[CommitGitScope | None] = ContextVar("commit_git_scope", default=None)
-
-
 class GitRunner:
     """Shell-free Git boundary shared by macOS and Windows."""
 
@@ -206,26 +194,6 @@ class GitRunner:
             raise WorkspaceError("Choose an available local folder")
         return resolved
 
-    @contextmanager
-    def for_commit(self, root: Path, policy: CheckPolicy | None):
-        from cowork.coding.check_sandbox import CheckPolicy, git_directories
-
-        root = root.resolve()
-        active = _commit_scope.get()
-        if active is not None and active.root == root:
-            yield
-            return
-        if policy is None:
-            policy = CheckPolicy.for_task(PermissionMode.full_access, False)
-        if policy.read_only:
-            raise WorkspaceError("This task is read-only and cannot commit changes")
-        scope = CommitGitScope(root, policy, git_directories(self.run, root))
-        token = _commit_scope.set(scope)
-        try:
-            yield
-        finally:
-            _commit_scope.reset(token)
-
     def run(
         self,
         cwd: Path,
@@ -240,24 +208,7 @@ class GitRunner:
             raise WorkspaceError("Local coding workspaces are not available on this deployment")
         working_directory = self._working_directory(cwd)
         try:
-            command = ["git", *_platform_config_args(), *args]
-            scope = _commit_scope.get()
-            if scope is None:
-                child_environment = os.environ.copy()
-            else:
-                from cowork.coding.check_sandbox import check_environment, sandbox_environment, sandboxed_argv
-
-                # Suppress implicit hooks throughout status, staging, commit and rollback.
-                # Hook discovery must see the repository's configured hooks path.
-                if args[:2] != ("rev-parse", "--git-path"):
-                    command[1:1] = ["-c", f"core.hooksPath={os.devnull}"]
-                command = sandboxed_argv(
-                    command, scope.policy, [scope.root], read_only=[scope.root / ".git"],
-                    git=scope.directories, committing=True,
-                )
-                child_environment = sandbox_environment(check_environment(
-                    os.environ, cache_root=scope.policy.cache_root,
-                ), scope.policy)
+            child_environment = os.environ.copy()
             child_environment["GIT_TERMINAL_PROMPT"] = "0"
             child_environment.update(environment or {})
             # This is deliberately assigned after caller-provided values.
@@ -265,7 +216,7 @@ class GitRunner:
             # such as ``ext`` at the execution boundary.
             child_environment["GIT_ALLOW_PROTOCOL"] = ALLOWED_GIT_PROTOCOLS
             result = subprocess.run(
-                command,
+                ["git", *_platform_config_args(), *args],
                 # The directory is an explicit desktop capability selected by
                 # the user and validated above. Git is fixed, arguments are an
                 # argv array, and shell execution is disabled.
@@ -732,10 +683,12 @@ class WorkspaceManager:
         runs none of them itself. With ``checks``, the supported ones run
         inside the task's sandbox first; without it, none run.
         """
-        with self._mutation_lock, self.git.for_commit(Path(workspace_path), checks):
+        with self._mutation_lock:
             root = Path(workspace_path)
             if not message.strip():
                 raise WorkspaceError("Commit message cannot be empty")
+            if checks is not None and checks.read_only:
+                raise WorkspaceError("This task is read-only and cannot commit changes")
             # Before staging anything: a direct-folder task commits through
             # here without the project-level preflight.
             self.check_git_identity(str(root))
@@ -745,8 +698,10 @@ class WorkspaceManager:
                 message_file.write_text(message.strip() + "\n", encoding="utf-8")
                 if checks is not None:
                     self._run_commit_hooks(root, message_file, checks)
+                no_hooks = Path(scratch) / "no-hooks"
+                no_hooks.mkdir()
                 self.git.run(
-                    root, "commit", "--no-verify", "--file", str(message_file),
+                    root, "-c", f"core.hooksPath={no_hooks}", "commit", "--no-verify", "--file", str(message_file),
                 )
             return self.git_state(str(root), str(root))
 
@@ -764,6 +719,7 @@ class WorkspaceManager:
             if path is None:
                 continue
             arguments = (str(message_file),) if name == "commit-msg" else ()
+            before = directories.control_files()
             try:
                 result = check_sandbox.run_sandboxed(
                     check_sandbox.hook_argv(path, *arguments),
@@ -777,6 +733,15 @@ class WorkspaceManager:
                 raise WorkspaceError(f"The {name} hook did not finish in time") from exc
             except OSError as exc:
                 raise WorkspaceError(f"The {name} hook could not run: {exc}") from exc
+            planted = directories.control_files() - before
+            if planted:
+                # Git would read these on the host, outside the sandbox.
+                for path in planted:
+                    if path.is_dir() and not path.is_symlink():
+                        force_remove(path)
+                    else:
+                        path.unlink(missing_ok=True)
+                raise WorkspaceError(f"The {name} hook tried to change Git's configuration, so nothing was committed")
             if result.returncode != 0:
                 output = "\n".join(part.strip() for part in (result.stdout, result.stderr) if part.strip())
                 raise WorkspaceError((f"The {name} hook failed" + (f":\n{output}" if output else ""))[:4_000])

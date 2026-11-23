@@ -19,7 +19,7 @@ from pathlib import Path
 
 from cowork.coding.contracts import PermissionMode
 from cowork.coding.engines.codex_config import toml_string
-from cowork.coding.workspace import WorkspaceError
+from cowork.coding.workspace import WorkspaceError, _org_mode
 
 # A new server variable stays private unless it is deliberately listed here.
 # These names cover process launch, paths, locale and Git author identity on
@@ -29,7 +29,13 @@ _PLATFORM_ENVIRONMENT = {
     "SYSTEMROOT", "WINDIR", "COMSPEC", "USERPROFILE", "HOMEDRIVE", "HOMEPATH",
     "APPDATA", "LOCALAPPDATA", "PROGRAMDATA", "PROGRAMFILES", "PROGRAMFILES(X86)",
     "LANG", "LANGUAGE", "LC_ALL", "LC_CTYPE", "LC_MESSAGES", "LC_TIME", "TZ",
-    "JAVA_HOME", "EMAIL", "GIT_CONFIG_GLOBAL", "GIT_CONFIG_NOSYSTEM", "GIT_AUTHOR_NAME", "GIT_AUTHOR_EMAIL", "GIT_COMMITTER_NAME", "GIT_COMMITTER_EMAIL",
+    "EMAIL", "GIT_CONFIG_GLOBAL", "GIT_CONFIG_NOSYSTEM", "GIT_AUTHOR_NAME", "GIT_AUTHOR_EMAIL", "GIT_COMMITTER_NAME", "GIT_COMMITTER_EMAIL",
+    # Toolchain homes that test runners resolve from the environment.
+    "JAVA_HOME", "GOPATH", "GOROOT", "CARGO_HOME", "RUSTUP_HOME", "NVM_DIR", "PYENV_ROOT",
+    "VIRTUAL_ENV", "CONDA_PREFIX", "ANDROID_HOME", "ANDROID_SDK_ROOT",
+    # Corporate networks: a proxy and its CA bundle are machine settings, not secrets.
+    "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "ALL_PROXY",
+    "SSL_CERT_FILE", "SSL_CERT_DIR", "REQUESTS_CA_BUNDLE", "NODE_EXTRA_CA_CERTS", "CURL_CA_BUNDLE",
 }
 # Tools that otherwise write caches under the home folder, which the sandbox
 # keeps read-only. A per-project cache keeps them working without letting a
@@ -101,37 +107,48 @@ def check_environment(
     return environment
 
 
+# Files that make Git run a program or read its settings from somewhere else.
+# A hook must not leave one behind for the next host-side Git command.
+_GIT_CONTROL_FILES = ("config", "config.worktree", "commondir", "gitdir", "hooks", "modules")
+
+
 @dataclass(frozen=True)
 class GitDirectories:
     """Where a repository keeps what a hook may change and what it must not."""
 
     common: Path
     private: Path
-    branch_ref: str | None = None
 
-    def grants(self, *, committing: bool = False) -> dict[Path, str]:
-        # A linked worktree shares its object database and branch refs with
-        # other checkouts. Limit writes to staging data and this task's ref.
-        # Git stash uses process-specific temporary index files in the
-        # private directory. Keep shared refs and executable configuration
-        # protected even when this is the repository's primary checkout.
+    def grants(self) -> dict[Path, str]:
+        # A linked worktree shares its object database and refs with other
+        # checkouts, so a hook may write only staging data, new objects and
+        # the stash. Only existing paths are listed: on Linux the sandbox
+        # creates a stand-in for a missing path, which Git then misreads.
         grants = {self.common: "read", self.private: "write", self.common / "objects": "write"}
-        for name in ("config", "config.worktree", "hooks", "modules", "worktrees", "info",
-                     "refs", "logs/refs", "packed-refs", "packed-refs.lock", "commondir", "gitdir", "HEAD"):
-            grants[self.private / name] = "read"
-        grants[self.common / "objects/info"] = "read"
-        # Stash-backed formatters need the stash ref even in a linked worktree.
-        refs = ["refs/stash"]
-        if committing and self.branch_ref:
-            refs.append(self.branch_ref)
-        if committing:
-            grants[self.private / "HEAD"] = "write"
-        for ref in refs:
-            for prefix in ("", "logs/"):
-                path = self.common / (prefix + ref)
-                grants[path] = "write"
-                grants[path.with_name(path.name + ".lock")] = "write"
+        protected = [self.common / "objects" / "info"]
+        protected += [self.private / name for name in (*_GIT_CONTROL_FILES, "worktrees", "info", "refs", "logs/refs", "packed-refs", "HEAD")]
+        grants.update({path: "read" for path in protected if path.exists()})
+        # Stash-backed formatters such as lint-staged keep their backup in
+        # refs/stash. Git writes a ref by renaming a lock file into place, and
+        # the Linux sandbox cannot grant a file that does not exist yet, so
+        # the refs folders stay writable while branches, tags and remotes
+        # inside them stay read-only.
+        for refs in (self.common / "refs", self.common / "logs" / "refs"):
+            if refs.is_dir():
+                grants[refs] = "write"
+                grants.update({
+                    path: "read" for path in (refs / name for name in ("heads", "tags", "remotes")) if path.exists()
+                })
         return grants
+
+    def control_files(self) -> set[Path]:
+        """The Git control files that exist now, to compare after a hook."""
+        return {
+            path
+            for directory in {self.common, self.private}
+            for path in (directory / name for name in _GIT_CONTROL_FILES)
+            if path.exists() or path.is_symlink()
+        }
 
 
 def sandbox_codex() -> Path:
@@ -150,7 +167,6 @@ def sandboxed_argv(
     git: GitDirectories | None = None,
     read_only: Sequence[Path] = (),
     codex: Path | None = None,
-    committing: bool = False,
 ) -> list[str]:
     """Wrap a command so it runs inside the task's sandbox.
 
@@ -170,7 +186,7 @@ def sandboxed_argv(
         filesystem.update({str(root): "write" for root in roots})
         filesystem.update({str(Path(path).resolve()): "read" for path in read_only})
         if git is not None:
-            for path, access in git.grants(committing=committing).items():
+            for path, access in git.grants().items():
                 if path.resolve() != path:
                     raise WorkspaceError("Cannot grant commit access through symbolic links in Git metadata")
                 filesystem[str(path)] = access
@@ -206,6 +222,8 @@ def sandbox_environment(environment: Mapping[str, str], policy: CheckPolicy) -> 
 
 def git_metadata(root: Path) -> list[Path]:
     """A folder's Git directories, which a check must not change."""
+    if _org_mode():
+        raise WorkspaceError("Local Code Project commands are not available on this deployment")
     paths = [root / ".git"]
     result = subprocess.run(
         ["git", "rev-parse", "--absolute-git-dir", "--git-common-dir"],
@@ -219,9 +237,7 @@ def git_metadata(root: Path) -> list[Path]:
 def git_directories(git_run, root: Path) -> GitDirectories:
     common = git_run(root, "rev-parse", "--git-common-dir").stdout.strip()
     private = git_run(root, "rev-parse", "--absolute-git-dir").stdout.strip()
-    ref = git_run(root, "symbolic-ref", "--quiet", "HEAD", check=False).stdout.strip()
-    branch_ref = ref if ref.startswith("refs/heads/") and ".." not in ref.split("/") else None
-    return GitDirectories(common=(root / common).resolve(), private=Path(private).resolve(), branch_ref=branch_ref)
+    return GitDirectories(common=(root / common).resolve(), private=Path(private).resolve())
 
 
 def hook_path(git_run, root: Path, name: str) -> Path | None:
@@ -256,6 +272,8 @@ def run_sandboxed(
     git: GitDirectories | None = None,
     timeout: int = HOOK_TIMEOUT_SECONDS,
 ) -> subprocess.CompletedProcess[str]:
+    if _org_mode():
+        raise WorkspaceError("Local Code Project commands are not available on this deployment")
     return subprocess.run(
         sandboxed_argv(argv, policy, writable, git=git),
         cwd=str(cwd),
