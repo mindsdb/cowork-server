@@ -610,6 +610,7 @@ class ProjectWorkspaceManager:
         # before touching any of them rather than after a rolled-back attempt.
         for workspace in repositories:
             self.workspaces.check_git_identity(workspace.workspace_path)
+            self.workspaces.check_no_operation_in_progress(workspace.workspace_path)
         states: list[GitState] = []
         checkpoints: list[tuple[TaskWorkspace, str]] = []
         try:

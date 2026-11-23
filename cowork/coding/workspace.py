@@ -759,6 +759,7 @@ class WorkspaceManager:
             # Before staging anything: a direct-folder task commits through
             # here without the project-level preflight.
             self.check_git_identity(str(root))
+            self.check_no_operation_in_progress(str(root))
             with tempfile.TemporaryDirectory(prefix="cowork-commit-", ignore_cleanup_errors=True) as scratch:
                 message_file = Path(scratch) / "COMMIT_EDITMSG"
                 message_file.write_text(message.strip() + "\n", encoding="utf-8")
@@ -771,22 +772,54 @@ class WorkspaceManager:
                 self._record_commit(root, message_file.read_text(encoding="utf-8"))
             return self.git_state(str(root), str(root))
 
+    def check_no_operation_in_progress(self, workspace_path: str) -> None:
+        """Refuse to commit over a merge, cherry-pick, revert or rebase Git is in the middle of.
+
+        Cowork records a plain commit, which would drop the extra parent and
+        leave Git still reporting the operation.
+        """
+        root = Path(workspace_path)
+        for marker, operation in (
+            ("MERGE_HEAD", "merge"),
+            ("CHERRY_PICK_HEAD", "cherry-pick"),
+            ("REVERT_HEAD", "revert"),
+            ("rebase-merge", "rebase"),
+            ("rebase-apply", "rebase"),
+        ):
+            raw = self.git.run(root, "rev-parse", "--git-path", marker).stdout.strip()
+            path = Path(raw) if Path(raw).is_absolute() else root / raw
+            if path.exists():
+                raise WorkspaceError(f"A {operation} is in progress in {root.name}. Finish it with Git, then commit again.")
+
     def _record_commit(self, root: Path, message: str) -> None:
-        """Commit the index without reading the working tree."""
-        message = self.git.run(root, "stripspace", input_text=message).stdout
+        """Commit the index without reading the working tree.
+
+        Git runs from an empty folder with the repository named explicitly,
+        so a signing program cannot pick up project code from the task's
+        folder through its own module or plugin lookup.
+        """
+        git_dir = self.git.run(root, "rev-parse", "--absolute-git-dir").stdout.strip()
+        with tempfile.TemporaryDirectory(prefix="cowork-record-", ignore_cleanup_errors=True) as neutral:
+            self._record_commit_in(Path(neutral), {"GIT_DIR": git_dir}, root, message)
+
+    def _record_commit_in(self, cwd: Path, environment: dict[str, str], root: Path, message: str) -> None:
+        def git(*args: str, **kwargs):
+            return self.git.run(cwd, *args, environment=environment, **kwargs)
+
+        message = git("stripspace", input_text=message).stdout
         if not message.strip():
             raise WorkspaceError("Commit message cannot be empty")
-        tree = self.git.run(root, "write-tree").stdout.strip()
-        parent = self.git.run(root, "rev-parse", "--verify", "--quiet", "HEAD^{commit}", check=False).stdout.strip()
-        if parent and tree == self.git.run(root, "rev-parse", f"{parent}^{{tree}}").stdout.strip():
+        tree = git("write-tree").stdout.strip()
+        parent = git("rev-parse", "--verify", "--quiet", "HEAD^{commit}", check=False).stdout.strip()
+        if parent and tree == git("rev-parse", f"{parent}^{{tree}}").stdout.strip():
             raise WorkspaceError("There are no changes to commit")
         arguments = ["commit-tree", tree, *(("-p", parent) if parent else ())]
-        if self.git.run(root, "config", "--type=bool", "--get", "commit.gpgSign", check=False).stdout.strip() == "true":
+        if git("config", "--type=bool", "--get", "commit.gpgSign", check=False).stdout.strip() == "true":
             self._refuse_task_signing_program(root)
             arguments.append("-S")
-        revision = self.git.run(root, *arguments, input_text=message).stdout.strip()
+        revision = git(*arguments, input_text=message).stdout.strip()
         subject = message.splitlines()[0][:200]
-        self.git.run(root, "update-ref", "-m", f"commit: {subject}", "HEAD", revision, *((parent,) if parent else ()))
+        git("update-ref", "-m", f"commit: {subject}", "HEAD", revision, *((parent,) if parent else ()))
 
     def _refuse_task_signing_program(self, root: Path) -> None:
         """Sign only with a program outside the task's own files."""
@@ -845,25 +878,25 @@ class WorkspaceManager:
         except OSError as exc:
             raise WorkspaceError(f"{label} could not run: {exc}") from exc
         finally:
-            # However the step ended, a control file it planted must not
-            # reach the next host-side Git command, where it would run code
-            # outside the sandbox. For a task worktree these sit in the task's
-            # own Git directory. For a task in the person's folder they are
-            # the repository's, and are removed all the same.
+            # However the step ended, a new control file must not reach the
+            # next host-side Git command, where it would run code outside the
+            # sandbox. A task worktree's own Git directory has no other
+            # writer, so what appears there is removed. Anywhere else Cowork
+            # cannot tell who made it, so it stops and leaves it in place.
             planted, added_refs = directories.left_behind(before)
-            for planted_path in planted:
-                if planted_path.is_dir() and not planted_path.is_symlink():
-                    force_remove(planted_path)
-                else:
-                    planted_path.unlink(missing_ok=True)
-        if planted:
+            if directories.task_owned:
+                for planted_path in planted:
+                    if planted_path.is_dir() and not planted_path.is_symlink():
+                        force_remove(planted_path)
+                    else:
+                        planted_path.unlink(missing_ok=True)
+        if planted and directories.task_owned:
             raise WorkspaceError(f"{label} tried to change Git's configuration, so nothing was committed")
-        if added_refs:
-            # Another worktree may have made these, so they are left alone.
-            names = ", ".join(sorted(path.name for path in added_refs))
+        unexplained = sorted(str(path) for path in added_refs | (set() if directories.task_owned else planted))
+        if unexplained:
             raise WorkspaceError(
-                f"New Git references ({names}) appeared while {label.lower()} ran, so nothing was committed. "
-                "Check them and commit again."
+                f"Git files appeared while {label.lower()} ran, so nothing was committed: {', '.join(unexplained)}. "
+                "Cowork left them in place. Remove any you didn't create, then commit again."
             )
         if result.returncode != 0:
             output = "\n".join(part.strip() for part in (result.stdout, result.stderr) if part.strip())

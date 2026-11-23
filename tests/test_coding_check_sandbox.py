@@ -149,8 +149,13 @@ def test_hooks_may_stage_but_not_change_what_makes_git_run_programs(tmp_path: Pa
         assert grants[common / "refs" / "stash"] == "write"
     for read_only in (private / "HEAD", private / "gitdir", private / "commondir"):
         assert grants[read_only] == "read"
-    # Missing paths are never listed: the Linux sandbox would create stand-ins.
-    assert all(path.exists() for path, access in grants.items() if access == "read")
+    missing = {path.name for path, access in grants.items() if access == "read" and not path.exists()}
+    if sys.platform.startswith("linux"):
+        # The Linux sandbox would create a stand-in for a missing path.
+        assert missing == set()
+    else:
+        # Elsewhere a missing control file is listed so nothing can create it.
+        assert missing <= {"config", "config.worktree", "commondir", "gitdir", "hooks", "modules"}
 
 
 def test_commit_without_checks_runs_no_repository_hook(tmp_path: Path) -> None:
@@ -312,40 +317,75 @@ def test_a_read_only_task_cannot_commit(tmp_path: Path) -> None:
     assert git(repo, "log", "-1", "--format=%s") == "base"
 
 
-@requires_sandbox
-def test_a_hook_that_plants_git_configuration_stops_the_commit(tmp_path: Path, checks: CheckPolicy) -> None:
+def task_worktree(tmp_path: Path) -> tuple[Path, Path, Path]:
     repo = repository(tmp_path / "repo")
     worktree = tmp_path / "task"
     git(repo, "worktree", "add", "-q", "-b", "task", str(worktree))
-    private = (repo / ".git" / "worktrees" / "task").resolve()
-    hook(repo, "pre-commit", f"printf '[core]\\n\\tfsmonitor = planted\\n' > '{private}/config.worktree'\n")
     (worktree / "README.md").write_text("changed\n", encoding="utf-8")
+    return repo, worktree, (repo / ".git" / "worktrees" / "task").resolve()
 
-    with pytest.raises(WorkspaceError, match="tried to change Git's configuration"):
+
+def plant_then(outcome):
+    """A sandboxed step that writes a Git control file, then ends as given."""
+    def run(argv, *, cwd, **_kwargs):
+        private = Path(subprocess.run(["git", "rev-parse", "--absolute-git-dir"], cwd=cwd, capture_output=True, text=True).stdout.strip())
+        (private / "config.worktree").write_text("[core]\n\tfsmonitor = planted\n", encoding="utf-8")
+        if isinstance(outcome, BaseException):
+            raise outcome
+        return subprocess.CompletedProcess(argv, outcome, stdout="", stderr="")
+    return run
+
+
+@pytest.mark.parametrize("outcome", [0, 1, subprocess.TimeoutExpired(["hook"], 3)])
+def test_what_a_step_plants_in_a_task_worktree_is_removed_however_it_ends(
+    tmp_path: Path, checks: CheckPolicy, monkeypatch: pytest.MonkeyPatch, outcome,
+) -> None:
+    from cowork.coding import check_sandbox
+
+    _repo, worktree, private = task_worktree(tmp_path)
+    monkeypatch.setattr(check_sandbox, "run_sandboxed", plant_then(outcome))
+
+    with pytest.raises(WorkspaceError):
         WorkspaceManager(tmp_path / "root").commit(str(worktree), "Change", checks)
 
     assert not (private / "config.worktree").exists()
     assert git(worktree, "log", "-1", "--format=%s") == "base"
 
 
-@requires_sandbox
-def test_a_timed_out_hook_still_has_what_it_planted_removed(
+def test_a_control_file_in_a_local_folder_is_reported_and_left_in_place(
     tmp_path: Path, checks: CheckPolicy, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    # A local folder's Git directory is the person's repository; another tool
+    # may have written there at the same moment.
     from cowork.coding import check_sandbox
 
     repo = repository(tmp_path / "repo")
-    worktree = tmp_path / "task"
-    git(repo, "worktree", "add", "-q", "-b", "task", str(worktree))
-    private = (repo / ".git" / "worktrees" / "task").resolve()
-    hook(repo, "pre-commit", f"printf '[core]\\n' > '{private}/config.worktree'\nsleep 30\n")
-    (worktree / "README.md").write_text("changed\n", encoding="utf-8")
-    monkeypatch.setattr(check_sandbox, "HOOK_TIMEOUT_SECONDS", 3)
+    (repo / "README.md").write_text("changed\n", encoding="utf-8")
+    monkeypatch.setattr(check_sandbox, "run_sandboxed", plant_then(0))
 
-    with pytest.raises(WorkspaceError, match="did not finish in time"):
-        WorkspaceManager(tmp_path / "root").commit(str(worktree), "Change", checks)
+    with pytest.raises(WorkspaceError, match="Cowork left them in place"):
+        WorkspaceManager(tmp_path / "root").commit(str(repo), "Change", checks)
+
+    assert (repo / ".git" / "config.worktree").exists()
+    assert git(repo, "log", "-1", "--format=%s") == "base"
+
+
+@requires_sandbox
+@pytest.mark.parametrize("local_folder", [True, False])
+def test_a_hook_cannot_create_git_control_files_on_macos(tmp_path: Path, checks: CheckPolicy, local_folder: bool) -> None:
+    if local_folder:
+        repo = folder = repository(tmp_path / "repo")
+        (folder / "README.md").write_text("changed\n", encoding="utf-8")
+        private = (repo / ".git").resolve()
+    else:
+        repo, folder, private = task_worktree(tmp_path)
+    hook(repo, "pre-commit", f"printf '[core]\\n' > '{private}/config.worktree' && touch '{private}/commondir'\nexit 0\n")
+
+    WorkspaceManager(tmp_path / "root").commit(str(folder), "Change", checks)
 
     assert not (private / "config.worktree").exists()
+    assert not (private / "commondir").exists() or not local_folder
+    assert git(folder, "log", "-1", "--format=%s") == "Change"
 
 
 @requires_sandbox
@@ -411,7 +451,7 @@ def test_an_unattributed_new_reference_is_reported_but_never_deleted(
     monkeypatch.setattr(check_sandbox, "run_sandboxed", another_worktree_adds_a_note)
     (repo / "README.md").write_text("changed\n", encoding="utf-8")
 
-    with pytest.raises(WorkspaceError, match=r"New Git references \(notes\)"):
+    with pytest.raises(WorkspaceError, match=r"Git files appeared .*notes"):
         WorkspaceManager(tmp_path / "root").commit(str(repo), "Change", checks)
 
     assert (notes / "commits").exists()
@@ -533,3 +573,38 @@ def test_host_status_never_runs_a_filter_script_from_the_task(tmp_path: Path) ->
 
     assert state.dirty
     assert not marker.exists()
+
+
+def test_an_unfinished_merge_is_left_for_git_to_finish(tmp_path: Path) -> None:
+    repo = repository(tmp_path / "repo")
+    git(repo, "switch", "-q", "-c", "side")
+    (repo / "side.txt").write_text("side\n", encoding="utf-8")
+    git(repo, "add", ".")
+    git(repo, "commit", "-q", "-m", "side")
+    git(repo, "switch", "-q", "-")
+    git(repo, "merge", "--no-ff", "--no-commit", "side")
+    head = git(repo, "rev-parse", "HEAD")
+
+    with pytest.raises(WorkspaceError, match="merge is in progress"):
+        WorkspaceManager(tmp_path / "root").commit(str(repo), "Merge side")
+
+    assert git(repo, "rev-parse", "HEAD") == head
+    assert (repo / ".git" / "MERGE_HEAD").exists()
+
+
+@requires_ssh_signing
+def test_the_signing_program_runs_outside_the_task_folder(tmp_path: Path) -> None:
+    repo = signing_repository(tmp_path)
+    marker = tmp_path / "signer-cwd"
+    signer = tmp_path / "bin" / "sign"
+    signer.parent.mkdir()
+    signer.write_text(f"#!/bin/sh\npwd -P > '{marker}'\nexec ssh-keygen \"$@\"\n", encoding="utf-8")
+    signer.chmod(signer.stat().st_mode | stat.S_IXUSR)
+    git(repo, "config", "gpg.ssh.program", str(signer))
+    (repo / "README.md").write_text("changed\n", encoding="utf-8")
+
+    WorkspaceManager(tmp_path / "root").commit(str(repo), "Change")
+
+    ran_in = Path(marker.read_text(encoding="utf-8").strip())
+    assert repo.resolve() != ran_in and repo.resolve() not in ran_in.parents
+    assert "gpgsig" in git(repo, "cat-file", "commit", "HEAD")

@@ -143,7 +143,14 @@ class GitDirectories:
         grants = {self.common: "read", self.private: "write", self.common / "objects": "write"}
         protected = [self.common / "objects" / "info"]
         protected += [self.private / name for name in (*_GIT_CONTROL_FILES, "worktrees", "info", "refs", "logs/refs", "packed-refs", "HEAD")]
-        grants.update({path: "read" for path in protected if path.exists()})
+        # Only existing paths are listed on Linux, where the sandbox would
+        # create a stand-in for a missing one. Elsewhere a missing control file
+        # is listed too, so a sandboxed step cannot create it at all.
+        grants.update({
+            path: "read"
+            for path in protected
+            if path.exists() or (not _GRANTS_FOLDERS_FOR_NEW_FILES and path.name in _GIT_CONTROL_FILES)
+        })
         # Stash-backed formatters such as lint-staged keep their backup in
         # refs/stash. Git writes a ref by renaming a lock file into place.
         # macOS and Windows can grant exactly those files. The Linux sandbox
@@ -167,6 +174,16 @@ class GitDirectories:
         }
         refs = {entry for folder in self._ref_folders() for entry in folder.iterdir() if entry.name not in _STASH_ENTRIES}
         return files, refs
+
+    @property
+    def task_owned(self) -> bool:
+        """Whether the private Git directory belongs to a task worktree alone.
+
+        A linked worktree's directory is written only by Git in that worktree.
+        A local folder's Git directory is the person's repository, where
+        another tool may be working at the same time.
+        """
+        return self.private != self.common
 
     def left_behind(self, before: tuple[set[Path], set[Path]]) -> tuple[set[Path], set[Path]]:
         """New control files in the task's Git directory, and new refs entries."""
