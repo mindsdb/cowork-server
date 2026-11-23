@@ -23,7 +23,7 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import FileResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from sqlmodel import Session
 
 from cowork.services.product_permissions import require_product_permission
@@ -42,7 +42,7 @@ from cowork.api.v1.artifact_preview import (
     wants_comment_layer,
     wants_html_preview,
 )
-from cowork.api.v1.artifact_scope import scoped_project_id_for_request
+from cowork.api.v1.artifact_scope import review_artifact_and_read, scoped_project_id_for_request
 from cowork.db.units import FilesystemBusy, run_db, run_efs, run_on_unit_threads
 from cowork.common.logger import log_context
 from cowork.common.paths import dir_scandir, dir_stat, open_pinned_child
@@ -860,6 +860,99 @@ def _desktop_artifact_status_for_path(path: str, *, scope: TenantScope | None) -
         except (OSError, ValueError):
             continue
     return ArtifactStatusView()
+
+
+class _SharedArtifactRef(BaseModel):
+    project_id: UUID
+    artifact_id: UUID
+
+
+class _LegacyShareLink(BaseModel):
+    url: str = Field(min_length=1, max_length=2048, pattern=r"^https://")
+
+
+def _legacy_share_ref(plan: RootsPlan, url: str, org_id: str) -> tuple[str, str] | None:
+    """Old notifications carried only a URL. Compare it with publish records in
+    listed roots. A link is never fetched or used as a filesystem path."""
+    from cowork.services.artifact_identity import _opened_child_directory, opened_artifact_root, read_full_id
+    from cowork.services.artifacts import _load_published_map_pinned
+
+    from cowork.services.artifact_draft_review import draft_review_allows
+    from cowork.services.artifact_roots import discover_roots
+
+    roots = discover_roots(plan)
+    listed = {source.base for source in roots.sources()}
+    match = None
+    for source in roots.unfiltered():
+        if not source.project_id:
+            continue
+        try:
+            with opened_artifact_root(source) as root, dir_scandir(root) as entries:
+                for entry in entries:
+                    if entry.name.startswith(".") or not entry.is_dir(follow_symlinks=False):
+                        continue
+                    try:
+                        with _opened_child_directory(root, entry.name) as folder:
+                            records = _load_published_map_pinned(folder)
+                            if any(isinstance(row, dict) and row.get("url") == url and row.get("published", True)
+                                   for row in records.values()):
+                                artifact_id, _ = read_full_id(folder)
+                                if source.base not in listed and not draft_review_allows(folder.path, org_id):
+                                    continue
+                                if match is not None:
+                                    return None
+                                match = str(source.project_id), artifact_id
+                    except (OSError, ValueError):
+                        continue
+        except (OSError, ValueError):
+            continue
+    return match
+
+
+def _shared_preview_card(found, *, artifact_id: str, url: str | None):
+    from cowork.services.artifact_identity import _opened_child_directory, opened_artifact_root
+    from cowork.services.artifacts import _listed_card_for_pinned_folder
+
+    source = found.source
+    with opened_artifact_root(source) as root, _opened_child_directory(root, found.folder.name) as folder:
+        card = _listed_card_for_pinned_folder(
+            found.folder, 0, project_id=source.project_id, project_name=source.project_name,
+            pinned_folder=folder, pinned_root=root, artifacts_base=source.base,
+        )
+    if card is None or card.id != artifact_id or not card.draft_url or (url and card.published_url != url):
+        raise HTTPException(404, "Artifact not found")
+    # The notification opens a read-only preview. Owner controls and sharing
+    # settings belong to the ordinary workspace, not this response.
+    return {
+        "id": card.id, "projectId": card.project_id, "path": card.path, "title": card.title,
+        "ext": card.ext, "type": card.type, "draftUrl": card.draft_url, "mtime": card.mtime,
+        "capabilities": {"role": "reviewer", "canEdit": False},
+    }
+
+
+@router.post("/shared-preview", dependencies=[Depends(require(AuthenticatedInOrgMode))])
+async def shared_artifact_preview(body: _SharedArtifactRef | _LegacyShareLink, scope: ScopeDep):
+    """Resolve a notification with the same authorization as the draft bytes."""
+    if not scope.org_mode:
+        raise HTTPException(404, "Artifact not found")
+    url = None
+    if isinstance(body, _LegacyShareLink):
+        url = body.url
+        plan = await run_db(lambda unit: with_held_roots(unit, plan_scope_roots(unit)), scope=scope)
+        ref = await run_efs(partial(_legacy_share_ref, plan, url, scope.org_id), scope=scope)
+        if ref is None:
+            raise HTTPException(404, "Artifact not found")
+        project_ref, artifact_id = ref
+    else:
+        project_ref, artifact_id = str(body.project_id), body.artifact_id.hex
+    try:
+        reviewed = await review_artifact_and_read(
+            scope, project_ref, artifact_id,
+            read=partial(_shared_preview_card, artifact_id=artifact_id, url=url),
+        )
+    except FileNotFoundError:
+        raise HTTPException(404, "Artifact not found") from None
+    return reviewed.value
 
 
 # require(AuthenticatedInOrgMode), declared explicitly, refuses a caller with

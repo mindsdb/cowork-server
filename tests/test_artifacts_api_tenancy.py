@@ -133,6 +133,48 @@ async def test_list_returns_own_org_artifacts(session, tmp_path, org_mode):
     assert "dash" in [c["slug"] for c in cards]
 
 
+async def test_shared_preview_finds_an_older_image_by_ref_and_legacy_link(session, tmp_path, org_mode):
+    from cowork.services.artifact_draft_review import disable_draft_review, enable_draft_review
+
+    row, folder = _project_with_artifact(session, tmp_path, name="charts", org_id=ORG_A, slug="old-image")
+    (folder / "index.html").unlink()
+    (folder / "chart.png").write_bytes(b"png")
+    (folder / "metadata.json").write_text(json.dumps({"slug": "old-image", "name": "Old chart", "type": "file"}))
+    url = "https://view.example/a/old-chart/"
+    (folder / ".published.json").write_text(json.dumps({"chart.png": {"url": url}}))
+    artifact_id, _ = ensure_full_id(folder)
+    for index in range(ep.LIST_CARDS):
+        newer = folder.parent / f"newer-{index}"
+        newer.mkdir()
+        (newer / "index.html").write_text("Newer")
+        (newer / "metadata.json").write_text(json.dumps({"slug": newer.name, "name": newer.name, "type": "html-app"}))
+    owner = TenantScope(org_mode=True, org_id=ORG_A, user_id=USER_A)
+    recent = await ep.list_artifacts(owner, project_id=None, project_path=None)
+    assert len(recent) == ep.LIST_CARDS and artifact_id not in [card["id"] for card in recent]
+    reviewer = TenantScope(org_mode=True, org_id=ORG_A, user_id=USER_A2)
+    ref = ep._SharedArtifactRef(project_id=row.id, artifact_id=artifact_id)
+    legacy = ep._LegacyShareLink(url=url)
+    for target in (ref, legacy):
+        with pytest.raises(HTTPException) as denied:
+            await ep.shared_artifact_preview(target, reviewer)
+        assert denied.value.status_code == 404
+    enable_draft_review(folder, org_id=ORG_A, enabled_by=USER_A)
+    for target in (ref, legacy):
+        preview = await ep.shared_artifact_preview(target, reviewer)
+        assert preview["id"] == artifact_id
+        assert preview["ext"] == ".png" and preview["draftUrl"].endswith("/chart.png")
+        assert preview["capabilities"]["canEdit"] is False
+        with pytest.raises(HTTPException) as denied:
+            await ep.shared_artifact_preview(target, TenantScope(org_mode=True, org_id=ORG_B, user_id=USER_A2))
+        assert denied.value.status_code == 404
+
+    assert disable_draft_review(folder)
+    for target in (ref, legacy):
+        with pytest.raises(HTTPException) as revoked:
+            await ep.shared_artifact_preview(target, reviewer)
+        assert revoked.value.status_code == 404
+
+
 async def test_list_hides_other_org_artifacts(session, tmp_path, org_mode):
     _project_with_artifact(session, tmp_path, name="mine", org_id=ORG_A, slug="dash")
     _project_with_artifact(session, tmp_path, name="theirs", org_id=ORG_B, slug="secret")

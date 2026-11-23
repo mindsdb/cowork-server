@@ -1408,7 +1408,7 @@ async def artifact_audience(
     )
 
 
-def _push_share(scope, principal: Principal | None, notices: list) -> None:
+def _push_share(scope, principal: Principal | None, notices: list, *, artifact_ref: str) -> None:
     """Push the people the save asked to notify, the ones MindsHub emails:
     individuals by id only. People named by address alone, and the members
     of a team or the whole organization a share opens to, get no push, as
@@ -1424,6 +1424,7 @@ def _push_share(scope, principal: Principal | None, notices: list) -> None:
                 recipient_ids=notice.recipients.user_ids,
                 artifact_title=notice.artifact_title,
                 url=notice.artifact_url,
+                artifact_ref=artifact_ref,
             )
     except Exception:
         logger.warning("Could not push an artifact share", exc_info=True, extra={"event": "push_share_failed"})
@@ -1553,7 +1554,7 @@ async def _publish_live(
                 ),
                 timeout=_LIVE_PUBLISH_TIMEOUT_S,
             )
-            _push_share(scope, principal, notices)
+            _push_share(scope, principal, notices, artifact_ref=f"{source.project_id}/{artifact_id}")
             return published
         except asyncio.TimeoutError as exc:
             publish_abandoned = True
