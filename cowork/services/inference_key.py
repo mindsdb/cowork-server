@@ -21,7 +21,8 @@ from cowork.common.settings.runtime_credential import InferenceKey
 
 logger = logging.getLogger(__name__)
 
-# Auth's bound for a desktop key; an older anton's scratchpad keeps the key it was built with.
+# Auth's bound for a desktop key. The pad re-reads the key before each cell; an anton
+# without the pad's credential file keeps the one it started with, so it must outlast a turn.
 _TTL = timedelta(minutes=60)
 # More than one missed hand-over of headroom, so a late push never finds it expired.
 _REMINT_WHEN_LEFT = timedelta(minutes=45)
@@ -218,7 +219,8 @@ def _post(body: dict, token: str, deadline: float) -> httpx.Response:
     thread.start()
     thread.join(left)
     with handoff:
-        state["taken"] = not thread.is_alive()
+        # A result, not the thread: one that has answered but not yet exited still owns nothing.
+        state["taken"] = "response" in result or "error" in result
         state["abandoned"] = not state["taken"]
     if state["abandoned"]:
         raise TimeoutError("turn-key mint ran out of time")

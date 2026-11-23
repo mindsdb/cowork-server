@@ -473,6 +473,31 @@ class TestTimeBudget:
         assert http.delete.call_args.args[0].endswith(f"/v1/turn-keys/{instance_id}/")
         assert runtime_credential.get_inference_key() is None
 
+    def test_a_mint_that_answers_as_the_budget_ends_is_kept_not_orphaned(self, http, monkeypatch):
+        class AnsweredButNotExited:
+            """The worker has its response and passed the hand-off, but hasn't exited yet."""
+
+            def __init__(self, target, daemon):
+                self.target = target
+
+            def start(self):
+                self.target()
+
+            def join(self, timeout):
+                pass
+
+            def is_alive(self):
+                return True
+
+        monkeypatch.setattr(inference_key.threading, "Thread", AnsweredButNotExited)
+        http.post.return_value = MagicMock(is_success=True, status_code=201)
+        http.post.return_value.json.return_value = {"key": "mdb_turn_new"}
+
+        inference_key.refresh_inference_key("jwt", ORG_A)
+
+        http.delete.assert_not_called()
+        assert runtime_credential.get_inference_key().value == "mdb_turn_new"
+
     def test_a_busy_lock_does_not_hold_up_the_hand_over(self, http, monkeypatch):
         monkeypatch.setattr(inference_key, "_MINT_BUDGET_S", 0.05)
 
@@ -545,6 +570,8 @@ class TestConcurrentMints:
                 target=inference_key.refresh_inference_key, args=("jwt", ORG_A)
             )
             new.start()
+            # Give the newer mint time to finish first if nothing holds it back.
+            new.join(0.5)
             release_first.set()
             old.join(5)
             new.join(5)
@@ -591,3 +618,33 @@ class TestRetry:
         first.cancel.assert_called_once()
         assert timer.call_args.args == (inference_key._RETRY_S * 2, inference_key._retry)
         assert timer.return_value.daemon is True
+
+
+class TestShutdown:
+    """A quit or restart sends SIGTERM, not a blank hand-over, so the lifespan revokes too."""
+
+    async def test_revokes_every_installed_key_with_the_session_token(self):
+        from cowork import server
+
+        runtime_credential.set_minds_credential("jwt")
+        with patch.object(inference_key, "revoke_all_inference_keys") as revoke:
+            await server._revoke_turn_keys()
+
+        revoke.assert_called_once_with("jwt")
+
+    async def test_does_nothing_when_signed_out(self):
+        from cowork import server
+
+        with patch.object(inference_key, "revoke_all_inference_keys") as revoke:
+            await server._revoke_turn_keys()
+
+        revoke.assert_not_called()
+
+    async def test_a_failed_revoke_does_not_stop_shutdown(self, caplog):
+        from cowork import server
+
+        runtime_credential.set_minds_credential("jwt")
+        with patch.object(inference_key, "revoke_all_inference_keys", side_effect=RuntimeError("boom")):
+            await server._revoke_turn_keys()
+
+        assert "Could not revoke turn keys at shutdown" in caplog.text

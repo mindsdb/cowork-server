@@ -35,7 +35,7 @@ tear.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pydantic import BaseModel, ConfigDict, SecretStr
 
@@ -50,7 +50,7 @@ _inference_key: InferenceKey | None = None
 
 @dataclass(frozen=True)
 class InferenceKey:
-    value: str
+    value: str = field(repr=False)
     organization_id: str
     instance_id: str
     expires_at: datetime

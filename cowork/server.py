@@ -570,6 +570,20 @@ def _warm_agent_runtime() -> None:
             logger.debug("agent runtime warm-up skipped %s", name, exc_info=True)
 
 
+async def _revoke_turn_keys() -> None:
+    from cowork.common.settings import runtime_credential
+    from cowork.services.inference_key import revoke_all_inference_keys
+
+    token = runtime_credential.get_minds_credential()
+    if not token:
+        return
+    try:
+        # Bounded by the revoke timeout, inside the desktop's SIGTERM grace.
+        await asyncio.to_thread(revoke_all_inference_keys, token)
+    except Exception:
+        logger.warning("Could not revoke turn keys at shutdown", extra={"event": "turn_key_revoke_failed"})
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     clock = _StartupClock()
@@ -790,6 +804,8 @@ async def lifespan(app: FastAPI):
         get_coding_service().close_all()
         shutdown_launched_backends()
         await close_scratchpads()
+        # Once nothing holds them: a quit or restart would otherwise leave each turn key live for up to an hour.
+        await _revoke_turn_keys()
         await close_proxy_client()
         await close_inference_client()
         await close_jev_client()
