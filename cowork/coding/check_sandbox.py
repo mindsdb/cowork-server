@@ -175,16 +175,6 @@ class GitDirectories:
         refs = {entry for folder in self._ref_folders() for entry in folder.iterdir() if entry.name not in _STASH_ENTRIES}
         return files, refs
 
-    @property
-    def task_owned(self) -> bool:
-        """Whether the private Git directory belongs to a task worktree alone.
-
-        A linked worktree's directory is written only by Git in that worktree.
-        A local folder's Git directory is the person's repository, where
-        another tool may be working at the same time.
-        """
-        return self.private != self.common
-
     def left_behind(self, before: tuple[set[Path], set[Path]]) -> tuple[set[Path], set[Path]]:
         """New control files in the task's Git directory, and new refs entries."""
         files, refs = self.snapshot()

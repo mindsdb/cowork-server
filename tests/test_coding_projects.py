@@ -509,10 +509,10 @@ def test_multi_repository_commit_rolls_back_commits_without_losing_changes(
     second_path = prepared.workspaces[1].workspace_path
     real_commit = manager.workspaces.commit
 
-    def fail_second_commit(workspace_path: str, message: str, checks=None):
+    def fail_second_commit(workspace_path: str, message: str, checks=None, *, workspace_kind=None):
         if workspace_path == second_path:
             raise WorkspaceError("simulated commit failure")
-        return real_commit(workspace_path, message, checks)
+        return real_commit(workspace_path, message, checks, workspace_kind=workspace_kind)
 
     monkeypatch.setattr(manager.workspaces, "commit", fail_second_commit)
 

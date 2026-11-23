@@ -138,7 +138,9 @@ class ProjectTaskOperations:
                 return states[0]
             if session.base_revision is None:
                 raise WorkspaceError("This task is not using a Git worktree")
-            state = self.workspaces.commit(session.workspace_path, message, checks)
+            state = self.workspaces.commit(
+                session.workspace_path, message, checks, workspace_kind=session.workspace_kind,
+            )
             self.emit(
                 session.id,
                 CodingEvent(

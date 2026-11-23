@@ -741,7 +741,10 @@ class WorkspaceManager:
                 return resolved.stdout.strip()
         return None
 
-    def commit(self, workspace_path: str, message: str, checks: CheckPolicy | None = None) -> GitState:
+    def commit(
+        self, workspace_path: str, message: str, checks: CheckPolicy | None = None, *,
+        workspace_kind: WorkspaceKind | None = None,
+    ) -> GitState:
         """Commit everything in the workspace.
 
         Staging can run programs the repository names, such as a clean filter
@@ -766,9 +769,11 @@ class WorkspaceManager:
                 if checks is None or not checks.sandboxed:
                     self.git.run(root, "add", "--all")
                 else:
-                    self._run_sandboxed_git_step(root, checks, "Staging", ["git", "add", "--all"], [root])
+                    self._run_sandboxed_git_step(
+                        root, checks, "Staging", ["git", "add", "--all"], [root], workspace_kind,
+                    )
                 if checks is not None:
-                    self._run_commit_hooks(root, message_file, checks)
+                    self._run_commit_hooks(root, message_file, checks, workspace_kind)
                 self._record_commit(root, message_file.read_text(encoding="utf-8"))
             return self.git_state(str(root), str(root))
 
@@ -831,7 +836,9 @@ class WorkspaceManager:
                     "Point the signing program outside the repository, or commit from a terminal."
                 )
 
-    def _run_commit_hooks(self, root: Path, message_file: Path, checks: CheckPolicy) -> None:
+    def _run_commit_hooks(
+        self, root: Path, message_file: Path, checks: CheckPolicy, workspace_kind: WorkspaceKind | None,
+    ) -> None:
         from cowork.coding import check_sandbox
 
         hooks = {name: check_sandbox.hook_path(self.git.run, root, name) for name in check_sandbox.SUPPORTED_COMMIT_HOOKS}
@@ -841,10 +848,12 @@ class WorkspaceManager:
             arguments = (str(message_file),) if name == "commit-msg" else ()
             self._run_sandboxed_git_step(
                 root, checks, f"The {name} hook", check_sandbox.hook_argv(path, *arguments), [root, message_file.parent],
+                workspace_kind,
             )
 
     def _run_sandboxed_git_step(
         self, root: Path, checks: CheckPolicy, label: str, argv: list[str], writable: list[Path],
+        workspace_kind: WorkspaceKind | None,
     ) -> None:
         """Run a command that may change the index, under the task's permissions."""
         from cowork.coding import check_sandbox
@@ -862,6 +871,8 @@ class WorkspaceManager:
             "GIT_CONFIG_VALUE_0": os.devnull,
         })
         directories = check_sandbox.git_directories(self.git.run, root)
+        # Local tasks may use linked worktrees the user created independently.
+        task_owned = workspace_kind == WorkspaceKind.git_worktree and directories.private != directories.common
         before = directories.snapshot()
         try:
             result = check_sandbox.run_sandboxed(
@@ -884,15 +895,15 @@ class WorkspaceManager:
             # writer, so what appears there is removed. Anywhere else Cowork
             # cannot tell who made it, so it stops and leaves it in place.
             planted, added_refs = directories.left_behind(before)
-            if directories.task_owned:
+            if task_owned:
                 for planted_path in planted:
                     if planted_path.is_dir() and not planted_path.is_symlink():
                         force_remove(planted_path)
                     else:
                         planted_path.unlink(missing_ok=True)
-        if planted and directories.task_owned:
+        if planted and task_owned:
             raise WorkspaceError(f"{label} tried to change Git's configuration, so nothing was committed")
-        unexplained = sorted(str(path) for path in added_refs | (set() if directories.task_owned else planted))
+        unexplained = sorted(str(path) for path in added_refs | (set() if task_owned else planted))
         if unexplained:
             raise WorkspaceError(
                 f"Git files appeared while {label.lower()} ran, so nothing was committed: {', '.join(unexplained)}. "

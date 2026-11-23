@@ -11,8 +11,8 @@ import pytest
 
 from cowork.coding.check_sandbox import CheckPolicy, GitDirectories, check_environment, sandboxed_argv
 from cowork.coding.contracts import PermissionMode, TaskWorkspace, WorkspaceKind
-from cowork.coding.project_models import CodeProject, ProjectCommand, ProjectFolder
-from cowork.coding.project_workspaces import ProjectCommandRunner
+from cowork.coding.project_models import CodeProject, ProjectCommand, ProjectEnvironment, ProjectFolder
+from cowork.coding.project_workspaces import ProjectCommandRunner, ProjectWorkspaceManager
 from cowork.coding.workspace import WorkspaceError, WorkspaceManager
 
 
@@ -346,7 +346,9 @@ def test_what_a_step_plants_in_a_task_worktree_is_removed_however_it_ends(
     monkeypatch.setattr(check_sandbox, "run_sandboxed", plant_then(outcome))
 
     with pytest.raises(WorkspaceError):
-        WorkspaceManager(tmp_path / "root").commit(str(worktree), "Change", checks)
+        WorkspaceManager(tmp_path / "root").commit(
+            str(worktree), "Change", checks, workspace_kind=WorkspaceKind.git_worktree,
+        )
 
     assert not (private / "config.worktree").exists()
     assert git(worktree, "log", "-1", "--format=%s") == "base"
@@ -368,6 +370,34 @@ def test_a_control_file_in_a_local_folder_is_reported_and_left_in_place(
 
     assert (repo / ".git" / "config.worktree").exists()
     assert git(repo, "log", "-1", "--format=%s") == "base"
+
+
+def test_local_task_preserves_control_file_in_existing_linked_worktree(
+    tmp_path: Path, checks: CheckPolicy, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from cowork.coding import check_sandbox
+
+    _, worktree, private = task_worktree(tmp_path)
+    manager = ProjectWorkspaceManager(WorkspaceManager(tmp_path / "coding"))
+    project = CodeProject(
+        id="local", name="Local", folders=[ProjectFolder(id="app", name="App", path=str(worktree))],
+        environment=ProjectEnvironment(port_names=[]),
+    )
+    prepared = manager.prepare_in_place("local-task", project)
+    assert prepared.primary.workspace_kind == WorkspaceKind.direct_folder
+    control_file = private / "config.worktree"
+    original_head = git(worktree, "rev-parse", "HEAD")
+
+    def concurrent_edit(argv, **kwargs):
+        control_file.write_text("# user's configuration\n", encoding="utf-8")
+        return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(check_sandbox, "run_sandboxed", concurrent_edit)
+    with pytest.raises(WorkspaceError, match="Git files appeared"):
+        manager.commit(list(prepared.workspaces), "Local change", checks)
+
+    assert control_file.read_text(encoding="utf-8") == "# user's configuration\n"
+    assert git(worktree, "rev-parse", "HEAD") == original_head
 
 
 @requires_sandbox

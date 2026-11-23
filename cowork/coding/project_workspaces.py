@@ -619,7 +619,9 @@ class ProjectWorkspaceManager:
                 if state.dirty:
                     checkpoint = self.workspaces.commit_checkpoint(workspace.workspace_path)
                     checkpoints.append((workspace, checkpoint))
-                    state = self.workspaces.commit(workspace.workspace_path, message, policy)
+                    state = self.workspaces.commit(
+                        workspace.workspace_path, message, policy, workspace_kind=workspace.workspace_kind,
+                    )
                 states.append(state.model_copy(update={"folder_id": workspace.folder_id, "folder_name": workspace.folder_name}))
             return states
         except Exception as exc:
