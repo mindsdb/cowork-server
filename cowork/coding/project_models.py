@@ -468,7 +468,7 @@ class DraftPullRequestSpec(BaseModel):
 class DraftPullRequestRequest(BaseModel):
     title: str = Field(min_length=1, max_length=256)
     body: str = Field(default="", max_length=100_000)
-    drafts: list[DraftPullRequestSpec] = Field(default_factory=list, max_length=24)
+    drafts: list[DraftPullRequestSpec] = Field(default_factory=list, min_length=1, max_length=24)
     connection_name: str | None = Field(default=None, max_length=512)
     confirmed: bool = False
 

@@ -93,8 +93,13 @@ class TaskDeliveryService:
             try:
                 self.remote.operation(
                     session,
-                    "push_branch",
-                    {"folder_id": item.folder_id, "revision": item.head_revision},
+                    "push_confirmed_commit",
+                    {
+                        "folder_id": item.folder_id,
+                        "revision": item.head_revision,
+                        "task_branch": item.task_branch,
+                        "remote_url": item.remote_url,
+                    },
                     timeout=180,
                 )
                 external_url = integrations.create_draft_pull_request(
