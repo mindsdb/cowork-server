@@ -61,6 +61,11 @@ TOO_BIG_TEXT = (
     "Refused (too_big): this answer would be over 1 MiB. Read the doc in parts: pass `tab` for one tab, "
     "or `ids` for some blocks; view \"outline\" lists the tabs and the block ids."
 )
+# A whole-tab read over this returns the outline instead: every read stays in the
+# turn's history, so a big table would cost its size again on each later call.
+READ_LIMIT_BYTES = 64 * 1024
+# Any read over this is refused (the remote transport passes its own, the same).
+MAX_READ_BYTES = 1024 * 1024
 
 T = TypeVar("T")
 EmitStep = Callable[[str], Awaitable[None]]
@@ -151,9 +156,20 @@ def _refusal(err: DocError, doc: Doc | None = None) -> DocToolResult:
     return DocToolResult("\n".join(lines), ok=False)
 
 
-def _tab_text_bytes(doc: Doc) -> int:
-    """A floor on the size of the first tab rendered in full: its blocks' text."""
-    return sum(len(block_text_for_search(b).encode("utf-8")) for b in find_tab(doc, None)["blocks"])
+def _read_text_bytes(doc: Doc, tab: str | None, ids: list[str] | None) -> int:
+    """A floor on the size of a full read: the text of the blocks it returns."""
+    wanted = set(ids or [])
+    return sum(
+        len(block_text_for_search(b).encode("utf-8"))
+        for b in find_tab(doc, tab)["blocks"] if not wanted or b["id"] in wanted
+    )
+
+
+def _over_read_limit(size: int, outline: str) -> str:
+    return (
+        f"This tab is {size // 1024} KB, over the {READ_LIMIT_BYTES // 1024} KB a read returns, so here is its "
+        "outline. Read the blocks you need with `ids`.\n" + outline
+    )
 
 
 def _pending_note(doc: dict[str, Any]) -> str:
@@ -346,9 +362,16 @@ async def _read(ctx: DocToolContext, tc_input: dict, emit_step: EmitStep, *, art
     def read() -> DocToolResult:
         if view == "outline":
             return DocToolResult(render.outline(doc, all_tabs=True))
-        if ctx.max_result_bytes is not None and not tab and not ids and _tab_text_bytes(doc) > ctx.max_result_bytes:
+        cap = ctx.max_result_bytes or MAX_READ_BYTES
+        if _read_text_bytes(doc, tab, ids) > cap:
             return DocToolResult(TOO_BIG_TEXT, ok=False)
-        return DocToolResult(render.full(doc, tab, ids=ids))
+        text = render.full(doc, tab, ids=ids)
+        size = len(text.encode("utf-8"))
+        if size > cap:
+            return DocToolResult(TOO_BIG_TEXT, ok=False)
+        if not ids and size > READ_LIMIT_BYTES:
+            return DocToolResult(_over_read_limit(size, render.outline(doc, all_tabs=True)))
+        return DocToolResult(text)
 
     try:
         return await ctx.run_in_thread(read)
@@ -453,6 +476,6 @@ def remote_doc_tool_specs(*, timeout_s: int = DOC_TOOL_TIMEOUT_S) -> list[dict[s
 
 
 __all__ = [
-    "DOC_TOOL_NAMES", "DOC_TOOL_SPECS", "DOC_WRITE_TOOL_NAMES", "DOC_TOOL_TIMEOUT_S", "TOO_BIG_TEXT", "DocToolContext", "DocToolResult",
+    "DOC_TOOL_NAMES", "DOC_TOOL_SPECS", "DOC_WRITE_TOOL_NAMES", "DOC_TOOL_TIMEOUT_S", "MAX_READ_BYTES", "READ_LIMIT_BYTES", "TOO_BIG_TEXT", "DocToolContext", "DocToolResult",
     "EmitStep", "OnWritten", "RunInThread", "edit_label", "remote_doc_tool_specs", "run_doc_tool",
 ]

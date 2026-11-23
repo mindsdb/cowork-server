@@ -207,10 +207,15 @@ async def test_no_relay_without_the_redis_backend(monkeypatch):
 
 
 async def test_the_redis_backend_starts_the_relay_on_the_process_hub(monkeypatch, server):
+    from types import SimpleNamespace
+
     from cowork.docs import hub as hub_mod
 
     monkeypatch.setattr(relay_mod, "get_backend", lambda: "redis")
     monkeypatch.setattr(relay_mod, "get_redis", lambda: _client(server))
+    monkeypatch.setattr(relay_mod, "get_app_settings", lambda: SimpleNamespace(remote_docs_available=lambda: False))
+    assert relay_mod.start_doc_relay() is None
+    monkeypatch.setattr(relay_mod, "get_app_settings", lambda: SimpleNamespace(remote_docs_available=lambda: True))
     relay = relay_mod.start_doc_relay()
     try:
         assert relay is not None

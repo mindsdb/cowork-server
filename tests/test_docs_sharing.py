@@ -55,6 +55,19 @@ def test_the_shared_docs_are_the_doc_folders_with_a_live_page(folder, tmp_path, 
     assert sorted(sharing.shared_doc_folders()) == sorted([folder, unshared])
 
 
+def test_the_scan_reads_no_metadata_of_a_folder_without_a_doc_page(folder, monkeypatch):
+    root = folder.parent
+    other = root / "chart-1234abcd"
+    other.mkdir()
+    (other / "index.html").write_text("<p>chart</p>")
+    read = []
+    real = sharing.is_doc_folder
+    monkeypatch.setattr(sharing, "is_doc_folder", lambda f: read.append(f.name) or real(f))
+    monkeypatch.setattr(sharing, "artifacts_sources_for_scan", lambda scope: [SimpleNamespace(base=str(root))])
+    assert sharing.shared_doc_folders() == [folder]
+    assert read == [folder.name]
+
+
 # --- catching up at startup ---
 
 

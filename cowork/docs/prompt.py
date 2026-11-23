@@ -19,10 +19,9 @@ DOC_PROMPT = """\
 A doc is a living document that opens beside this chat. It is made of tabs, and each tab holds headings, prose, lists, tasks, tables, charts, metrics and callouts. The user watches it fill as you write. They can also type in it directly, and they can select a passage and ask you to change it.
 
 When to use one:
-- Write a doc for work the user will keep, share, edit or come back to. That includes reports, plans, briefs, analyses, comparisons, trackers, meeting notes, research summaries, specs and checklists. Asking for "a doc", "a page", "a write-up", "a report" or "a plan" means a doc, even when phrased as a question.
+- Write a doc only when the user asks for one: they ask for "a doc", "a document", "a write-up", "a report", "a brief" or a written plan, spec, tracker or meeting notes, even when phrased as a question, or they picked Output: Doc (an `<output-choice>` block).
 - A written report is a doc. Build it as an HTML page or a Markdown file instead (DIRECT REPORTS) only when the user asks for that format: a web page, a dashboard, an HTML or .md file.
-- Decide before you write. If the answer needs a table, or runs past about 300 words of structured content (sections, a plan, options weighed against each other), it is a doc, even though the user never said "doc". Comparing options for a decision counts.
-- A quick question or a short answer stays in chat.
+- Everything else is answered in chat, even when the answer has a table or runs long. Never turn an answer into a doc on your own. When a long answer is something the user will likely keep, you may offer a doc in one line at the end.
 - An interactive app or a custom-coded dashboard is an HTML artifact (`create_artifact`), not a doc.
 - Use the doc tools for docs, never scratchpad file writes. Never write `doc.cdoc.json` yourself.
 
@@ -61,7 +60,7 @@ Shaping the content:
 - Give material with its own bulk (long raw data, sources, appendices) its own tab with `add_tab`. Otherwise one tab is right.
 
 Changing a doc:
-- The person may have edited the doc since you last saw it. Read it first with `read_doc`, unless your own last call returned its current rev. Pass that rev as `if_rev` to `edit_doc`. If the result is `stale`, the person changed a block you targeted: read it again, keep their change, and resend.
+- The person may have edited the doc since you last saw it. Read what you will change first, unless your own last call returned its current rev: `read_doc` with the `ids` of those blocks, or the whole tab when the doc is short. View "outline" lists the block ids. Pass that rev as `if_rev` to `edit_doc`. If the result is `stale`, the person changed a block you targeted: read it again, keep their change, and resend.
 - Change only what was asked; every other word stays. If your change makes another figure in the doc wrong (a total, the lead's number, a summary tile), fix that too and name it in your chat reply.
   - For a word or figure, use `edit_text` with `find` quoted exactly as the doc has it.
   - For a whole block or section, `replace` its block ids. Replacing one block with one block of the same kind keeps its id, so a chart drawn from a rewritten table still points at it.
@@ -104,8 +103,8 @@ CREATE_DOC_SCHEMA = {
 READ_DOC_DESCRIPTION = (
     "Read a doc. `view: \"full\"` (the default) returns one tab's blocks, each as `[block id] type` followed by "
     "its Markdown: the ids edit_doc targets. `view: \"outline\"` returns one line per block, for every tab, which "
-    "is cheaper for a long doc. Pass `ids` to read just those blocks in full. The header line gives the doc's "
-    "current rev; pass it to edit_doc as if_rev."
+    "is cheaper for a long doc. Pass `ids` to read just those blocks in full. A full tab over 64 KB comes back "
+    "as the outline. The header line gives the doc's current rev; pass it to edit_doc as if_rev."
 )
 
 READ_DOC_SCHEMA = {

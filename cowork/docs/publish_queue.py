@@ -264,8 +264,14 @@ class DocPublishWorker:
 
 
 def start_doc_publish_worker() -> DocPublishWorker | None:
-    """Start the poll on an org deployment with the Redis backend; None anywhere else. Runs on the server's loop."""
-    if get_app_settings().tenancy_mode != "org":
+    """Start the poll on an org deployment with the Redis backend and
+    COWORK_REMOTE_DOCS on; None anywhere else. Runs on the server's loop.
+
+    Without the flag no doc is written there, and the poll would cost a Redis
+    call a second on every replica for nothing.
+    """
+    settings = get_app_settings()
+    if settings.tenancy_mode != "org" or not settings.remote_docs_available():
         return None
     if get_backend() != "redis":
         logger.warning("doc_publish", extra={"event": "doc_publish", "outcome": "not_started", "reason": "no_redis"})

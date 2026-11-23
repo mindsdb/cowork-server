@@ -103,6 +103,19 @@ async def test_a_read_over_the_cap_is_refused_before_it_renders(ctx, monkeypatch
     assert outline.ok
 
 
+async def test_a_tab_over_the_read_limit_comes_back_as_its_outline(ctx, monkeypatch):
+    monkeypatch.setattr(doc_tools, "READ_LIMIT_BYTES", 2048)
+    rows = "\n".join(f"| r{i} | {'x' * 40} |" for i in range(80))
+    await _run(ctx, "create_doc", title="Big", markdown=f"Lead.\n\n| Name | Note |\n| --- | --- |\n{rows}")
+
+    _steps, out = await _run(ctx, "read_doc", doc="Big")
+    assert out.ok and "over the 2 KB a read returns" in out.text and "x" * 40 not in out.text
+    table_id = re.search(r"^(b_\w+)\s+table", out.text, re.M).group(1)
+
+    _steps, block = await _run(ctx, "read_doc", doc="Big", ids=[table_id])
+    assert block.ok and "x" * 40 in block.text
+
+
 def test_the_remote_specs_are_the_doc_tools_with_the_retry_rule_only_in_their_prompt(ctx):
     specs = remote_doc_tool_specs()
     assert [s["name"] for s in specs] == list(DOC_TOOL_NAMES)

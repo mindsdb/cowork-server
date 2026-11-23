@@ -3311,6 +3311,7 @@ async def test_pinned_scheduled_turn_bypasses_direct_answers(monkeypatch, schedu
 @pytest.mark.parametrize("request_extra", [
     {"doc_context": {"artifactId": "a" * 32, "title": "Plan", "mode": "edit",
                      "selection": {"blockIds": ["b_12345678"], "quote": "The checkout change needs a security review."}}},
+    {"doc_context": {"artifactId": "a" * 32, "title": "Plan", "request": "Shorter, please."}},
     {"output": "doc"},
 ])
 @pytest.mark.asyncio
@@ -3346,13 +3347,62 @@ async def test_a_turn_about_a_doc_goes_to_the_agent_not_the_gate(monkeypatch, re
         gate_rows=start.gate_rows,
         has_attachments=False,
         has_disabled_connections=False,
-        has_doc=responses._turn_has_doc(request),
+        has_doc=responses._turn_needs_doc_agent(request),
     )
 
     assert start.gate_rows == []
     assert decision.route == DELEGATED_AGENTIC
     assert decision.reason == "doc_context_present"
     assert turn_llm is None
+
+
+@pytest.mark.parametrize(("doc_context", "needs_agent"), [
+    ({"artifactId": "a" * 32, "title": "Plan"}, False),
+    ({"artifactId": "a" * 32, "selection": {"blockIds": [], "quote": None}}, False),
+    ({"artifactId": "a" * 32, "selection": {"blockIds": ["b_1"]}}, True),
+    ({"artifactId": "a" * 32, "selection": {"quote": "GA slips"}}, True),
+    ({"artifactId": "a" * 32, "request": "Shorter"}, True),
+])
+def test_only_a_selection_or_an_edit_request_on_the_open_doc_skips_the_gate(doc_context, needs_agent):
+    import cowork.handlers.responses as responses
+    from cowork.schemas.responses import ResponsesRequest
+
+    request = ResponsesRequest(input="Thanks!", doc_context=doc_context)
+    assert responses._turn_has_doc(request) is True
+    assert responses._turn_needs_doc_agent(request) is needs_agent
+
+
+@pytest.mark.asyncio
+async def test_with_a_doc_merely_open_the_llm_gate_decides_and_is_told_a_doc_is_open(monkeypatch):
+    """Jev cannot be told about the doc, so the LLM gate decides; it sees one
+    short line, never the doc's ids."""
+    import cowork.handlers.responses as responses
+    from cowork.docs.prompt import doc_context_block
+    from cowork.handlers.response_routing import _SYSTEM_PROMPT, DOC_OPEN_MARKER
+
+    handler = _routing_handler(monkeypatch)
+    handler._jev_gate = lambda _turn_llm: "jev"
+    seen = {}
+
+    async def fake_decide_route(**kwargs):
+        seen.update(kwargs)
+        return RouteDecision(route=DELEGATED_AGENTIC, reason="test")
+
+    monkeypatch.setattr(responses, "decide_route", fake_decide_route)
+    block = doc_context_block({"artifactId": "a" * 32, "title": "Plan"})
+    await handler._route_request(
+        conversation_id=None,
+        gate_rows=[],
+        harness_input=[{"type": "text", "text": block}, {"type": "text", "text": "Thanks!"}],
+        has_attachments=False,
+        has_disabled_connections=False,
+        doc_open=True,
+    )
+
+    assert seen["jev"] is None
+    latest = seen["history"][-1]["content"]
+    assert DOC_OPEN_MARKER in latest and "Thanks!" in latest and "a" * 32 not in latest
+    assert DOC_OPEN_MARKER in _SYSTEM_PROMPT
 
 
 def test_a_message_carries_the_open_doc_and_the_output_choice_ahead_of_the_words_typed():

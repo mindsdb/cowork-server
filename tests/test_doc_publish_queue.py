@@ -238,14 +238,25 @@ def test_stopping_puts_claimed_entries_back_and_waits_for_enqueues(server, monke
     assert asyncio.run(scenario()) == (True, True)
 
 
-def test_the_worker_starts_only_on_an_org_deployment_with_redis(monkeypatch):
+def test_the_worker_starts_only_on_an_org_deployment_with_redis_and_cloud_docs_on(monkeypatch):
     from types import SimpleNamespace
 
-    monkeypatch.setattr(pq, "get_app_settings", lambda: SimpleNamespace(tenancy_mode="local"))
+    def settings(tenancy_mode, remote_docs=True):
+        return lambda: SimpleNamespace(tenancy_mode=tenancy_mode, remote_docs_available=lambda: remote_docs)
+
+    started = []
+    monkeypatch.setattr(pq.DocPublishWorker, "start", lambda self: started.append(self))
+    monkeypatch.setattr(pq, "get_redis", lambda: object())
+    monkeypatch.setattr(pq, "get_app_settings", settings("local"))
     assert pq.start_doc_publish_worker() is None
-    monkeypatch.setattr(pq, "get_app_settings", lambda: SimpleNamespace(tenancy_mode="org"))
+    monkeypatch.setattr(pq, "get_app_settings", settings("org"))
     monkeypatch.setattr(pq, "get_backend", lambda: "file")
     assert pq.start_doc_publish_worker() is None
+    monkeypatch.setattr(pq, "get_backend", lambda: "redis")
+    monkeypatch.setattr(pq, "get_app_settings", settings("org", remote_docs=False))
+    assert pq.start_doc_publish_worker() is None and started == []
+    monkeypatch.setattr(pq, "get_app_settings", settings("org"))
+    assert pq.start_doc_publish_worker() is not None and len(started) == 1
 
 
 def test_the_log_fields_survive_the_json_formatter(caplog):

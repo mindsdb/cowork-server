@@ -21,6 +21,7 @@ from typing import Any
 
 from redis.asyncio import Redis
 
+from cowork.common.settings.app_settings import get_app_settings
 from cowork.docs.hub import DocHub, hub
 from cowork.streaming.backend import get_backend
 from cowork.turnqueue.redis_client import get_redis, redis_deadline
@@ -152,8 +153,13 @@ class DocRelay:
 
 
 def start_doc_relay() -> DocRelay | None:
-    """Start the relay where replicas share Redis; None everywhere else. Runs on the server's loop."""
-    if get_backend() != "redis":
+    """Start the relay where replicas share Redis and cloud turns write docs;
+    None everywhere else. Runs on the server's loop.
+
+    Without COWORK_REMOTE_DOCS no doc is written there, and the relay would
+    hold a pub/sub connection per replica for nothing.
+    """
+    if get_backend() != "redis" or not get_app_settings().remote_docs_available():
         return None
     relay = DocRelay(hub, get_redis())
     relay.start()

@@ -167,12 +167,15 @@ async def test_the_lifespan_runs_the_doc_relay_only_on_the_redis_backend(boot, m
     server keeps the doc hub in-process."""
     import fakeredis.aioredis as fakeaioredis
 
+    from types import SimpleNamespace
+
     from cowork.docs import relay as relay_mod
     from cowork.docs.hub import hub
 
     app, _order, _probe = boot()
     monkeypatch.setattr(relay_mod, "get_backend", lambda: backend)
     monkeypatch.setattr(relay_mod, "get_redis", lambda: fakeaioredis.FakeRedis(decode_responses=True))
+    monkeypatch.setattr(relay_mod, "get_app_settings", lambda: SimpleNamespace(remote_docs_available=lambda: True))
     async with server.lifespan(app):
         relay = app.state.doc_relay
         if backend == "redis":

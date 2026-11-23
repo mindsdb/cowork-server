@@ -50,6 +50,7 @@ from cowork.handlers import direct_answer, jev_route
 from cowork.services.providers import build_llm_client, minds_chat_base_url
 from cowork.handlers.first_take import FirstTake, clears_take as first_take_clears
 from cowork.handlers.response_routing import (
+    DOC_OPEN_MARKER,
     DELEGATED_AGENTIC,
     DIRECT_CONTEXT,
     ANSWER_HISTORY_MESSAGES,
@@ -247,6 +248,23 @@ def _turn_has_doc(request: ResponsesRequest, *, remote_docs: bool = False) -> bo
     if _runs_remotely(request) and not remote_docs:
         return False
     return request.doc_context is not None or request.output == "doc"
+
+
+def _turn_needs_doc_agent(request: ResponsesRequest, *, remote_docs: bool = False) -> bool:
+    """A doc turn only the agent can answer: Output: Doc, "Edit with agent", or a selection.
+
+    With the doc merely open, the gate still decides: a "thanks" needs no
+    agent turn, and the gate is told to delegate anything about the doc.
+    """
+    if not _turn_has_doc(request, remote_docs=remote_docs):
+        return False
+    if request.output == "doc":
+        return True
+    ctx = request.doc_context
+    if ctx is None:
+        return False
+    picked = ctx.selection is not None and (bool(ctx.selection.blockIds) or bool(ctx.selection.quote))
+    return bool(ctx.request) or picked
 
 
 def _client_shows_docs(request: ResponsesRequest) -> bool:
@@ -594,8 +612,20 @@ def _routing_history(gate_rows: list[Message], harness_input: list[dict]) -> lis
     handle(), not _build_chat_session. Scrubbed on the loop, after that
     registration, never inside the unit."""
     history = [scrubbed_openai_dump(m) for m in gate_rows]
-    history.append({"role": "user", "content": scrub_credentials(prompt_text(harness_input))})
+    history.append({"role": "user", "content": scrub_credentials(prompt_text(_doc_blocks_as_marker(harness_input)))})
     return history
+
+
+def _doc_blocks_as_marker(blocks: list[dict]) -> list[dict]:
+    """The doc view block as one short line the gate prompt knows: the gate
+    never needs the doc's ids, only that a doc is open."""
+    out = []
+    for block in blocks:
+        text = str(block.get("text", "")) if block.get("type") == "text" else ""
+        if text.startswith(CONTEXT_PREFIXES):
+            block = {"type": "text", "text": DOC_OPEN_MARKER}
+        out.append(block)
+    return out
 
 
 def _conversation_for_harness(session: ScopedSession, *, conversation_id: UUID) -> Conversation:
@@ -1083,7 +1113,8 @@ class ResponsesHandler:
                     is_pinned_schedule=self.schedule_id is not None and request.model is not None,
                     trace_metadata=trace_metadata,
                     first_take=bool(request.stream) and self.interactive,
-                    has_doc=_turn_has_doc(request, remote_docs=remote_docs),
+                    has_doc=_turn_needs_doc_agent(request, remote_docs=remote_docs),
+                    doc_open=_turn_has_doc(request, remote_docs=remote_docs),
                 )
             except BaseException:
                 # A refused or cancelled request must not leave the take's model call running.
@@ -1437,7 +1468,7 @@ class ResponsesHandler:
             has_disabled_connections=has_disabled_connections,
             is_comparison_side=comparison_pin is not None,
             is_pinned_schedule=self.schedule_id is not None and request.model is not None,
-            has_doc=_turn_has_doc(request, remote_docs=remote_docs),
+            has_doc=_turn_needs_doc_agent(request, remote_docs=remote_docs),
         ) is None
         attached_files = False
         project_path = None
@@ -1596,6 +1627,7 @@ class ResponsesHandler:
         trace_metadata: dict[str, str] | None = None,
         first_take: bool = False,
         has_doc: bool = False,
+        doc_open: bool = False,
     ) -> tuple[RouteDecision, dict | None]:
         """Run Cowork's narrow pre-Anton gate with only safe text context.
 
@@ -1713,7 +1745,8 @@ class ResponsesHandler:
                             has_files=has_files,
                             binding=binding,
                             binding_factory=binding_for_turn,
-                            jev=jev,
+                            # Jev cannot be told a doc is open; the LLM gate is.
+                            jev=None if doc_open else jev,
                             ui_locale=self.ui_locale,
                         )
                     gate_ms = round((time.monotonic() - gate_started) * 1000)
