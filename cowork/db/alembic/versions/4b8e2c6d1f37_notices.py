@@ -5,7 +5,7 @@ about, what opening it shows, and when it was read. Scheduled runs are the
 first source.
 
 Revision ID: 4b8e2c6d1f37
-Revises: f6a2c4e8b1d3
+Revises: a8d3f6c1e924
 Create Date: 2026-11-16 12:00:00.000000
 
 """
@@ -16,7 +16,7 @@ from alembic import op
 
 
 revision: str = "4b8e2c6d1f37"
-down_revision: Union[str, Sequence[str], None] = "f6a2c4e8b1d3"
+down_revision: Union[str, Sequence[str], None] = "a8d3f6c1e924"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 
