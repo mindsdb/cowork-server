@@ -699,6 +699,7 @@ def _workspace_state(
     progress, and the export source."""
     selected = _selected_source(source, folder, metadata, requested)
     result = current_workspace(folder, metadata, artifact_id, selected)
+    result = {**result, "publishedRevision": _published_revision(folder, metadata, result.get("path"))}
     repair = active_agent_repair(folder, result.get("path"))
     export_source = (
         primary_export_source(folder=folder, metadata=metadata)
@@ -706,6 +707,24 @@ def _workspace_state(
         else ExportSource(source_name="", is_backend=False)
     )
     return _WorkspaceState(result, repair, export_source)
+
+
+def _published_revision(folder: Path, metadata: ArtifactMetadata, rel_path: str | None) -> dict | None:
+    """The revision of *rel_path* the live page shows (ENG-4595), for the
+    viewer's "Review changes": None when unpublished or unknown. Never raises,
+    so the workspace still loads without it."""
+    from cowork.services.artifact_revisions import published_revision
+    from cowork.services.artifacts import load_published_map
+
+    try:
+        primary = _artifact_primary(folder, metadata)
+        if primary is None:
+            return None
+        entry = load_published_map(folder).get(primary.name)
+        return published_revision(folder, entry, rel_path)
+    except Exception:
+        logger.debug("Could not tell which revision is published", exc_info=True)
+        return None
 
 
 def _save_selected_source(
@@ -1426,11 +1445,6 @@ async def set_artifact_access(
     every turn, with the owner's selection in place of the first-publish default.
     """
     await require_product_permission(scope, "artifact.manage")
-    from cowork.services.publish import PublishRejected, PublisherUnavailable, ShareOrgRequired
-    from cowork.services.publish import publish_artifact as _publish_bundle
-    from cowork.services.artifact_access import ArtifactAccessRefused, ArtifactAccessUnavailable
-    from cowork.services.artifact_locks import refresh
-
     source, folder, metadata, _capabilities = await _owner_workspace(
         scope, project_ref, artifact_id
     )
@@ -1461,6 +1475,43 @@ async def set_artifact_access(
         )
         return await run_in_threadpool(stored_rule_under, keys, scope)
 
+    async def plan() -> tuple[ArtifactAccessRequest, ArtifactRule | None]:
+        # Checked under the lock, so no other publish of this artifact writes
+        # its rule between the check's read and this publish, which plans
+        # against the rule the check read rather than reading it again.
+        checked = await _checked_team_audience(
+            access, request=request, scope=scope, principal=principal, stored_rule=stored_rule
+        )
+        return checked.access, checked.stored
+
+    return await _publish_live(
+        scope, source, folder, artifact_id,
+        plan=plan, notify=notify or None, owner_save=True, principal=principal,
+        failure_log="Could not change access for artifact %s",
+    )
+
+
+async def _publish_live(
+    scope: TenantScope,
+    source,
+    folder: Path,
+    artifact_id: str,
+    *,
+    plan: Callable[[], Awaitable[tuple[ArtifactAccessRequest, ArtifactRule | None]]],
+    notify,
+    owner_save: bool,
+    principal: Principal | None,
+    failure_log: str,
+):
+    """Publish *folder* now, under its live publish lock, as the owner asked:
+    the access and stored rule come from *plan*, run under the lock. Shared by
+    the Share dialog's save and Publish changes (ENG-4595), with the same
+    refusals mapped to the same statuses."""
+    from cowork.services.publish import PublishRejected, PublisherUnavailable, ShareOrgRequired
+    from cowork.services.publish import publish_artifact as _publish_bundle
+    from cowork.services.artifact_access import ArtifactAccessRefused, ArtifactAccessUnavailable
+    from cowork.services.artifact_locks import refresh
+
     if not await _acquire_live_publish_lock(folder, scope):
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -1472,12 +1523,7 @@ async def set_artifact_access(
     publish_abandoned = False
     publish_started = False
     try:
-        # Checked under the lock, so no other publish of this artifact writes
-        # its rule between the check's read and this publish, which plans
-        # against the rule the check read rather than reading it again.
-        checked = await _checked_team_audience(
-            access, request=request, scope=scope, principal=principal, stored_rule=stored_rule
-        )
+        planned_access, planned_stored = await plan()
         artifacts_base, publish_url, key = await run_on_unit_threads(partial(_owner_publish_context, scope, folder))
         api_key = await key.get()
         if not api_key:
@@ -1495,12 +1541,12 @@ async def set_artifact_access(
                     artifacts_base=artifacts_base,
                     api_key=api_key,
                     publish_url=publish_url,
-                    access=checked.access,
+                    access=planned_access,
                     scope=scope,
                     project_id=source.project_id,
-                    notify=notify or None,
-                    stored=checked.stored,
-                    owner_save=True,
+                    notify=notify,
+                    stored=planned_stored,
+                    owner_save=owner_save,
                     job_budget_s=job_budget_for(_LIVE_PUBLISH_LOCK_TTL_S),
                     on_job_accepted=lambda _job: refresh(folder.parent, folder.name),
                     notices=notices,
@@ -1539,7 +1585,7 @@ async def set_artifact_access(
     except (RuntimeError, OSError) as exc:
         # A local failure's text can name shared-storage paths, so only the log
         # gets it. Not every such error passed publish_artifact's own log.
-        logger.warning("Could not change access for artifact %s", artifact_id, exc_info=True)
+        logger.warning(failure_log, artifact_id, exc_info=True)
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,
             detail="Publishing failed. Try again in a moment.",
@@ -1560,6 +1606,59 @@ router.add_api_route(
     methods=["PUT"],
     route_class_override=_AccessSaveRoute,
 )
+
+
+@router.post("/workspace/{project_ref}/{artifact_id}/republish")
+async def republish_artifact(
+    project_ref: str,
+    artifact_id: ArtifactIdDep,
+    scope: ScopeDep,
+    principal: Principal | None = Depends(get_principal),
+):
+    """Publish changes: put the draft live at the same link, with the access
+    it already has. Owner-only (ENG-4595).
+
+    Desktop's Update, for every deployment: in MindsHub mode the viewer had
+    no way to publish a draft that moved past its page. The access is the
+    stored one (`published_artifact_access`, as autopublish re-publishes), so
+    nobody gains or loses access and nobody is notified. 404 when nothing is
+    published.
+    """
+    await require_product_permission(scope, "artifact.manage")
+    from cowork.services.publish import published_artifact_access
+
+    source, folder, metadata, _capabilities = await _owner_workspace(
+        scope, project_ref, artifact_id
+    )
+    if await run_efs(partial(_artifact_primary, folder, metadata), scope=scope) is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="This artifact has no publishable file.",
+        )
+
+    async def plan() -> tuple[ArtifactAccessRequest, ArtifactRule | None]:
+        # Read under the lock, so the access kept is the one the last publish
+        # wrote, not one a concurrent save is replacing.
+        try:
+            kept = await run_efs(
+                partial(
+                    published_artifact_access, folder,
+                    artifacts_base=folder.parent, org_mode=bool(scope.org_mode),
+                ),
+                scope=scope,
+            )
+        except FileNotFoundError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="This artifact isn't shared yet, so there is nothing to update.",
+            ) from exc
+        return kept, None
+
+    return await _publish_live(
+        scope, source, folder, artifact_id,
+        plan=plan, notify=None, owner_save=False, principal=principal,
+        failure_log="Could not publish changes for artifact %s",
+    )
 
 
 class CommentsAccessResponse(CamelResponse):

@@ -20,7 +20,7 @@ def run(*args: str) -> str:
 
 def prepare_commit(base: str, previous: str, title: str) -> bool:
     """Keep CI intact only when both the staging parent and proposed tree match."""
-    run("git", "add", "--", "uv.lock", "cowork/release-requirements.txt")
+    run("git", "add", "--", "pyproject.toml", "uv.lock", "cowork/release-requirements.txt")
     tree = run("git", "write-tree")
     if previous:
         parent = run("git", "rev-parse", f"{previous}^")
@@ -31,6 +31,15 @@ def prepare_commit(base: str, previous: str, title: str) -> bool:
         raise RuntimeError("The relock produced no change; refusing to publish an empty bump")
     run("git", "commit", "-m", title)
     return True
+
+
+def relock(version: str) -> None:
+    """Lock the final, raise a candidate floor to it, drop the candidate's allowance, and refresh the export."""
+    pyproject = Path("pyproject.toml")
+    pyproject.write_text(selection.drop_allowance(selection.raise_floor(pyproject.read_text(), version)))
+    run("uv", "lock", "--upgrade-package", f"anton-agent=={version}")
+    run(sys.executable, "scripts/release_contract.py")
+    run(sys.executable, "scripts/release_contract.py", "--check")
 
 
 def remote_head(branch: str) -> str:
@@ -94,7 +103,9 @@ def main() -> None:
         run("git", "push", f"--force-with-lease=refs/heads/{branch}:{previous}",
             "origin", f"HEAD:refs/heads/{branch}")
     body = (
-        f"Staging locks `{locked}`. This proposes final `{version}` for ENG-4355.\n\n"
+        f"Staging locks `{locked}`. This proposes final `{version}` for ENG-4355, raises "
+        "a release-candidate `anton-agent` floor in `pyproject.toml` to it, and removes "
+        "anton-agent's production pre-release allowance.\n\n"
         "Before merging, check that the final contains the anton changes staging needs, "
         "and let CI finish. Merge it before the staging → main release PR, which stays red "
         "until staging locks a final. anton's final usually lands during the release freeze, "
@@ -126,9 +137,7 @@ def refresh_staging() -> None:
     # Replace every old decision, including clearing a previously selected final.
     os.environ.update(LOCKED=locked, VERSION=version or "", LOCKED_FINAL=str(final).lower())
     if version:
-        run("uv", "lock", "--upgrade-package", f"anton-agent=={version}")
-        run(sys.executable, "scripts/release_contract.py")
-        run(sys.executable, "scripts/release_contract.py", "--check")
+        relock(version)
 
 
 def retry_staging(*, attempts: int = 3) -> None:
@@ -149,5 +158,7 @@ if __name__ == "__main__":
     # direct/manual calls retain the non-destructive, single-attempt behavior.
     if sys.argv[1:] == ["--retry-staging"]:
         retry_staging()
+    elif sys.argv[1:2] == ["--relock"] and len(sys.argv) == 3:
+        relock(sys.argv[2])
     else:
         main()
