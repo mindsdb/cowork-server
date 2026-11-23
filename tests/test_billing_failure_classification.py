@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import httpx
 import pytest
@@ -15,6 +16,7 @@ from anton.core.llm.provider import (
     WalletEmptyError,
     mindshub_billing_stop,
 )
+from fastapi import HTTPException
 from openai import APIStatusError
 
 from cowork.db.scoped import LOCAL_SCOPE
@@ -170,3 +172,175 @@ def test_model_deadline_over_a_billing_stop_keeps_its_own_saved_failure(
     assert failed["code"] == turn_errors.MODEL_TIMEOUT_CODE
     assert failed["error"] == str(error)
     assert "reset_at" not in failed
+
+
+@pytest.mark.parametrize(("scope", "owner"), [("workspace", "This workspace's"), (None, "A")])
+def test_a_spent_budget_names_its_scope_live_and_on_reload(
+    monkeypatch, self_hosted_minds_url, conversation_id, scope, owner,
+):
+    error = _billing_stop(status=402, reason="budget_exceeded")
+    if scope is not None:
+        error.__cause__.response.headers["X-MindsHub-Budget-Scope"] = scope
+
+    failed = _saved_and_streamed_failure(monkeypatch, conversation_id, error)
+
+    assert failed["code"] == turn_errors.BUDGET_EXCEEDED_CODE
+    assert failed["error"].startswith(f"{owner} spending budget is used up.")
+    assert failed.get("budget_scope") == scope
+    assert "reset_at" not in failed
+
+
+def test_a_spent_budget_names_its_period_live_and_on_reload(monkeypatch, self_hosted_minds_url, conversation_id):
+    error = _billing_stop(status=402, reason="budget_exceeded")
+    error.__cause__.response.headers["X-MindsHub-Budget-Scope"] = "workspace"
+    error.__cause__.response.headers["X-MindsHub-Budget-Period"] = "day"
+
+    failed = _saved_and_streamed_failure(monkeypatch, conversation_id, error)
+
+    assert failed["error"].startswith("This workspace's daily spending budget is used up.")
+    assert failed.get("budget_period") == "day"
+
+
+# ── ENG-4186: the two subscription stops ─────────────────────────────────
+# anton has no typed stop for either yet, so the raw SDK error reaches the
+# ladder and the gateway's reason header decides it. That needs the gateway to
+# be the configured `minds_url` host: on self-hosted's nonresolving one only a
+# typed anton stop could carry the verdict, as for the stops above. The gateway puts `window`
+# and `required_tier` at the top level of the body, beside `error`, where the
+# OpenAI SDK's `body` (the `error` envelope alone) does not keep them; they are
+# read back off the response.
+
+
+@pytest.fixture
+def mindshub_minds_url(self_hosted_minds_url):
+    self_hosted_minds_url.minds_url = "https://api.mindshub.ai"
+    return self_hosted_minds_url
+
+
+def _plan_stop(*, status: int, reason: str, url: str = GATEWAY_URL, **top_level: str) -> APIStatusError:
+    body = {"code": reason, "message": "Denied"}
+    headers = {"X-MindsHub-Reason": reason}
+    if status == 429:
+        headers["X-MindsHub-Reset-At"] = RESET_AT
+    response = httpx.Response(
+        status,
+        request=httpx.Request("POST", url),
+        headers=headers,
+        json={"error": body, **top_level},
+    )
+    return APIStatusError("Denied", response=response, body=body)
+
+
+@pytest.mark.parametrize("window", ["5h", "7d"])
+def test_a_spent_plan_window_keeps_its_card_reset_and_window_on_reload(
+    monkeypatch, mindshub_minds_url, conversation_id, window,
+):
+    error = _plan_stop(status=429, reason="window_allowance_exhausted", reset_at=RESET_AT, window=window)
+
+    failed = _saved_and_streamed_failure(monkeypatch, conversation_id, error)
+
+    assert failed["code"] == turn_errors.WINDOW_ALLOWANCE_EXHAUSTED_CODE
+    assert failed["error"] == turn_errors.WINDOW_ALLOWANCE_EXHAUSTED_USER_MESSAGE
+    assert failed["reset_at"] == RESET_AT
+    assert failed["window"] == window
+    assert "required_tier" not in failed
+
+
+def test_an_unknown_plan_window_is_left_off_the_frame(monkeypatch, mindshub_minds_url, conversation_id):
+    error = _plan_stop(status=429, reason="window_allowance_exhausted", window="1d")
+
+    failed = _saved_and_streamed_failure(monkeypatch, conversation_id, error)
+
+    assert failed["code"] == turn_errors.WINDOW_ALLOWANCE_EXHAUSTED_CODE
+    assert failed["reset_at"] == RESET_AT
+    assert "window" not in failed
+
+
+@pytest.mark.parametrize(
+    ("tier", "expected"), [("plus", "plus"), ("pro", "pro"), ("free", None), ("enterprise", None)],
+)
+def test_a_model_outside_the_tier_keeps_its_card_and_tier_on_reload(
+    monkeypatch, mindshub_minds_url, conversation_id, tier, expected,
+):
+    error = _plan_stop(status=403, reason="model_not_in_tier", required_tier=tier)
+
+    failed = _saved_and_streamed_failure(monkeypatch, conversation_id, error)
+
+    assert failed["code"] == turn_errors.MODEL_NOT_IN_TIER_CODE
+    assert failed["error"] == turn_errors.MODEL_NOT_IN_TIER_USER_MESSAGE
+    assert failed.get("required_tier") == expected
+    assert "reset_at" not in failed
+    assert "window" not in failed
+
+
+def test_a_third_party_cannot_persist_a_plan_card(monkeypatch, mindshub_minds_url, conversation_id):
+    error = _plan_stop(
+        status=429, reason="window_allowance_exhausted", url="https://openrouter.ai/api/v1/x", window="5h",
+    )
+
+    failed = _saved_and_streamed_failure(monkeypatch, conversation_id, error)
+
+    assert failed["code"] == turn_errors.GENERIC_TURN_ERROR_CODE
+    assert "window" not in failed
+
+
+# ── The non-streaming 400 carries the same fields ────────────────────────
+# `POST /responses` with `stream=false` raises the failure frame as the 400's
+# detail. These pin that the detail keeps the reset instant and the plan fields
+# for their own codes, as the streaming frame above does, and drops them for
+# any other code even when the inference service sent them.
+
+
+def _collected_failure(error: Exception) -> dict:
+    handler = _handler_with_raising_formatter(error)
+    with pytest.raises(HTTPException) as raised:
+        asyncio.run(handler._collect(stream=None, conversation_id=uuid4(), model="anton", original_content="hi"))
+    assert raised.value.status_code == 400
+    assert raised.value.detail["type"] == "response.failed"
+    return raised.value.detail
+
+
+@pytest.mark.parametrize(
+    ("status", "reason", "code", "has_reset"),
+    [
+        pytest.param(402, "wallet_empty", turn_errors.TOKEN_LIMIT_CODE, False, id="wallet"),
+        pytest.param(429, "included_allowance_exhausted", turn_errors.ALLOWANCE_EXHAUSTED_CODE, True, id="allowance"),
+        pytest.param(
+            429, "free_air_daily_spend_fuse_exceeded", turn_errors.FREE_SERVING_PAUSED_CODE, True, id="fuse",
+        ),
+    ],
+)
+def test_the_non_streaming_400_carries_the_reset_instant_for_its_codes(
+    self_hosted_minds_url, status, reason, code, has_reset,
+):
+    # Every row's response from the inference service carries a reset instant.
+    # Only the codes that offer waiting may pass it on.
+    failed = _collected_failure(_billing_stop(status=status, reason=reason))
+
+    assert failed["code"] == code
+    assert failed.get("reset_at") == (RESET_AT if has_reset else None)
+    assert "window" not in failed
+    assert "required_tier" not in failed
+
+
+def test_the_non_streaming_400_names_the_spent_plan_window(mindshub_minds_url):
+    error = _plan_stop(status=429, reason="window_allowance_exhausted", window="7d", required_tier="pro")
+
+    failed = _collected_failure(error)
+
+    assert failed["code"] == turn_errors.WINDOW_ALLOWANCE_EXHAUSTED_CODE
+    assert failed["reset_at"] == RESET_AT
+    assert failed["window"] == "7d"
+    assert "required_tier" not in failed
+
+
+def test_the_non_streaming_400_names_the_tier_that_covers_the_model(mindshub_minds_url):
+    error = _plan_stop(status=403, reason="model_not_in_tier", required_tier="pro", window="7d")
+    error.response.headers["X-MindsHub-Reset-At"] = RESET_AT
+
+    failed = _collected_failure(error)
+
+    assert failed["code"] == turn_errors.MODEL_NOT_IN_TIER_CODE
+    assert failed["required_tier"] == "pro"
+    assert "reset_at" not in failed
+    assert "window" not in failed

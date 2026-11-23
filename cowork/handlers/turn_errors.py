@@ -50,8 +50,10 @@ except ImportError:  # TODO(ENG-1585): import it above once uv.lock pins an anto
             self.status_code = status_code
 from sqlalchemy.exc import TimeoutError as PoolTimeoutError
 
+from cowork.coding.context import BUDGET_MODEL_PATTERN, BUDGET_PERIOD_ADJECTIVES, BUDGET_SCOPE_PATTERN
 from cowork.common.settings.app_settings import default_minds_url
 from cowork.db.units import busy_retry_seconds
+from cowork.schemas.mindshub_usage import PAID_PLAN_TIERS, PLAN_WINDOWS, is_one_of
 
 # Curated copy for the unsupported-image case. Surfaced verbatim.
 IMAGE_FORMAT_USER_MESSAGE = (
@@ -162,6 +164,33 @@ ALLOWANCE_EXHAUSTED_USER_MESSAGE = (
     "Add credits to keep working now."
 )
 
+# Curated copy + wire code for a spent subscription window (gateway 429
+# `window_allowance_exhausted`, ENG-4186). A Plus or Pro plan covers the model,
+# one of its rolling windows (5 hours or 7 days) is used up, and the wallet
+# cannot pay. Adding credits lifts it at once, since the wallet pays for any
+# model past the allowance, and otherwise it holds until the window frees up.
+# The gate names that instant on `X-MindsHub-Reset-At`, which rides the failure
+# frame as `reset_at`, and which window is spent in the body's `window`, which
+# rides it as `window`. The copy names neither: this string is the fallback
+# for consumers that do not render the card, and never states a size, because
+# the product never shows allowance sizes.
+WINDOW_ALLOWANCE_EXHAUSTED_CODE = "window_allowance_exhausted"
+WINDOW_ALLOWANCE_EXHAUSTED_USER_MESSAGE = (
+    "You've used your plan's allowance for now. "
+    "Add credits to keep working now, or wait for it to reset."
+)
+
+# Curated copy + wire code for a model the plan does not cover (gateway 403
+# `model_not_in_tier`, ENG-4186), when the wallet cannot pay for it either.
+# Not an admin's rule, so it never shares the model_restricted card: upgrading
+# to the tier the body's `required_tier` names, or adding credits, lifts it.
+# `required_tier` rides the failure frame beside the code.
+MODEL_NOT_IN_TIER_CODE = "model_not_in_tier"
+MODEL_NOT_IN_TIER_USER_MESSAGE = (
+    "Your plan doesn't include this model. "
+    "Upgrade your plan or add credits to use it."
+)
+
 # Curated copy + wire code for the fleet-wide free-Air spend fuse (gateway 429
 # `free_air_daily_spend_fuse_exceeded`). The gate trips it when the day's
 # budget for free MindsHub Air serving is spent, and then denies every org
@@ -176,16 +205,29 @@ FREE_SERVING_PAUSED_USER_MESSAGE = (
     "Add credits to keep working now."
 )
 
-# Curated copy + wire code for a spent organization budget (gateway 402
-# `budget_exceeded`). An admin set a hard spending cap and paid requests hit it,
-# so credits do not lift it: the card sends the user to the console's Budgets
-# tab. MindsHub Air keeps working while its free allowance lasts. The gate sends
-# no reset instant, so this code is not in RESET_AT_CODES.
+# Curated copy + wire code for a spent budget (gateway 402 `budget_exceeded`).
+# Credits do not lift it, so the card sends the user to the console's Budgets tab.
+# The gate sends no reset instant, so this code is not in RESET_AT_CODES.
 BUDGET_EXCEEDED_CODE = "budget_exceeded"
+# The copy when the gateway did not say whose budget it is.
 BUDGET_EXCEEDED_USER_MESSAGE = (
-    "Your organization's spending budget is used up. "
-    "An owner or admin can raise it in Budgets."
+    "A spending budget is used up. "
+    "An administrator can raise it in Budgets."
 )
+# Whose budget the gateway's `budget_scope` names; any other scope gets the copy above.
+# `user` and `all_members` both cap the caller's own spend.
+_BUDGET_SCOPE_OWNERS = {
+    "org": "Your organization's",
+    "workspace": "This workspace's",
+    "api_key": "This API key's",
+    "team": "Your team's",
+    "user": "Your",
+    "all_members": "Your",
+}
+# One definition of the budget fields' shapes, shared with the coding path.
+_BUDGET_SCOPE_PATTERN = BUDGET_SCOPE_PATTERN
+_BUDGET_PERIOD_ADJECTIVES = BUDGET_PERIOD_ADJECTIVES
+_BUDGET_MODEL_PATTERN = BUDGET_MODEL_PATTERN
 
 # Codes whose failure frame carries the gate's `X-MindsHub-Reset-At` instant as
 # `reset_at`, so the card can say when the free way forward comes back.
@@ -194,7 +236,7 @@ BUDGET_EXCEEDED_USER_MESSAGE = (
 # named `*_CODE` on purpose: the wire-vocabulary inventory test collects those,
 # and this is not a wire code.
 RESET_AT_CODES: frozenset[str] = frozenset(
-    {ALLOWANCE_EXHAUSTED_CODE, FREE_SERVING_PAUSED_CODE}
+    {ALLOWANCE_EXHAUSTED_CODE, WINDOW_ALLOWANCE_EXHAUSTED_CODE, FREE_SERVING_PAUSED_CODE}
 )
 
 # Curated copy + wire code for a VELOCITY rate-limit (gateway 429
@@ -334,14 +376,15 @@ MODEL_UNAVAILABLE_FALLBACK_MESSAGE = (
 # The X-MindsHub-Reason header values the inference gateway sets to name the
 # billing decision precisely. Preferred over status/message heuristics.
 #
-# mindshub_inference (`denial_error()` and `credential_rejected()` in
-# minds/inference/errors.py) emits nine reasons today: unknown_model,
+# The inference service (its `denial_error()` and `credential_rejected()`)
+# emits eleven reasons today: unknown_model,
 # rate_limited, wallet_empty, included_allowance_exhausted,
+# window_allowance_exhausted, model_not_in_tier,
 # free_air_daily_spend_fuse_exceeded, budget_exceeded, policy_unavailable,
 # permission_denied and invalid_credentials. Any other gate reason fails closed
 # to policy_unavailable.
 #
-# This module maps the first seven, below. permission_denied (403) and
+# This module maps the first nine, below. permission_denied (403) and
 # invalid_credentials (401) are credential rejections with no reason mapping
 # here: they fall through to the rest of `friendly_turn_error`'s ladder, where
 # `is_auth_error` picks up anton's typed ProviderAuthError for a 401 and a 403
@@ -349,6 +392,8 @@ MODEL_UNAVAILABLE_FALLBACK_MESSAGE = (
 # deny detail below: `_is_model_restricted` maps that to MODEL_RESTRICTED_CODE.
 _REASON_WALLET_EMPTY = "wallet_empty"
 _REASON_ALLOWANCE_EXHAUSTED = "included_allowance_exhausted"
+_REASON_WINDOW_ALLOWANCE_EXHAUSTED = "window_allowance_exhausted"
+_REASON_MODEL_NOT_IN_TIER = "model_not_in_tier"
 _REASON_FREE_AIR_FUSE = "free_air_daily_spend_fuse_exceeded"
 _REASON_BUDGET_EXCEEDED = "budget_exceeded"
 _REASON_POLICY_UNAVAILABLE = "policy_unavailable"
@@ -1027,6 +1072,8 @@ def _gateway_body_denial(*, exc: BaseException) -> _BodyDenial | None:
     known = (
         _REASON_WALLET_EMPTY,
         _REASON_ALLOWANCE_EXHAUSTED,
+        _REASON_WINDOW_ALLOWANCE_EXHAUSTED,
+        _REASON_MODEL_NOT_IN_TIER,
         _REASON_FREE_AIR_FUSE,
         _REASON_BUDGET_EXCEEDED,
         _REASON_POLICY_UNAVAILABLE,
@@ -1283,6 +1330,8 @@ def _map_gateway_reason(reason: str) -> tuple[str, str] | None:
 
     An empty wallet is "out of credits". A spent or absent free allowance is
     NOT, because that user has never paid, so it has its own code and copy.
+    A spent subscription window and a model outside the plan's tier are not
+    either: waiting or upgrading lifts them as well as credits do.
     The free-Air spend fuse is neither: free serving is paused for
     every org whose wallet cannot pay, not just this one, so it has its own code
     and copy too. A spent budget is not out of credits either: an admin
@@ -1298,6 +1347,10 @@ def _map_gateway_reason(reason: str) -> tuple[str, str] | None:
         return RATE_LIMITED_CODE, RATE_LIMITED_USER_MESSAGE
     if reason == _REASON_ALLOWANCE_EXHAUSTED:
         return ALLOWANCE_EXHAUSTED_CODE, ALLOWANCE_EXHAUSTED_USER_MESSAGE
+    if reason == _REASON_WINDOW_ALLOWANCE_EXHAUSTED:
+        return WINDOW_ALLOWANCE_EXHAUSTED_CODE, WINDOW_ALLOWANCE_EXHAUSTED_USER_MESSAGE
+    if reason == _REASON_MODEL_NOT_IN_TIER:
+        return MODEL_NOT_IN_TIER_CODE, MODEL_NOT_IN_TIER_USER_MESSAGE
     if reason == _REASON_FREE_AIR_FUSE:
         return FREE_SERVING_PAUSED_CODE, FREE_SERVING_PAUSED_USER_MESSAGE
     if reason == _REASON_BUDGET_EXCEEDED:
@@ -1318,18 +1371,21 @@ class GatewayDenial(NamedTuple):
     # `code` that carries the same value.
     reason: str
     # The gate's X-MindsHub-Reset-At instant, as the opaque ISO string it sent.
-    # The gate sets it on the allowance and free-Air fuse denials only.
+    # The gate sets it on the allowance, plan-window and free-Air fuse denials only.
     reset_at: str | None
 
 
 # The gateway reasons `gateway_denial` reports. The credential and model
 # reasons (invalid_credentials, permission_denied, unknown_model) stay out:
 # the Settings probe reads a 401 or 403 as a rejected key by its status, and it
-# always sends a model the gateway serves.
+# always sends a model the gateway serves. model_not_in_tier is a 403 too, but
+# it names a billing decision rather than a rejected key, so it is reported.
 PROBE_DENIAL_REASONS: frozenset[str] = frozenset(
     {
         _REASON_WALLET_EMPTY,
         _REASON_ALLOWANCE_EXHAUSTED,
+        _REASON_WINDOW_ALLOWANCE_EXHAUSTED,
+        _REASON_MODEL_NOT_IN_TIER,
         _REASON_FREE_AIR_FUSE,
         _REASON_BUDGET_EXCEEDED,
         _REASON_RATE_LIMITED,
@@ -1364,6 +1420,21 @@ def friendly_turn_error(
     exc: Exception, model_info: tuple[str, str] | None | object = _UNSET
 ) -> tuple[str, str] | None:
     """Map a known, cryptic turn failure to ``(code, user_message)``.
+
+    A spent budget's copy names whose budget it is when the gateway said so.
+    """
+    friendly = _classify_turn_error(exc, model_info)
+    if friendly is not None and friendly[0] == BUDGET_EXCEEDED_CODE:
+        return BUDGET_EXCEEDED_CODE, budget_exceeded_message(
+            gate_budget_scope(exc), gate_budget_period(exc), gate_budget_model(exc)
+        )
+    return friendly
+
+
+def _classify_turn_error(
+    exc: Exception, model_info: tuple[str, str] | None | object = _UNSET
+) -> tuple[str, str] | None:
+    """``friendly_turn_error`` before the budget copy names its scope.
 
     Returns ``None`` when the exception isn't one we have curated copy
     for — the caller then falls back to the generic redacted message.
@@ -1577,6 +1648,18 @@ _REMOTE_TYPE_MAPPINGS: dict[str, _RemoteTypeMapping] = {
     "AllowanceExhaustedError": _RemoteTypeMapping(
         ALLOWANCE_EXHAUSTED_CODE, ALLOWANCE_EXHAUSTED_USER_MESSAGE
     ),
+    # ENG-4186's two plan stops, under the names anton's billing stops follow.
+    # Inert until the worker image's anton raises them: a worker that predates
+    # them reports the stop under whatever type it falls back to, and the card
+    # is the one that type maps to. The worker sends `window` and
+    # `required_tier` beside `error`, as it does `reset_at`, and the producer
+    # keeps each for its own code only.
+    "WindowAllowanceExhaustedError": _RemoteTypeMapping(
+        WINDOW_ALLOWANCE_EXHAUSTED_CODE, WINDOW_ALLOWANCE_EXHAUSTED_USER_MESSAGE
+    ),
+    "ModelNotInTierError": _RemoteTypeMapping(
+        MODEL_NOT_IN_TIER_CODE, MODEL_NOT_IN_TIER_USER_MESSAGE
+    ),
     "FreeServingPausedError": _RemoteTypeMapping(
         FREE_SERVING_PAUSED_CODE, FREE_SERVING_PAUSED_USER_MESSAGE
     ),
@@ -1646,7 +1729,12 @@ _REMOTE_TYPE_MAPPINGS: dict[str, _RemoteTypeMapping] = {
 }
 
 
-def remote_turn_error(error: str | None) -> tuple[str, str]:
+def remote_turn_error(
+    error: str | None,
+    budget_scope: str | None = None,
+    budget_period: str | None = None,
+    budget_model: str | None = None,
+) -> tuple[str, str]:
     """Map a remote pod's ``turn_failed`` error STRING to ``(code, message)``.
 
     The in-process path classifies exceptions (`friendly_turn_error`); remote
@@ -1687,6 +1775,8 @@ def remote_turn_error(error: str | None) -> tuple[str, str]:
     message = message.strip()
     mapping = _REMOTE_TYPE_MAPPINGS.get(type_name)
     if mapping is not None:
+        if mapping.code == BUDGET_EXCEEDED_CODE:
+            return mapping.code, budget_exceeded_message(budget_scope, budget_period, budget_model)
         if mapping.passes_message_through and message:
             return mapping.code, message
         return mapping.code, mapping.message
@@ -1733,6 +1823,150 @@ def remote_error_label(*, error: str | None) -> str:
     return "unmapped"
 
 
+def clean_budget_scope(value: object) -> str | None:
+    """``value`` when it is a well-formed scope name, else None. Unknown names pass, for newer scopes."""
+    if isinstance(value, str) and _BUDGET_SCOPE_PATTERN.fullmatch(value):
+        return value
+    return None
+
+
+def clean_budget_period(value: object) -> str | None:
+    """``value`` when it is a period the copy can name (``day``, ``month``, ``year``), else None."""
+    return value if isinstance(value, str) and value in _BUDGET_PERIOD_ADJECTIVES else None
+
+
+def clean_budget_model(value: object) -> str | None:
+    """``value`` when it is a header-safe catalog alias, else None."""
+    return value if isinstance(value, str) and _BUDGET_MODEL_PATTERN.fullmatch(value) else None
+
+
+def budget_model_label(model: str) -> str:
+    """The catalog label for a budget's model alias, or the alias when the catalog has none."""
+    from cowork.services.providers import budget_model_label as _label
+
+    return _label(model)
+
+
+def budget_exceeded_message(scope: str | None, period: str | None = None, model: str | None = None) -> str:
+    """The budget_exceeded copy naming whose budget is spent, its period and its model, when known."""
+    adjective = _BUDGET_PERIOD_ADJECTIVES.get(period or "")
+    budget = f"{adjective} spending budget" if adjective else "spending budget"
+    if model:
+        # A per-model budget stops that model only.
+        budget = f"{budget} for {budget_model_label(model)}"
+    owner = _BUDGET_SCOPE_OWNERS.get(scope or "")
+    others = " Other models still work." if model else ""
+    if owner is None:
+        return f"A {budget} is used up.{others} An administrator can raise it in Budgets."
+    # Only org budgets are certainly the org owners'; others may be managed below the org.
+    who = "An owner or admin" if scope == "org" else "An administrator"
+    return f"{owner} {budget} is used up.{others} {who} can raise it in Budgets."
+
+
+def _gate_budget_field(exc: BaseException, name: str, clean) -> str | None:
+    """A ``budget_<name>`` field from anywhere in the cause chain: anton's attribute, the
+    ``X-MindsHub-Budget-<Name>`` header, then the body. Only read once the denial is the gateway's."""
+    attr, header = f"budget_{name}", f"x-mindshub-budget-{name}"
+    for cur in _cause_chain(exc=exc):
+        value = clean(getattr(cur, attr, None))
+        if value is not None:
+            return value
+        resp = getattr(cur, "response", None)
+        headers = getattr(resp, "headers", None) or getattr(cur, "headers", None)
+        if headers is not None:
+            try:
+                raw = headers.get(header)
+                if raw is None and hasattr(headers, "items"):
+                    # A plain dict is case-sensitive; match the header name in any casing.
+                    raw = next((v for k, v in headers.items() if str(k).lower() == header.lower()), None)
+            except Exception:
+                raw = None
+            value = clean(raw)
+            if value is not None:
+                return value
+        body = getattr(cur, "body", None)
+        if isinstance(body, list) and body and isinstance(body[0], dict):
+            body = body[0]
+        if isinstance(body, dict):
+            env = body.get("error") if isinstance(body.get("error"), dict) else {}
+            value = clean(body.get(attr) or env.get(attr))
+            if value is not None:
+                return value
+    return None
+
+
+def clean_plan_window(value: object) -> str | None:
+    """``value`` when it names a plan window (``5h`` or ``7d``), else None."""
+    return value if is_one_of(value, PLAN_WINDOWS) else None
+
+
+def clean_required_tier(value: object) -> str | None:
+    """``value`` when it names a tier a model can require (``plus`` or ``pro``), else None."""
+    return value if is_one_of(value, PAID_PLAN_TIERS) else None
+
+
+def _gate_body_field(exc: BaseException, name: str, clean) -> str | None:
+    """A denial field the gateway sends only in the body, from anywhere in the cause chain.
+
+    ENG-4186's ``window`` and ``required_tier`` are top-level body fields beside
+    ``reset_at``, with no header. Read from anton's attribute of the same name,
+    then the exception's ``body`` (top level, or inside the ``error`` envelope
+    a proxy may keep), then the response's own JSON: the OpenAI SDK keeps only
+    the ``error`` envelope as ``body``, which drops top-level fields, but the
+    response it holds still has them. Only read once the denial is the
+    gateway's, and every value passes ``clean`` first. Never raises.
+    """
+    for cur in _cause_chain(exc=exc):
+        value = clean(getattr(cur, name, None))
+        if value is not None:
+            return value
+        body = getattr(cur, "body", None)
+        if isinstance(body, list) and body and isinstance(body[0], dict):
+            body = body[0]
+        if isinstance(body, dict):
+            env = body.get("error") if isinstance(body.get("error"), dict) else {}
+            value = clean(body.get(name)) or clean(env.get(name))
+            if value is not None:
+                return value
+        resp = getattr(cur, "response", None)
+        if resp is not None:
+            try:
+                payload = resp.json()
+            except Exception:
+                payload = None
+            if isinstance(payload, dict):
+                env = payload.get("error") if isinstance(payload.get("error"), dict) else {}
+                value = clean(payload.get(name)) or clean(env.get(name))
+                if value is not None:
+                    return value
+    return None
+
+
+def gate_window(exc: BaseException) -> str | None:
+    """Which plan window a window_allowance_exhausted denial names, from anywhere in the cause chain."""
+    return _gate_body_field(exc, "window", clean_plan_window)
+
+
+def gate_required_tier(exc: BaseException) -> str | None:
+    """The tier a model_not_in_tier denial names, from anywhere in the cause chain."""
+    return _gate_body_field(exc, "required_tier", clean_required_tier)
+
+
+def gate_budget_scope(exc: BaseException) -> str | None:
+    """Whose budget a budget_exceeded denial names, from anywhere in the cause chain."""
+    return _gate_budget_field(exc, "scope", clean_budget_scope)
+
+
+def gate_budget_period(exc: BaseException) -> str | None:
+    """The spent budget's period a budget_exceeded denial names, from anywhere in the cause chain."""
+    return _gate_budget_field(exc, "period", clean_budget_period)
+
+
+def gate_budget_model(exc: BaseException) -> str | None:
+    """The model a per-model budget_exceeded denial names, from anywhere in the cause chain."""
+    return _gate_budget_field(exc, "model", clean_budget_model)
+
+
 def response_failed_payload(
     error: str,
     code: str,
@@ -1743,6 +1977,11 @@ def response_failed_payload(
     retry_after: float | None = None,
     retry_at: str | None = None,
     reset_at: str | None = None,
+    budget_scope: str | None = None,
+    budget_period: str | None = None,
+    budget_model: str | None = None,
+    window: str | None = None,
+    required_tier: str | None = None,
     request_id: str | None = None,
     assistant_message_id: str | None = None,
 ) -> dict:
@@ -1752,8 +1991,11 @@ def response_failed_payload(
     ``provider_auth`` case so the renderer can offer "Reconnect" (MindsHub) vs
     "Open Settings" (BYOK); ``model`` only for the model-403 case so the card
     can name the locked model ("Sonnet needs credits"); ``retry_after`` only for
-    ``rate_limited`` so the card can time-gate its Retry — omitted otherwise to
-    keep the shape unchanged for every other failure. All additive: an older
+    ``rate_limited`` so the card can time-gate its Retry; ``budget_scope``,
+    ``budget_period`` and ``budget_model`` only for ``budget_exceeded``, naming whose budget is spent, its
+    period and its model; ``window`` only for ``window_allowance_exhausted``
+    (which plan window is spent) and ``required_tier`` only for
+    ``model_not_in_tier`` — omitted otherwise to keep the shape unchanged for every other failure. All additive: an older
     client ignores fields it doesn't read.
 
     ``request_id`` is the producing turn's own correlation id — present on
@@ -1782,6 +2024,16 @@ def response_failed_payload(
         payload["retry_at"] = retry_at
     if reset_at is not None:
         payload["reset_at"] = reset_at
+    if budget_scope is not None:
+        payload["budget_scope"] = budget_scope
+    if budget_period is not None:
+        payload["budget_period"] = budget_period
+    if budget_model is not None:
+        payload["budget_model"] = budget_model
+    if window is not None:
+        payload["window"] = window
+    if required_tier is not None:
+        payload["required_tier"] = required_tier
     if request_id is not None:
         payload["request_id"] = request_id
     if assistant_message_id is not None:
@@ -1799,6 +2051,11 @@ def response_failed_sse(
     retry_after: float | None = None,
     retry_at: str | None = None,
     reset_at: str | None = None,
+    budget_scope: str | None = None,
+    budget_period: str | None = None,
+    budget_model: str | None = None,
+    window: str | None = None,
+    required_tier: str | None = None,
     request_id: str | None = None,
     assistant_message_id: str | None = None,
 ) -> str:
@@ -1813,6 +2070,11 @@ def response_failed_sse(
         retry_after=retry_after,
         retry_at=retry_at,
         reset_at=reset_at,
+        budget_scope=budget_scope,
+        budget_period=budget_period,
+        budget_model=budget_model,
+        window=window,
+        required_tier=required_tier,
         request_id=request_id,
         assistant_message_id=assistant_message_id,
     )

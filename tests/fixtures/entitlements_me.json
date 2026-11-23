@@ -1,0 +1,57 @@
+{
+  "wallet": {
+    "balance_usd": "12.40",
+    "can_consume": true
+  },
+  "is_billing_owner": true,
+  "org_role": "owner",
+  "feature_gates": {},
+  "included_percent_remaining": 64.0,
+  "free_grant_eligible": true,
+  "next_refresh_at": "2026-11-19T20:00:00Z",
+  "plan": {
+    "tier": "plus",
+    "status": "active",
+    "renews_at": "2026-12-19T00:00:00Z",
+    "cancel_at_period_end": false,
+    "windows": [
+      {"window": "5h", "percent_used": 42, "resets_at": "2026-11-19T18:00:00Z"},
+      {"window": "7d", "percent_used": 10, "resets_at": "2026-11-24T09:00:00Z"}
+    ]
+  },
+  "models": [
+    {
+      "id": "mindshub_air",
+      "label": "MindsHub Air",
+      "provider": "openai",
+      "family": "mindshub_air",
+      "free_bucket": true,
+      "enabled": true,
+      "disabled_reason": null,
+      "covered_by_tier": "free",
+      "kind": "chat"
+    },
+    {
+      "id": "kimi-k3",
+      "label": "Kimi K3",
+      "provider": "fireworks",
+      "family": "kimi-k3",
+      "free_bucket": false,
+      "enabled": true,
+      "disabled_reason": null,
+      "covered_by_tier": "plus",
+      "kind": "chat"
+    },
+    {
+      "id": "opus",
+      "label": "Claude Opus",
+      "provider": "anthropic",
+      "family": "opus",
+      "free_bucket": false,
+      "enabled": false,
+      "disabled_reason": "model_not_in_tier",
+      "covered_by_tier": "pro",
+      "kind": "chat"
+    }
+  ]
+}

@@ -27,6 +27,7 @@ from cowork.common.paths import (
 from cowork.db.scoped import ScopedSelect, ScopedSession, TenantScope
 from cowork.db.units import run_db
 from cowork.models.conversation import Conversation
+from cowork.models.conversation_folder import ConversationFolder
 from cowork.models.message import Message
 from cowork.models.message_event import MessageEvent
 from cowork.models.project import Project
@@ -779,6 +780,12 @@ class ConversationService:
         # outlive the conversation as orphans pointing at artifacts no
         # task owns anymore.
         TaskObjectService(self.session).delete_for_conversation(conversation)
+        for folder in self.session.exec(
+            self.session.select(ConversationFolder).where(
+                ConversationFolder.conversation_id == conversation_id
+            )
+        ).all():
+            self.session.delete(folder)
         # Drop the conversation's uploaded attachments (rows + bytes) — they're
         # keyed by conversation id and would otherwise orphan in the file store
         # forever, invisible in any UI (ENG-701). Stage the row deletes into
@@ -1088,7 +1095,10 @@ class ConversationService:
                 self.session.select(MessageEvent)
                 .where(MessageEvent.message_id == reply.id)
             ).all()
-            if any(e.event_data.get("type") in {"response.completed", "response.failed"} for e in events):
+            if any(
+                e.event_data.get("type") in {"response.completed", "response.failed", "response.cancelled"}
+                for e in events
+            ):
                 return False
             self.session.add(MessageEvent(
                 message_id=reply.id,

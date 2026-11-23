@@ -167,9 +167,22 @@ class EngineFailure:
     code: str = ""
     detail: str = ""
     model: str = ""
+    # Whose budget a budget_exceeded failure names, and its period, so the card can say so.
+    budget_scope: str = ""
+    budget_period: str = ""
+    # A per-model budget's alias; the app turns it into the catalog label.
+    budget_model: str = ""
 
     def event_data(self) -> dict[str, str]:
-        return {key: value for key, value in (("code", self.code), ("detail", self.detail), ("model", self.model)) if value}
+        fields = (
+            ("code", self.code),
+            ("detail", self.detail),
+            ("model", self.model),
+            ("budget_scope", self.budget_scope),
+            ("budget_period", self.budget_period),
+            ("budget_model", self.budget_model),
+        )
+        return {key: value for key, value in fields if value}
 
 
 FAILURE_MESSAGES = {
@@ -181,14 +194,33 @@ FAILURE_MESSAGES = {
     "model_upstream_unavailable": "The model service is temporarily unavailable. Try again in a moment.",
     "rate_limited": "MindsHub is receiving requests from your organization too quickly. Wait a moment, then continue.",
     "included_allowance_exhausted": "Your included allowance is used up. Add credits to continue now, or wait for it to refill.",
+    "window_allowance_exhausted": (
+        "You've used your plan's allowance for now. Add credits to continue now, or wait for it to reset."
+    ),
+    "model_not_in_tier": "Your plan doesn't include this model. Upgrade your plan, add credits, or choose another model.",
     "free_air_daily_spend_fuse_exceeded": (
         "Free MindsHub Air is paused until the daily budget resets. Add credits to continue now."
     ),
     "budget_exceeded": (
-        "Your organization's spending budget is used up. An owner or admin can raise it in Budgets, "
+        "A spending budget is used up. An administrator can raise it in Budgets, "
         "or choose a model that is still available."
     ),
 }
+
+# Whose budget a budget_exceeded failure names; any other scope keeps neutral wording.
+_BUDGET_SCOPE_OWNERS = {
+    "org": "Your organization's",
+    "workspace": "This workspace's",
+    "api_key": "This API key's",
+    "team": "Your team's",
+    "user": "Your",
+    "all_members": "Your",
+}
+BUDGET_SCOPE_PATTERN = re.compile(r"[a-z_]{1,32}")
+# The periods a budget_exceeded failure can name; anything else is left out.
+BUDGET_PERIOD_ADJECTIVES = {"day": "daily", "month": "monthly", "year": "yearly"}
+# A per-model budget's catalog alias, as the gateway sends it.
+BUDGET_MODEL_PATTERN = re.compile(r"[A-Za-z0-9._:/-]{1,128}")
 
 _FAILURE_MARKERS = (
     ("insufficient_credits", ("402 payment required", "wallet has no balance", "insufficient credits")),
@@ -222,27 +254,61 @@ def classify_engine_failure(
     for responses that reached it without the rewrite.
     """
     safe = safe_engine_error(message, credentials)
-    code = _embedded_error_code(safe) or next(
+    error = _embedded_error(safe)
+    code = _string_field(error, "code") or next(
         (code for code, markers in _FAILURE_MARKERS if any(marker in safe.casefold() for marker in markers)),
         "",
     )
     if code not in FAILURE_MESSAGES:
         return EngineFailure(message=safe)
     detail = _URL_SUFFIX.sub("", safe).strip() if code == "model_upstream_unavailable" else safe
+    if code == "budget_exceeded":
+        scope = _string_field(error, "budget_scope")
+        scope = scope if BUDGET_SCOPE_PATTERN.fullmatch(scope) else ""
+        period = _string_field(error, "budget_period")
+        period = period if period in BUDGET_PERIOD_ADJECTIVES else ""
+        budget_model = _string_field(error, "budget_model")
+        budget_model = budget_model if BUDGET_MODEL_PATTERN.fullmatch(budget_model) else ""
+        adjective = BUDGET_PERIOD_ADJECTIVES.get(period)
+        budget = f"{adjective} spending budget" if adjective else "spending budget"
+        if budget_model:
+            budget = f"{budget} for {_budget_model_label(budget_model)}"
+        owner = _BUDGET_SCOPE_OWNERS.get(scope)
+        lead = f"{owner} {budget}" if owner else f"A {budget}"
+        others = " Other models still work." if budget_model else ""
+        who = "An owner or admin" if scope == "org" else "An administrator"
+        text = (
+            f"{lead} is used up.{others} {who} can raise it in Budgets, or choose a model that is still available."
+        )
+        return EngineFailure(
+            message=text, code=code, detail=detail, model=model, budget_scope=scope, budget_period=period,
+            budget_model=budget_model,
+        )
     return EngineFailure(message=FAILURE_MESSAGES[code], code=code, detail=detail, model=model)
 
 
-def _embedded_error_code(text: str) -> str:
+def _budget_model_label(model: str) -> str:
+    # Imported lazily: providers pulls in the settings stack, which coding modules avoid at import.
+    from cowork.services.providers import budget_model_label
+
+    return budget_model_label(model)
+
+
+def _embedded_error(text: str) -> dict:
     start = text.find("{")
     if start < 0:
-        return ""
+        return {}
     try:
         payload = json.loads(text[start:])
     except json.JSONDecodeError:
-        return ""
+        return {}
     error = payload.get("error") if isinstance(payload, dict) else None
-    code = error.get("code") if isinstance(error, dict) else None
-    return code if isinstance(code, str) else ""
+    return error if isinstance(error, dict) else {}
+
+
+def _string_field(error: dict, key: str) -> str:
+    value = error.get(key)
+    return value if isinstance(value, str) else ""
 
 
 def is_context_exhaustion_error(message: str | None) -> bool:

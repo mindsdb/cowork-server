@@ -430,8 +430,8 @@ def test_an_omitted_path_is_none():
 
 def _client(base_url: str = "http://127.0.0.1:26866", peer: str = "127.0.0.1"):
     """`base_url` sets `scope["server"]`, the accepted socket's local address,
-    which is what the chosen-folder gate reads. `client` sets the peer, which
-    `require_local` reads."""
+    and `client` sets the peer. `require_local`, which the chosen-folder gate
+    calls, reads both."""
     from fastapi.testclient import TestClient
 
     from cowork.server import create_app

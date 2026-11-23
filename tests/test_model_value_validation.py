@@ -25,7 +25,7 @@ IMAGE_CATALOG = ["gpt-image-2.6-flare", "gpt-image-2.6-sunburst"]
 def _listing(ids, image_models=()):
     return providers.MindsModelListing(
         ids=ids, efforts={}, enabled={}, labels={}, providers={}, families={}, role_defaults={},
-        disabled_reasons={}, image_models=dict.fromkeys(image_models, True),
+        disabled_reasons={}, image_models=dict.fromkeys(image_models, True), covered_by_tier={},
     )
 
 

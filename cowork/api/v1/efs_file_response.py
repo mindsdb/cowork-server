@@ -22,6 +22,7 @@ the body, as Starlette's ``StreamingResponse`` does.
 from __future__ import annotations
 
 import asyncio
+import io
 import os
 import stat
 from collections.abc import Awaitable, Callable
@@ -108,6 +109,21 @@ class EfsFileResponse(FileResponse):
             raise HTTPException(status_code=404, detail="File not found") from exc
         file = opened.file
         try:
+            from cowork.services.content_safety import ContentSafetySettings, MAX_FILE_BYTES, check_file_bytes
+            if ContentSafetySettings().required:
+                data = await self._read(file, start=0, size=MAX_FILE_BYTES + 1)
+                await check_file_bytes(data, content_type=self.media_type or '', purpose='output', scope=self._tenant_scope)
+                # Scan and serve one immutable snapshot, including range reads.
+                snapshot = io.BytesIO(data)
+                await run_efs_cleanup(file.close, scope=self._tenant_scope)
+                file = snapshot
+                snapshot_stat = list(opened.stat)
+                snapshot_stat[6] = len(data)
+                opened = _OpenedFile(file, os.stat_result(snapshot_stat))
+                self.stat_result = None
+                self.headers['content-length'] = str(len(data))
+                self.headers['cache-control'] = 'no-store'
+                self.headers['x-content-type-options'] = 'nosniff'
             stat_result = self.stat_result
             if stat_result is None:
                 stat_result = opened.stat

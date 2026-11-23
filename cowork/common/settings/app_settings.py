@@ -648,6 +648,12 @@ class OAuthSettings(Settings):
     hubspot_client_id: str = Field(default="", validation_alias=AliasChoices("HUBSPOT_CLIENT_ID"))
     hubspot_client_secret: str = Field(default="", validation_alias=AliasChoices("HUBSPOT_CLIENT_SECRET"))
 
+    slack_client_id: str = Field(default="", validation_alias=AliasChoices("SLACK_CLIENT_ID"))
+    slack_client_secret: str = Field(default="", validation_alias=AliasChoices("SLACK_CLIENT_SECRET"))
+    # Offers Slack's `mcp` method for new connections. Off hides it and refuses
+    # new sign-ins; existing connections of any method keep working.
+    slack_connector_enabled: bool = Field(default=False, validation_alias=AliasChoices("SLACK_CONNECTOR_ENABLED"))
+
     # Browser-side key for the Google Picker widget (drive.file scope only
     # grants access to files the user explicitly picks via this UI).
     google_picker_api_key: str = Field(default="", validation_alias=AliasChoices("GOOGLE_PICKER_API_KEY"))
@@ -767,6 +773,11 @@ class TurnQueueSettings(Settings):
     @property
     def is_remote(self) -> bool:
         return self.backend == "remote"
+
+    @property
+    def needs_turn_key_id(self) -> bool:
+        """Whether a turn key's public prefix is minted, which auth binds turn grants to."""
+        return self.datasource_enabled or self.custom_api_enabled
 
     redis_url: str = Field(
         default="redis://localhost:6379/0",
@@ -945,6 +956,32 @@ class TurnQueueSettings(Settings):
             "until the controller and pod support the datasource block."
         ),
     )  # COWORK_TURN_DATASOURCE_ENABLED
+    connector_drafts_enabled: bool = Field(
+        default=False,
+        description=(
+            "Let cloud turns build custom connector templates a member saves "
+            "from a card and connects. The code default is false; "
+            "the Helm chart turns it on in every environment (connectorDraftsEnabled)."
+        ),
+    )  # COWORK_TURN_CONNECTOR_DRAFTS_ENABLED
+    custom_api_enabled: bool = Field(
+        default=False,
+        description=(
+            "Give a member's org-mode cloud turns the custom API connections they "
+            "connected. Keep false until auth, the inference gateway and the pod's "
+            "anton that serve those connections are deployed."
+        ),
+    )  # COWORK_TURN_CUSTOM_API_ENABLED
+    custom_connect_refused_domains: list[str] = Field(
+        default=[
+            "mindshub.ai", "mindshub.co", "mindsdb.com", "mindsdb.cloud", "mindscloud.ai",
+            "minds-db.com", "mdb.ai", "4nton.ai", "cluster.local",
+        ],
+        description=(
+            "Domains a custom connector's address may not be, or be under: our own, "
+            "so a member cannot point the check at our services."
+        ),
+    )  # COWORK_TURN_CUSTOM_CONNECT_REFUSED_DOMAINS
     datasource_labels_enabled: bool = Field(
         default=False,
         description=(

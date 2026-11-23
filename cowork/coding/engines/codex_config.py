@@ -230,6 +230,12 @@ def prepare_launch(config: EngineSessionConfig, workspace: Path, endpoint: str) 
     permission = PermissionMode.read_only if config.task_mode == "plan" else config.permission_mode
     resolved_approval = "never" if config.task_mode == "plan" else approval_policy(permission)
     resolved_reviewer = approvals_reviewer(permission)
+    if not config.writes_allowed and permission != PermissionMode.full_access:
+        # Like Codex on a folder it does not track: the sandbox reads only, and
+        # each write still asks the person. The automatic reviewer would grant
+        # those writes on its own, which is what holding them back prevents.
+        permission = PermissionMode.read_only
+        resolved_reviewer = "user"
     resolved_sandbox = sandbox_mode(permission)
     resolved_policy = sandbox_policy(
         permission,

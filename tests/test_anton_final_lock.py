@@ -77,6 +77,65 @@ def test_the_locked_version_is_read_from_the_export():
     assert lock.locked_version(export) == "2.26.11.13.1rc3"
 
 
+PYPROJECT = (
+    '[project]\ndependencies = [\n'
+    '    # 2.26.11.20.1rc3 is the first with the feature.\n'
+    '    "anton-agent>={floor},<3",\n'
+    '    "other>=1",\n]\n'
+)
+
+
+def test_a_candidate_floor_is_raised_to_the_final():
+    raised = lock.raise_floor(PYPROJECT.format(floor="2.26.11.20.1rc3"), "2.26.11.20.1")
+    assert raised == PYPROJECT.format(floor="2.26.11.20.1")
+
+
+def test_a_final_floor_is_left_alone():
+    text = PYPROJECT.format(floor="2.26.11.15.1")
+    assert lock.raise_floor(text, "2.26.11.20.1") == text
+
+
+@pytest.mark.parametrize("text", [
+    '[project]\ndependencies = ["other>=1"]\n',
+    '[project]\ndependencies = ["anton-agent>=1.0rc1"]\n[project.optional-dependencies]\nx = ["anton-agent>=1.0rc1"]\n',
+])
+def test_the_floor_must_be_found_exactly_once(text):
+    with pytest.raises(ValueError, match="Expected one anton-agent>= floor"):
+        lock.raise_floor(text, "1.0")
+
+
+ALLOWANCE = (
+    '[project]\ndependencies = ["anton-agent>=1.0rc1,<3"]\n\n'
+    '[tool.cowork.release.allow-prerelease]\n'
+    '# Removed by the relock.\n'
+    'other = "2.0b1"\n'
+    '{entry}'
+    'later = "3.0rc1"\n\n'
+    '[tool.other]\n'
+    'anton-agent = "kept"\n'
+)
+
+
+def test_the_relock_drops_only_anton_agents_allowance():
+    dropped = lock.drop_allowance(ALLOWANCE.format(entry='anton-agent = "1.0rc1"\n'))
+    assert dropped == ALLOWANCE.format(entry="")
+
+
+def test_no_allowance_is_left_alone():
+    text = ALLOWANCE.format(entry="")
+    assert lock.drop_allowance(text) == text
+
+
+def test_an_allowance_the_relock_cannot_remove_is_refused():
+    with pytest.raises(ValueError, match="Could not remove anton-agent's entry"):
+        lock.drop_allowance(ALLOWANCE.format(entry='"anton-agent" = "1.0rc1"\n'))
+
+
+def test_a_final_below_the_candidate_floor_is_refused():
+    with pytest.raises(ValueError, match="not newer than the floor"):
+        lock.raise_floor(PYPROJECT.format(floor="2.0rc1"), "1.9")
+
+
 @pytest.mark.parametrize("value, expected", [
     ("2.26.11.15.1", "2.26.11.15.1"), ("", None), ("2.26.11.16.1rc1", None), ("not-a-version", None),
 ])

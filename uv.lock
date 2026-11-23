@@ -1,5 +1,5 @@
 version = 1
-revision = 5
+revision = 3
 requires-python = ">=3.12, <3.14"
 resolution-markers = [
     "python_full_version >= '3.13' and platform_machine == 'x86_64' and sys_platform == 'darwin'",
@@ -141,7 +141,7 @@ wheels = [
 
 [[package]]
 name = "anton-agent"
-version = "2.26.11.15.1"
+version = "2.26.11.23.1"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "anthropic" },
@@ -163,9 +163,9 @@ dependencies = [
     { name = "truststore" },
     { name = "typer" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/a4/7f/beb8b647416dcfab0ff2fcecbbd1c30a7480317668a3ce67529148427f0b/anton_agent-2.26.11.15.1.tar.gz", hash = "sha256:5a415982fcdc5e5520b6b461da3ca158d2f52dff29fe9920c3455e9bbaae556f", size = 7477857, upload-time = "2026-11-15T21:38:53.536Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/b1/46/5b55359ad4b37f58d8cbf6c488059fffc258dde44cff65467fa93c519933/anton_agent-2.26.11.23.1.tar.gz", hash = "sha256:fad26e2be525ff275aaf5d7a2f065a490e7accbf8ae7ff89816c0fe299ad0fe9", size = 7678092, upload-time = "2026-11-23T02:25:19.774Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/bc/d3/7f86b0c65d4362bd033858667082cb63a338bbdc5cb4bbf22d3dd44a6364/anton_agent-2.26.11.15.1-py3-none-any.whl", hash = "sha256:e2bc0b8b3527425df527ad679fae38754a11dc5c51c540cf2fa3ed6dd406f03c", size = 4461985, upload-time = "2026-11-15T21:38:51.65Z" },
+    { url = "https://files.pythonhosted.org/packages/6b/e6/c9b0c3ef1b0e09582d4195af437bd96806c403ca773df917a6d8947c56e1/anton_agent-2.26.11.23.1-py3-none-any.whl", hash = "sha256:fbc38ca3f89bc50878289318e5818a7c5ba95be41e40c28ca1efc5daa5d9f145", size = 4542456, upload-time = "2026-11-23T02:25:17.969Z" },
 ]
 
 [[package]]
@@ -459,7 +459,7 @@ requires-dist = [
     { name = "aiohttp", specifier = ">=3.14" },
     { name = "aiohttp", marker = "extra == 'channels'", specifier = ">=3.9.0" },
     { name = "alembic", specifier = ">=1.17.0" },
-    { name = "anton-agent", specifier = ">=2.26.11.15.1,<3" },
+    { name = "anton-agent", specifier = ">=2.26.11.23.1,<3" },
     { name = "anyio", specifier = ">=4.14.2" },
     { name = "beautifulsoup4", specifier = "==4.15.0" },
     { name = "cryptography", specifier = ">=48.0.0,<51" },
@@ -998,14 +998,14 @@ wheels = [
 
 [[package]]
 name = "mako"
-version = "1.3.12"
+version = "1.4.3"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "markupsafe" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/00/62/791b31e69ae182791ec67f04850f2f062716bbd205483d63a215f3e062d3/mako-1.3.12.tar.gz", hash = "sha256:9f778e93289bd410bb35daadeb4fc66d95a746f0b75777b942088b7fd7af550a", size = 400219, upload-time = "2026-04-28T19:01:08.512Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/5a/09/e07c4b5579a79f4b16f8d4f29f6c54514ac787c4ad506b8c4f28a0e6b0bf/mako-1.4.3.tar.gz", hash = "sha256:cd6537fe88d5fec315c55c2f8529bc4ce7a9a352ad7db3eeaa6a66e2dd4ec37a", size = 412799, upload-time = "2026-09-22T20:54:31.509Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/bc/b1/a0ec7a5a9db730a08daef1fdfb8090435b82465abbf758a596f0ea88727e/mako-1.3.12-py3-none-any.whl", hash = "sha256:8f61569480282dbf557145ce441e4ba888be453c30989f879f0d652e39f53ea9", size = 78521, upload-time = "2026-04-28T19:01:10.393Z" },
+    { url = "https://files.pythonhosted.org/packages/6d/a0/053d6af3e8f871e0073b4a36732d9e65be77a72e5434c31b94f6af78a6bb/mako-1.4.3-py3-none-any.whl", hash = "sha256:723296007c870bfd6b3f0c3230dba7198096e5269297ebf5e4eff9e7ffa39d4f", size = 80164, upload-time = "2026-09-22T20:54:33.128Z" },
 ]
 
 [[package]]

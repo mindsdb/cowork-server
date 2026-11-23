@@ -1419,6 +1419,114 @@ def test_agent_repair_prompt_says_how_to_find_the_artifact(artifact):
     assert ":" not in hint.split(" ", 1)[0]
 
 
+def test_agent_repair_prompt_points_the_agent_at_the_thread_s_images(artifact):
+    """ENG-4410: the app attaches a thread's images to the repair message."""
+    folder, metadata, artifact_id = artifact
+    initial = current_source(folder, metadata, artifact_id)
+    image = "0" * 32 + ".png"
+
+    def prompt(thread):
+        return create_agent_repair(
+            folder, metadata, artifact_id,
+            expected_revision_id=initial["revision"]["id"],
+            comment_thread_id="thread-1", selector=None, thread=thread,
+            conversation_id="conversation-1",
+        )
+
+    with_images = prompt([{"text": f"Like this\n\n![shot.png](cowork-image:{image})"}])
+    cancel_agent_repair(folder, with_images["repair"]["id"])
+    without = prompt([{"text": "Fix the title"}])["prompt"]
+
+    lines = with_images["prompt"].splitlines()
+    images = next(line for line in lines if line.startswith("Images: "))
+    assert "1 `cowork-image:` reference(s)" in images
+    assert lines.index(images) < lines.index("Complete comment thread:")
+    assert "Images: " not in without
+
+
+def _repair_prompt(folder, metadata, artifact_id, *, selector):
+    initial = current_source(folder, metadata, artifact_id)
+    return create_agent_repair(
+        folder,
+        metadata,
+        artifact_id,
+        expected_revision_id=initial["revision"]["id"],
+        comment_thread_id="thread-1",
+        selector=selector,
+        thread=[{"text": "Rename this to Harbor and Pines"}],
+        conversation_id="conversation-1",
+    )["prompt"]
+
+
+def _html_artifact(folder, metadata, html):
+    (folder / "index.html").write_text(html, encoding="utf-8")
+    raw = metadata.model_dump(mode="json", exclude_none=True) if isinstance(metadata, ArtifactMetadata) else metadata
+    raw = {**raw, "type": "html-app", "primary": "index.html"}
+    (folder / "metadata.json").write_text(json.dumps(raw), encoding="utf-8")
+    return ArtifactMetadata.model_validate(raw)
+
+
+def test_agent_repair_prompt_routes_the_fix_through_edit_artifact(artifact):
+    """A comment fix takes the chat edit's route (ENG-4386): one edit_artifact
+    call on this folder, not a list_artifacts round and a scratchpad patch."""
+    folder, metadata, artifact_id = artifact
+    prompt = _repair_prompt(folder, metadata, artifact_id, selector=None)
+
+    lines = prompt.splitlines()
+    hint = lines[next(i for i, line in enumerate(lines) if line.startswith("Source path: ")) + 1]
+    assert hint.startswith("Make the change with one `edit_artifact` call")
+    assert f"pass `{folder.name}` as `slug`" in hint
+    # The old route stays only as the fallback for an anton without the editor.
+    assert hint.index("edit_artifact") < hint.index("list_artifacts")
+    assert "verify the artifact still renders" not in prompt
+    assert "Anchor: the artifact as a whole (brief.md)" in lines
+
+
+def test_agent_repair_prompt_anchors_an_element_comment_in_the_source(artifact):
+    folder, metadata, artifact_id = artifact
+    metadata = _html_artifact(folder, metadata, (
+        "<html><body><header><h1 class=\"title hero\">Old title</h1></header>"
+        "<section><h2>Revenue</h2></section><section><h2>Costs\n  by month</h2></section>"
+        "</body></html>"
+    ))
+    prompt = _repair_prompt(folder, metadata, artifact_id, selector="section:nth-of-type(2) > h2")
+
+    anchor = next(line for line in prompt.splitlines() if line.startswith("Anchor: "))
+    assert anchor == (
+        "Anchor: the element matching the CSS selector `section:nth-of-type(2) > h2` in index.html, "
+        "which the source writes as: <h2> with the text \u201cCosts by month\u201d"
+    )
+    # The thread's JSON is still the prompt's last bracketed block, which the
+    # desktop's chat card parses.
+    assert prompt.rindex("]") > prompt.index("Complete comment thread:")
+
+
+def test_agent_repair_prompt_keeps_a_selector_the_source_does_not_have(artifact):
+    """A page that builds the element in script has no match in its source:
+    the selector alone is passed on, never a guess at another element."""
+    folder, metadata, artifact_id = artifact
+    metadata = _html_artifact(folder, metadata, "<html><body><div id=\"root\"></div></body></html>")
+    prompt = _repair_prompt(folder, metadata, artifact_id, selector="#root > div:nth-of-type(3)")
+
+    assert (
+        "Anchor: the element matching the CSS selector `#root > div:nth-of-type(3)` in index.html\n"
+        in prompt
+    )
+
+
+def test_agent_repair_prompt_anchors_a_text_comment_by_its_quote(artifact):
+    folder, metadata, artifact_id = artifact
+    selector = json.dumps({
+        "type": "text-quote",
+        "path": "brief.md",
+        "quote": "First\nline",
+        "revisionId": None,
+    })
+    prompt = _repair_prompt(folder, metadata, artifact_id, selector=selector)
+
+    assert "Anchor: the text \u201cFirst line\u201d in brief.md\n" in prompt
+
+
 def _refresh(folder, text, *, schedule_id="schedule-1", conversation_id="run-1"):
     (folder / "brief.md").write_text(text, encoding="utf-8")
     return capture_agent_revision(

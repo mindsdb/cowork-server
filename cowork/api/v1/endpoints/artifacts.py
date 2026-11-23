@@ -937,15 +937,42 @@ async def delete_artifact_by_slug(
     )
 
 
+async def take_down_credential(scope: TenantScope) -> tuple[str, str]:
+    """The (publish_url, api_key) a delete takes published pages down with.
+
+    In org mode the key is minted for the acting user: unpublish acts on the
+    viewer, and the viewer scopes by the token's owner, so the credential has
+    to be the acting user's - not a stored provider key (org deployments have
+    none). On desktop it is the provider key, "" when there is none.
+    """
+    from cowork.common.settings.user_settings import get_user_settings
+    from cowork.services.artifact_publish_key import PublishKey
+    from cowork.services.publish import _resolve_publish_endpoint
+
+    publish_url, api_key = _resolve_publish_endpoint(await run_on_unit_threads(get_user_settings))
+    if not _org_mode():
+        return publish_url, api_key
+    if not scope or not scope.org_id or not scope.user_id:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="No tenant in scope")
+    from cowork.services.artifact_autopublish import _active_workspace_id
+
+    api_key = await PublishKey(
+        scope.user_id, scope.org_id, min_ttl_s=120.0,
+        workspace_id=await run_on_unit_threads(partial(_active_workspace_id, scope)),
+    ).get()
+    if not api_key:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Could not mint a publish credential",
+        )
+    return publish_url, api_key
+
+
 async def delete_artifact_for_request(
     scope: TenantScope, slug: str | _ArtifactDeleteRef, *, project_id: UUID, principal: Principal | None = None
 ) -> None:
     """Delete one artifact of one project. Unpublishes first; a failed unpublish
     leaves the folder in place and surfaces the error."""
-    from cowork.common.settings.user_settings import get_user_settings
-    from cowork.services.artifact_publish_key import PublishKey
-    from cowork.services.publish import _resolve_publish_endpoint
-
     # This helper is also called directly by internal/test code, so retain the
     # same concrete parsing boundary the HTTP adapter applies above. In
     # particular, no request-derived string can select a project path.
@@ -1009,28 +1036,12 @@ async def delete_artifact_for_request(
 
     admin_delete = await run_db(owner_decision, scope=scope)
     expected_artifact_id = artifact_id if ref.artifact_id is not None else None
-    publish_url, api_key = _resolve_publish_endpoint(await run_on_unit_threads(get_user_settings))
+    publish_url, api_key = await take_down_credential(scope)
     # Set once the draft review rule is gone: the delete step may then no
     # longer refuse a busy file store, which would leave the folder's review
     # marker without its rule.
     revoked = False
     if _org_mode():
-        if not scope or not scope.org_id or not scope.user_id:
-            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="No tenant in scope")
-        # Unpublish acts on the viewer, and the viewer scopes by the token's owner,
-        # so the credential has to be the acting user's - not a stored provider key
-        # (org deployments have none).
-        from cowork.services.artifact_autopublish import _active_workspace_id
-
-        api_key = await PublishKey(
-            scope.user_id, scope.org_id, min_ttl_s=120.0,
-            workspace_id=await run_on_unit_threads(partial(_active_workspace_id, scope)),
-        ).get()
-        if not api_key:
-            raise HTTPException(
-                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                detail="Could not mint a publish credential",
-            )
         from cowork.services.artifact_access import (
             ArtifactAccessUnavailable,
             revoke_draft_review_access,
