@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import tempfile
 import threading
 import uuid
 from collections.abc import Callable
@@ -211,7 +212,16 @@ class RuntimeWorkspaceOperations:
         ).stdout.strip()
         if not branch:
             raise WorkspaceError("Create a task branch before publishing this resource")
-        self.manager.workspaces.git.run(root, "push", "origin", f"{branch}:{branch}")
+        revision = str(payload.get("revision") or "")
+        head = self.manager.workspaces.git.run(root, "rev-parse", "--verify", "HEAD").stdout.strip()
+        if revision and revision != head:
+            raise WorkspaceError("This folder changed after you confirmed its draft pull request. Review it and confirm again.")
+        # Push the confirmed commit, not whatever the branch points at by the
+        # time Git runs, and run none of the repository's hooks.
+        with tempfile.TemporaryDirectory(prefix="cowork-no-hooks-") as no_hooks:
+            self.manager.workspaces.git.run(
+                root, "-c", f"core.hooksPath={no_hooks}", "push", "--no-verify", "origin", f"{head}:refs/heads/{branch}",
+            )
         return {"folder_id": folder_id, "task_branch": branch}
 
     def _terminal_page(self, payload: dict[str, object]) -> dict[str, object]:
