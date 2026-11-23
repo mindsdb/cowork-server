@@ -1738,6 +1738,37 @@ async def test_produce_remote_failure_carries_the_budget_period(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_produce_remote_failure_carries_a_spent_plan_window(monkeypatch):
+    # ENG-4186: the hosted card says when the window frees up and which one it is.
+    message = "You've used your plan's allowance for now. Add credits to keep working now, or wait for it to reset."
+    frame, events = await _remote_failure_frames(monkeypatch, {
+        "error": "WindowAllowanceExhaustedError: spent", "code": "window_allowance_exhausted",
+        "message": message, "reset_at": _RESET_AT, "window": "7d",
+    })
+    expected = {
+        "type": "response.failed", "code": "window_allowance_exhausted", "error": message,
+        "reset_at": _RESET_AT, "window": "7d", "request_id": "corr-reset-at",
+    }
+    assert frame == expected
+    assert events[-1] == expected
+
+
+@pytest.mark.asyncio
+async def test_produce_remote_failure_carries_the_required_tier(monkeypatch):
+    message = "Your plan doesn't include this model. Upgrade your plan or add credits to use it."
+    frame, events = await _remote_failure_frames(monkeypatch, {
+        "error": "ModelNotInTierError: not covered", "code": "model_not_in_tier",
+        "message": message, "required_tier": "pro",
+    })
+    expected = {
+        "type": "response.failed", "code": "model_not_in_tier", "error": message,
+        "required_tier": "pro", "request_id": "corr-reset-at",
+    }
+    assert frame == expected
+    assert events[-1] == expected
+
+
+@pytest.mark.asyncio
 async def test_produce_remote_failure_without_reset_at_keeps_its_shape(monkeypatch):
     # An older worker sends none, so the frame stays exactly as before.
     frame, events = await _remote_failure_frames(monkeypatch, {

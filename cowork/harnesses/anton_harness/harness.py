@@ -1518,7 +1518,8 @@ class AntonHarness:
                 created_at.replace(tzinfo=timezone.utc)
                 if created_at.tzinfo is None else created_at.astimezone(timezone.utc)
             )
-        ts = created_at.strftime("%Y-%m-%d %H:%M UTC") if created_at else None
+        # Same bytes as anton's live stamp, so the replayed message keeps the prompt cache.
+        ts = created_at.strftime("%Y-%m-%d %H:%M") if created_at else None
         if m.role == "user" and ts and isinstance(om.get("content"), str) and om["content"]:
             om["content"] = f"[{ts}] {om['content']}"
         return om

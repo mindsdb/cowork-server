@@ -59,9 +59,9 @@ annotated-types==0.7.0 \
 anthropic==1.8.0 \
     --hash=sha256:79a4516a21e64fd7b15be1a49ebf544bd6376c96a971a77365358823a2717bc6 \
     --hash=sha256:9c1783ed90f409617749a61c5ab98e20624a572626f2e0a15cea03ed8e1401e5
-anton-agent==2.26.11.20.1rc2 \
-    --hash=sha256:15454315a2dc8ada368e1a334f12e9b177d4e5f785fc877ce8a10cac62bfc6c6 \
-    --hash=sha256:fd286cc5b04fcd33146bd33c1091c534c82e3119abd7d0c7bbeca3ddf9f13c81
+anton-agent==2.26.11.23.1 \
+    --hash=sha256:fad26e2be525ff275aaf5d7a2f065a490e7accbf8ae7ff89816c0fe299ad0fe9 \
+    --hash=sha256:fbc38ca3f89bc50878289318e5818a7c5ba95be41e40c28ca1efc5daa5d9f145
 anyio==4.15.1 \
     --hash=sha256:6152fdbbf9a77fdec97731721bebf7c4c44f7c29b424b0065826173efc7ed101 \
     --hash=sha256:9f28306018cbd6d329e64a36d58256edff76dd996fe423bc957326e578b82a94

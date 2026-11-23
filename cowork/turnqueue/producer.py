@@ -24,10 +24,14 @@ from redis.exceptions import RedisError
 from cowork.build_info import KEY_ANTON_VERSION, account_ids, build_trace_metadata, surface
 from cowork.handlers.turn_errors import (
     BUDGET_EXCEEDED_CODE,
+    MODEL_NOT_IN_TIER_CODE,
     RESET_AT_CODES,
+    WINDOW_ALLOWANCE_EXHAUSTED_CODE,
     clean_budget_model,
     clean_budget_period,
     clean_budget_scope,
+    clean_plan_window,
+    clean_required_tier,
     WORKER_UNRESPONSIVE_TYPE_NAME,
     remote_error_label,
     remote_turn_error,
@@ -1583,6 +1587,11 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
                         budget_scope = clean_budget_scope(data.pop("budget_scope", None))
                         budget_period = clean_budget_period(data.pop("budget_period", None))
                         budget_model = clean_budget_model(data.pop("budget_model", None))
+                        # ENG-4186: which plan window is spent, and which tier
+                        # covers a model the plan does not. Each kept for its
+                        # own code only, like the budget fields.
+                        window = clean_plan_window(data.pop("window", None))
+                        required_tier = clean_required_tier(data.pop("required_tier", None))
                         code, message = remote_turn_error(data.get("error"), budget_scope, budget_period, budget_model)
                         data = {**data, "code": code, "message": message}
                         reset_at = _remote_reset_at(code=code, value=data.pop("reset_at", None))
@@ -1594,6 +1603,10 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
                             data["budget_period"] = budget_period
                         if code == BUDGET_EXCEEDED_CODE and budget_model is not None:
                             data["budget_model"] = budget_model
+                        if code == WINDOW_ALLOWANCE_EXHAUSTED_CODE and window is not None:
+                            data["window"] = window
+                        if code == MODEL_NOT_IN_TIER_CODE and required_tier is not None:
+                            data["required_tier"] = required_tier
                         logger.warning(
                             "Remote turn failed conversation=%s correlation_id=%s error_type=%s error_code=%s",
                             conversation_id, corr, remote_error_label(error=data.get("error")), code,

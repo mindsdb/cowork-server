@@ -13,7 +13,7 @@ from _fakes import FakeRequest
 
 def _listing(
     ids, efforts=None, enabled=None, labels=None, providers=None, families=None, role_defaults=None,
-    disabled_reasons=None, image_models=None,
+    disabled_reasons=None, image_models=None, covered_by_tier=None,
 ):
     """A MindsModelListing with everything a test doesn't care about left empty.
 
@@ -33,6 +33,7 @@ def _listing(
         role_defaults or {},
         disabled_reasons or {},
         image_models or {},
+        covered_by_tier or {},
     )
 
 
@@ -760,6 +761,50 @@ def test_recommended_models_relays_why_a_minds_model_is_locked(monkeypatch):
         assert result["modelEnabled"] == {"mindshub_air": True, "opus": False, "gpt": False}
     finally:
         _delete_settings(session, "minds_api_key", "minds_url", "minds_model_enabled")
+        session.close()
+
+
+def test_model_covered_by_tier_is_passed_through(monkeypatch):
+    """ENG-4186: each MindsHub model's covering tier reaches the picker as `modelCoveredByTier`."""
+    from cowork.api.v1.endpoints import settings as settings_endpoint
+    from cowork.api.v1.endpoints.settings import recommended_models
+    from cowork.db.session import get_open_session
+
+    async def fake_fetch(base_url, api_key, force_refresh=False, tenant_key=None, **_kw):
+        return _listing(
+            ["mindshub_air", "kimi-k3", "opus"],
+            enabled={"mindshub_air": True, "kimi-k3": True, "opus": False},
+            disabled_reasons={"opus": "model_not_in_tier"},
+            covered_by_tier={"mindshub_air": "free", "kimi-k3": "plus", "opus": "pro"},
+        )
+
+    monkeypatch.setattr(settings_endpoint, "fetch_minds_models", fake_fetch)
+
+    session = get_open_session()
+    try:
+        _set_settings(session, minds_api_key="mdb_free", minds_url="https://api.mindshub.ai")
+        _delete_settings(session, "providers_json")
+
+        result = asyncio.run(recommended_models(FakeRequest(), LOCAL_SCOPE))
+
+        assert result["modelCoveredByTier"] == {"mindshub_air": "free", "kimi-k3": "plus", "opus": "pro"}
+        assert result["modelDisabledReasons"] == {"opus": "model_not_in_tier"}
+    finally:
+        _delete_settings(session, "minds_api_key", "minds_url", "minds_model_enabled")
+        session.close()
+
+
+def test_model_covered_by_tier_is_empty_without_mindshub():
+    """No MindsHub key, no tiers: a custom endpoint can never say which plan covers a model."""
+    from cowork.api.v1.endpoints.settings import recommended_models
+    from cowork.db.session import get_open_session
+
+    session = get_open_session()
+    try:
+        _delete_settings(session, "minds_api_key", "minds_url", "providers_json")
+        result = asyncio.run(recommended_models(FakeRequest(), LOCAL_SCOPE))
+        assert result["modelCoveredByTier"] == {}
+    finally:
         session.close()
 
 

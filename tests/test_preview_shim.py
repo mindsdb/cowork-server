@@ -748,8 +748,11 @@ def test_the_shim_reports_the_page_height_and_whether_it_scrolls():
     page's full height and whether the root or body hide their overflow,
     after load and on every resize, best effort."""
     js = SHIM_JS
-    block = js[js.index("type: 'size'") - 600 : js.index("size reports are best effort")]
-    assert "content: Math.ceil(Math.max(root.scrollHeight" in block
-    assert "locked: hidesOverflow(root) || hidesOverflow(body)" in block
+    block = js[js.index("type: 'size'") - 2400 : js.index("size reports are best effort")]
+    # A locked page counts only what starts on screen: a deck's hidden
+    # slides stacked below the frame don't make it look cut off.
+    assert "? visibleBottom(height)" in js
+    assert "if (box.top >= frameHeight - 1 || box.bottom <= 0) continue;" in js
+    assert "var locked = hidesOverflow(root) || hidesOverflow(body);" in js
     assert "window.addEventListener('load', scheduleSize)" in js
     assert "window.addEventListener('resize', scheduleSize)" in js
