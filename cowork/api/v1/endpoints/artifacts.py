@@ -26,6 +26,7 @@ from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 from sqlmodel import Session
 
+from cowork.services.artifact_share_links import legacy_share_ref
 from cowork.services.product_permissions import require_product_permission
 from cowork.db.scoped import (
     ScopedSession,
@@ -42,7 +43,9 @@ from cowork.api.v1.artifact_preview import (
     wants_comment_layer,
     wants_html_preview,
 )
-from cowork.api.v1.artifact_scope import review_artifact_and_read, scoped_project_id_for_request
+from cowork.api.v1.artifact_scope import (
+    review_artifact_and_read, review_indexed_artifact_and_read, scoped_project_id_for_request,
+)
 from cowork.db.units import FilesystemBusy, run_db, run_efs, run_on_unit_threads
 from cowork.common.logger import log_context
 from cowork.common.paths import dir_scandir, dir_stat, open_pinned_child
@@ -871,44 +874,6 @@ class _LegacyShareLink(BaseModel):
     url: str = Field(min_length=1, max_length=2048, pattern=r"^https://")
 
 
-def _legacy_share_ref(plan: RootsPlan, url: str, org_id: str) -> tuple[str, str] | None:
-    """Old notifications carried only a URL. Compare it with publish records in
-    listed roots. A link is never fetched or used as a filesystem path."""
-    from cowork.services.artifact_identity import _opened_child_directory, opened_artifact_root, read_full_id
-    from cowork.services.artifacts import _load_published_map_pinned
-
-    from cowork.services.artifact_draft_review import draft_review_allows
-    from cowork.services.artifact_roots import discover_roots
-
-    roots = discover_roots(plan)
-    listed = {source.base for source in roots.sources()}
-    match = None
-    for source in roots.unfiltered():
-        if not source.project_id:
-            continue
-        try:
-            with opened_artifact_root(source) as root, dir_scandir(root) as entries:
-                for entry in entries:
-                    if entry.name.startswith(".") or not entry.is_dir(follow_symlinks=False):
-                        continue
-                    try:
-                        with _opened_child_directory(root, entry.name) as folder:
-                            records = _load_published_map_pinned(folder)
-                            if any(isinstance(row, dict) and row.get("url") == url and row.get("published", True)
-                                   for row in records.values()):
-                                artifact_id, _ = read_full_id(folder)
-                                if source.base not in listed and not draft_review_allows(folder.path, org_id):
-                                    continue
-                                if match is not None:
-                                    return None
-                                match = str(source.project_id), artifact_id
-                    except (OSError, ValueError):
-                        continue
-        except (OSError, ValueError):
-            continue
-    return match
-
-
 def _shared_preview_card(found, *, artifact_id: str, url: str | None):
     from cowork.services.artifact_identity import _opened_child_directory, opened_artifact_root
     from cowork.services.artifacts import _listed_card_for_pinned_folder
@@ -938,15 +903,15 @@ async def shared_artifact_preview(body: _SharedArtifactRef | _LegacyShareLink, s
     url = None
     if isinstance(body, _LegacyShareLink):
         url = body.url
-        plan = await run_db(lambda unit: with_held_roots(unit, plan_scope_roots(unit)), scope=scope)
-        ref = await run_efs(partial(_legacy_share_ref, plan, url, scope.org_id), scope=scope)
+        ref = await run_db(lambda unit: legacy_share_ref(unit, url), scope=scope)
         if ref is None:
             raise HTTPException(404, "Artifact not found")
         project_ref, artifact_id = ref
     else:
         project_ref, artifact_id = str(body.project_id), body.artifact_id.hex
     try:
-        reviewed = await review_artifact_and_read(
+        review = review_indexed_artifact_and_read if url else review_artifact_and_read
+        reviewed = await review(
             scope, project_ref, artifact_id,
             read=partial(_shared_preview_card, artifact_id=artifact_id, url=url),
         )

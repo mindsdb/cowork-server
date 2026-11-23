@@ -1,3 +1,4 @@
+from cowork.models.artifact_share_link import ArtifactShareLink  # noqa: F401
 from cowork.models.artifact_location import ArtifactLocation  # noqa: F401
 from cowork.models.artifact_sort_time import ArtifactSortTime  # noqa: F401
 from cowork.models.artifact_owner_choice import ArtifactOwnerChoice  # noqa: F401

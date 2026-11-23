@@ -1149,9 +1149,23 @@ def share_pushes(monkeypatch):
 
 
 async def test_a_save_that_notifies_people_pushes_exactly_those_people(
-    as_owner, publish_calls, publish_context, share_pushes,
+    as_owner, publish_calls, publish_context, share_pushes, monkeypatch,
 ):
-    from uuid import UUID
+    from uuid import UUID, uuid4
+    from cowork.db.units import run_db
+    from cowork.models.project import Project
+    from cowork.services.artifact_share_links import legacy_share_ref
+
+    project_id = uuid4()
+
+    def add_project(unit):
+        unit.add(Project(id=project_id, name="Share test", path=str(as_owner.parent), org_id=ORG_SCOPE.org_id))
+        unit.commit()
+
+    await run_db(add_project, scope=ORG_SCOPE)
+    monkeypatch.setattr(aw, "_owner_workspace", awaitable(lambda *_: (
+        SimpleNamespace(project_id=str(project_id)), as_owner, ArtifactMetadata.model_validate({"slug": "rep"}), {},
+    )))
 
     person = "aaaaaaaa-1111-1111-1111-111111111111"
     sharer = Principal(user_id=ORG_SCOPE.user_id, org_id=ORG_SCOPE.org_id, email="owner@example.com")
@@ -1164,12 +1178,15 @@ async def test_a_save_that_notifies_people_pushes_exactly_those_people(
     artifact_id = await aw._artifact_id_from_path(UUID(ARTIFACT_ID))
     await aw.set_artifact_access("proj", artifact_id, aw._AccessBody(access=access), ORG_SCOPE, request, principal=sharer)
 
+    assert await run_db(lambda unit: legacy_share_ref(unit, "https://view.example/r/1"), scope=ORG_SCOPE) == (
+        str(project_id), artifact_id,
+    )
     assert share_pushes == [{
         "org_id": ORG_SCOPE.org_id,
         "sharer_id": ORG_SCOPE.user_id,
         "sharer_name": "owner@example.com",
         "recipient_ids": (person,),
-        "artifact_ref": f"proj-1/{artifact_id}",
+        "artifact_ref": f"{project_id}/{artifact_id}",
         "artifact_title": "Q3 report",
         "url": "https://view.example/r/1",
     }]

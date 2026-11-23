@@ -596,6 +596,28 @@ async def review_artifact_for_request(
     return (await _review(scope, project_ref=project_ref, artifact_id=artifact_id, read=_read_nothing)).artifact
 
 
+async def review_indexed_artifact_and_read(
+    scope: TenantScope, project_ref: str, artifact_id: str, *, read: Callable[[ResolvedArtifact], T],
+) -> ReviewedRead[T]:
+    """Legacy notifications use the location recorded alongside the URL in the backfill.
+    Missing, conflicting, stale or inaccessible hints must never trigger a discovery walk."""
+    lookup = await run_db(
+        partial(_lookup_for_request, project_ref=project_ref, artifact_id=artifact_id), scope=scope
+    )
+    if lookup.source is None or not lookup.serves:
+        raise _not_found()
+
+    def open_hint():
+        if _in_another_partition(lookup):
+            raise _not_found()
+        opened = _open_recorded(lookup, artifact_id=artifact_id, org_id=scope.org_id, read=read)
+        if opened.reviewed is None:
+            raise _not_found()
+        return opened.reviewed
+
+    return await run_efs(open_hint, scope=scope)
+
+
 async def review_artifact_and_read(
     scope: TenantScope,
     project_ref: str,

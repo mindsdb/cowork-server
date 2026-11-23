@@ -1,5 +1,7 @@
 """One-time backfill of artifact_locations rows (cowork/models/artifact_location.py).
 
+Version 2 also indexes published URLs for notifications sent before pushes carried artifact IDs.
+
 Artifacts made before the table existed have no row, so their first lookup
 lists the project's roots. This pass records a row for each of them, once per
 environment, at cowork-server startup in org tenancy. It walks every org
@@ -20,7 +22,7 @@ holds one of the file store's slots for the whole walk. A started file store
 call is never abandoned, so shutdown sets ``stop`` and the walk ends at the
 next root or id. The pass walks projects in id order and records each project
 it finishes, and each it could not read, in the
-``_artifact_location_backfill_v1_progress`` setting row. So a stop or a
+``_artifact_location_backfill_v2_progress`` setting row. So a stop or a
 restart costs only the project the walk was in: the next start walks the
 projects it has not finished and the ones it could not read, and drops from
 the progress an unread project deleted since. An id it cannot write (a value
@@ -29,7 +31,7 @@ counted, and so is an id whose one folder has a name that is not valid
 UTF-8; any other database error ends the pass. The sentinel is written, and
 the progress row deleted, once a pass reaches the last project with none
 left unread. To walk every project again, delete the
-``_artifact_location_backfill_v1`` and ``_artifact_location_backfill_v1_progress``
+``_artifact_location_backfill_v2`` and ``_artifact_location_backfill_v2_progress``
 setting rows and restart cowork-server.
 """
 from __future__ import annotations
@@ -50,7 +52,10 @@ from cowork.common.settings.app_settings import get_app_settings
 from cowork.db.scoped import ScopedSession, TenantScope
 from cowork.db.session import get_engine
 from cowork.models.project import Project
-from cowork.services.artifact_identity import identities_below
+from cowork.models.setting import Setting
+from cowork.services.artifact_identity import _strictly_holds_no_id, identities_below, opened_artifact_folder, storable_name
+from cowork.services.artifact_share_links import record_share_link
+from cowork.services.artifacts import _load_published_map_pinned
 from cowork.services.artifact_locations import Location, RecordOutcome, record_checked_folders
 from cowork.services.artifact_owner_backfill import (
     BackfillStopped,
@@ -73,9 +78,9 @@ from cowork.services.shared_resources import advisory_lock_key
 
 logger = logging.getLogger(__name__)
 
-SENTINEL_KEY = "_artifact_location_backfill_v1"
-PROGRESS_KEY = "_artifact_location_backfill_v1_progress"
-_LOCK_KEY = advisory_lock_key(b"cowork\0artifact_location_backfill_v1")
+SENTINEL_KEY = "_artifact_location_backfill_v2"
+PROGRESS_KEY = "_artifact_location_backfill_v2_progress"
+_LOCK_KEY = advisory_lock_key(b"cowork\0artifact_location_backfill_v2")
 
 
 @dataclass
@@ -94,18 +99,46 @@ class LocationBackfillSummary:
     skipped: int = 0
 
 
-def _found_locations(project: ProjectRow, *, stop: threading.Event | None) -> dict[str, list[Location]]:
-    """Every id in `project`'s roots and the folders that hold it. Raises
-    OSError when a root or a folder cannot be read."""
+def location_index_ready(session: ScopedSession) -> bool:
+    return session.exec(session.select(Setting).where(
+        Setting.key == SENTINEL_KEY, Setting.scope.is_(None),
+    )).first() is not None
+
+
+def _published_urls(source, folder_name: str) -> list[str]:
+    try:
+        with opened_artifact_folder(source, folder_name) as folder:
+            records = _load_published_map_pinned(folder, strict=True)
+    except OSError as exc:
+        if _strictly_holds_no_id(exc=exc):
+            return []
+        raise
+    urls = []
+    for record in records.values():
+        if not isinstance(record, dict) or not record.get("published", True):
+            continue
+        url = record.get("url")
+        if isinstance(url, str) and url.startswith("https://") and len(url) <= 2048 and storable_name(url):
+            urls.append(url)
+    return urls
+
+
+def _found_locations(
+    project: ProjectRow, *, stop: threading.Event | None,
+) -> tuple[dict[str, list[Location]], set[tuple[str, str]]]:
+    """Collect locations and active share URLs on the same resumable project pass."""
     found: dict[str, list[Location]] = {}
+    links: set[tuple[str, str]] = set()
     for root in project_roots(project, strict=True):
         check_stop(stop)
         for artifact_id, folder_names in identities_below(root.source).items():
             for folder_name in folder_names:
+                check_stop(stop)
                 location = recorded_location(root.source, root.source.base / folder_name)
                 if location is not None:
                     found.setdefault(artifact_id, []).append(location)
-    return found
+                    links.update((artifact_id, url) for url in _published_urls(root.source, folder_name))
+    return found, links
 
 
 def _record_project(
@@ -176,7 +209,7 @@ def _walk_project(
     if left_out_for_another_partition(project, partition=str(org_id), shared_root=shared_root):
         return True
     try:
-        found = _found_locations(project, stop=stop)
+        found, links = _found_locations(project, stop=stop)
     except OSError as exc:
         summary.unread += 1
         logger.warning(
@@ -189,6 +222,12 @@ def _walk_project(
         )
         return False
     _record_project(engine, org_id=org_id, project_id=project.id, found=found, summary=summary, stop=stop)
+    if links:
+        with Session(engine) as raw:
+            session = ScopedSession(raw, TenantScope(org_mode=True, org_id=org_id))
+            for artifact_id, url in links:
+                check_stop(stop)
+                record_share_link(session, project.id, artifact_id, url)
     return True
 
 

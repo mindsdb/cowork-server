@@ -412,11 +412,15 @@ def _load_published_map(folder: Path) -> dict:
     return data if isinstance(data, dict) else {}
 
 
-def _load_published_map_pinned(folder: PinnedDir) -> dict:
+def _load_published_map_pinned(folder: PinnedDir, *, strict: bool = False) -> dict:
     """Read the direct publish record without following a planted link."""
+    from cowork.services.artifact_identity import _strictly_holds_no_id
+
     try:
-        fd = dir_open(folder, ".published.json", os.O_RDONLY | O_NOFOLLOW)
-    except OSError:
+        fd = dir_open(folder, ".published.json", os.O_RDONLY | O_NOFOLLOW | getattr(os, "O_NONBLOCK", 0))
+    except OSError as exc:
+        if strict and not _strictly_holds_no_id(exc=exc):
+            raise
         return {}
     try:
         if not stat.S_ISREG(os.fstat(fd).st_mode):
@@ -424,7 +428,11 @@ def _load_published_map_pinned(folder: PinnedDir) -> dict:
         with os.fdopen(fd, "r", encoding="utf-8") as stream:
             fd = -1
             data = json.load(stream)
-    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+    except OSError:
+        if strict:
+            raise
+        return {}
+    except (ValueError, TypeError):
         return {}
     finally:
         if fd >= 0:

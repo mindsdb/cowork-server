@@ -1554,6 +1554,20 @@ async def _publish_live(
                 ),
                 timeout=_LIVE_PUBLISH_TIMEOUT_S,
             )
+            if notices and scope.org_mode:
+                from cowork.services.artifact_share_links import record_share_link
+
+                # The publish has already succeeded. A hint write must not suppress
+                # the notification, whose stable reference works independently.
+                try:
+                    for notice in notices:
+                        write_hint = partial(
+                            record_share_link, project_id=UUID(str(source.project_id)),
+                            artifact_id=artifact_id, url=notice.artifact_url,
+                        )
+                        await run_db(write_hint, scope=scope)
+                except Exception:
+                    logger.exception("Could not index a published share notification")
             _push_share(scope, principal, notices, artifact_ref=f"{source.project_id}/{artifact_id}")
             return published
         except asyncio.TimeoutError as exc:
