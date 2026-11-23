@@ -115,6 +115,7 @@ def check_environment(
 # A hook must not leave one behind for the next host-side Git command.
 _GIT_CONTROL_FILES = ("config", "config.worktree", "commondir", "gitdir", "hooks", "modules")
 _STASH_ENTRIES = ("stash", "stash.lock")
+_GRANTS_FOLDERS_FOR_NEW_FILES = sys.platform.startswith("linux")
 
 
 def _has_credentials(url: str) -> bool:
@@ -144,26 +145,33 @@ class GitDirectories:
         protected += [self.private / name for name in (*_GIT_CONTROL_FILES, "worktrees", "info", "refs", "logs/refs", "packed-refs", "HEAD")]
         grants.update({path: "read" for path in protected if path.exists()})
         # Stash-backed formatters such as lint-staged keep their backup in
-        # refs/stash. Git writes a ref by renaming a lock file into place, and
-        # the Linux sandbox cannot grant a file that does not exist yet, so a
-        # refs folder itself is writable while everything already in it, such
-        # as branches, tags, notes and replacements, stays read-only. Anything
-        # new other than the stash is removed after the hook.
+        # refs/stash. Git writes a ref by renaming a lock file into place.
+        # macOS and Windows can grant exactly those files. The Linux sandbox
+        # cannot grant a file that does not exist yet, so there the refs
+        # folder itself is writable while everything already in it, such as
+        # branches, tags and notes, stays read-only.
         for refs in self._ref_folders():
-            grants[refs] = "write"
-            grants.update({entry: "read" for entry in refs.iterdir() if entry.name not in _STASH_ENTRIES})
+            if _GRANTS_FOLDERS_FOR_NEW_FILES:
+                grants[refs] = "write"
+                grants.update({entry: "read" for entry in refs.iterdir() if entry.name not in _STASH_ENTRIES})
+            else:
+                grants.update({refs / name: "write" for name in _STASH_ENTRIES})
         return grants
 
-    def hook_surface(self) -> set[Path]:
-        """What a hook could add that host Git would later read, as it is now."""
+    def snapshot(self) -> tuple[set[Path], set[Path]]:
+        """Control files and top-level refs entries, to compare after a step."""
         files = {
             path
-            for directory in {self.common, self.private}
-            for path in (directory / name for name in _GIT_CONTROL_FILES)
+            for path in (self.private / name for name in _GIT_CONTROL_FILES)
             if path.exists() or path.is_symlink()
         }
         refs = {entry for folder in self._ref_folders() for entry in folder.iterdir() if entry.name not in _STASH_ENTRIES}
-        return files | refs
+        return files, refs
+
+    def left_behind(self, before: tuple[set[Path], set[Path]]) -> tuple[set[Path], set[Path]]:
+        """New control files in the task's Git directory, and new refs entries."""
+        files, refs = self.snapshot()
+        return files - before[0], refs - before[1]
 
     def _ref_folders(self) -> list[Path]:
         return [path for path in (self.common / "refs", self.common / "logs" / "refs") if path.is_dir()]

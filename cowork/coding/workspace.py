@@ -4,6 +4,8 @@ import difflib
 import json
 import logging
 import os
+import re
+import shlex
 import shutil
 import stat
 import subprocess
@@ -174,7 +176,37 @@ def _platform_config_args() -> tuple[str, ...]:
     return ()
 
 
-def _host_hooks_off(args: tuple[str, ...]) -> tuple[str, ...]:
+# Commands that read settings without running any program they name.
+_SETTINGS_ONLY_COMMANDS = {"config", "rev-parse", "var"}
+_FILTER_KEY = re.compile(r"^filter\..+\.(clean|smudge|process)$")
+
+
+def names_task_file(command: str, root: Path) -> bool:
+    """Whether a configured command runs a file inside ``root``.
+
+    The setting itself may be the person's, but a script it names in the
+    checkout is code the agent can edit.
+    """
+    try:
+        tokens = shlex.split(command)
+    except ValueError:
+        tokens = command.split()
+    top = root.resolve()
+    for token in tokens:
+        if not token or token.startswith("-") or "%" in token:
+            continue
+        path = Path(os.path.expanduser(token))
+        candidate = path if path.is_absolute() else top / path
+        try:
+            resolved = candidate.resolve()
+        except (OSError, RuntimeError):
+            continue
+        if resolved.exists() and (resolved == top or top in resolved.parents):
+            return True
+    return False
+
+
+def _host_safety_args(args: tuple[str, ...]) -> tuple[str, ...]:
     """Keep Git from running repository hooks in the server's process.
 
     A hook path can point into the task's own files (husky keeps hooks in
@@ -185,7 +217,8 @@ def _host_hooks_off(args: tuple[str, ...]) -> tuple[str, ...]:
     """
     if args[:2] == ("rev-parse", "--git-path"):
         return ()
-    return ("-c", f"core.hooksPath={os.devnull}")
+    # An fsmonitor setting names a program, which may live in the checkout.
+    return ("-c", f"core.hooksPath={os.devnull}", "-c", "core.fsmonitor=false")
 
 
 class GitRunner:
@@ -208,6 +241,22 @@ class GitRunner:
             raise WorkspaceError("Choose an available local folder")
         return resolved
 
+    def _task_drivers_off(self, cwd: Path) -> tuple[str, ...]:
+        """Turn off content filters that run a file in the task.
+
+        Those filters run only under the task's permissions, during staging.
+        Filters that name an installed program, such as Git LFS, still run.
+        Cowork's own diffs pass --no-ext-diff and --no-textconv, and it never
+        merges on the host, so diff and merge drivers do not run here.
+        """
+        listed = self.run(cwd, "config", "--get-regexp", r"^filter\.", check=False).stdout
+        overrides: list[str] = []
+        for line in listed.splitlines():
+            key, _, value = line.partition(" ")
+            if _FILTER_KEY.match(key) and names_task_file(value, cwd):
+                overrides += ["-c", f"{key}="]
+        return tuple(overrides)
+
     def run(
         self,
         cwd: Path,
@@ -229,8 +278,9 @@ class GitRunner:
             # Project configuration cannot re-enable command-capable helpers
             # such as ``ext`` at the execution boundary.
             child_environment["GIT_ALLOW_PROTOCOL"] = ALLOWED_GIT_PROTOCOLS
+            drivers = () if args[:1] and args[0] in _SETTINGS_ONLY_COMMANDS else self._task_drivers_off(working_directory)
             result = subprocess.run(
-                ["git", *_platform_config_args(), *_host_hooks_off(args), *args],
+                ["git", *_platform_config_args(), *_host_safety_args(args), *drivers, *args],
                 # The directory is an explicit desktop capability selected by
                 # the user and validated above. Git is fixed, arguments are an
                 # argv array, and shell execution is disabled.
@@ -555,6 +605,7 @@ class WorkspaceManager:
                 root,
                 "diff",
                 "--no-ext-diff",
+                "--no-textconv",
                 "--binary",
                 "--unified=3",
                 base_revision,
@@ -693,9 +744,11 @@ class WorkspaceManager:
     def commit(self, workspace_path: str, message: str, checks: CheckPolicy | None = None) -> GitState:
         """Commit everything in the workspace.
 
-        The repository's hooks are code the agent may have written, so Git
-        runs none of them itself. With ``checks``, the supported ones run
-        inside the task's sandbox first; without it, none run.
+        Staging can run programs the repository names, such as a clean filter
+        script in the checkout, so with ``checks`` it runs under the task's
+        permissions, followed by the supported hooks. The commit itself is
+        then recorded on the host with Git plumbing that never reads the
+        working tree, so signing keeps the person's own environment.
         """
         with self._mutation_lock:
             root = Path(workspace_path)
@@ -706,59 +759,115 @@ class WorkspaceManager:
             # Before staging anything: a direct-folder task commits through
             # here without the project-level preflight.
             self.check_git_identity(str(root))
-            self.git.run(root, "add", "--all")
             with tempfile.TemporaryDirectory(prefix="cowork-commit-", ignore_cleanup_errors=True) as scratch:
                 message_file = Path(scratch) / "COMMIT_EDITMSG"
                 message_file.write_text(message.strip() + "\n", encoding="utf-8")
+                if checks is None or not checks.sandboxed:
+                    self.git.run(root, "add", "--all")
+                else:
+                    self._run_sandboxed_git_step(root, checks, "Staging", ["git", "add", "--all"], [root])
                 if checks is not None:
                     self._run_commit_hooks(root, message_file, checks)
-                self.git.run(root, "commit", "--no-verify", "--file", str(message_file))
+                self._record_commit(root, message_file.read_text(encoding="utf-8"))
             return self.git_state(str(root), str(root))
+
+    def _record_commit(self, root: Path, message: str) -> None:
+        """Commit the index without reading the working tree."""
+        message = self.git.run(root, "stripspace", input_text=message).stdout
+        if not message.strip():
+            raise WorkspaceError("Commit message cannot be empty")
+        tree = self.git.run(root, "write-tree").stdout.strip()
+        parent = self.git.run(root, "rev-parse", "--verify", "--quiet", "HEAD^{commit}", check=False).stdout.strip()
+        if parent and tree == self.git.run(root, "rev-parse", f"{parent}^{{tree}}").stdout.strip():
+            raise WorkspaceError("There are no changes to commit")
+        arguments = ["commit-tree", tree, *(("-p", parent) if parent else ())]
+        if self.git.run(root, "config", "--type=bool", "--get", "commit.gpgSign", check=False).stdout.strip() == "true":
+            self._refuse_task_signing_program(root)
+            arguments.append("-S")
+        revision = self.git.run(root, *arguments, input_text=message).stdout.strip()
+        subject = message.splitlines()[0][:200]
+        self.git.run(root, "update-ref", "-m", f"commit: {subject}", "HEAD", revision, *((parent,) if parent else ()))
+
+    def _refuse_task_signing_program(self, root: Path) -> None:
+        """Sign only with a program outside the task's own files."""
+        for key in ("gpg.program", "gpg.openpgp.program", "gpg.x509.program", "gpg.ssh.program", "gpg.ssh.defaultKeyCommand"):
+            value = self.git.run(root, "config", "--get", key, check=False).stdout.strip()
+            if value and names_task_file(value, root):
+                raise WorkspaceError(
+                    f"Commit signing runs {value!r} from this task's folder, so Cowork won't sign with it. "
+                    "Point the signing program outside the repository, or commit from a terminal."
+                )
 
     def _run_commit_hooks(self, root: Path, message_file: Path, checks: CheckPolicy) -> None:
         from cowork.coding import check_sandbox
 
         hooks = {name: check_sandbox.hook_path(self.git.run, root, name) for name in check_sandbox.SUPPORTED_COMMIT_HOOKS}
-        if not any(hooks.values()):
-            return
-        index = self.git.run(root, "rev-parse", "--git-path", "index").stdout.strip()
-        environment = check_sandbox.check_environment(os.environ, cache_root=checks.cache_root)
-        environment.update({"GIT_INDEX_FILE": str((root / index).resolve()), "GIT_EDITOR": ":"})
-        directories = check_sandbox.git_directories(self.git.run, root)
         for name, path in hooks.items():
             if path is None:
                 continue
             arguments = (str(message_file),) if name == "commit-msg" else ()
-            before = directories.hook_surface()
-            planted: set[Path] = set()
-            try:
-                result = check_sandbox.run_sandboxed(
-                    check_sandbox.hook_argv(path, *arguments),
-                    cwd=root,
-                    policy=checks,
-                    environment=environment,
-                    writable=[root, message_file.parent],
-                    git=directories,
-                    timeout=check_sandbox.HOOK_TIMEOUT_SECONDS,
-                )
-            except subprocess.TimeoutExpired as exc:
-                raise WorkspaceError(f"The {name} hook did not finish in time") from exc
-            except OSError as exc:
-                raise WorkspaceError(f"The {name} hook could not run: {exc}") from exc
-            finally:
-                # However the hook ended, nothing it left behind may change
-                # what the next host-side Git command reads.
-                planted = directories.hook_surface() - before
-                for planted_path in planted:
-                    if planted_path.is_dir() and not planted_path.is_symlink():
-                        force_remove(planted_path)
-                    else:
-                        planted_path.unlink(missing_ok=True)
-            if planted:
-                raise WorkspaceError(f"The {name} hook tried to change Git's configuration or references, so nothing was committed")
-            if result.returncode != 0:
-                output = "\n".join(part.strip() for part in (result.stdout, result.stderr) if part.strip())
-                raise WorkspaceError((f"The {name} hook failed" + (f":\n{output}" if output else ""))[:4_000])
+            self._run_sandboxed_git_step(
+                root, checks, f"The {name} hook", check_sandbox.hook_argv(path, *arguments), [root, message_file.parent],
+            )
+
+    def _run_sandboxed_git_step(
+        self, root: Path, checks: CheckPolicy, label: str, argv: list[str], writable: list[Path],
+    ) -> None:
+        """Run a command that may change the index, under the task's permissions."""
+        from cowork.coding import check_sandbox
+
+        index = self.git.run(root, "rev-parse", "--git-path", "index").stdout.strip()
+        environment = check_sandbox.check_environment(os.environ, cache_root=checks.cache_root)
+        environment.update({
+            "GIT_INDEX_FILE": str((root / index).resolve()),
+            "GIT_EDITOR": ":",
+            "GIT_TERMINAL_PROMPT": "0",
+            "GIT_ALLOW_PROTOCOL": ALLOWED_GIT_PROTOCOLS,
+            # Git inside the sandbox runs no repository hook either.
+            "GIT_CONFIG_COUNT": "1",
+            "GIT_CONFIG_KEY_0": "core.hooksPath",
+            "GIT_CONFIG_VALUE_0": os.devnull,
+        })
+        directories = check_sandbox.git_directories(self.git.run, root)
+        before = directories.snapshot()
+        try:
+            result = check_sandbox.run_sandboxed(
+                argv,
+                cwd=root,
+                policy=checks,
+                environment=environment,
+                writable=writable,
+                git=directories,
+                timeout=check_sandbox.HOOK_TIMEOUT_SECONDS,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise WorkspaceError(f"{label} did not finish in time") from exc
+        except OSError as exc:
+            raise WorkspaceError(f"{label} could not run: {exc}") from exc
+        finally:
+            # However the step ended, a control file it planted must not
+            # reach the next host-side Git command, where it would run code
+            # outside the sandbox. For a task worktree these sit in the task's
+            # own Git directory. For a task in the person's folder they are
+            # the repository's, and are removed all the same.
+            planted, added_refs = directories.left_behind(before)
+            for planted_path in planted:
+                if planted_path.is_dir() and not planted_path.is_symlink():
+                    force_remove(planted_path)
+                else:
+                    planted_path.unlink(missing_ok=True)
+        if planted:
+            raise WorkspaceError(f"{label} tried to change Git's configuration, so nothing was committed")
+        if added_refs:
+            # Another worktree may have made these, so they are left alone.
+            names = ", ".join(sorted(path.name for path in added_refs))
+            raise WorkspaceError(
+                f"New Git references ({names}) appeared while {label.lower()} ran, so nothing was committed. "
+                "Check them and commit again."
+            )
+        if result.returncode != 0:
+            output = "\n".join(part.strip() for part in (result.stdout, result.stderr) if part.strip())
+            raise WorkspaceError((f"{label} failed" + (f":\n{output}" if output else ""))[:4_000])
 
     def check_policy(self, owner_id: str, permission_mode: PermissionMode, network_access: bool) -> CheckPolicy:
         from cowork.coding.check_sandbox import CheckPolicy
@@ -826,8 +935,14 @@ class WorkspaceManager:
         return revision
 
     def rollback_commit(self, workspace_path: str, revision: str) -> None:
-        """Remove a task commit while retaining its file changes for retry."""
-        self.git.run(Path(workspace_path), "reset", "--mixed", revision)
+        """Remove a task commit while retaining its file changes for retry.
+
+        Like ``git reset --mixed``, but without refreshing the index from the
+        working tree, which can run a repository's filters on the host.
+        """
+        root = Path(workspace_path)
+        self.git.run(root, "update-ref", "-m", "rollback: cowork commit", "HEAD", revision)
+        self.git.run(root, "read-tree", revision)
 
     def apply_to_source(self, session_id: str, source_path: str, workspace_path: str, base_revision: str | None) -> Path | None:
         with self._mutation_lock:
@@ -1295,7 +1410,9 @@ class WorkspaceManager:
         snapshot = snapshot_dir / filename
         temp = snapshot.with_suffix(".tmp")
         try:
-            self.git.run(workspace, "diff", "--binary", f"--output={temp.resolve()}", base_revision)
+            self.git.run(
+                workspace, "diff", "--no-ext-diff", "--no-textconv", "--binary", f"--output={temp.resolve()}", base_revision,
+            )
         except Exception:
             temp.unlink(missing_ok=True)
             raise

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import shutil
 import stat
 import subprocess
 import sys
@@ -139,8 +140,13 @@ def test_hooks_may_stage_but_not_change_what_makes_git_run_programs(tmp_path: Pa
     assert grants[common] == "read"
     assert grants[private] == "write"
     assert grants[common / "objects"] == "write"
-    assert grants[common / "refs"] == "write"
-    assert grants[common / "refs" / "heads"] == "read"
+    if sys.platform.startswith("linux"):
+        # Linux can only grant the folder; what is already in it stays read-only.
+        assert grants[common / "refs"] == "write"
+        assert grants[common / "refs" / "heads"] == "read"
+    else:
+        assert common / "refs" not in grants
+        assert grants[common / "refs" / "stash"] == "write"
     for read_only in (private / "HEAD", private / "gitdir", private / "commondir"):
         assert grants[read_only] == "read"
     # Missing paths are never listed: the Linux sandbox would create stand-ins.
@@ -268,26 +274,31 @@ def test_commit_hooks_run_sandboxed_and_may_restage_and_edit_the_message(
     assert subprocess.run(["git", "config", "core.fsmonitor"], cwd=repo, capture_output=True).returncode != 0
 
 
-def test_git_itself_commits_on_the_host_with_hooks_off(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    # Signing and credential helpers need the person's own environment, and
-    # plain Git runs no code the agent controls once hooks are off.
+@requires_sandbox
+def test_staging_is_sandboxed_and_the_commit_is_recorded_on_the_host(
+    tmp_path: Path, checks: CheckPolicy, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Staging can run repository filters, so it runs under the task's
+    # permissions. Recording the commit reads no working tree, so it runs on
+    # the host, where signing keeps the person's environment.
     repo = repository(tmp_path / "repo")
     (repo / "README.md").write_text("changed\n", encoding="utf-8")
     calls = []
     real_run = subprocess.run
 
     def record(argv, **kwargs):
-        if "commit" in argv:
-            calls.append(argv)
+        calls.append(list(argv))
         return real_run(argv, **kwargs)
 
     monkeypatch.setattr(subprocess, "run", record)
-    manager = WorkspaceManager(tmp_path / "root")
-    manager.commit(str(repo), "Change", manager.check_policy("project", PermissionMode.workspace, False))
+    WorkspaceManager(tmp_path / "root").commit(str(repo), "Change", checks)
 
-    [argv] = calls
-    assert argv[0] == "git" and "--no-verify" in argv
-    assert any(part.startswith("core.hooksPath=") for part in argv)
+    [staging] = [argv for argv in calls if argv[-2:] == ["add", "--all"]]
+    assert staging[1] == "sandbox"
+    [recording] = [argv for argv in calls if "commit-tree" in argv]
+    assert recording[0] == "git"
+    assert not any(argv[0] == "git" and "commit" in argv for argv in calls)
+    assert git(repo, "show", "HEAD:README.md") == "changed"
 
 
 def test_a_read_only_task_cannot_commit(tmp_path: Path) -> None:
@@ -344,13 +355,14 @@ def test_a_hook_may_stash_but_not_add_or_move_other_references(tmp_path: Path, c
     hook(repo, "pre-commit", (
         "git stash create >/dev/null\n"
         "git update-ref refs/heads/main HEAD~0 2>/dev/null && git update-ref refs/heads/moved HEAD 2>/dev/null\n"
-        f"mkdir -p '{common}/refs/replace' && printf 'x' > '{common}/refs/replace/planted'\n"
+        f"mkdir -p '{common}/refs/replace' 2>/dev/null && printf 'x' > '{common}/refs/replace/planted'\n"
+        "exit 0\n"
     ))
     (repo / "README.md").write_text("changed\n", encoding="utf-8")
 
-    with pytest.raises(WorkspaceError, match="configuration or references"):
-        WorkspaceManager(tmp_path / "root").commit(str(repo), "Change", checks)
+    WorkspaceManager(tmp_path / "root").commit(str(repo), "Change", checks)
 
+    assert git(repo, "log", "-1", "--format=%s") == "Change"
     assert not (common / "refs" / "replace").exists()
     assert not (common / "refs" / "heads" / "moved").exists()
 
@@ -379,3 +391,145 @@ def test_commit_hooks_in_a_task_worktree_can_stage(tmp_path: Path, checks: Check
 
     assert git(worktree, "show", "HEAD:README.md") == "formatted"
     assert os.access(repo / ".git" / "config", os.R_OK)
+
+
+def test_an_unattributed_new_reference_is_reported_but_never_deleted(
+    tmp_path: Path, checks: CheckPolicy, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # On Linux a hook can create a refs folder, but so can a person working in
+    # another worktree at the same moment, so Cowork stops without deleting.
+    from cowork.coding import check_sandbox
+
+    repo = repository(tmp_path / "repo")
+    notes = (repo / ".git" / "refs" / "notes").resolve()
+
+    def another_worktree_adds_a_note(*_args, **_kwargs):
+        notes.mkdir()
+        (notes / "commits").write_text("0" * 40 + "\n", encoding="utf-8")
+        return subprocess.CompletedProcess([], 0, stdout="", stderr="")
+
+    monkeypatch.setattr(check_sandbox, "run_sandboxed", another_worktree_adds_a_note)
+    (repo / "README.md").write_text("changed\n", encoding="utf-8")
+
+    with pytest.raises(WorkspaceError, match=r"New Git references \(notes\)"):
+        WorkspaceManager(tmp_path / "root").commit(str(repo), "Change", checks)
+
+    assert (notes / "commits").exists()
+    assert git(repo, "log", "-1", "--format=%s") == "base"
+
+
+def test_nothing_to_commit_is_reported(tmp_path: Path) -> None:
+    repo = repository(tmp_path / "repo")
+
+    with pytest.raises(WorkspaceError, match="no changes to commit"):
+        WorkspaceManager(tmp_path / "root").commit(str(repo), "Nothing")
+
+
+requires_ssh_signing = pytest.mark.skipif(
+    os.name == "nt" or shutil.which("ssh-keygen") is None, reason="needs ssh-keygen for SSH commit signing",
+)
+
+
+def signing_repository(tmp_path: Path) -> Path:
+    repo = repository(tmp_path / "repo")
+    key = tmp_path / "signing-key"
+    subprocess.run(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", str(key)], check=True)
+    git(repo, "config", "gpg.format", "ssh")
+    git(repo, "config", "user.signingkey", str(key))
+    git(repo, "config", "commit.gpgsign", "true")
+    return repo
+
+
+@requires_ssh_signing
+def test_the_commit_is_signed_with_the_persons_own_signing_setup(tmp_path: Path) -> None:
+    repo = signing_repository(tmp_path)
+    (repo / "README.md").write_text("changed\n", encoding="utf-8")
+
+    WorkspaceManager(tmp_path / "root").commit(str(repo), "Signed change\n\n  with a body  \n")
+
+    raw = git(repo, "cat-file", "commit", "HEAD")
+    assert "gpgsig -----BEGIN SSH SIGNATURE-----" in raw
+    assert raw.endswith("Signed change\n\n  with a body") or raw.endswith("Signed change\n\n  with a body\n")
+    assert git(repo, "show", "HEAD:README.md") == "changed"
+    assert "commit: Signed change" in git(repo, "reflog", "-1")
+
+
+@requires_ssh_signing
+def test_cowork_will_not_sign_with_a_program_inside_the_task(tmp_path: Path) -> None:
+    repo = signing_repository(tmp_path)
+    marker = tmp_path / "signer-ran"
+    signer = repo / "tools" / "sign.sh"
+    signer.parent.mkdir()
+    signer.write_text(f"#!/bin/sh\ntouch '{marker}'\nexec ssh-keygen \"$@\"\n", encoding="utf-8")
+    signer.chmod(signer.stat().st_mode | stat.S_IXUSR)
+    git(repo, "config", "gpg.ssh.program", "./tools/sign.sh")
+    (repo / "README.md").write_text("changed\n", encoding="utf-8")
+
+    with pytest.raises(WorkspaceError, match="won't sign"):
+        WorkspaceManager(tmp_path / "root").commit(str(repo), "Change")
+
+    assert not marker.exists()
+    assert git(repo, "log", "-1", "--format=%s") == "base"
+
+
+@requires_sandbox
+def test_staging_runs_a_repository_filter_under_the_task_permissions(
+    tmp_path: Path, checks: CheckPolicy, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The filter is configured by the person, but its script is in the
+    # checkout, where the agent can edit it.
+    repo = repository(tmp_path / "repo")
+    marker = tmp_path / "filter-environment"
+    script = repo / "tools" / "clean.sh"
+    script.parent.mkdir()
+    script.write_text(f"#!/bin/sh\nenv > '{marker}'\ntr a-z A-Z\n", encoding="utf-8")
+    script.chmod(script.stat().st_mode | stat.S_IXUSR)
+    (repo / ".gitattributes").write_text("*.txt filter=upper\n", encoding="utf-8")
+    git(repo, "config", "filter.upper.clean", "./tools/clean.sh")
+    (repo / "note.txt").write_text("staged through the filter\n", encoding="utf-8")
+    monkeypatch.setenv("COWORK_TEST_SECRET", "server-only")
+
+    WorkspaceManager(tmp_path / "root").commit(str(repo), "Change", checks)
+
+    assert git(repo, "show", "HEAD:note.txt") == "STAGED THROUGH THE FILTER"
+    assert "COWORK_TEST_SECRET" not in marker.read_text(encoding="utf-8")
+
+
+def test_only_commands_that_run_a_file_in_the_task_count_as_task_code(tmp_path: Path) -> None:
+    from cowork.coding.workspace import names_task_file
+
+    root = tmp_path / "repo"
+    (root / "tools").mkdir(parents=True)
+    (root / "tools" / "clean.sh").write_text("", encoding="utf-8")
+    (root / "clean.py").write_text("", encoding="utf-8")
+
+    assert names_task_file("./tools/clean.sh", root)
+    assert names_task_file("sh tools/clean.sh %f", root)
+    assert names_task_file("python clean.py", root)
+    assert names_task_file(str(root / "tools" / "clean.sh"), root)
+    assert not names_task_file("git-lfs clean -- %f", root)
+    assert not names_task_file("gpg", root)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="the filter under test is a POSIX shell script")
+def test_host_status_never_runs_a_filter_script_from_the_task(tmp_path: Path) -> None:
+    repo = repository(tmp_path / "repo")
+    marker = tmp_path / "filter-ran"
+    script = repo / "tools" / "clean.sh"
+    script.parent.mkdir()
+    script.write_text(f"#!/bin/sh\ntouch '{marker}'\ncat\n", encoding="utf-8")
+    script.chmod(script.stat().st_mode | stat.S_IXUSR)
+    (repo / ".gitattributes").write_text("*.txt filter=task diff=task\n", encoding="utf-8")
+    git(repo, "config", "filter.task.clean", "./tools/clean.sh")
+    git(repo, "config", "diff.task.textconv", "./tools/clean.sh")
+    (repo / "note.txt").write_text("one\n", encoding="utf-8")
+    git(repo, "-c", "filter.task.clean=", "add", ".")
+    git(repo, "-c", "filter.task.clean=", "commit", "-q", "-m", "filtered")
+    (repo / "note.txt").write_text("two\n", encoding="utf-8")
+    manager = WorkspaceManager(tmp_path / "root")
+
+    state = manager.git_state(str(repo), str(repo))
+    manager.diff(str(repo), git(repo, "rev-parse", "HEAD~1"))
+
+    assert state.dirty
+    assert not marker.exists()
