@@ -44,6 +44,20 @@ def operation(index: int, payload: dict[str, object]) -> RuntimeCommand:
     return RuntimeCommand(id=f"operation-{index}", run_id="run-ops", epoch=1, kind="operation", payload=payload)
 
 
+def test_remote_validation_honors_a_read_only_change_during_a_lease(tmp_path: Path) -> None:
+    manager = ProjectWorkspaceManager(WorkspaceManager(tmp_path / "coding"))
+    seen = []
+    manager.run_commands = lambda *args, policy=None, **kwargs: seen.append(policy) or []
+    prepared = SimpleNamespace(workspaces=[], ports={})
+    operations = RuntimeWorkspaceOperations(lease(), manager, prepared, object())
+
+    result, error = operations.execute(operation(1, {"operation": "validate", "permission_mode": "read_only"}))
+
+    assert error is None
+    assert result == {"items": []}
+    assert seen[0].read_only
+
+
 def test_refresh_project_hands_validate_the_new_commands_without_touching_workspaces() -> None:
     seen: list[CodeProject] = []
     manager = SimpleNamespace(

@@ -6,8 +6,10 @@ from collections.abc import Callable
 from dataclasses import asdict
 from pathlib import Path
 
+from cowork.coding.check_sandbox import CheckPolicy
 from cowork.coding.contracts import (
     DeliveryRecord,
+    PermissionMode,
     TerminalPage,
     TerminalShellPreference,
     WorkspaceKind,
@@ -141,27 +143,33 @@ class RuntimeWorkspaceOperations:
         message = str(payload.get("message") or "").strip()
         if not message:
             raise WorkspaceError("A commit message is required")
-        states = self.manager.commit(list(self.prepared.workspaces), message, self._check_policy())
+        states = self.manager.commit(list(self.prepared.workspaces), message, self._check_policy(payload))
         if not states:
             raise WorkspaceError("This task does not contain a Git repository")
         return states[0].model_dump(mode="json")
 
-    def _validate(self, _payload: dict[str, object]) -> dict[str, object]:
+    def _validate(self, payload: dict[str, object]) -> dict[str, object]:
         results = self.manager.run_commands(
             self.project,
             list(self.prepared.workspaces),
             "validate",
             self.prepared.ports,
-            policy=self._check_policy(),
+            policy=self._check_policy(payload),
         )
         return {"items": [asdict(item) for item in results]}
 
-    def _check_policy(self):
-        return self.manager.check_policy(
-            self.project.id,
-            self.lease.execution.permission_mode,
-            self.lease.execution.network_access,
-        )
+    def _check_policy(self, payload: dict[str, object]) -> CheckPolicy:
+        execution = self.lease.execution
+        # Missing fields indicate an older control plane. The command may
+        # tighten the lease but cannot widen either filesystem or network access.
+        current = PermissionMode(payload.get("permission_mode", execution.permission_mode))
+        mode = current
+        if PermissionMode.read_only in (current, execution.permission_mode):
+            mode = PermissionMode.read_only
+        elif current == PermissionMode.full_access:
+            mode = execution.permission_mode
+        network_access = execution.network_access and payload.get("network_access", True) is True
+        return self.manager.check_policy(self.project.id, mode, network_access)
 
     def _refresh_project(self, payload: dict[str, object]) -> dict[str, object]:
         """Adopt commands the control plane copied onto the task after this lease began.

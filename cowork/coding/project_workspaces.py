@@ -607,20 +607,22 @@ class ProjectWorkspaceManager:
         # A missing author identity would fail every repository; ask for it
         # before touching any of them rather than after a rolled-back attempt.
         for workspace in repositories:
-            self.workspaces.check_git_identity(workspace.workspace_path)
+            with self.workspaces.git.for_commit(Path(workspace.workspace_path), policy):
+                self.workspaces.check_git_identity(workspace.workspace_path)
         states: list[GitState] = []
         checkpoints: list[tuple[TaskWorkspace, str]] = []
         try:
             for workspace in repositories:
-                state = self.workspaces.git_state(workspace.source_path, workspace.workspace_path)
-                if state.dirty:
-                    checkpoint = self.workspaces.commit_checkpoint(workspace.workspace_path)
-                    checkpoints.append((workspace, checkpoint))
-                    state = self.workspaces.commit(workspace.workspace_path, message, policy)
-                states.append(state.model_copy(update={"folder_id": workspace.folder_id, "folder_name": workspace.folder_name}))
+                with self.workspaces.git.for_commit(Path(workspace.workspace_path), policy):
+                    state = self.workspaces.git_state(workspace.source_path, workspace.workspace_path)
+                    if state.dirty:
+                        checkpoint = self.workspaces.commit_checkpoint(workspace.workspace_path)
+                        checkpoints.append((workspace, checkpoint))
+                        state = self.workspaces.commit(workspace.workspace_path, message, policy)
+                    states.append(state.model_copy(update={"folder_id": workspace.folder_id, "folder_name": workspace.folder_name}))
             return states
         except Exception as exc:
-            failures = self._rollback_commits(checkpoints)
+            failures = self._rollback_commits(checkpoints, policy)
             if failures:
                 raise WorkspaceError(
                     "Some repository commits could not be restored; open the task workspaces to recover them: "
@@ -695,11 +697,12 @@ class ProjectWorkspaceManager:
             keep_recovery=keep_recovery,
         )
 
-    def _rollback_commits(self, checkpoints: list[tuple[TaskWorkspace, str]]) -> list[str]:
+    def _rollback_commits(self, checkpoints: list[tuple[TaskWorkspace, str]], policy: CheckPolicy | None) -> list[str]:
         failures: list[str] = []
         for workspace, revision in reversed(checkpoints):
             try:
-                self.workspaces.rollback_commit(workspace.workspace_path, revision)
+                with self.workspaces.git.for_commit(Path(workspace.workspace_path), policy):
+                    self.workspaces.rollback_commit(workspace.workspace_path, revision)
             except WorkspaceError as exc:
                 failures.append(f"{workspace.folder_name}: {exc}")
         return failures

@@ -118,7 +118,9 @@ class ProjectTaskOperations:
             "Wait for the active turn to finish before committing task changes",
         ) as session:
             checks = self.project_workspaces.check_policy(
-                session.project_id or session.id, session.permission_mode, session.network_access,
+                session.project_id or session.id,
+                session.effective_permission_mode,
+                session.network_access,
             )
             if session.workspaces:
                 states = self.project_workspaces.commit(session.workspaces, message, checks)
@@ -202,7 +204,9 @@ class ProjectTaskOperations:
                 "validate",
                 session.allocated_ports,
                 policy=self.project_workspaces.check_policy(
-                    project.id, session.permission_mode, session.network_access,
+                    project.id,
+                    session.effective_permission_mode,
+                    session.network_access,
                 ),
             )
             for result in results:

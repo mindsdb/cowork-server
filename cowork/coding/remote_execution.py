@@ -293,6 +293,13 @@ class RemoteExecutionCoordinator:
         run = self.control.store.get_run(session.run_id)
         if run.status in {RunStatus.completed, RunStatus.cancelled, RunStatus.failed}:
             raise RuntimeError("The task execution workspace is no longer available")
+        if operation in {"commit", "validate"}:
+            # The user can narrow task permissions while a worker holds its lease.
+            payload = {
+                **(payload or {}),
+                "permission_mode": session.effective_permission_mode.value,
+                "network_access": session.network_access,
+            }
         command = self.control.queue_command(
             session.run_id,
             "operation",
@@ -421,7 +428,7 @@ class RemoteExecutionCoordinator:
             execution=RuntimeExecutionConfig(
                 engine_id=session.engine_id,
                 model=session.model,
-                permission_mode=session.permission_mode,
+                permission_mode=session.effective_permission_mode,
                 reasoning_effort=session.reasoning_effort,
                 service_tier=session.service_tier,
                 personality=session.personality,

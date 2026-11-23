@@ -1,17 +1,14 @@
 """Run project checks and commit hooks under the task's sandbox.
 
 Checks and hooks run code the agent may have written, so they get the same
-boundary as the agent, shaped for test runs: they read anywhere but write only
-to the task's folders, temp and a per-project cache; they may listen on
-localhost and use Unix sockets there; and outbound traffic follows the task's
-network setting. Their environment is the server's minus Cowork's own
-variables and anything credential-shaped.
+effective write permission as the agent. Writable tasks get space for build
+outputs and tool caches. Outbound traffic follows the task's network setting.
+Only selected platform settings and explicit project variables are inherited.
 """
 
 from __future__ import annotations
 
 import os
-import re
 import shutil
 import subprocess
 import sys
@@ -24,8 +21,16 @@ from cowork.coding.contracts import PermissionMode
 from cowork.coding.engines.codex_config import toml_string
 from cowork.coding.workspace import WorkspaceError
 
-_PRIVATE_NAME = re.compile(r"(SECRET|TOKEN|PASSWORD|PASSWD|CREDENTIAL|_KEY$|^KEY$|_KEY_)", re.IGNORECASE)
-_PRIVATE_PREFIXES = ("COWORK_", "ANTON_", "DATABASE_")
+# A new server variable stays private unless it is deliberately listed here.
+# These names cover process launch, paths, locale and Git author identity on
+# our supported platforms. Project-specific tools get overrides separately.
+_PLATFORM_ENVIRONMENT = {
+    "PATH", "PATHEXT", "HOME", "USER", "LOGNAME", "SHELL", "TMP", "TEMP", "TMPDIR",
+    "SYSTEMROOT", "WINDIR", "COMSPEC", "USERPROFILE", "HOMEDRIVE", "HOMEPATH",
+    "APPDATA", "LOCALAPPDATA", "PROGRAMDATA", "PROGRAMFILES", "PROGRAMFILES(X86)",
+    "LANG", "LANGUAGE", "LC_ALL", "LC_CTYPE", "LC_MESSAGES", "LC_TIME", "TZ",
+    "JAVA_HOME", "EMAIL", "GIT_CONFIG_GLOBAL", "GIT_CONFIG_NOSYSTEM", "GIT_AUTHOR_NAME", "GIT_AUTHOR_EMAIL", "GIT_COMMITTER_NAME", "GIT_COMMITTER_EMAIL",
+}
 # Tools that otherwise write caches under the home folder, which the sandbox
 # keeps read-only. A per-project cache keeps them working without letting a
 # check poison a cache the person's own builds use.
@@ -48,6 +53,7 @@ class CheckPolicy:
 
     sandboxed: bool
     network_access: bool
+    read_only: bool = False
     cache_root: Path | None = None
     sandbox_home: Path | None = None
 
@@ -65,6 +71,7 @@ class CheckPolicy:
         return cls(
             sandboxed=permission_mode != PermissionMode.full_access,
             network_access=network_access,
+            read_only=permission_mode == PermissionMode.read_only,
             cache_root=cache_root,
             sandbox_home=sandbox_home,
         )
@@ -77,11 +84,11 @@ def check_environment(
     ports: Mapping[str, int] | None = None,
     cache_root: Path | None = None,
 ) -> dict[str, str]:
-    """The server's environment without what the agent's shell must not see."""
+    """Platform settings plus the variables explicitly assigned to the task."""
     environment = {
         name: value
         for name, value in base.items()
-        if not _PRIVATE_NAME.search(name) and not name.upper().startswith(_PRIVATE_PREFIXES)
+        if name.upper() in _PLATFORM_ENVIRONMENT
     }
     if cache_root is not None:
         for name, folder in _CACHE_VARIABLES.items():
@@ -100,17 +107,30 @@ class GitDirectories:
 
     common: Path
     private: Path
+    branch_ref: str | None = None
 
-    def grants(self) -> dict[Path, str]:
-        # Hooks may stage files and stash (the index, objects, refs and logs);
-        # nothing that makes Git run a program or point somewhere else.
-        grants: dict[Path, str] = {self.common: "write"}
-        for name in ("config", "config.worktree", "hooks", "modules", "worktrees", "commondir"):
-            grants[self.common / name] = "read"
-        if self.private != self.common:
-            grants[self.private] = "write"
-            for name in ("config.worktree", "commondir", "gitdir"):
-                grants[self.private / name] = "read"
+    def grants(self, *, committing: bool = False) -> dict[Path, str]:
+        # A linked worktree shares its object database and branch refs with
+        # other checkouts. Limit writes to staging data and this task's ref.
+        # Git stash uses process-specific temporary index files in the
+        # private directory. Keep shared refs and executable configuration
+        # protected even when this is the repository's primary checkout.
+        grants = {self.common: "read", self.private: "write", self.common / "objects": "write"}
+        for name in ("config", "config.worktree", "hooks", "modules", "worktrees", "info",
+                     "refs", "logs/refs", "packed-refs", "packed-refs.lock", "commondir", "gitdir", "HEAD"):
+            grants[self.private / name] = "read"
+        grants[self.common / "objects/info"] = "read"
+        # Stash-backed formatters need the stash ref even in a linked worktree.
+        refs = ["refs/stash"]
+        if committing and self.branch_ref:
+            refs.append(self.branch_ref)
+        if committing:
+            grants[self.private / "HEAD"] = "write"
+        for ref in refs:
+            for prefix in ("", "logs/"):
+                path = self.common / (prefix + ref)
+                grants[path] = "write"
+                grants[path.with_name(path.name + ".lock")] = "write"
         return grants
 
 
@@ -130,6 +150,7 @@ def sandboxed_argv(
     git: GitDirectories | None = None,
     read_only: Sequence[Path] = (),
     codex: Path | None = None,
+    committing: bool = False,
 ) -> list[str]:
     """Wrap a command so it runs inside the task's sandbox.
 
@@ -139,16 +160,24 @@ def sandboxed_argv(
     if not policy.sandboxed:
         return list(argv)
     temp = Path(tempfile.gettempdir()).resolve()
-    roots = [Path(path).resolve() for path in writable]
-    if policy.cache_root is not None:
-        roots.append(policy.cache_root.resolve())
-    filesystem: dict[str, str] = {":root": "read", ":slash_tmp": "write", str(temp): "write"}
-    filesystem.update({str(root): "write" for root in roots})
-    filesystem.update({str(Path(path).resolve()): "read" for path in read_only})
-    if git is not None:
-        filesystem.update({str(path.resolve()): access for path, access in git.grants().items()})
-    sockets = ", ".join(f"{toml_string(str(path))}=\"allow\"" for path in (*roots, temp))
-    network = f"enabled=true, allow_local_binding=true, unix_sockets={{{sockets}}}"
+    filesystem: dict[str, str] = {":root": "read"}
+    roots: list[Path] = []
+    if not policy.read_only:
+        roots = [Path(path).resolve() for path in writable]
+        if policy.cache_root is not None:
+            roots.append(policy.cache_root.resolve())
+        filesystem.update({":slash_tmp": "write", str(temp): "write"})
+        filesystem.update({str(root): "write" for root in roots})
+        filesystem.update({str(Path(path).resolve()): "read" for path in read_only})
+        if git is not None:
+            for path, access in git.grants(committing=committing).items():
+                if path.resolve() != path:
+                    raise WorkspaceError("Cannot grant commit access through symbolic links in Git metadata")
+                filesystem[str(path)] = access
+    network = "enabled=true"
+    if not policy.read_only:
+        sockets = ", ".join(f'{toml_string(str(path))}="allow"' for path in (*roots, temp))
+        network += f", allow_local_binding=true, unix_sockets={{{sockets}}}"
     if not policy.network_access:
         # Outbound traffic goes only through Codex's proxy, which allows no
         # domain; direct connections are refused by the sandbox itself.
@@ -190,7 +219,9 @@ def git_metadata(root: Path) -> list[Path]:
 def git_directories(git_run, root: Path) -> GitDirectories:
     common = git_run(root, "rev-parse", "--git-common-dir").stdout.strip()
     private = git_run(root, "rev-parse", "--absolute-git-dir").stdout.strip()
-    return GitDirectories(common=(root / common).resolve(), private=Path(private).resolve())
+    ref = git_run(root, "symbolic-ref", "--quiet", "HEAD", check=False).stdout.strip()
+    branch_ref = ref if ref.startswith("refs/heads/") and ".." not in ref.split("/") else None
+    return GitDirectories(common=(root / common).resolve(), private=Path(private).resolve(), branch_ref=branch_ref)
 
 
 def hook_path(git_run, root: Path, name: str) -> Path | None:

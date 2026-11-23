@@ -8,7 +8,7 @@ import pytest
 
 from tests.support.coding.service_fakes import CREDS, FakeEngine, repository, service_with
 
-from cowork.coding.contracts import SessionCreateRequest, SessionStatus, TaskCapability
+from cowork.coding.contracts import PermissionMode, SessionCreateRequest, SessionStatus, TaskCapability
 from cowork.coding.control_models import ComputerCapabilities, RuntimeCommand, RuntimeEvent
 from cowork.coding.engines.registry import CodingEngineRegistry
 from cowork.coding.project_models import ProjectCreateRequest, RepositoryResource
@@ -201,6 +201,16 @@ def test_worker_redelivery_applies_a_workspace_event_whose_first_application_fai
     assert [item.title for item in service.events(task.id).items].count("Workspace prepared") == 1
     assert engine.prompts == ["Build remotely"]
     assert session.run_status == "completed"
+
+
+def test_remote_plan_lease_has_the_effective_read_only_permission(tmp_path: Path) -> None:
+    service, computer, task = connected_task(tmp_path, FakeEngine())
+    service.store.update_session(task.id, lambda session: setattr(session, "task_mode", "plan"))
+
+    lease = service.remote.acquire_lease(computer.id)
+
+    assert lease is not None
+    assert lease.execution.permission_mode == PermissionMode.read_only
 
 
 def test_redelivery_after_a_crash_between_event_and_sequence_writes_appends_once(tmp_path: Path) -> None:

@@ -37,12 +37,13 @@ def hook(repo: Path, name: str, body: str) -> None:
     path.chmod(path.stat().st_mode | stat.S_IXUSR)
 
 
-def test_check_environment_drops_cowork_and_credential_shaped_variables(tmp_path: Path) -> None:
+def test_check_environment_inherits_only_selected_platform_variables(tmp_path: Path) -> None:
     environment = check_environment(
         {
             "PATH": "/usr/bin",
             "HOME": "/home/person",
             "JAVA_HOME": "/opt/java",
+            "INTERNAL_AUTH_HEADER": "private",
             "COWORK_AUTH_TOKEN": "server-only",
             "GITHUB_CLIENT_SECRET": "bundled",
             "MINDSHUB_CODEX_API_KEY": "loopback",
@@ -54,6 +55,7 @@ def test_check_environment_drops_cowork_and_credential_shaped_variables(tmp_path
         cache_root=tmp_path / "cache",
     )
 
+    assert "INTERNAL_AUTH_HEADER" not in environment
     assert environment["PATH"] == "/usr/bin"
     assert environment["JAVA_HOME"] == "/opt/java"
     assert {"COWORK_AUTH_TOKEN", "GITHUB_CLIENT_SECRET", "MINDSHUB_CODEX_API_KEY", "DATABASE_URI"}.isdisjoint(environment)
@@ -84,20 +86,15 @@ def test_sandboxed_checks_follow_the_task_network_setting(tmp_path: Path, networ
 
 def test_hooks_may_stage_but_not_change_what_makes_git_run_programs(tmp_path: Path) -> None:
     common = tmp_path / "repo" / ".git"
-    grants = GitDirectories(common=common, private=common / "worktrees" / "task").grants()
-
-    assert grants[common] == "write"
-    assert grants[common / "worktrees" / "task"] == "write"
-    for read_only in (
-        common / "config",
-        common / "hooks",
-        common / "modules",
-        common / "worktrees",
-        common / "worktrees" / "task" / "config.worktree",
-        common / "worktrees" / "task" / "commondir",
-        common / "worktrees" / "task" / "gitdir",
-    ):
-        assert grants[read_only] == "read"
+    private = common / "worktrees" / "task"
+    dirs = GitDirectories(common=common, private=private, branch_ref="refs/heads/task")
+    grants = dirs.grants()
+    assert grants[common] == "read"
+    assert grants[private] == "write"
+    assert grants[private / "HEAD"] == "read"
+    assert grants[private / "gitdir"] == "read"
+    assert common / "refs/heads/task" not in grants
+    assert dirs.grants(committing=True)[common / "refs/heads/task"] == "write"
 
 
 def test_commit_without_checks_runs_no_repository_hook(tmp_path: Path) -> None:
@@ -169,6 +166,37 @@ def test_project_checks_run_sandboxed_with_localhost_but_no_secrets_or_network(
 
 
 @requires_sandbox
+def test_read_only_validation_can_read_but_cannot_modify_project_files(tmp_path: Path) -> None:
+    repo = repository(tmp_path / "repo")
+    original = (repo / "README.md").read_text()
+    script = (
+        "from pathlib import Path\n"
+        "source = Path('README.md')\n"
+        "print(source.read_text())\n"
+        "try: source.write_text('changed')\n"
+        "except PermissionError: print('write denied')\n"
+    )
+    project = CodeProject(
+        id="project", name="Checks",
+        folders=[ProjectFolder(id="app", name="App", path=str(repo), commands=[
+            ProjectCommand(id="check", label="Check", phase="validate", argv=[sys.executable, "-c", script]),
+        ])],
+    )
+    workspace = TaskWorkspace(
+        folder_id="app", folder_name="App", source_path=str(repo), workspace_path=str(repo),
+        workspace_kind=WorkspaceKind.direct_folder,
+    )
+    policy = WorkspaceManager(tmp_path / "root").check_policy("project", PermissionMode.read_only, False)
+
+    [result] = ProjectCommandRunner().run(project, (workspace,), "validate", {}, policy=policy)
+
+    assert result.return_code == 0, result.output
+    assert original.strip() in result.output
+    assert "write denied" in result.output
+    assert (repo / "README.md").read_text() == original
+
+
+@requires_sandbox
 def test_commit_hooks_run_sandboxed_and_may_restage_and_edit_the_message(
     tmp_path: Path, checks: CheckPolicy, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -188,6 +216,28 @@ def test_commit_hooks_run_sandboxed_and_may_restage_and_edit_the_message(
     assert git(repo, "show", "HEAD:README.md") == "formatted"
     assert "Checked-by: hook" in git(repo, "log", "-1", "--format=%B")
     assert subprocess.run(["git", "config", "core.fsmonitor"], cwd=repo, capture_output=True).returncode != 0
+
+
+@requires_sandbox
+def test_staging_and_commit_use_the_task_sandbox(tmp_path: Path, checks: CheckPolicy, monkeypatch) -> None:
+    repo = repository(tmp_path / "repo")
+    (repo / "README.md").write_text("changed\n", encoding="utf-8")
+    monkeypatch.setenv("INTERNAL_AUTH_HEADER", "test-only")
+    calls = []
+    real_run = subprocess.run
+
+    def record(argv, **kwargs):
+        if "add" in argv or "commit" in argv:
+            calls.append((argv, kwargs["env"]))
+        return real_run(argv, **kwargs)
+
+    monkeypatch.setattr(subprocess, "run", record)
+    WorkspaceManager(tmp_path / "root").commit(str(repo), "Change", checks)
+    assert len(calls) == 2
+    for argv, env in calls:
+        assert argv[1] == "sandbox"
+        assert f"core.hooksPath={os.devnull}" in argv
+        assert "INTERNAL_AUTH_HEADER" not in env
 
 
 @requires_sandbox
