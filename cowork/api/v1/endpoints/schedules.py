@@ -72,6 +72,7 @@ def _create_schedule(scoped: ScopedSession, *, body: ScheduleCreateRequest) -> S
             timezone=body.timezone,
             project_id=body.project_id,
             enabled=body.enabled,
+            disabled_connections=[c.model_dump() for c in body.disabled_connections or []],
         )
     except ValueError as e:
         # e.g. a project_id that isn't visible in this scope

@@ -260,6 +260,7 @@ class _ScheduledTurn:
     prompt: str
     model: str | None
     project_id: UUID | None
+    disabled_connections: list[dict] | None = None
 
 
 @dataclass(frozen=True)
@@ -575,6 +576,7 @@ def _read_schedule(session: ScopedSession, *, schedule_id: UUID) -> _ScheduledTu
         prompt=schedule.prompt,
         model=schedule.model,
         project_id=schedule.project_id,
+        disabled_connections=schedule.disabled_connections or None,
     )
 
 
@@ -925,6 +927,7 @@ async def _execute_schedule(
             input=scheduled.prompt,
             model=resolve_schedule_model(scheduled.model),
             stream=True,
+            disabled_connections=scheduled.disabled_connections,
             conversation=str(conversation_id),
             trace_tags=["scheduled_task", f"trigger:{trigger.value}"],
             trace_metadata={

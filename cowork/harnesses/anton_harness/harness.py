@@ -632,6 +632,18 @@ def _turn_memory_read(*, session: "ChatSession", learns: bool) -> TurnMemoryRead
     return TurnMemoryRead(read=read.learned and learns, entries=read.entries)
 
 
+def _left_out_connections_guidance(disabled_connections: list[dict]) -> str:
+    """Tell a scheduled run which connections its task leaves out, so a run
+    that needed one says which instead of failing vaguely."""
+    names = ", ".join(f"{d['name']} ({d['engine']})" for d in disabled_connections)
+    return (
+        "\n\n## Connections this task leaves out\n"
+        f"This scheduled task is set not to use: {names}. If the task needs one of them, "
+        "don't work around it: say which connection it needs, and that it can be turned back "
+        "on in the task's settings.\n"
+    )
+
+
 def _picked_files_guidance(picked_by_connection: dict[str, list[dict]]) -> str:
     """Prompt text naming the Google-Picker-granted Drive files, or "".
 
@@ -2082,6 +2094,10 @@ class AntonHarness:
                 integration_guidance += describe_project_pages(
                     service.picked_files_by_project(data_vault, conversation.project.name, engine="notion")
                 )
+            if not interactive and disabled_connections:
+                # A scheduled task left these out, so they're hidden from the
+                # turn; without a word the agent would just say it can't.
+                integration_guidance += _left_out_connections_guidance(disabled_connections)
 
             cells = extract_scratchpad_cells(history.events)
             os.environ["ANTON_SCRATCHPAD_PERSIST_SESSION"] = "true"

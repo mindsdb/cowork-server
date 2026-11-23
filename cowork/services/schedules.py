@@ -101,6 +101,7 @@ class ScheduleService:
         timezone: str = "UTC",
         project_id: UUID | None = None,
         enabled: bool = True,
+        disabled_connections: list[dict] | None = None,
     ) -> Schedule:
         # Anchor the parent (same as conversations): the target project must be
         # visible in scope, or a foreign org's project id could be attached.
@@ -116,6 +117,7 @@ class ScheduleService:
             timezone=timezone,
             project_id=target_project_id,
             enabled=enabled,
+            disabled_connections=disabled_connections or None,
             # `timezone` is this method's zone-name argument here.
             paused_at=None if enabled else datetime.now(timezone_.utc),
         )
