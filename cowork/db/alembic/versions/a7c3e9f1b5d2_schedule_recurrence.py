@@ -6,7 +6,7 @@ keep NULL: a weekly task without a rule runs on its next run's weekday, as
 before.
 
 Revision ID: a7c3e9f1b5d2
-Revises: f6a2c4e8b1d3
+Revises: a8d3f6c1e924
 Create Date: 2026-11-17 00:00:00.000000
 
 """
@@ -18,7 +18,7 @@ import sqlalchemy as sa
 
 # revision identifiers, used by Alembic.
 revision: str = "a7c3e9f1b5d2"
-down_revision: Union[str, Sequence[str], None] = "f6a2c4e8b1d3"
+down_revision: Union[str, Sequence[str], None] = "a8d3f6c1e924"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 
