@@ -174,6 +174,20 @@ def _platform_config_args() -> tuple[str, ...]:
     return ()
 
 
+def _host_hooks_off(args: tuple[str, ...]) -> tuple[str, ...]:
+    """Keep Git from running repository hooks in the server's process.
+
+    A hook path can point into the task's own files (husky keeps hooks in
+    ``.husky``), and Git runs some hooks, such as ``post-index-change``,
+    from ordinary staging and status commands. Cowork runs the hooks it
+    supports itself, inside the task's sandbox. Only hook discovery sees
+    the repository's real hook path.
+    """
+    if args[:2] == ("rev-parse", "--git-path"):
+        return ()
+    return ("-c", f"core.hooksPath={os.devnull}")
+
+
 class GitRunner:
     """Shell-free Git boundary shared by macOS and Windows."""
 
@@ -216,7 +230,7 @@ class GitRunner:
             # such as ``ext`` at the execution boundary.
             child_environment["GIT_ALLOW_PROTOCOL"] = ALLOWED_GIT_PROTOCOLS
             result = subprocess.run(
-                ["git", *_platform_config_args(), *args],
+                ["git", *_platform_config_args(), *_host_hooks_off(args), *args],
                 # The directory is an explicit desktop capability selected by
                 # the user and validated above. Git is fixed, arguments are an
                 # argv array, and shell execution is disabled.
@@ -698,11 +712,7 @@ class WorkspaceManager:
                 message_file.write_text(message.strip() + "\n", encoding="utf-8")
                 if checks is not None:
                     self._run_commit_hooks(root, message_file, checks)
-                no_hooks = Path(scratch) / "no-hooks"
-                no_hooks.mkdir()
-                self.git.run(
-                    root, "-c", f"core.hooksPath={no_hooks}", "commit", "--no-verify", "--file", str(message_file),
-                )
+                self.git.run(root, "commit", "--no-verify", "--file", str(message_file))
             return self.git_state(str(root), str(root))
 
     def _run_commit_hooks(self, root: Path, message_file: Path, checks: CheckPolicy) -> None:
@@ -719,7 +729,8 @@ class WorkspaceManager:
             if path is None:
                 continue
             arguments = (str(message_file),) if name == "commit-msg" else ()
-            before = directories.control_files()
+            before = directories.hook_surface()
+            planted: set[Path] = set()
             try:
                 result = check_sandbox.run_sandboxed(
                     check_sandbox.hook_argv(path, *arguments),
@@ -728,20 +739,23 @@ class WorkspaceManager:
                     environment=environment,
                     writable=[root, message_file.parent],
                     git=directories,
+                    timeout=check_sandbox.HOOK_TIMEOUT_SECONDS,
                 )
             except subprocess.TimeoutExpired as exc:
                 raise WorkspaceError(f"The {name} hook did not finish in time") from exc
             except OSError as exc:
                 raise WorkspaceError(f"The {name} hook could not run: {exc}") from exc
-            planted = directories.control_files() - before
-            if planted:
-                # Git would read these on the host, outside the sandbox.
-                for path in planted:
-                    if path.is_dir() and not path.is_symlink():
-                        force_remove(path)
+            finally:
+                # However the hook ended, nothing it left behind may change
+                # what the next host-side Git command reads.
+                planted = directories.hook_surface() - before
+                for planted_path in planted:
+                    if planted_path.is_dir() and not planted_path.is_symlink():
+                        force_remove(planted_path)
                     else:
-                        path.unlink(missing_ok=True)
-                raise WorkspaceError(f"The {name} hook tried to change Git's configuration, so nothing was committed")
+                        planted_path.unlink(missing_ok=True)
+            if planted:
+                raise WorkspaceError(f"The {name} hook tried to change Git's configuration or references, so nothing was committed")
             if result.returncode != 0:
                 output = "\n".join(part.strip() for part in (result.stdout, result.stderr) if part.strip())
                 raise WorkspaceError((f"The {name} hook failed" + (f":\n{output}" if output else ""))[:4_000])

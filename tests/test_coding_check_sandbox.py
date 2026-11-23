@@ -65,6 +65,50 @@ def test_check_environment_inherits_only_selected_platform_variables(tmp_path: P
     assert environment["UV_CACHE_DIR"] == str(tmp_path / "cache" / "uv")
 
 
+def test_check_environment_keeps_proxies_only_without_credentials() -> None:
+    environment = check_environment({
+        "HTTPS_PROXY": "http://proxy.corp:3128",
+        "HTTP_PROXY": "http://person:secret@proxy.corp:3128",
+        "ALL_PROXY": "person@proxy.corp:1080",
+        "NO_PROXY": "localhost",
+        "NODE_EXTRA_CA_CERTS": "/etc/corp-ca.pem",
+    })
+
+    assert environment["HTTPS_PROXY"] == "http://proxy.corp:3128"
+    assert "HTTP_PROXY" not in environment and "ALL_PROXY" not in environment
+    assert environment["NO_PROXY"] == "localhost"
+    assert environment["NODE_EXTRA_CA_CERTS"] == "/etc/corp-ca.pem"
+
+
+@pytest.mark.skipif(os.name == "nt", reason="the hook under test is a POSIX shell script")
+def test_host_git_runs_no_repository_hook_while_staging_or_reading_status(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Git runs post-index-change from ordinary staging and status commands,
+    # and husky points the hook path into the task's own files.
+    repo = repository(tmp_path / "repo")
+    marker = tmp_path / "hook-ran"
+    husky = repo / ".husky"
+    husky.mkdir()
+    for name in ("post-index-change", "pre-commit", "post-commit"):
+        script = husky / name
+        script.write_text(f"#!/bin/sh\necho {name} >> '{marker}'\n", encoding="utf-8")
+        script.chmod(script.stat().st_mode | stat.S_IXUSR)
+    git(repo, "-c", f"core.hooksPath={os.devnull}", "add", ".husky")
+    git(repo, "-c", f"core.hooksPath={os.devnull}", "commit", "-q", "-m", "hooks")
+    git(repo, "config", "core.hooksPath", ".husky")
+    (repo / "README.md").write_text("changed\n", encoding="utf-8")
+    manager = WorkspaceManager(tmp_path / "root")
+
+    manager.git_state(str(repo), str(repo))
+    manager.commit(str(repo), "Change", manager.check_policy("project", PermissionMode.full_access, False))
+
+    # Full access runs the supported pre-commit hook outside the sandbox, as
+    # the agent itself would; Git must run none of the others.
+    assert marker.read_text().split() == ["pre-commit"]
+    assert git(repo, "log", "-1", "--format=%s") == "Change"
+
+
 def test_full_access_checks_run_outside_the_sandbox(tmp_path: Path) -> None:
     policy = CheckPolicy.for_task(PermissionMode.full_access, network_access=False)
 
@@ -271,6 +315,44 @@ def test_a_hook_that_plants_git_configuration_stops_the_commit(tmp_path: Path, c
 
     assert not (private / "config.worktree").exists()
     assert git(worktree, "log", "-1", "--format=%s") == "base"
+
+
+@requires_sandbox
+def test_a_timed_out_hook_still_has_what_it_planted_removed(
+    tmp_path: Path, checks: CheckPolicy, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from cowork.coding import check_sandbox
+
+    repo = repository(tmp_path / "repo")
+    worktree = tmp_path / "task"
+    git(repo, "worktree", "add", "-q", "-b", "task", str(worktree))
+    private = (repo / ".git" / "worktrees" / "task").resolve()
+    hook(repo, "pre-commit", f"printf '[core]\\n' > '{private}/config.worktree'\nsleep 30\n")
+    (worktree / "README.md").write_text("changed\n", encoding="utf-8")
+    monkeypatch.setattr(check_sandbox, "HOOK_TIMEOUT_SECONDS", 3)
+
+    with pytest.raises(WorkspaceError, match="did not finish in time"):
+        WorkspaceManager(tmp_path / "root").commit(str(worktree), "Change", checks)
+
+    assert not (private / "config.worktree").exists()
+
+
+@requires_sandbox
+def test_a_hook_may_stash_but_not_add_or_move_other_references(tmp_path: Path, checks: CheckPolicy) -> None:
+    repo = repository(tmp_path / "repo")
+    common = (repo / ".git").resolve()
+    hook(repo, "pre-commit", (
+        "git stash create >/dev/null\n"
+        "git update-ref refs/heads/main HEAD~0 2>/dev/null && git update-ref refs/heads/moved HEAD 2>/dev/null\n"
+        f"mkdir -p '{common}/refs/replace' && printf 'x' > '{common}/refs/replace/planted'\n"
+    ))
+    (repo / "README.md").write_text("changed\n", encoding="utf-8")
+
+    with pytest.raises(WorkspaceError, match="configuration or references"):
+        WorkspaceManager(tmp_path / "root").commit(str(repo), "Change", checks)
+
+    assert not (common / "refs" / "replace").exists()
+    assert not (common / "refs" / "heads" / "moved").exists()
 
 
 @requires_sandbox

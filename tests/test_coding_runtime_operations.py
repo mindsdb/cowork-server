@@ -108,7 +108,9 @@ def test_refresh_project_then_validate_runs_the_new_commands_through_the_real_ru
     result, error = operations.execute(operation(2, {"operation": "validate"}))
 
     assert error is None
-    assert [(item["label"], item["return_code"], item["output"]) for item in result["items"]] == [("Check", 0, "late")]
+    # On Linux the sandbox launcher adds a warning when its home is under a
+    # temporary folder, as it is in tests; the command's own output comes first.
+    assert [(item["label"], item["return_code"], item["output"].splitlines()[0]) for item in result["items"]] == [("Check", 0, "late")]
 
 
 @pytest.mark.parametrize("payload", [{}, {"commands": ["not", "a", "map"]}])

@@ -476,9 +476,9 @@ def test_git_runner_rejects_an_unavailable_working_directory_before_spawning(
 @pytest.mark.parametrize(
     ("platform", "expected_prefix"),
     [
-        ("win32", ["git", "-c", "core.longpaths=true", "status"]),
-        ("darwin", ["git", "status"]),
-        ("linux", ["git", "status"]),
+        ("win32", ["git", "-c", "core.longpaths=true", "-c", f"core.hooksPath={os.devnull}", "status"]),
+        ("darwin", ["git", "-c", f"core.hooksPath={os.devnull}", "status"]),
+        ("linux", ["git", "-c", f"core.hooksPath={os.devnull}", "status"]),
     ],
 )
 def test_git_runner_enables_long_paths_only_on_windows(

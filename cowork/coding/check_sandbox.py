@@ -16,6 +16,7 @@ import tempfile
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from cowork.coding.contracts import PermissionMode
 from cowork.coding.engines.codex_config import toml_string
@@ -33,10 +34,12 @@ _PLATFORM_ENVIRONMENT = {
     # Toolchain homes that test runners resolve from the environment.
     "JAVA_HOME", "GOPATH", "GOROOT", "CARGO_HOME", "RUSTUP_HOME", "NVM_DIR", "PYENV_ROOT",
     "VIRTUAL_ENV", "CONDA_PREFIX", "ANDROID_HOME", "ANDROID_SDK_ROOT",
-    # Corporate networks: a proxy and its CA bundle are machine settings, not secrets.
-    "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "ALL_PROXY",
+    # Corporate networks: a CA bundle is a machine setting, not a secret.
+    # Proxy URLs pass only without credentials, see _PROXY_VARIABLES.
+    "NO_PROXY",
     "SSL_CERT_FILE", "SSL_CERT_DIR", "REQUESTS_CA_BUNDLE", "NODE_EXTRA_CA_CERTS", "CURL_CA_BUNDLE",
 }
+_PROXY_VARIABLES = {"HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY"}
 # Tools that otherwise write caches under the home folder, which the sandbox
 # keeps read-only. A per-project cache keeps them working without letting a
 # check poison a cache the person's own builds use.
@@ -95,6 +98,7 @@ def check_environment(
         name: value
         for name, value in base.items()
         if name.upper() in _PLATFORM_ENVIRONMENT
+        or (name.upper() in _PROXY_VARIABLES and not _has_credentials(value))
     }
     if cache_root is not None:
         for name, folder in _CACHE_VARIABLES.items():
@@ -110,6 +114,17 @@ def check_environment(
 # Files that make Git run a program or read its settings from somewhere else.
 # A hook must not leave one behind for the next host-side Git command.
 _GIT_CONTROL_FILES = ("config", "config.worktree", "commondir", "gitdir", "hooks", "modules")
+_STASH_ENTRIES = ("stash", "stash.lock")
+
+
+def _has_credentials(url: str) -> bool:
+    """Whether a proxy URL carries a user name or password."""
+    candidate = url if "://" in url else f"http://{url}"
+    try:
+        parsed = urlsplit(candidate)
+    except ValueError:
+        return True
+    return "@" in parsed.netloc
 
 
 @dataclass(frozen=True)
@@ -130,25 +145,28 @@ class GitDirectories:
         grants.update({path: "read" for path in protected if path.exists()})
         # Stash-backed formatters such as lint-staged keep their backup in
         # refs/stash. Git writes a ref by renaming a lock file into place, and
-        # the Linux sandbox cannot grant a file that does not exist yet, so
-        # the refs folders stay writable while branches, tags and remotes
-        # inside them stay read-only.
-        for refs in (self.common / "refs", self.common / "logs" / "refs"):
-            if refs.is_dir():
-                grants[refs] = "write"
-                grants.update({
-                    path: "read" for path in (refs / name for name in ("heads", "tags", "remotes")) if path.exists()
-                })
+        # the Linux sandbox cannot grant a file that does not exist yet, so a
+        # refs folder itself is writable while everything already in it, such
+        # as branches, tags, notes and replacements, stays read-only. Anything
+        # new other than the stash is removed after the hook.
+        for refs in self._ref_folders():
+            grants[refs] = "write"
+            grants.update({entry: "read" for entry in refs.iterdir() if entry.name not in _STASH_ENTRIES})
         return grants
 
-    def control_files(self) -> set[Path]:
-        """The Git control files that exist now, to compare after a hook."""
-        return {
+    def hook_surface(self) -> set[Path]:
+        """What a hook could add that host Git would later read, as it is now."""
+        files = {
             path
             for directory in {self.common, self.private}
             for path in (directory / name for name in _GIT_CONTROL_FILES)
             if path.exists() or path.is_symlink()
         }
+        refs = {entry for folder in self._ref_folders() for entry in folder.iterdir() if entry.name not in _STASH_ENTRIES}
+        return files | refs
+
+    def _ref_folders(self) -> list[Path]:
+        return [path for path in (self.common / "refs", self.common / "logs" / "refs") if path.is_dir()]
 
 
 def sandbox_codex() -> Path:
