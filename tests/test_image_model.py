@@ -382,7 +382,7 @@ def _listing(*, image_models, enabled=None, role_defaults=None, disabled_reasons
     return MindsModelListing(
         [MINDS_FREE_MODEL, "sonnet"], {}, enabled or {MINDS_FREE_MODEL: True, "sonnet": True},
         {FLARE: "GPT Image 2.6 Flare"}, {}, {}, role_defaults or {}, disabled_reasons or {},
-        image_models,
+        image_models, {},
     )
 
 

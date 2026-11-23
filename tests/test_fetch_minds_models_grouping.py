@@ -327,6 +327,45 @@ def test_a_reason_on_an_enabled_row_is_ignored(monkeypatch):
     assert asyncio.run(fetch_minds_models(_URL, _KEY)).disabled_reasons == {}
 
 
+def test_each_rows_covering_tier_is_recorded_locked_or_not(monkeypatch):
+    # ENG-4186: the picker shows the tier on a covered row and offers it as the
+    # upgrade on a locked one, so it is kept either way.
+    _serve(
+        monkeypatch,
+        {
+            "data": [
+                _row("mindshub_air", enabled=True, covered_by_tier="free"),
+                _row("kimi-k3", enabled=True, covered_by_tier="plus"),
+                _row("opus", enabled=False, disabled_reason="model_not_in_tier", covered_by_tier="pro"),
+                _row("sonnet", covered_by_tier=None),
+                _row("gpt", covered_by_tier="enterprise"),
+                _row("glm", covered_by_tier=3),
+                _row("qwen"),
+            ]
+        },
+    )
+
+    listing = asyncio.run(fetch_minds_models(_URL, _KEY))
+
+    assert listing.covered_by_tier == {"mindshub_air": "free", "kimi-k3": "plus", "opus": "pro"}
+    assert listing.disabled_reasons == {"opus": "model_not_in_tier"}
+
+
+@pytest.mark.parametrize("junk", [[], {}, ["plus"], {"tier": "plus"}, True])
+def test_an_unhashable_or_non_string_covering_tier_is_dropped_not_raised(monkeypatch, junk):
+    # A custom endpoint's rows run through the same loop. A list or an object
+    # is unhashable, so a bare `in` test on it would raise out of the listing.
+    _serve(
+        monkeypatch,
+        {"data": [_row("odd", covered_by_tier=junk), _row("kimi-k3", covered_by_tier="plus")]},
+    )
+
+    listing = asyncio.run(fetch_minds_models(_URL, _KEY))
+
+    assert listing.covered_by_tier == {"kimi-k3": "plus"}
+    assert listing.ids == ["odd", "kimi-k3"]
+
+
 @pytest.mark.parametrize("junk", [None, 42, "", "   ", ["model_restricted"]])
 def test_a_junk_reason_is_treated_as_absent(monkeypatch, junk):
     _serve(monkeypatch, {"data": [_row("opus", enabled=False, disabled_reason=junk)]})
