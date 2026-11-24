@@ -90,17 +90,31 @@ class RecordTooLargeError(ValueError):
         )
 
 
+def too_large_refusal(*, connection: str) -> str:
+    """What a save route says when the sealed vault refuses a record as too large, built from the
+    route's own data, never from the exception (RecordTooLargeError carries the sizes)."""
+    return (
+        f"The saved connection {connection} is too large to save: sealed, its record file would be "
+        f"larger than the limit of {MAX_RECORD_BYTES} bytes."
+    )
+
+
+def reserved_field_refusal(*, connection: str) -> str:
+    """ReservedFieldError's message. It names ``connection`` and the field, never a value."""
+    return (
+        f"The saved connection {connection} can't be saved: the field name {SEALED_FIELD} is reserved "
+        "for the sealed mark. Rename the field and save again."
+    )
+
+
 class ReservedFieldError(ValueError):
     """A save whose values hold a field named SEALED_FIELD, a name reserved
     for the sealed mark. ``connection`` is ``engine/name``. The message names
-    it and the field, never a value."""
+    it and the field, never a value (reserved_field_refusal)."""
 
     def __init__(self, *, connection: str) -> None:
         self.connection = connection
-        super().__init__(
-            f"The saved connection {connection} can't be saved: the field name {SEALED_FIELD} is reserved "
-            "for the sealed mark. Rename the field and save again."
-        )
+        super().__init__(reserved_field_refusal(connection=connection))
 
 
 class RecordSealing(Enum):

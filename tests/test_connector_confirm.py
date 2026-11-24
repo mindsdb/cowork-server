@@ -200,19 +200,19 @@ class TestTheMemberAnswers:
 
 FLAG = "flag-value-6150"
 _RESERVED = re.compile(
-    r"The saved connection planner/planner-[0-9a-f]{8} can't be saved: the field name _sealed is reserved for "
+    r"The saved connection planner can't be saved: the field name _sealed is reserved for "
     r"the sealed mark\. Rename the field and save again\."
 )
 _TOO_LARGE = re.compile(
-    r"The saved connection planner/planner-[0-9a-f]{8} is too large to save: sealed, its record file would be "
-    rf"\d+ bytes, and the limit is {MAX_RECORD_BYTES}\."
+    r"The saved connection planner is too large to save: sealed, its record file would be "
+    rf"larger than the limit of {MAX_RECORD_BYTES} bytes\."
 )
 
 
 class TestAKeyedSaveTheVaultRefuses:
     """With a key file, SealedDataVault.save refuses a field named like the sealed mark and a record
-    too large to read back once sealed. The member's form and the conversation give the vault's own
-    reason, which names the connection and never a value, not a generic failure that submitting the
+    too large to read back once sealed. The member's form and the conversation give the vault's
+    reason, built from the waiting entry and naming the connector, never a value, not a generic failure that submitting the
     form again can't get past."""
 
     @pytest.mark.asyncio
