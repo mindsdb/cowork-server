@@ -32,6 +32,25 @@ class PinnedStreamingResponse(StreamingResponse):
 
     async def __call__(self, scope, receive, send) -> None:
         try:
+            from fastapi import HTTPException
+            from cowork.services.content_safety import ContentSafetySettings, MAX_FILE_BYTES, check_file_bytes
+            if ContentSafetySettings().required:
+                if self.status_code == 206:
+                    raise HTTPException(503, 'Partial file safety checks are not available yet.')
+                parts, size = [], 0
+                async for chunk in self.body_iterator:
+                    size += len(chunk)
+                    if size > MAX_FILE_BYTES:
+                        raise HTTPException(413, 'This file is too large for a safety check.')
+                    parts.append(chunk)
+                data = b''.join(parts)
+                await check_file_bytes(data, content_type=self.media_type or '', purpose='output', scope=self._tenant_scope)
+                async def checked_body():
+                    yield data
+                self.body_iterator = checked_body()
+                self.headers['content-length'] = str(len(data))
+                self.headers['cache-control'] = 'no-store'
+                self.headers['x-content-type-options'] = 'nosniff'
             await super().__call__(scope, receive, send)
         finally:
             # The one release, after the last frame or whatever ended the

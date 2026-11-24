@@ -382,7 +382,7 @@ def _listing(*, image_models, enabled=None, role_defaults=None, disabled_reasons
     return MindsModelListing(
         [MINDS_FREE_MODEL, "sonnet"], {}, enabled or {MINDS_FREE_MODEL: True, "sonnet": True},
         {FLARE: "GPT Image 2.6 Flare"}, {}, {}, role_defaults or {}, disabled_reasons or {},
-        image_models,
+        image_models, {},
     )
 
 
@@ -548,7 +548,9 @@ def test_an_anton_without_the_image_setting_is_skipped_not_crashed():
     from cowork.harnesses.anton_harness.harness import _overlay_user_settings
 
     a = AntonSettings(_env_file=None)
-    applied = _overlay_user_settings(a, _minds())
+    applied = _overlay_user_settings(
+        a, _minds(image_model=SUNBURST, minds_image_model_enabled=json.dumps({SUNBURST: True})),
+    )
 
     assert ("image_model" in applied) == hasattr(a, "image_model")
 

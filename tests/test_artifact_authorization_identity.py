@@ -36,6 +36,7 @@ from cowork.services import (
 )
 from cowork.services.artifact_access import ArtifactAccessUnavailable
 from cowork.services.artifact_identity import artifact_key
+from cowork.services.artifact_metadata import ArtifactMetadata
 from cowork.services.publish import publish_artifact
 from tests._org_sharing import TEAM_ELSEWHERE, TEAM_ENG, TEAM_OPS, TEAM_QA, member_request, mindshub_sharing_answers
 from tests.anton_minds_fake import fake_minds_requests
@@ -499,7 +500,7 @@ async def test_live_editor_sync_preserves_canonical_identity_and_refuses_peer(
         scope=scope,
         project_id=str(project.id),
     )
-    metadata = json.loads((folder / "metadata.json").read_text())
+    metadata = ArtifactMetadata.parse((folder / "metadata.json").read_text())
     initial = current_source(folder, metadata, local_id)
     body = artifact_workspace._SourceUpdateBody(
         content="<html>Updated owner bytes</html>",
@@ -2415,3 +2416,37 @@ def test_the_share_email_link_is_left_to_mindshubs_allowlist(tmp_path):
     too_long = "https://view.mindshub.ai/r/" + "a" * 2048
     for url in ("http://view.mindshub.ai/r/1", "https:///r/1", too_long, ""):
         assert link(url) == ""
+
+
+@pytest.mark.asyncio
+async def test_a_member_who_may_review_reads_the_owners_audience_without_the_password(
+    issuer, scope, local_id, owned_artifact, monkeypatch
+):
+    """GET .../audience (ENG-4455): a co-member the owner granted review reads
+    who the artifact is shared with from the rule MindsHub binds to the
+    owner, while GET .../access stays the owner's."""
+    from cowork.principal import Principal
+
+    session, project, _conversation, folder = owned_artifact
+    await artifact_workspace.enable_artifact_comments(str(project.id), local_id, session.scope)
+    run, _uploads = _org_publisher(issuer, folder, scope, project, monkeypatch)
+    run({"mode": "restricted", "emails": ["a@else.com"], "org_allowed": True, "allowed_team_ids": [TEAM_ENG]},
+        owner_save=True)
+    peer = TenantScope(org_mode=True, org_id=scope.org_id, user_id=str(uuid4()))
+    member = Principal(user_id=peer.user_id, org_id=peer.org_id)
+
+    with Session(get_engine(get_app_settings().database.uri)) as raw:
+        peer_scope = ScopedSession(raw, peer).scope
+        with pytest.raises(HTTPException) as refused:
+            await artifact_workspace.artifact_access(str(project.id), local_id, peer_scope)
+        assert refused.value.status_code == 403
+        audience = (
+            await artifact_workspace.artifact_audience(str(project.id), local_id, peer_scope, member)
+        ).model_dump(by_alias=True, mode="json")
+
+    assert audience == {
+        "accessMode": "restricted", "ownerOnly": False, "orgAllowed": True,
+        "allowedTeamIds": [TEAM_ENG], "allowedUserIds": [], "accessEmails": ["a@else.com"], "names": True,
+    }
+    reads = [body for path, body in issuer.calls if path.endswith("/read/")]
+    assert reads and all(body["owner_keycloak_id"] == scope.user_id for body in reads)

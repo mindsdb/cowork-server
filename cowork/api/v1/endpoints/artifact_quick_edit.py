@@ -3,13 +3,18 @@
 The artifact viewer's chat bar sends a change here. Jev routes it (anton's
 ``route_request``): a change that needs only the artifact's own files runs
 anton's artifact editor right here, with no chat turn, checks the open
-preview, and saves ONE new draft revision; anything else is handed back to
-the app (``done`` with status ``agent``), which sends the message to the
-artifact's chat as a normal turn.
+preview, and saves ONE new draft revision; a greeting or a question the
+artifact itself answers, when the installed anton can reply, is answered
+right here by a quick LLM (``done`` with status ``reply``), with no change,
+no revision and no chat turn; anything else is handed back to the app
+(``done`` with status ``agent``), which sends the message to the artifact's
+chat as a normal turn.
 
 The response is ``text/event-stream``:
 
-* ``route``         ``{"route": "edit"|"agent", "confidence": float, "ms": int, "reason": str}``;
+* ``route``         ``{"route": "edit"|"agent"|"reply", "confidence": float, "ms": int, "reason": str}``;
+  ``reply`` only when the app asks for it (``allowReply``) and the installed
+  anton's router takes ``allow_reply`` and it has ``answer_request``;
   with no decisions model for the caller's provider, at once
   ``{"route": "agent", "confidence": 1, "ms": 0, "reason": "no_decisions_model"}``
   and neither Jev nor the editor runs
@@ -18,8 +23,13 @@ The response is ``text/event-stream``:
   answered with the existing ``POST /api/v1/artifacts/checks/{check_id}``
   (same broker as a turn's checks, authorized against this request's owner)
 * ``done``          ``{"status", "summary", "revisionId", "previousRevisionId", "changed", "check",
-  "editId", "undoable", "ms"}``
+  "editId", "undoable", "ms"}``; status ``reply`` carries the answer as its
+  ``summary``, and a reply that comes back empty or fails ends ``agent``
 * ``error``         ``{"message": str}``
+
+``images`` (at most 4 PNG, JPEG, GIF or WebP images of up to 5 MB, base64)
+go to the editor's model beside the request and are never stored; the router
+reads the text alone. Anything else there is a 422 before the stream starts.
 
 ``POST .../quick-edits/{edit_id}/undo`` puts back every file an applied
 edit changed and removes those it created, all or nothing
@@ -42,6 +52,7 @@ away cancels the edit, and anton's editor restores every file it touched.
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
 import time
 from collections.abc import AsyncIterator, Callable
@@ -62,6 +73,7 @@ from cowork.db.scoped import TenantScope
 from cowork.db.units import run_db, run_efs, run_to_completion
 from cowork.harnesses.anton_harness.preview_checker import ask_preview
 from cowork.services import artifact_quick_edits
+from cowork.services.artifact_metadata import ArtifactMetadata
 from cowork.services import quick_edit as quick_edit_service
 from cowork.services.artifact_revisions import (
     RepairAlreadyPending,
@@ -71,6 +83,7 @@ from cowork.services.artifact_revisions import (
     list_revisions,
     record_quick_edit,
 )
+from cowork.services.comment_images import MAX_REQUEST_IMAGES, ImageRefused, decode_request_image
 from cowork.services.product_permissions import require_product_permission
 from cowork.services.quick_edit import AntonQuickEdit, QuickEditBackend
 from cowork.streaming.preview_checks import PreviewCheckBroker, preview_checks
@@ -102,6 +115,10 @@ _MAX_STAGE = 40
 #: What the app is told when the edit could not run; the reason is logged.
 _ERROR_MESSAGE = "Couldn't run the quick edit. Try again, or ask the agent."
 _TIMEOUT_SUMMARY = "The edit took too long, so nothing was changed."
+#: A quick reply past this goes to the agent instead: anton's own limit when
+#: its answer_request takes ``timeout_s``, and ours a little later.
+REPLY_TIMEOUT_S = 30.0
+_REPLY_GRACE_S = 5.0
 
 #: The route event's reason when no decisions model serves the caller.
 NO_DECISIONS_REASON = "no_decisions_model"
@@ -114,13 +131,26 @@ class _HistoryEntry(BaseModel):
     text: str = Field(max_length=4000)
 
 
+class _QuickEditImage(BaseModel):
+    """An image pasted into the bar, sent to the editor's model with the
+    request and never stored. Checked by its bytes (services/comment_images)."""
+
+    name: str | None = Field(default=None, max_length=200)
+    # Base64 of at most MAX_IMAGE_BYTES (5 MB), with room for its padding.
+    data: str = Field(min_length=1, max_length=7_000_000)
+
+
 class _QuickEditBody(BaseModel):
     message: str = Field(min_length=1, max_length=4000)
+    images: list[_QuickEditImage] = Field(default_factory=list, max_length=MAX_REQUEST_IMAGES)
     # Earlier messages of the bar's thread, so "make it bigger" has a referent.
     history: list[_HistoryEntry] = Field(default_factory=list, max_length=20)
     expectedRevisionId: str | None = Field(default=None, min_length=1, max_length=80)
     conversationId: UUID | None = None
     forceRoute: Literal["edit", "agent"] | None = None
+    # The app shows an answer in the bar (``done`` status ``reply``). An app
+    # that does not send it never gets one: it would read it as a failure.
+    allowReply: bool = False
     # The bar's model picker. A model the composer offers this person (GET
     # /api/v1/settings/recommended-models), else 422; null is their default.
     model: str | None = Field(default=None, min_length=1, max_length=200)
@@ -188,9 +218,8 @@ def _broker_key(artifact_id: str) -> str:
     return f"quick-edit:{artifact_id}"
 
 
-def _artifact_kind(metadata: dict) -> str:
-    kind = metadata.get("type") if isinstance(metadata, dict) else None
-    return kind if isinstance(kind, str) and kind else "html-app"
+def _artifact_kind(metadata: ArtifactMetadata) -> str:
+    return metadata.type or "html-app"
 
 
 def _router_input(
@@ -307,7 +336,7 @@ def _capture_for_undo(anton: AntonQuickEdit, folder: Path, kind: str, source_pat
 
 def _finish_applied(
     folder: Path,
-    metadata: dict,
+    metadata: ArtifactMetadata,
     artifact_id: str,
     *,
     source_path: str,
@@ -395,7 +424,7 @@ class QuickEditRun:
     anton: AntonQuickEdit
     scope: TenantScope
     folder: Path
-    metadata: dict
+    metadata: ArtifactMetadata
     artifact_id: str
     body: _QuickEditBody
     # From begin_quick_edit: the tracked source and the head the edit follows.
@@ -404,6 +433,9 @@ class QuickEditRun:
     started: float
     lock_key: str
     broker: PreviewCheckBroker = preview_checks
+    # The bar's images as ``(base64, media type)``, checked; sent to the
+    # editor's model with the request (quick_edit.with_request_images).
+    images: list[tuple[str, str]] = field(default_factory=list)
     # The bar's model pick and effort (``_model_choice``); None: the person's own.
     model: str | None = None
     reasoning_effort: str | None = None
@@ -412,6 +444,8 @@ class QuickEditRun:
     # None reads EDIT_TIMEOUT_S at call time.
     edit_timeout_s: float | None = None
     _released: bool = field(default=False, init=False)
+    # The context the router got, for a quick reply to read too.
+    _route_context: dict = field(default_factory=dict, init=False)
 
     @property
     def kind(self) -> str:
@@ -449,6 +483,9 @@ class QuickEditRun:
                 )
             except Exception:
                 logger.warning("Could not read the conversation for the quick edit router", exc_info=True)
+        self._route_context = {key: extra[key] for key in quick_edit_service.REPLY_CONTEXT if key in extra}
+        if self.anton.can_reply and body.allowReply:
+            extra["allow_reply"] = True
         refusals: list[dict] = []
         http = _jev_client(refusals)
         try:
@@ -465,7 +502,9 @@ class QuickEditRun:
             if http is not None:
                 await http.aclose()
         route = getattr(decision, "route", "agent")
-        if route not in ("edit", "agent"):
+        if route not in ("edit", "agent", "reply") or (
+            route == "reply" and not (self.anton.can_reply and body.allowReply)
+        ):
             route = "agent"
         try:
             confidence = float(getattr(decision, "confidence", 0.0) or 0.0)
@@ -484,6 +523,36 @@ class QuickEditRun:
                        "jev_error_code": refusal["code"], "artifact_id": self.artifact_id},
             )
         return route, confidence, reason
+
+    async def _reply(self, backend: QuickEditBackend) -> str:
+        """anton's quick answer to a message routed ``reply``, from the
+        context the router got; "" (the agent takes it) when it has none,
+        fails or takes too long. Touches no file.
+
+        No ``role``: the editor here runs on anton's default role, and so
+        does its reply."""
+        try:
+            params = set(inspect.signature(self.anton.answer_request).parameters)
+        except (TypeError, ValueError):
+            params = set()
+        try:
+            answer = await asyncio.wait_for(
+                self.anton.answer_request(
+                    self.body.message,
+                    llm=quick_edit_service.with_request_images(
+                        backend.llm, request=self.body.message, images=self.images,
+                    ),
+                    **self._route_context,
+                    **({"timeout_s": REPLY_TIMEOUT_S} if "timeout_s" in params else {}),
+                ),
+                timeout=REPLY_TIMEOUT_S + _REPLY_GRACE_S,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.warning("Quick reply on %s failed; the message goes to the agent", self.artifact_id, exc_info=True)
+            return ""
+        return answer.strip() if isinstance(answer, str) else ""
 
     def _checker(self, emit: Callable[[str], None]):
         """The editor's checker chain, ending in the viewer's preview, asked
@@ -563,6 +632,12 @@ class QuickEditRun:
             route_started = time.monotonic()
             route, confidence, reason = await self._route(backend, decisions)
             emit(sse_frame("route", {"route": route, "confidence": confidence, "ms": _ms(route_started), "reason": reason}))
+            if route == "reply":
+                # A reply changes nothing: the artifact is free for an edit now.
+                self.release()
+                answer = await self._reply(backend)
+                emit(_done(status_="reply" if answer else "agent", summary=answer, started=self.started))
+                return
             if route == "agent":
                 emit(_done(status_="agent", started=self.started))
                 return
@@ -581,7 +656,9 @@ class QuickEditRun:
                         self.folder,
                         self.body.message,
                         kind=self.kind,
-                        llm=backend.llm,
+                        llm=quick_edit_service.with_request_images(
+                            backend.llm, request=self.body.message, images=self.images,
+                        ),
                         checker=self._checker(emit),
                         history=[entry.model_dump() for entry in self.body.history],
                         on_progress=on_progress,
@@ -608,7 +685,7 @@ class QuickEditRun:
                         conversation_id=self.body.conversationId,
                         artifact_id=self.artifact_id,
                         artifact_slug=self.folder.name,
-                        artifact_title=str(self.metadata.get("name") or "") if isinstance(self.metadata, dict) else "",
+                        artifact_title=self.metadata.name or "",
                         edit=quick_edit_service.quick_edit_entry(
                             edit_id=edit_id,
                             request=self.body.message,
@@ -634,7 +711,9 @@ class QuickEditRun:
             logger.exception("Quick edit on %s failed", self.artifact_id)
             emit(sse_frame("error", {"message": _ERROR_MESSAGE}))
         finally:
-            self.broker.close_conversation(_broker_key(self.artifact_id))
+            if not self._released:
+                # Released early (a reply), the key may be a newer edit's now.
+                self.broker.close_conversation(_broker_key(self.artifact_id))
             if backend is not None:
                 await asyncio.shield(backend.close())
 
@@ -699,6 +778,10 @@ async def quick_edit_artifact(
             detail="Quick edits are not available on this server.",
         )
     started = time.monotonic()
+    try:
+        images = [decode_request_image(image.data) for image in body.images]
+    except ImageRefused as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
     _source, folder, metadata, _capabilities = await _owner_workspace(scope, project_ref, artifact_id)
     model, reasoning_effort = await _model_choice(request, scope, body)
 
@@ -740,6 +823,7 @@ async def quick_edit_artifact(
 
     run = QuickEditRun(
         anton=anton,
+        images=images,
         model=model,
         reasoning_effort=reasoning_effort,
         scope=scope,

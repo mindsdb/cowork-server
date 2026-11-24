@@ -43,6 +43,8 @@ from cowork.services.artifact_journal import (
     write_journal_file,
 )
 from cowork.services.artifact_lock import artifact_lock
+from cowork.services.artifact_metadata import ArtifactMetadata
+from cowork.services.comment_images import comment_image_ids
 from cowork.services.artifact_revision_records import (
     AgentRepair,
     JournalRecord,
@@ -354,10 +356,10 @@ def _finish_queued_repairs(
         _write_repair(folder, repair)
 
 
-def resolve_source(folder: Path, metadata: dict, rel_path: str | None = None) -> tuple[Path, str]:
+def resolve_source(folder: Path, metadata: ArtifactMetadata, rel_path: str | None = None) -> tuple[Path, str]:
     """Resolve an editable source without accepting an absolute/client path."""
     canonical_folder = folder.resolve(strict=False)
-    candidate_rel = (rel_path or metadata.get("primary") or "").strip().replace("\\", "/")
+    candidate_rel = (rel_path or metadata.primary or "").strip().replace("\\", "/")
     if not candidate_rel:
         # The card's own walk: content files only, no symlinks. The journal is
         # also refused below the top level, as the explicit-path gate does.
@@ -689,7 +691,7 @@ def _recover_pending_source_write(folder: Path) -> None:
         _abandon_pending(folder, "blob_refused")
         return
     try:
-        target, _ = resolve_source(folder, {}, pending.path)
+        target, _ = resolve_source(folder, ArtifactMetadata.empty(), pending.path)
         current = _read_source(target)
     except (FileNotFoundError, ValueError):
         _abandon_pending(folder, "source_unavailable")
@@ -793,7 +795,7 @@ class _RevisionText:
 
 
 def _current_source_locked(
-    folder: Path, metadata: dict, artifact_id: str, rel_path: str | None = None
+    folder: Path, metadata: ArtifactMetadata, artifact_id: str, rel_path: str | None = None
 ) -> _Source:
     """Read/capture source while the caller holds the artifact revision lock."""
     _recover_pending_source_write(folder)
@@ -826,14 +828,14 @@ def _current_source_locked(
     )
 
 
-def current_source(folder: Path, metadata: dict, artifact_id: str, rel_path: str | None = None) -> dict:
+def current_source(folder: Path, metadata: ArtifactMetadata, artifact_id: str, rel_path: str | None = None) -> dict:
     """Read source plus the revision token required by a subsequent save."""
     with artifact_lock(folder):
         return _current_source_locked(folder, metadata, artifact_id, rel_path).to_json()
 
 
 def current_workspace(
-    folder: Path, metadata: dict, artifact_id: str, rel_path: str | None = None
+    folder: Path, metadata: ArtifactMetadata, artifact_id: str, rel_path: str | None = None
 ) -> dict:
     """Read editable source and its history under one artifact lock.
 
@@ -854,7 +856,7 @@ def current_workspace(
 
 def save_source(
     folder: Path,
-    metadata: dict,
+    metadata: ArtifactMetadata,
     artifact_id: str,
     *,
     content: str,
@@ -978,7 +980,7 @@ def capture_agent_revision(
             ]
             queued = [r for r in turn_repairs if r.path == relative]
             # The primary can move between minting a handoff and this capture
-            # (metadata["primary"] rewritten, or resolve_source's sorted
+            # (metadata.primary rewritten, or resolve_source's sorted
             # fallback picking a file the turn created). A handoff left on the
             # old path would never be finished by any later turn either, so it
             # ends here rather than gating that path forever.
@@ -1065,7 +1067,7 @@ def capture_agent_revision(
 
 
 def begin_quick_edit(
-    folder: Path, metadata: dict, artifact_id: str, *, expected_revision_id: str | None
+    folder: Path, metadata: ArtifactMetadata, artifact_id: str, *, expected_revision_id: str | None
 ) -> dict:
     """The source a quick edit (ENG-4227) starts from, or why it may not start.
 
@@ -1092,7 +1094,7 @@ QUICK_EDIT_SUMMARY_PREFIX = "Quick edit: "
 
 def record_quick_edit(
     folder: Path,
-    metadata: dict,
+    metadata: ArtifactMetadata,
     artifact_id: str,
     *,
     rel_path: str,
@@ -1204,9 +1206,79 @@ def _preview_error_lines(entries: object, source_path: str) -> list[str]:
     return lines
 
 
+_MAX_ANCHOR_QUOTE = 500
+_MAX_ANCHOR_TEXT = 200
+_MAX_ANCHOR_TAG = 200
+# The comment layer's page-level anchor: the whole page, not an element.
+_PAGE_SELECTORS = {"", "body", "html"}
+# Parsing is in the request: a source past this size is not parsed for the hint.
+_MAX_ANCHOR_PARSE = 2_000_000
+
+
+def _source_element(content: str, selector: str) -> str:
+    """How the saved HTML source writes the element `selector` points at, or "".
+
+    The comment layer anchors a thread with ``document.querySelector`` on a
+    positional CSS path (``div:nth-of-type(2) > h2``), which a model reading
+    raw HTML places poorly. The element's opening tag and text are what it can
+    find. ``select_one`` takes the first match in document order, as
+    ``querySelector`` does; a page that builds the element in script has no
+    match here, and then the selector alone is passed on. Best-effort: a parse
+    or selector failure only drops this hint.
+    """
+    if len(content) > _MAX_ANCHOR_PARSE:
+        return ""
+    try:
+        from bs4 import BeautifulSoup
+
+        element = BeautifulSoup(content, "html.parser").select_one(selector)
+    except Exception:
+        return ""
+    if element is None:
+        return ""
+    attrs = "".join(
+        f' {name}="{" ".join(value) if isinstance(value, list) else value}"'
+        for name, value in element.attrs.items()
+    )
+    tag = _flatten(f"<{element.name}{attrs}>")[:_MAX_ANCHOR_TAG]
+    text = _flatten(element.get_text(" "))[:_MAX_ANCHOR_TEXT]
+    return f"{tag} with the text \u201c{text}\u201d" if text else tag
+
+
+def _anchor_line(selector: str | None, source_path: str, content: str) -> str:
+    """Where the thread is anchored, in words an editor can place: the quoted
+    text, or the element (its selector and, when the source has it, how the
+    source writes it), in the source file.
+
+    Every value is flattened to one line: the desktop reads this prompt's
+    lines back into a card, and a newline here could forge one.
+    """
+    raw = (selector or "").strip()
+    if raw.startswith("{"):
+        # A text comment (TextSelectionComment): {type: "text-quote", path, quote}.
+        try:
+            quoted = json.loads(raw)
+        except ValueError:
+            quoted = None
+        if isinstance(quoted, dict) and quoted.get("type") == "text-quote":
+            quote = _flatten(str(quoted.get("quote") or ""))[:_MAX_ANCHOR_QUOTE]
+            path = _flatten(str(quoted.get("path") or "")) or source_path
+            if quote:
+                return f"the text \u201c{quote}\u201d in {path}"
+    flat = _flatten(raw)
+    if flat.lower() in _PAGE_SELECTORS:
+        return f"the artifact as a whole ({source_path})"
+    line = f"the element matching the CSS selector `{flat}` in {source_path}"
+    if source_path.lower().endswith((".html", ".htm")):
+        found = _source_element(content, flat)
+        if found:
+            line += f", which the source writes as: {found}"
+    return line
+
+
 def create_agent_repair(
     folder: Path,
-    metadata: dict,
+    metadata: ArtifactMetadata,
     artifact_id: str,
     *,
     expected_revision_id: str,
@@ -1256,21 +1328,44 @@ def create_agent_repair(
             + "\n".join(preview_lines)
             + "\n"
         )
+    anchor = _anchor_line(selector, source.path, source.content)
+    # The app attaches a thread's images to the message that carries this
+    # prompt, in the order the thread names them (services/comment_images.py).
+    image_ids = comment_image_ids("\n".join(str(entry.get("text") or "") for entry in thread))
+    images_block = (
+        f"Images: the thread's {len(image_ids)} `cowork-image:` reference(s) are the images "
+        "attached to this message, in the order the thread names them. Look at them before editing.\n"
+        if image_ids
+        else ""
+    )
+    # The same route as an edit asked for in chat: one `edit_artifact` call
+    # (anton's diff-based artifact editor), which reads, edits, checks and
+    # repairs the page itself, so the turn needs no list_artifacts round, no
+    # file reads and no scratchpad patch. Its writes land in the folder like
+    # any other, so the repair is finalized from the folder as before. An
+    # anton without the editor falls back to the old route.
     prompt = (
         "Address this artifact review thread. Work on the existing artifact source; "
         "do not create a replacement artifact and do not resolve the comment yourself.\n\n"
         f"Artifact id: {artifact_id}\n"
         f"Source path: {source.path}\n"
-        "Find the artifact with `list_artifacts` by passing this artifact id in "
-        "`match`; `Source path` is relative to the artifact folder.\n"
+        f"Make the change with one `edit_artifact` call: pass `{folder.name}` as `slug`, and as "
+        "`task` what the thread asks for, in your own words, followed by where it is anchored "
+        "(the `Anchor` line below, verbatim) so the edit lands on that element. Do not call "
+        "`list_artifacts` or read the files first. Only if `edit_artifact` is not offered, find "
+        "the artifact with `list_artifacts` by passing this artifact id in `match`; `Source path` "
+        "is relative to the artifact folder.\n"
         f"Base revision: {current.id}\n"
         f"Repair id: {repair_id}\n"
         f"Selected element: {selector or 'General artifact feedback'}\n"
+        f"Anchor: {anchor}\n"
         f"{preview_block}"
+        f"{images_block}"
         "Complete comment thread:\n"
         f"{json.dumps(thread, ensure_ascii=False, indent=2)}\n\n"
-        "Make the smallest coherent fix, preserve unrelated behavior and styling, "
-        "and verify the artifact still renders."
+        "Make the smallest coherent fix and preserve unrelated behavior and styling. "
+        "`edit_artifact` checks the page in a browser itself: once it reports the change "
+        "applied, do not re-read or re-verify the files."
     )
     return {"repair": repair.to_json(), "prompt": prompt}
 
@@ -1380,7 +1475,7 @@ def release_repairs_for_comment(folder: Path, comment_thread_id: str) -> list[di
 
 def finalize_agent_repair(
     folder: Path,
-    metadata: dict,
+    metadata: ArtifactMetadata,
     artifact_id: str,
     repair_id: str,
     decision: str,
@@ -1474,3 +1569,58 @@ def finalize_agent_repair(
         repair.updated_at = _now()
         _write_repair(folder, repair)
         return repair.to_json()
+
+
+# ── the revision a published page shows (ENG-4595) ───────────────────────
+
+#: How long after a publish's content mtime a revision may be stamped and still
+#: be the one it published: a save writes the file, then its revision.
+_PUBLISHED_AT_SLACK_S = 2.0
+
+
+def published_head_revision_id(folder: Path) -> str | None:
+    """The revision a publish of *folder* is about to put live: its editable
+    source's head, captured first when the file moved without one, as the
+    viewer reads it. None for a folder with no editable source (binary,
+    oversized). Never raises: a publish never fails over it."""
+    try:
+        from cowork.services.artifact_identity import ensure_full_id
+
+        artifact_id, metadata = ensure_full_id(folder)
+        revision = current_source(folder, metadata, artifact_id).get("revision") or {}
+        return revision.get("id") or None
+    except Exception:
+        logger.debug("Could not read the revision a publish puts live", exc_info=True)
+        return None
+
+
+def published_revision(folder: Path, entry: object, rel_path: str | None) -> dict | None:
+    """The revision of *rel_path* the live page was published from, or None.
+
+    *entry* is the artifact's ``.published.json`` entry. A publish since
+    ENG-4595 records ``published_revision_id``; for an older one, the newest
+    revision of *rel_path* stamped no later than the publish's content mtime
+    (``published_mtime``) stands in. None when nothing is published, or no
+    revision can be told apart as the published one.
+    """
+    if not isinstance(entry, dict) or not entry.get("report_id") or entry.get("published") is False:
+        return None
+    if not rel_path:
+        return None
+    with artifact_lock(folder):
+        manifest = _read_manifest(folder)
+    recorded = manifest.revision(entry.get("published_revision_id"))
+    if recorded is not None and recorded.path == rel_path:
+        return recorded.to_json()
+    published_mtime = entry.get("published_mtime")
+    if not isinstance(published_mtime, (int, float)) or isinstance(published_mtime, bool):
+        return None
+    cutoff = datetime.fromtimestamp(published_mtime + _PUBLISHED_AT_SLACK_S, tz=timezone.utc)
+    best = None
+    for revision in manifest.revisions:
+        if revision.path != rel_path:
+            continue
+        created = _parse_timestamp(revision.created_at)
+        if created is not None and created <= cutoff:
+            best = revision
+    return best.to_json() if best is not None else None

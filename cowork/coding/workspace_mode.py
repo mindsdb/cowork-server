@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import sys
 
-from cowork.coding.contracts import WorkspaceMode, WorkspaceModeOptions
+from cowork.coding.contracts import WorkspaceMode, WorkspaceModeOptions, WorkspaceReasonCode
 
 # An in-place task relies on Codex's sandbox to keep writes inside the user's
 # folder: Seatbelt on macOS and Landlock on Linux. Its Windows sandbox has not
@@ -17,6 +17,14 @@ from cowork.coding.contracts import WorkspaceMode, WorkspaceModeOptions
 _IN_PLACE_PLATFORMS = frozenset({"darwin", "linux"})
 # Like Claude Code and the Codex app, a task works in the user's folder unless
 # it asks for a worktree; isolation is opt-in.
+
+
+class WorkspaceModeUnavailable(ValueError):
+    """This computer cannot prepare the requested mode at all."""
+
+    def __init__(self, message: str, reason: WorkspaceReasonCode | None = None) -> None:
+        super().__init__(message)
+        self.reason = reason
 
 
 def supported_workspace_modes(
@@ -52,7 +60,7 @@ def resolve_workspace_mode(
     supported = supported_workspace_modes(runs_locally=runs_locally, org_mode=org_mode, platform=platform)
     if requested is not None:
         if requested not in supported:
-            raise ValueError(_unsupported_message(requested, runs_locally=runs_locally, org_mode=org_mode))
+            raise _unsupported(requested, runs_locally=runs_locally, org_mode=org_mode)
         return requested
     if project_default is not None and project_default in supported:
         return project_default
@@ -69,35 +77,43 @@ def workspace_mode_options(
     """What a client may offer for a new task, resolved the way creation resolves it."""
     context = {"runs_locally": runs_locally, "org_mode": org_mode, "platform": platform}
     supported = supported_workspace_modes(**context)
-    return WorkspaceModeOptions(
+    options = WorkspaceModeOptions(
         supported=list(supported),
         default=resolve_workspace_mode(None, project_default, **context),
-        in_place_unavailable_reason=(
-            None
-            if WorkspaceMode.in_place in supported
-            else _unsupported_message(
-                WorkspaceMode.in_place, runs_locally=runs_locally, org_mode=org_mode,
-            )
-        ),
     )
+    if WorkspaceMode.in_place in supported:
+        return options
+    problem = _unsupported(WorkspaceMode.in_place, runs_locally=runs_locally, org_mode=org_mode)
+    return options.model_copy(update=_unavailable(WorkspaceMode.in_place, problem))
 
 
-def without_in_place(options: WorkspaceModeOptions, reason: str) -> WorkspaceModeOptions:
+def without_in_place(options: WorkspaceModeOptions, problem: Exception) -> WorkspaceModeOptions:
     """``options`` for a folder that cannot be worked in directly."""
     if WorkspaceMode.in_place not in options.supported:
         return options
-    return _without(options, WorkspaceMode.in_place, in_place_unavailable_reason=reason)
+    return _without(options, WorkspaceMode.in_place, **_unavailable(WorkspaceMode.in_place, problem))
 
 
 def without_worktree(
-    options: WorkspaceModeOptions, reason: str, *, can_initialize_git: bool = False,
+    options: WorkspaceModeOptions, problem: Exception, *, can_initialize_git: bool = False,
 ) -> WorkspaceModeOptions:
     """``options`` for a folder a worktree cannot be made from."""
     if WorkspaceMode.worktree not in options.supported:
         return options.model_copy(update={"can_initialize_git": can_initialize_git})
     return _without(
-        options, WorkspaceMode.worktree, worktree_unavailable_reason=reason, can_initialize_git=can_initialize_git,
+        options, WorkspaceMode.worktree, **_unavailable(WorkspaceMode.worktree, problem),
+        can_initialize_git=can_initialize_git,
     )
+
+
+def _unavailable(mode: WorkspaceMode, problem: Exception) -> dict[str, object]:
+    """The option fields saying why ``mode`` is refused: text, and a code where there is one."""
+    reason = getattr(problem, "reason", None)
+    return {
+        f"{mode.value}_unavailable_reason": str(problem),
+        f"{mode.value}_unavailable_code": reason if isinstance(reason, WorkspaceReasonCode) else None,
+        f"{mode.value}_unavailable_folder": getattr(problem, "folder", None),
+    }
 
 
 def _without(options: WorkspaceModeOptions, mode: WorkspaceMode, **update: object) -> WorkspaceModeOptions:
@@ -106,9 +122,15 @@ def _without(options: WorkspaceModeOptions, mode: WorkspaceMode, **update: objec
     return options.model_copy(update={"supported": supported, "default": default, **update})
 
 
-def _unsupported_message(mode: WorkspaceMode, *, runs_locally: bool, org_mode: bool) -> str:
+def _unsupported(mode: WorkspaceMode, *, runs_locally: bool, org_mode: bool) -> WorkspaceModeUnavailable:
     if mode == WorkspaceMode.in_place:
         if org_mode or not runs_locally:
-            return "Tasks on another computer run in an isolated worktree; choose Worktree"
-        return "Running a task in the original folder is not available on this platform yet; choose Worktree"
-    return f"This computer cannot prepare a {mode.value} workspace"
+            return WorkspaceModeUnavailable(
+                "Tasks on another computer run in an isolated worktree; choose Worktree",
+                WorkspaceReasonCode.in_place_other_computer,
+            )
+        return WorkspaceModeUnavailable(
+            "Running a task in the original folder is not available on this platform yet; choose Worktree",
+            WorkspaceReasonCode.in_place_unsupported_platform,
+        )
+    return WorkspaceModeUnavailable(f"This computer cannot prepare a {mode.value} workspace")

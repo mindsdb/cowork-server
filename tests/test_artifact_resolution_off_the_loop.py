@@ -70,7 +70,8 @@ REVIEW = f"{WORKSPACE}/review"
 pytestmark = pytest.mark.usefixtures("without_gc_pauses")
 
 # Every route that resolves an artifact folder: the review and source routes,
-# the owner-gated workspace routes and the private draft. Each body passes
+# the owner-gated workspace routes, the audience any reviewer reads, and the
+# private draft. Each body passes
 # validation, so the request reaches the lookup.
 ROUTES = [
     ("GET", REVIEW, None),
@@ -79,6 +80,7 @@ ROUTES = [
     ("POST", f"{WORKSPACE}/export", {"format": "html"}),
     ("GET", f"{WORKSPACE}/revisions", None),
     ("GET", f"{WORKSPACE}/access", None),
+    ("GET", f"{WORKSPACE}/audience", None),
     ("PUT", f"{WORKSPACE}/access", {"access": {"mode": "public"}}),
     ("POST", f"{WORKSPACE}/comments-access", None),
     ("GET", f"{WORKSPACE}/revisions/r1", None),

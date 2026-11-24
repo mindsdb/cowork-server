@@ -47,6 +47,8 @@ class EngineSessionConfig:
     network_access: bool = False
     web_search: bool = False
     additional_dirs: tuple[str, ...] = ()
+    # False holds a sandboxed task to read-only while it has no starting commit.
+    writes_allowed: bool = True
     developer_instructions: str = ""
     skill_roots: tuple[str, ...] | None = None
     environment: tuple[tuple[str, str], ...] = ()

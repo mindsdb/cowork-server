@@ -11,10 +11,12 @@ from typing import Any
 
 from anton.utils.datasources import scrub_output
 
-from cowork.db.scoped import ScopedSession
+from cowork.db.scoped import ScopedSession, tenant_scope_required
 from cowork.models.custom_connector import CustomConnector
 from cowork.schemas.connectors import ConnectorSpecResponse
-from cowork.services.connectors.custom_connectors import scope_definitions, scope_is_one_persons
+from cowork.services.connectors.custom_connect import auth_summary, parse_stored
+from cowork.services.connectors.custom_connectors import has_test_requests, scope_definitions, scope_is_one_persons
+from cowork.services.connectors.custom_mcp import is_custom_mcp
 from cowork.services.connectors.specs._registry import ConnectorSpecRegistry, registry
 
 logger = logging.getLogger(__name__)
@@ -40,8 +42,13 @@ def custom_connector_spec(row: CustomConnector) -> dict[str, Any]:
         "keywords": [],
         "featured": row.featured,
         "custom": True,
+        # Saved before connection tests existed: a single-user install shows
+        # the member the rebuild text instead of a form that cannot pass.
+        "needs_rebuild": not tenant_scope_required() and not has_test_requests(dict(row.spec)),
         "usage_notes": row.usage_notes,
         "form": dict(row.spec),
+        "check": {"path": template.path} if (template := parse_stored(row)) else None,
+        "auth_summary": auth_summary(template.auth) if template else None,
     }
 
 
@@ -84,8 +91,9 @@ class ConnectorCatalog(ConnectorSpecRegistry):
 
         A custom connector's notes are model-written and, there, read with the
         caller's credentials in reach, so they are used only in one person's
-        scope (scope_is_one_persons), never in org mode, and pass anton's
-        output scrubber first. Otherwise only the built-ins' notes.
+        scope (scope_is_one_persons) and pass anton's output scrubber first.
+        Otherwise only the built-ins' notes. An org-mode member's own notes
+        reach their own cloud turns through member_turn_templates instead.
         """
         wanted = list(engines)
         notes = self._base.usage_notes_for(wanted)
@@ -108,6 +116,9 @@ class ConnectorCatalog(ConnectorSpecRegistry):
             merged = dict(self._base.get_connectors())
             own = scope_is_one_persons(self._session.scope)
             for row in self._custom_rows():
+                if is_custom_mcp(row.connector_id):
+                    logger.warning("a custom connector row uses the reserved id %r; it is not served", row.connector_id)
+                    continue
                 if row.connector_id in merged:
                     logger.warning(
                         "custom connector %r shares an id with a built-in connector; "

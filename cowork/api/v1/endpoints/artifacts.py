@@ -42,12 +42,15 @@ from cowork.api.v1.artifact_preview import (
     wants_comment_layer,
     wants_html_preview,
 )
-from cowork.api.v1.artifact_scope import scoped_project_id_for_request
+from cowork.api.v1.artifact_scope import (
+    review_artifact_and_read, scoped_project_id_for_request,
+)
 from cowork.db.units import FilesystemBusy, run_db, run_efs, run_on_unit_threads
 from cowork.common.logger import log_context
 from cowork.common.paths import dir_scandir, dir_stat, open_pinned_child
 from cowork.api.v1.endpoints.live_apps import LiveAppRoute
 from cowork.schemas.artifact_access import ArtifactStatusView
+from cowork.schemas.artifact_card import ArtifactCard
 from cowork.schemas.live_apps import (
     LiveAppCopyRef,
     LiveAppDuplicateRequest,
@@ -193,13 +196,11 @@ def _legacy_artifact_in_plan(plan: RootsPlan, folder_name: str):
 # Query sentinels standing in for the defaults.
 
 
-def _artifact_cards(session, sources) -> list[dict]:
+def _artifact_cards(session, sources) -> list[ArtifactCard]:
     """The cards of ``sources``, with the file store and the database read in
     turn on the calling thread. The routes read the two halves in their own
     worker threads instead (``_cards_for``)."""
-    # Owner-side fields are stripped inside `card_for_folder`, not here: inline chat
-    # cards use the same builder and would otherwise still carry the plaintext
-    # password.
+    # Org-mode cards leave out owner-side fields in `_prepare_artifact_card`.
     found = _sources_and_cards(find_sources=lambda: sources)
     return _card_capabilities(session, sources=found.sources, cards=found.cards)
 
@@ -209,7 +210,7 @@ class _FoundCard(NamedTuple):
     capabilities read. That is found there too: it can lstat the card's
     primary file."""
 
-    card: dict
+    card: ArtifactCard
     export_source: ExportSource
 
 
@@ -253,7 +254,7 @@ class _NewestCards(NamedTuple):
     named a folder its read of every folder did not find, or one that
     opened and built no card (ListedCards.no_card)."""
 
-    cards: list[dict]
+    cards: list[ArtifactCard]
     stale: tuple[ProjectArtifacts, ...]
 
 
@@ -350,7 +351,7 @@ async def _cards_for(
     find_sources: Callable[[], list[ProjectArtifacts]],
     *,
     newest: NewestFolders | None = None,
-) -> list[dict]:
+) -> list[ArtifactCard]:
     """``_artifact_cards`` with the roots found and their folders walked in one
     file store call, then the owner reads in a database unit, so no pooled
     connection waits on the file server. ``find_sources`` runs in that file
@@ -395,7 +396,7 @@ def _ask_for_location_checks(scope: TenantScope, *, roots: tuple[ProjectArtifact
         request_project_location_check(artifacts_base=Path(root.base), scope=project_scope, project_id=root.project_id)
 
 
-def _card_capabilities(session, *, sources, cards: list[_FoundCard]) -> list[dict]:
+def _card_capabilities(session, *, sources, cards: list[_FoundCard]) -> list[ArtifactCard]:
     """The database half of the cards: each card's owner, its capabilities and,
     with live apps, who shared it. Reads no artifact folder: the file store
     half found each card's export source (``_sources_and_cards``)."""
@@ -413,7 +414,7 @@ def _card_capabilities(session, *, sources, cards: list[_FoundCard]) -> list[dic
     by_base = {Path(source.base): source for source in sources}
     cards_by_base: dict[Path, list[tuple[str, _FoundCard]]] = {}
     for found in cards:
-        folder = Path(str(found.card.get("folder") or ""))
+        folder = Path(found.card.folder)
         if folder.parent in by_base:
             cards_by_base.setdefault(folder.parent, []).append((folder.name, found))
     roots = list(cards_by_base.items())
@@ -427,7 +428,7 @@ def _card_capabilities(session, *, sources, cards: list[_FoundCard]) -> list[dic
     for (base, entries), resolutions in zip(roots, owners_by_root, strict=True):
         source = by_base[base]
         for slug, found in entries:
-            found.card["capabilities"] = artifact_capabilities(
+            found.card.capabilities = artifact_capabilities(
                 session,
                 source,
                 slug,
@@ -444,7 +445,7 @@ def _mark_received_live_apps(
     *,
     cards_by_base: dict[Path, list[tuple[str, _FoundCard]]],
     by_base: dict[Path, ProjectArtifacts],
-    cards: list[dict],
+    cards: list[ArtifactCard],
 ) -> None:
     """With live apps on, give each card ``receivedFrom``: the owner's email
     for a copy the caller duplicated from a share, from the server's own
@@ -458,7 +459,7 @@ def _mark_received_live_apps(
 
     received = received_from(session, partition_id=scope.org_id)
     for card in cards:
-        card["receivedFrom"] = None
+        card.received_from = None
     for base, entries in cards_by_base.items():
         project_id = by_base[base].project_id
         if not project_id:
@@ -466,7 +467,7 @@ def _mark_received_live_apps(
         for slug, found in entries:
             owner_email = received.get((UUID(str(project_id)), slug))
             if owner_email:
-                found.card["receivedFrom"] = {"email": owner_email}
+                found.card.received_from = {"email": owner_email}
 
 
 def _plan_scoped_project(session, *, project_ref: str) -> RootsPlan:
@@ -710,27 +711,10 @@ def _pinned_artifact_match(
 
 def _pinned_loose_status(directory, logical_file: Path) -> ArtifactStatusView:
     """Status for a metadata-less legacy file using its pinned parent record."""
-    from cowork.services.artifacts import (
-        _load_published_map_pinned,
-        _published_access_for,
-        _published_url_for,
-    )
+    from cowork.services.artifacts import _load_published_map_pinned, loose_file_status
 
-    published_map = _load_published_map_pinned(directory)
-    return ArtifactStatusView.of_card(
-        {
-            "publishedUrl": _published_url_for(
-                directory.path,
-                logical_file,
-                published_map=published_map,
-            ),
-            "modified": False,
-            **_published_access_for(
-                directory.path,
-                logical_file,
-                published_map=published_map,
-            ),
-        }
+    return loose_file_status(
+        directory.path, logical_file, published_map=_load_published_map_pinned(directory)
     )
 
 
@@ -880,6 +864,48 @@ def _desktop_artifact_status_for_path(path: str, *, scope: TenantScope | None) -
     return ArtifactStatusView()
 
 
+class _SharedArtifactRef(BaseModel):
+    project_id: UUID
+    artifact_id: UUID
+
+
+def _shared_preview_card(found, *, artifact_id: str):
+    from cowork.services.artifact_identity import _opened_child_directory, opened_artifact_root
+    from cowork.services.artifacts import _listed_card_for_pinned_folder
+
+    source = found.source
+    with opened_artifact_root(source) as root, _opened_child_directory(root, found.folder.name) as folder:
+        card = _listed_card_for_pinned_folder(
+            found.folder, 0, project_id=source.project_id, project_name=source.project_name,
+            pinned_folder=folder, pinned_root=root, artifacts_base=source.base,
+        )
+    if card is None or card.id != artifact_id or not card.draft_url:
+        raise HTTPException(404, "Artifact not found")
+    # The notification opens a read-only preview. Owner controls and sharing
+    # settings belong to the ordinary workspace, not this response.
+    return {
+        "id": card.id, "projectId": card.project_id, "path": card.path, "title": card.title,
+        "ext": card.ext, "type": card.type, "draftUrl": card.draft_url, "mtime": card.mtime,
+        "capabilities": {"role": "reviewer", "canEdit": False},
+    }
+
+
+@router.post("/shared-preview", dependencies=[Depends(require(AuthenticatedInOrgMode))])
+async def shared_artifact_preview(body: _SharedArtifactRef, scope: ScopeDep):
+    """Resolve a notification with the same authorization as the draft bytes."""
+    if not scope.org_mode:
+        raise HTTPException(404, "Artifact not found")
+    artifact_id = body.artifact_id.hex
+    try:
+        reviewed = await review_artifact_and_read(
+            scope, str(body.project_id), artifact_id,
+            read=partial(_shared_preview_card, artifact_id=artifact_id),
+        )
+    except FileNotFoundError:
+        raise HTTPException(404, "Artifact not found") from None
+    return reviewed.value
+
+
 # require(AuthenticatedInOrgMode), declared explicitly, refuses a caller with
 # no org in scope in org mode before the route runs. Without it the route
 # still fails closed: the ScopedSession each run_db unit builds (unit_session
@@ -916,7 +942,7 @@ async def list_artifacts(
             source = _desktop_registered_source(catalog, requested, project_name)
             if source is None:
                 return []
-            return await _cards_for(scope, lambda: [source])
+            return [card.to_json() for card in await _cards_for(scope, lambda: [source])]
     if project_id is not None:
         raw_project_ref = str(project_id)
         # Although FastAPI has already parsed this as UUID, make the recognized
@@ -928,9 +954,9 @@ async def list_artifacts(
                 detail="Invalid project",
             )
         plan = await _scoped_project_plan(scope, project_ref, listed=True)
-        return await _cards_for(scope, partial(readable_sources, plan), newest=plan.newest)
+        return [card.to_json() for card in await _cards_for(scope, partial(readable_sources, plan), newest=plan.newest)]
     plan = await run_db(_listed_scope_plan, scope=scope)
-    return await _cards_for(scope, partial(_browsable_sources, plan=plan), newest=plan.newest)
+    return [card.to_json() for card in await _cards_for(scope, partial(_browsable_sources, plan=plan), newest=plan.newest)]
 
 
 
@@ -955,15 +981,42 @@ async def delete_artifact_by_slug(
     )
 
 
+async def take_down_credential(scope: TenantScope) -> tuple[str, str]:
+    """The (publish_url, api_key) a delete takes published pages down with.
+
+    In org mode the key is minted for the acting user: unpublish acts on the
+    viewer, and the viewer scopes by the token's owner, so the credential has
+    to be the acting user's - not a stored provider key (org deployments have
+    none). On desktop it is the provider key, "" when there is none.
+    """
+    from cowork.common.settings.user_settings import get_user_settings
+    from cowork.services.artifact_publish_key import PublishKey
+    from cowork.services.publish import _resolve_publish_endpoint
+
+    publish_url, api_key = _resolve_publish_endpoint(await run_on_unit_threads(get_user_settings))
+    if not _org_mode():
+        return publish_url, api_key
+    if not scope or not scope.org_id or not scope.user_id:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="No tenant in scope")
+    from cowork.services.artifact_autopublish import _active_workspace_id
+
+    api_key = await PublishKey(
+        scope.user_id, scope.org_id, min_ttl_s=120.0,
+        workspace_id=await run_on_unit_threads(partial(_active_workspace_id, scope)),
+    ).get()
+    if not api_key:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Could not mint a publish credential",
+        )
+    return publish_url, api_key
+
+
 async def delete_artifact_for_request(
     scope: TenantScope, slug: str | _ArtifactDeleteRef, *, project_id: UUID, principal: Principal | None = None
 ) -> None:
     """Delete one artifact of one project. Unpublishes first; a failed unpublish
     leaves the folder in place and surfaces the error."""
-    from cowork.common.settings.user_settings import get_user_settings
-    from cowork.services.artifact_publish_key import PublishKey
-    from cowork.services.publish import _resolve_publish_endpoint
-
     # This helper is also called directly by internal/test code, so retain the
     # same concrete parsing boundary the HTTP adapter applies above. In
     # particular, no request-derived string can select a project path.
@@ -1027,28 +1080,12 @@ async def delete_artifact_for_request(
 
     admin_delete = await run_db(owner_decision, scope=scope)
     expected_artifact_id = artifact_id if ref.artifact_id is not None else None
-    publish_url, api_key = _resolve_publish_endpoint(await run_on_unit_threads(get_user_settings))
+    publish_url, api_key = await take_down_credential(scope)
     # Set once the draft review rule is gone: the delete step may then no
     # longer refuse a busy file store, which would leave the folder's review
     # marker without its rule.
     revoked = False
     if _org_mode():
-        if not scope or not scope.org_id or not scope.user_id:
-            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="No tenant in scope")
-        # Unpublish acts on the viewer, and the viewer scopes by the token's owner,
-        # so the credential has to be the acting user's - not a stored provider key
-        # (org deployments have none).
-        from cowork.services.artifact_autopublish import _active_workspace_id
-
-        api_key = await PublishKey(
-            scope.user_id, scope.org_id, min_ttl_s=120.0,
-            workspace_id=await run_on_unit_threads(partial(_active_workspace_id, scope)),
-        ).get()
-        if not api_key:
-            raise HTTPException(
-                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                detail="Could not mint a publish credential",
-            )
         from cowork.services.artifact_access import (
             ArtifactAccessUnavailable,
             revoke_draft_review_access,
@@ -1756,7 +1793,7 @@ async def duplicate_live_app(
         raise
     plan = await _scoped_project_plan(scope, str(body.project_id))
     cards = await _cards_for(scope, partial(readable_sources, plan))
-    card = next((card for card in cards if Path(str(card.get("folder") or "")).name == slug), None)
+    card = next((card for card in cards if Path(card.folder).name == slug), None)
     if card is None:
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="The copy has no card")
-    return card
+    return card.to_json()

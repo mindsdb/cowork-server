@@ -22,11 +22,14 @@ from typing import NamedTuple
 from uuid import UUID, uuid4
 
 import pytest
+from anton.cloud_turn.session import drain_pending_connectors
+from anton.core.tools.connector_draft import ConnectorDraftBox, connector_draft_tool
 
 import cowork.handlers.responses as responses_mod
 from cowork.common import event_clock
 from cowork.handlers.responses import ResponsesHandler, _RemoteArtifactsDir
 from cowork.services.artifact_identity import ListedIds
+from cowork.services.connectors.custom_connectors import CustomConnectorService
 from cowork.streaming.registry import TurnLifecycle
 from cowork.turnqueue import producer as prod
 from cowork.turnqueue.producer import RemoteWorkspace
@@ -1703,6 +1706,68 @@ async def test_produce_remote_failure_carries_the_workers_reset_at(
 
 
 @pytest.mark.asyncio
+async def test_produce_remote_failure_carries_the_budget_scope(monkeypatch):
+    # The hosted budget card names whose budget is spent, on the frame and on reload.
+    message = "This workspace's spending budget is used up. An administrator can raise it in Budgets."
+    frame, events = await _remote_failure_frames(monkeypatch, {
+        "error": "BudgetExceededError: spent", "code": "budget_exceeded", "message": message,
+        "budget_scope": "workspace",
+    })
+    expected = {
+        "type": "response.failed", "code": "budget_exceeded", "error": message,
+        "budget_scope": "workspace", "request_id": "corr-reset-at",
+    }
+    assert frame == expected
+    assert events[-1] == expected
+
+
+@pytest.mark.asyncio
+async def test_produce_remote_failure_carries_the_budget_period(monkeypatch):
+    message = "Your team's monthly spending budget is used up. An administrator can raise it in Budgets."
+    frame, events = await _remote_failure_frames(monkeypatch, {
+        "error": "BudgetExceededError: spent", "code": "budget_exceeded", "message": message,
+        "budget_scope": "team", "budget_period": "month",
+    })
+    expected = {
+        "type": "response.failed", "code": "budget_exceeded", "error": message,
+        "budget_scope": "team", "budget_period": "month", "request_id": "corr-reset-at",
+    }
+    assert frame == expected
+    assert events[-1] == expected
+
+
+@pytest.mark.asyncio
+async def test_produce_remote_failure_carries_a_spent_plan_window(monkeypatch):
+    # ENG-4186: the hosted card says when the window frees up and which one it is.
+    message = "You've used your plan's allowance for now. Add credits to keep working now, or wait for it to reset."
+    frame, events = await _remote_failure_frames(monkeypatch, {
+        "error": "WindowAllowanceExhaustedError: spent", "code": "window_allowance_exhausted",
+        "message": message, "reset_at": _RESET_AT, "window": "7d",
+    })
+    expected = {
+        "type": "response.failed", "code": "window_allowance_exhausted", "error": message,
+        "reset_at": _RESET_AT, "window": "7d", "request_id": "corr-reset-at",
+    }
+    assert frame == expected
+    assert events[-1] == expected
+
+
+@pytest.mark.asyncio
+async def test_produce_remote_failure_carries_the_required_tier(monkeypatch):
+    message = "Your plan doesn't include this model. Upgrade your plan or add credits to use it."
+    frame, events = await _remote_failure_frames(monkeypatch, {
+        "error": "ModelNotInTierError: not covered", "code": "model_not_in_tier",
+        "message": message, "required_tier": "pro",
+    })
+    expected = {
+        "type": "response.failed", "code": "model_not_in_tier", "error": message,
+        "required_tier": "pro", "request_id": "corr-reset-at",
+    }
+    assert frame == expected
+    assert events[-1] == expected
+
+
+@pytest.mark.asyncio
 async def test_produce_remote_failure_without_reset_at_keeps_its_shape(monkeypatch):
     # An older worker sends none, so the frame stays exactly as before.
     frame, events = await _remote_failure_frames(monkeypatch, {
@@ -1823,6 +1888,9 @@ async def test_produce_remote_treats_a_controller_cancel_as_a_real_cancel_not_a_
     assert buffer.frames[-1] == "CLOSE:cancelled"
     assert not any("response.failed" in f for f in buffer.frames)
     assert saved["assistant"] == "partial"
+    # The saved turn ends on the Stop, so a reload shows it as stopped (ENG-4345).
+    assert saved["events"][-1]["type"] == "response.cancelled"
+    assert isinstance(saved["events"][-1]["at_ms"], int)
 
 
 @pytest.mark.asyncio
@@ -4039,6 +4107,129 @@ async def test_a_pod_model_call_timeout_saves_its_own_code_and_request_id(monkey
     assert failed["code"] == "model_timeout"
     assert failed["error"] == "The model sent no output for 10 minutes, so the call was stopped."
     assert failed["request_id"] == "corr-deadline"
+
+
+_TURN_CONNECTOR_REPLY = json.loads(
+    (Path(__file__).parent / "fixtures" / "turn_connector_reply.json").read_text()
+)
+
+
+def _anton_connector_entries() -> list[dict]:
+    """The pod's drafts as anton's real tool and drain produce them."""
+    box = ConnectorDraftBox()
+    asyncio.run(connector_draft_tool(box).handler(None, {
+        "connector_id": "acme_crm", "label": "Acme CRM",
+        "description": "Contacts and deals in Acme CRM.", "category": "CRM",
+        "help_url": "https://docs.acme.example/api-keys",
+        "usage_notes": "Base URL https://api.acme.example/v2. Send the key as Authorization: Bearer <api_key>.",
+        "fields": [{"name": "api_key", "label": "API key", "help": "Settings, then API."},
+                   {"name": "region", "label": "Region", "secret": False, "placeholder": "eu"}],
+        "auth": {"type": "header", "headers": {"Authorization": "Bearer {api_key}", "X-Region": "{region}"}},
+        "check": {"path": "/v2/me"},
+    }))
+    return drain_pending_connectors(SimpleNamespace(_connector_drafts=box))
+
+
+def test_the_turn_connector_fixture_is_what_the_pod_sends():
+    assert _TURN_CONNECTOR_REPLY["data"]["entries"] == _anton_connector_entries()
+
+
+async def _connector_frames(monkeypatch, *replies) -> tuple[list[str], dict]:
+    """Run a remote turn whose pod sends ``replies``; return its SSE frames and saved rows."""
+    saved = {}
+    handler = _remote_handler(monkeypatch, saved)
+    handler._remote_memory = lambda session, conv_id: None
+    stored = []
+    monkeypatch.setattr(CustomConnectorService, "save_member_draft", lambda self, d: stored.append(d))
+    saved["stored_connectors"] = stored
+
+    async def fake_replies(**kwargs):
+        saved["connector_drafts_requested"] = kwargs.get("connector_drafts")
+        yield "progress", {"phase": "workspace_authorized", "workspace_mode": "persistent"}
+        yield "turn_delta", {"text": "Built it."}
+        for reply in replies:
+            yield reply
+        yield "turn_completed", {}
+
+    monkeypatch.setattr(responses_mod, "stream_remote_replies", fake_replies)
+    frames = []
+
+    class RecBuffer:
+        async def append(self, kind, record):
+            frames.append(record["sse"])
+
+        async def close(self, reason):
+            frames.append(f"CLOSE:{reason}")
+
+    await handler._produce_remote(
+        conv_id=uuid4(), input_text="hi", original_content="hi",
+        model="anton", harness_id="anton", buffer=RecBuffer(),
+    )
+    return frames, saved
+
+
+def _payloads(frames, event):
+    return [json.loads(f.split("data: ", 1)[1]) for f in frames if f.startswith(f"event: {event}\n")]
+
+
+@pytest.mark.asyncio
+async def test_a_connector_draft_from_the_pod_becomes_a_card_and_is_not_stored(monkeypatch):
+    frames, saved = await _connector_frames(
+        monkeypatch, (_TURN_CONNECTOR_REPLY["kind"], _TURN_CONNECTOR_REPLY["data"]),
+    )
+
+    [card] = _payloads(frames, "response.connector_drafted")
+    assert card["connector"] == _TURN_CONNECTOR_REPLY["data"]["entries"][0]
+    assert any(e.get("type") == "response.connector_drafted" for e in saved["events"])
+    assert saved["stored_connectors"] == []
+    assert saved["connector_drafts_requested"] is True
+    assert frames[-1] == "CLOSE:completed"
+
+
+@pytest.mark.asyncio
+async def test_a_reply_shows_at_most_three_cards_and_says_so(monkeypatch):
+    entry = _TURN_CONNECTOR_REPLY["data"]["entries"][0]
+    entries = [{**entry, "connector_id": f"acme_{i}"} for i in range(5)]
+
+    frames, _ = await _connector_frames(monkeypatch, ("turn_connector", {"entries": entries}))
+
+    cards = _payloads(frames, "response.connector_drafted")
+    assert [c["connector"]["connector_id"] for c in cards] == ["acme_0", "acme_1", "acme_2"]
+    notices = [p for p in _payloads(frames, "response.in_progress") if p.get("phase") == "connector_draft_dropped"]
+    assert [n["message"] for n in notices] == ["2 more connector template(s) from this turn were not shown."]
+
+
+@pytest.mark.asyncio
+async def test_a_refused_draft_is_a_notice_without_its_value(monkeypatch):
+    entry = _TURN_CONNECTOR_REPLY["data"]["entries"][0]
+    token = "ghp_" + "16C7e42F292c6912E7710c838347Ae178B4a"
+    entries = [{**entry, "label": token}, {**entry, "connector_id": "postgres"}, {**entry, "extra": 1}]
+
+    frames, _ = await _connector_frames(monkeypatch, ("turn_connector", {"entries": entries}))
+
+    # A built-in id is not refused: the template takes its own id.
+    assert [c["connector"]["connector_id"] for c in _payloads(frames, "response.connector_drafted")] == [
+        "postgres_custom",
+    ]
+    notices = [p["message"] for p in _payloads(frames, "response.in_progress")
+               if p.get("phase") == "connector_draft_dropped"]
+    assert len(notices) == 2
+    assert "label" in notices[0] and "not allowed" in notices[1]
+    assert not any(token in f for f in frames)
+    assert frames[-1] == "CLOSE:completed"
+
+
+@pytest.mark.asyncio
+async def test_a_draft_from_a_pod_without_auth_is_a_notice_not_a_card(monkeypatch):
+    entry = _TURN_CONNECTOR_REPLY["data"]["entries"][0]
+    older = {key: value for key, value in entry.items() if key != "auth"}
+
+    frames, _ = await _connector_frames(monkeypatch, ("turn_connector", {"entries": [older]}))
+
+    assert _payloads(frames, "response.connector_drafted") == []
+    notices = [p["message"] for p in _payloads(frames, "response.in_progress")
+               if p.get("phase") == "connector_draft_dropped"]
+    assert len(notices) == 1 and "auth" in notices[0]
 
 
 class _QueueRedis:
