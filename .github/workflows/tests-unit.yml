@@ -225,6 +225,13 @@ jobs:
       - name: Install dependencies
         run: uv sync --group dev
 
+      - name: Verify Windows Code Mode permissions and hook dispatch
+        if: runner.os == 'Windows'
+        run: >-
+          uv run python -m pytest -q
+          tests/test_coding_check_sandbox.py::test_windows_native_check_network_policy
+          tests/test_coding_check_sandbox.py::test_windows_hook_uses_git_interpreter_dispatch
+
       - name: Run export tests
         # -rs names every skipped test and its reason in the log. The export
         # service tests place files through Windows' rename, which runs only

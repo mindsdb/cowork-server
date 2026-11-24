@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import shutil
+import socket
 import stat
 import subprocess
 import sys
@@ -9,7 +10,9 @@ from pathlib import Path
 
 import pytest
 
-from cowork.coding.check_sandbox import CheckPolicy, GitDirectories, check_environment, filter_storage, sandboxed_argv
+from cowork.coding.check_sandbox import (
+    CheckPolicy, GitDirectories, check_environment, filter_storage, run_sandboxed, sandbox_environment, sandboxed_argv,
+)
 from cowork.coding.contracts import PermissionMode, TaskWorkspace, WorkspaceKind
 from cowork.coding.project_models import CodeProject, ProjectCommand, ProjectEnvironment, ProjectFolder
 from cowork.coding.project_workspaces import ProjectCommandRunner, ProjectWorkspaceManager
@@ -117,16 +120,65 @@ def test_full_access_checks_run_outside_the_sandbox(tmp_path: Path) -> None:
 
 
 @pytest.mark.parametrize("network_access", [False, True])
-def test_sandboxed_checks_follow_the_task_network_setting(tmp_path: Path, network_access: bool) -> None:
+@pytest.mark.parametrize("platform", ["darwin", "linux", "win32"])
+def test_sandboxed_checks_follow_the_task_network_setting(
+    tmp_path: Path, network_access: bool, platform: str, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(sys, "platform", platform)
     policy = CheckPolicy.for_task(PermissionMode.workspace, network_access=network_access)
-    argv = sandboxed_argv(["npm", "test"], policy, [tmp_path], codex=Path("/bin/codex"))
+    argv = sandboxed_argv(["npm", "test"], policy, [tmp_path], codex=Path("codex"))
     joined = " ".join(argv)
 
-    assert argv[:2] == ["/bin/codex", "sandbox"]
+    assert argv[:2] == ["codex", "sandbox"]
     assert argv[-3:] == ["--", "npm", "test"]
-    assert "allow_local_binding=true" in joined
-    assert ("features.network_proxy=true" in argv) is not network_access
-    assert ("domains={}" in joined) is not network_access
+    assert ("allow_local_binding=true" in joined) == (platform != "win32")
+    uses_proxy = platform != "win32" and not network_access
+    assert ("features.network_proxy=true" in argv) == uses_proxy
+    assert ("domains={}" in joined) == uses_proxy
+    windows_offline = platform == "win32" and not network_access
+    assert ('windows.sandbox="elevated"' in argv) == windows_offline
+    assert ("permissions.checks.network={enabled=false}" in argv) == windows_offline
+
+
+def test_windows_offline_checks_drop_proxy_firewall_exceptions(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(sys, "platform", "win32")
+    environment = {
+        "https_proxy": "http://localhost:3128", "Ws_Proxy": "http://localhost:1234",
+        "CODEX_WINDOWS_SANDBOX_PROXY_PORTS": "5555", "CODEX_NETWORK_ALLOW_LOCAL_BINDING": "1", "PATH": "bin",
+    }
+    offline = CheckPolicy.for_task(PermissionMode.workspace, network_access=False)
+    online = CheckPolicy.for_task(PermissionMode.workspace, network_access=True)
+    assert sandbox_environment(environment, offline) == {"PATH": "bin"}
+    assert sandbox_environment(environment, online) == environment
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="exercise the native Windows firewall and sandbox identities")
+def test_windows_native_check_network_policy(tmp_path: Path) -> None:
+    # The same live listener is the positive control and the restricted target.
+    # Checking the child's own output distinguishes a firewall denial from a
+    # sandbox that failed to start (e.g. offline account setup was denied).
+    script = (
+        "import socket, sys\n"
+        "try:\n"
+        "    socket.create_connection(('127.0.0.1', int(sys.argv[1])), timeout=3).close()\n"
+        "except OSError:\n"
+        "    print('blocked')\n"
+        "else:\n"
+        "    print('connected')\n"
+    )
+    workspace = tmp_path / "project"
+    workspace.mkdir()
+    with socket.create_server(("127.0.0.1", 0)) as listener:
+        command = [sys.executable, "-c", script, str(listener.getsockname()[1])]
+        for network_access, expected in [(True, "connected"), (False, "blocked")]:
+            policy = CheckPolicy.for_task(
+                PermissionMode.workspace, network_access, sandbox_home=tmp_path / "check-sandbox",
+            )
+            result = run_sandboxed(
+                command, cwd=workspace, policy=policy, environment=check_environment(os.environ), writable=[workspace],
+            )
+            assert result.returncode == 0, result.stderr
+            assert result.stdout.strip() == expected
 
 
 def test_hooks_may_stage_but_not_change_what_makes_git_run_programs(tmp_path: Path) -> None:
@@ -410,6 +462,13 @@ def test_local_task_preserves_control_file_in_existing_linked_worktree(
         control_file.write_text("# user's configuration\n", encoding="utf-8")
         return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
 
+    host_run = manager.workspaces.git.run
+
+    def require_safe_metadata(*args, **kwargs):
+        assert not control_file.exists(), "host Git ran after the metadata check failed"
+        return host_run(*args, **kwargs)
+
+    monkeypatch.setattr(manager.workspaces.git, "run", require_safe_metadata)
     monkeypatch.setattr(check_sandbox, "run_sandboxed", concurrent_edit)
     with pytest.raises(WorkspaceError, match="Git files appeared"):
         manager.commit(list(prepared.workspaces), "Local change", checks)
@@ -733,6 +792,33 @@ def test_filtered_git_reads_use_read_only_sandbox_and_can_export_patch(tmp_path:
     assert len(reads) == 2
 
 
+def test_windows_filtered_git_reads_reuse_the_cowork_sandbox_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from cowork.coding import check_sandbox
+    from cowork.common.settings.app_settings import get_app_settings
+
+    repo = repository(tmp_path / "repo")
+    git(repo, "config", "filter.normalize.clean", "cat")
+    manager = WorkspaceManager(tmp_path / "coding")
+    monkeypatch.setattr(get_app_settings().coding, "root_dir", str(manager.root))
+    monkeypatch.setattr(sys, "platform", "win32")
+    monkeypatch.setattr(check_sandbox, "sandbox_codex", lambda: Path("codex"))
+    real_run = subprocess.run
+    homes = []
+
+    def record(argv, **kwargs):
+        if argv[:2] == ["codex", "sandbox"]:
+            homes.append(Path(kwargs["env"]["CODEX_HOME"]))
+            return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+        return real_run(argv, **kwargs)
+
+    monkeypatch.setattr(subprocess, "run", record)
+    for operation in ("status", "diff"):
+        manager.git.run(repo, operation)
+    home = manager.root / "check-sandbox"
+    assert homes == [home, home]
+    assert home.is_dir()
+
+
 def stateful_filter_repository(tmp_path: Path) -> Path:
     """A repository whose installed filter stores content in the Git directory, as Git LFS does."""
     program = tmp_path / "bin" / "store-filter"
@@ -900,7 +986,7 @@ def test_an_edit_made_right_after_staging_is_still_reported(tmp_path: Path, monk
 
     def edit_then_record(root, message):
         (repo / "README.md").write_text("late\n", encoding="utf-8")
-        record(root, message)
+        return record(root, message)
 
     monkeypatch.setattr(manager, "_record_commit", edit_then_record)
 
@@ -908,3 +994,26 @@ def test_an_edit_made_right_after_staging_is_still_reported(tmp_path: Path, monk
 
     assert git(repo, "show", "HEAD:README.md") == "task"
     assert state.dirty
+
+
+def test_windows_hook_uses_git_interpreter_dispatch(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from cowork.coding import check_sandbox
+
+    repo = repository(tmp_path / "repo")
+    hooks = repo / "project hooks"
+    hooks.mkdir()
+    script = hooks / "commit-msg"
+    script.write_text(
+        '#!/usr/bin/env python\nimport sys\nfrom pathlib import Path\nPath(sys.argv[1]).write_text("checked")\n',
+        encoding="utf-8",
+    )
+    script.chmod(0o755)
+    message = tmp_path / "message with spaces"
+    with monkeypatch.context() as platform:
+        platform.setattr(sys, "platform", "win32")
+        argv = check_sandbox.hook_argv(script, str(message))
+    # Use Git's real interpreter dispatch, including the environment override
+    # that normally prevents implicit hooks in a sandboxed Git step.
+    env = {**os.environ, "GIT_CONFIG_COUNT": "1", "GIT_CONFIG_KEY_0": "core.hooksPath", "GIT_CONFIG_VALUE_0": os.devnull}
+    subprocess.run(argv, cwd=repo, env=env, check=True)
+    assert message.read_text() == "checked"

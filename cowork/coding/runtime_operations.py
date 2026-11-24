@@ -22,7 +22,7 @@ from cowork.coding.project_workspaces import (
     PreparedProjectWorkspace,
     ProjectWorkspaceManager,
 )
-from cowork.coding.runtime_protocol import RuntimeLease
+from cowork.coding.runtime_protocol import CHECK_POLICY_OPERATIONS, UNSUPPORTED_OPERATION, RuntimeLease
 from cowork.coding.terminal import TerminalBuffer
 from cowork.coding.workspace import WorkspaceError
 
@@ -55,8 +55,8 @@ class RuntimeWorkspaceOperations:
             "diff": self._diff,
             "review_file": self._review_file,
             "branch": self._branch,
-            "commit": self._commit,
-            "validate": self._validate,
+            CHECK_POLICY_OPERATIONS["commit"]: self._commit,
+            CHECK_POLICY_OPERATIONS["validate"]: self._validate,
             "refresh_project": self._refresh_project,
             "delivery_plan": self._delivery_plan,
             "push_branch": self._push_branch,
@@ -77,8 +77,10 @@ class RuntimeWorkspaceOperations:
                 return cached
             operation = str(command.payload.get("operation") or "")
             handler = self._handlers.get(operation)
-            if handler is None:
-                result = (None, "The selected computer does not support that operation")
+            if operation in CHECK_POLICY_OPERATIONS:
+                result = (None, "Update the Cowork server before validating or committing this remote task")
+            elif handler is None:
+                result = (None, UNSUPPORTED_OPERATION)
             else:
                 try:
                     result = (handler(command.payload), None)
@@ -160,15 +162,16 @@ class RuntimeWorkspaceOperations:
 
     def _check_policy(self, payload: dict[str, object]) -> CheckPolicy:
         execution = self.lease.execution
-        # Missing fields indicate an older control plane. The command may
-        # tighten the lease but cannot widen either filesystem or network access.
-        current = PermissionMode(payload.get("permission_mode", execution.permission_mode))
+        # Both the lease and the current task must permit the operation.
+        if not isinstance(payload.get("network_access"), bool) or payload.get("permission_mode") is None:
+            raise WorkspaceError("The Cowork server must send the current task permissions before validating or committing")
+        current = PermissionMode(payload["permission_mode"])
         mode = current
         if PermissionMode.read_only in (current, execution.permission_mode):
             mode = PermissionMode.read_only
         elif current == PermissionMode.full_access:
             mode = execution.permission_mode
-        network_access = execution.network_access and payload.get("network_access", True) is True
+        network_access = execution.network_access and payload["network_access"] is True
         return self.manager.check_policy(self.project.id, mode, network_access)
 
     def _refresh_project(self, payload: dict[str, object]) -> dict[str, object]:

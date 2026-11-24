@@ -3,6 +3,7 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 
@@ -17,6 +18,7 @@ from cowork.coding.project_workspaces import (
     PreparedProjectWorkspace,
     ProjectWorkspaceManager,
 )
+from cowork.coding.remote_execution import RemoteExecutionCoordinator
 from cowork.coding.runtime_operations import RuntimeWorkspaceOperations
 from cowork.coding.runtime_protocol import RuntimeExecutionConfig, RuntimeLease
 from cowork.coding.workspace import WorkspaceManager
@@ -51,7 +53,7 @@ def test_remote_validation_honors_a_read_only_change_during_a_lease(tmp_path: Pa
     prepared = SimpleNamespace(workspaces=[], ports={})
     operations = RuntimeWorkspaceOperations(lease(), manager, prepared, object())
 
-    result, error = operations.execute(operation(1, {"operation": "validate", "permission_mode": "read_only"}))
+    result, error = operations.execute(operation(1, {"operation": "validate_v2", "permission_mode": "read_only", "network_access": False}))
 
     assert error is None
     assert result == {"items": []}
@@ -68,13 +70,13 @@ def test_refresh_project_hands_validate_the_new_commands_without_touching_worksp
     operations = RuntimeWorkspaceOperations(lease(), manager, prepared, object())
     check = {"id": "check", "label": "Check", "argv": ["npm", "test"], "phase": "validate"}
 
-    assert operations.execute(operation(0, {"operation": "validate"})) == ({"items": []}, None)
+    assert operations.execute(operation(0, {"operation": "validate_v2", "permission_mode": "workspace", "network_access": False})) == ({"items": []}, None)
     assert seen[0].resources[0].commands == []
 
     result, error = operations.execute(operation(1, {"operation": "refresh_project", "commands": {"repo": [check], "gone": [check]}}))
 
     assert (result, error) == ({"resources": 1}, None)
-    operations.execute(operation(2, {"operation": "validate"}))
+    operations.execute(operation(2, {"operation": "validate_v2", "permission_mode": "workspace", "network_access": False}))
     assert [command.id for command in seen[1].resources[0].commands] == ["check"]
     assert seen[1].resources[1].commands == []
     assert [resource.id for resource in seen[1].resources] == ["repo", "docs"]
@@ -102,10 +104,10 @@ def test_refresh_project_then_validate_runs_the_new_commands_through_the_real_ru
     operations = RuntimeWorkspaceOperations(lease(project), manager, prepared, object())
     check = {"id": "check", "label": "Check", "argv": [sys.executable, "-c", "print('late')"], "phase": "validate"}
 
-    assert operations.execute(operation(0, {"operation": "validate"})) == ({"items": []}, None)
+    assert operations.execute(operation(0, {"operation": "validate_v2", "permission_mode": "workspace", "network_access": False})) == ({"items": []}, None)
     assert operations.execute(operation(1, {"operation": "refresh_project", "commands": {"app": [check]}})) == ({"resources": 1}, None)
 
-    result, error = operations.execute(operation(2, {"operation": "validate"}))
+    result, error = operations.execute(operation(2, {"operation": "validate_v2", "permission_mode": "workspace", "network_access": False}))
 
     assert error is None
     # On Linux the sandbox launcher adds a warning when its home is under a
@@ -121,3 +123,43 @@ def test_refresh_project_rejects_a_malformed_payload(payload: dict[str, object])
 
     assert result is None
     assert error == "A project command refresh needs a commands map"
+
+
+@pytest.mark.parametrize("name", ["commit", "validate"])
+def test_legacy_control_plane_cannot_start_a_check(name: str) -> None:
+    manager = Mock()
+    ops = RuntimeWorkspaceOperations(lease(), manager, SimpleNamespace(workspaces=[], ports={}), object())
+
+    result, error = ops.execute(operation(0, {"operation": name, "message": "Commit"}))
+
+    assert result is None and "Update the Cowork server" in error
+    assert not manager.mock_calls
+
+
+@pytest.mark.parametrize("name", ["commit_v2", "validate_v2"])
+@pytest.mark.parametrize("policy", [{"permission_mode": "workspace"}, {"network_access": False}])
+def test_versioned_checks_require_the_full_current_task_policy(name: str, policy: dict) -> None:
+    manager = Mock()
+    ops = RuntimeWorkspaceOperations(lease(), manager, SimpleNamespace(workspaces=[], ports={}), object())
+
+    result, error = ops.execute(operation(0, {"operation": name, "message": "Commit", **policy}))
+
+    assert result is None and "current task permissions" in error
+    assert not manager.mock_calls
+
+
+@pytest.mark.parametrize("name", ["commit", "validate"])
+def test_control_plane_refuses_to_fall_back_to_an_older_worker(name: str) -> None:
+    control = Mock()
+    control.store.get_run.return_value.status = RunStatus.ready
+    control.wait_for_command.return_value.error = "The selected computer does not support that operation"
+    remote = RemoteExecutionCoordinator(control, Mock(), Mock(), Mock())
+    session = SimpleNamespace(run_id="run-ops", effective_permission_mode=PermissionMode.read_only, network_access=False)
+
+    with pytest.raises(RuntimeError, match="Update Cowork on the selected execution computer"):
+        remote.operation(session, name, {"message": "Commit"})
+
+    control.queue_command.assert_called_once()
+    assert control.queue_command.call_args.args[2] == {
+        "operation": f"{name}_v2", "message": "Commit", "permission_mode": "read_only", "network_access": False,
+    }

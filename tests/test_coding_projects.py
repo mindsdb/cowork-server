@@ -509,10 +509,10 @@ def test_multi_repository_commit_rolls_back_commits_without_losing_changes(
     second_path = prepared.workspaces[1].workspace_path
     real_commit = manager.workspaces.commit
 
-    def fail_second_commit(workspace_path: str, message: str, checks=None, *, workspace_kind=None):
+    def fail_second_commit(workspace_path: str, message: str, checks=None, **kwargs):
         if workspace_path == second_path:
             raise WorkspaceError("simulated commit failure")
-        return real_commit(workspace_path, message, checks, workspace_kind=workspace_kind)
+        return real_commit(workspace_path, message, checks, **kwargs)
 
     monkeypatch.setattr(manager.workspaces, "commit", fail_second_commit)
 
@@ -524,6 +524,19 @@ def test_multi_repository_commit_rolls_back_commits_without_losing_changes(
         assert git(root, "rev-parse", "HEAD") == original_revisions[workspace.folder_id]
         assert (root / "README.md").read_text(encoding="utf-8") == "task\n"
         assert git(root, "status", "--short") == "M README.md"
+
+
+def test_rollback_preserves_a_later_commit(tmp_path: Path) -> None:
+    repo = repository(tmp_path, "app")
+    manager = WorkspaceManager(tmp_path / "coding")
+    (repo / "README.md").write_text("task change\n")
+    recorded = []
+    manager.commit(str(repo), "Task change", on_recorded=recorded.append)
+    git(repo, "commit", "--allow-empty", "-m", "Later commit")
+    later = git(repo, "rev-parse", "HEAD")
+    with pytest.raises(WorkspaceError):
+        manager.rollback_commit(str(repo), recorded[0])
+    assert git(repo, "rev-parse", "HEAD") == later
 
 
 def test_multi_repository_commit_asks_for_a_git_identity_before_touching_any_repository(

@@ -33,6 +33,8 @@ from cowork.coding.project_models import (
 from cowork.coding.workspace import (
     ApplyPlan,
     PreparedWorkspace,
+    RecordedCommit,
+    UnsafeGitMetadata,
     WorkspaceError,
     WorkspaceManager,
     _org_mode,
@@ -612,20 +614,21 @@ class ProjectWorkspaceManager:
             self.workspaces.check_git_identity(workspace.workspace_path)
             self.workspaces.check_no_operation_in_progress(workspace.workspace_path)
         states: list[GitState] = []
-        checkpoints: list[tuple[TaskWorkspace, str]] = []
+        recorded: list[tuple[TaskWorkspace, RecordedCommit]] = []
         try:
             for workspace in repositories:
                 state = self.workspaces.git_state(workspace.source_path, workspace.workspace_path, policy)
                 if state.dirty:
-                    checkpoint = self.workspaces.commit_checkpoint(workspace.workspace_path)
-                    checkpoints.append((workspace, checkpoint))
+                    if state.revision is None:
+                        raise WorkspaceError("This task repository has no commit to checkpoint")
                     state = self.workspaces.commit(
                         workspace.workspace_path, message, policy, workspace_kind=workspace.workspace_kind,
+                        on_recorded=lambda record, ws=workspace: recorded.append((ws, record)),
                     )
                 states.append(state.model_copy(update={"folder_id": workspace.folder_id, "folder_name": workspace.folder_name}))
             return states
         except Exception as exc:
-            failures = self._rollback_commits(checkpoints)
+            failures = self._rollback_commits(recorded, exc)
             if failures:
                 raise WorkspaceError(
                     "Some repository commits could not be restored; open the task workspaces to recover them: "
@@ -700,11 +703,14 @@ class ProjectWorkspaceManager:
             keep_recovery=keep_recovery,
         )
 
-    def _rollback_commits(self, checkpoints: list[tuple[TaskWorkspace, str]]) -> list[str]:
+    def _rollback_commits(self, recorded: list[tuple[TaskWorkspace, RecordedCommit]], cause: Exception) -> list[str]:
         failures: list[str] = []
-        for workspace, revision in reversed(checkpoints):
+        for workspace, record in reversed(recorded):
+            if isinstance(cause, UnsafeGitMetadata) and record.common_dir == cause.common_dir:
+                failures.append(f"{workspace.folder_name}: {cause}")
+                continue
             try:
-                self.workspaces.rollback_commit(workspace.workspace_path, revision)
+                self.workspaces.rollback_commit(workspace.workspace_path, record)
             except WorkspaceError as exc:
                 failures.append(f"{workspace.folder_name}: {exc}")
         return failures

@@ -12,6 +12,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+from collections.abc import Callable
 from contextlib import ExitStack
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
@@ -63,6 +64,19 @@ class WorkspaceError(RuntimeError):
     def in_folder(cls, folder: str, exc: Exception) -> WorkspaceError:
         """``exc`` about one of a project's folders, named so the person knows which."""
         return cls(f"{folder}: {exc}", reason=getattr(exc, "reason", None), folder=folder)
+
+
+class UnsafeGitMetadata(WorkspaceError):
+    def __init__(self, common_dir: Path, detail: str) -> None:
+        super().__init__(detail)
+        self.common_dir = common_dir
+
+
+@dataclass(frozen=True)
+class RecordedCommit:
+    common_dir: Path
+    parent: str
+    revision: str
 
 
 class GitUnavailableError(WorkspaceError):
@@ -297,8 +311,13 @@ class GitRunner:
                     # task operation, Git reads get no writes or network.
                     from cowork.coding import check_sandbox
 
-                    home = resources.enter_context(tempfile.TemporaryDirectory(prefix="cowork-git-read-"))
-                    policy = check_sandbox.CheckPolicy.for_task(PermissionMode.read_only, False, sandbox_home=Path(home))
+                    if sys.platform == "win32":
+                        # The offline account setup marker belongs to CODEX_HOME.
+                        # Reuse it across reads to avoid repeating elevated setup.
+                        home = Path(get_app_settings().coding.root_dir) / "check-sandbox"
+                    else:
+                        home = Path(resources.enter_context(tempfile.TemporaryDirectory(prefix="cowork-git-read-")))
+                    policy = check_sandbox.CheckPolicy.for_task(PermissionMode.read_only, False, sandbox_home=home)
                     child_environment = check_sandbox.check_environment(os.environ)
                     # Snapshot diffs use an isolated index and object store.
                     for name in ("GIT_INDEX_FILE", "GIT_OBJECT_DIRECTORY", "GIT_ALTERNATE_OBJECT_DIRECTORIES"):
@@ -795,6 +814,7 @@ class WorkspaceManager:
     def commit(
         self, workspace_path: str, message: str, checks: CheckPolicy | None = None, *,
         workspace_kind: WorkspaceKind | None = None,
+        on_recorded: Callable[[RecordedCommit], None] | None = None,
     ) -> GitState:
         """Commit everything in the workspace.
 
@@ -828,7 +848,9 @@ class WorkspaceManager:
                     )
                 if checks is not None:
                     self._run_commit_hooks(root, message_file, checks, workspace_kind, new_objects)
-                self._record_commit(root, message_file.read_text(encoding="utf-8"))
+                record = self._record_commit(root, message_file.read_text(encoding="utf-8"))
+                if on_recorded is not None:
+                    on_recorded(record)
             return self.git_state(str(root), str(root), checks, committed=True)
 
     def check_no_operation_in_progress(self, workspace_path: str) -> None:
@@ -850,7 +872,7 @@ class WorkspaceManager:
             if path.exists():
                 raise WorkspaceError(f"A {operation} is in progress in {root.name}. Finish it with Git, then commit again.")
 
-    def _record_commit(self, root: Path, message: str) -> None:
+    def _record_commit(self, root: Path, message: str) -> RecordedCommit:
         """Commit the index without reading the working tree.
 
         Git runs from an empty folder with the repository named explicitly,
@@ -859,9 +881,9 @@ class WorkspaceManager:
         """
         git_dir = self.git.run(root, "rev-parse", "--absolute-git-dir").stdout.strip()
         with tempfile.TemporaryDirectory(prefix="cowork-record-", ignore_cleanup_errors=True) as neutral:
-            self._record_commit_in(Path(neutral), {"GIT_DIR": git_dir}, root, message)
+            return self._record_commit_in(Path(neutral), {"GIT_DIR": git_dir}, root, message)
 
-    def _record_commit_in(self, cwd: Path, environment: dict[str, str], root: Path, message: str) -> None:
+    def _record_commit_in(self, cwd: Path, environment: dict[str, str], root: Path, message: str) -> RecordedCommit:
         def git(*args: str, **kwargs):
             return self.git.run(cwd, *args, environment=environment, **kwargs)
 
@@ -884,7 +906,9 @@ class WorkspaceManager:
             arguments.append("-S")
         revision = git(*arguments, input_text=message).stdout.strip()
         subject = message.splitlines()[0][:200]
+        common = Path(git("rev-parse", "--path-format=absolute", "--git-common-dir").stdout.strip()).resolve()
         git("update-ref", "-m", f"commit: {subject}", "HEAD", revision, *((parent,) if parent else ()))
+        return RecordedCommit(common, parent, revision)
 
     def _refuse_task_signing_program(self, root: Path) -> None:
         """Sign only with a program outside the task's own files."""
@@ -976,7 +1000,8 @@ class WorkspaceManager:
                     planted_path.unlink(missing_ok=True)
         unexplained = sorted(str(path) for path in added_refs | (set() if task_owned else planted))
         if unexplained:
-            raise WorkspaceError(
+            raise UnsafeGitMetadata(
+                directories.common,
                 f"Git files appeared while {label.lower()} ran, so nothing was committed: {', '.join(unexplained)}. "
                 "Cowork left them in place. Remove any you didn't create, then commit again."
             ) from failure
@@ -1095,22 +1120,15 @@ class WorkspaceManager:
             self.git.run(home, "config", "--global", "user.email", email.strip())
         return self.git_identity()
 
-    def commit_checkpoint(self, workspace_path: str) -> str:
-        root = Path(workspace_path)
-        revision = self._head_revision(root)
-        if revision is None:
-            raise WorkspaceError("This task repository has no commit to checkpoint")
-        return revision
-
-    def rollback_commit(self, workspace_path: str, revision: str) -> None:
+    def rollback_commit(self, workspace_path: str, record: RecordedCommit) -> None:
         """Remove a task commit while retaining its file changes for retry.
 
         Like ``git reset --mixed``, but without refreshing the index from the
         working tree, which can run a repository's filters on the host.
         """
         root = Path(workspace_path)
-        self.git.run(root, "update-ref", "-m", "rollback: cowork commit", "HEAD", revision)
-        self.git.run(root, "read-tree", revision)
+        self.git.run(root, "update-ref", "-m", "rollback: cowork commit", "HEAD", record.parent, record.revision)
+        self.git.run(root, "read-tree", record.parent)
 
     def apply_to_source(self, session_id: str, source_path: str, workspace_path: str, base_revision: str | None) -> Path | None:
         with self._mutation_lock:

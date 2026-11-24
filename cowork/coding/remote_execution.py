@@ -31,7 +31,7 @@ from cowork.coding.control_models import (
 from cowork.coding.control_service import ControlPlaneService
 from cowork.coding.project_service import CodeProjectService
 from cowork.coding.redaction import redact_text
-from cowork.coding.runtime_protocol import RuntimeExecutionConfig, RuntimeLease
+from cowork.coding.runtime_protocol import CHECK_POLICY_OPERATIONS, UNSUPPORTED_OPERATION, RuntimeExecutionConfig, RuntimeLease
 from cowork.coding.store import CodingStore
 
 
@@ -293,7 +293,7 @@ class RemoteExecutionCoordinator:
         run = self.control.store.get_run(session.run_id)
         if run.status in {RunStatus.completed, RunStatus.cancelled, RunStatus.failed}:
             raise RuntimeError("The task execution workspace is no longer available")
-        if operation in {"commit", "validate"}:
+        if operation in CHECK_POLICY_OPERATIONS:
             # The user can narrow task permissions while a worker holds its lease.
             payload = {
                 **(payload or {}),
@@ -303,10 +303,12 @@ class RemoteExecutionCoordinator:
         command = self.control.queue_command(
             session.run_id,
             "operation",
-            {"operation": operation, **(payload or {})},
+            {**(payload or {}), "operation": CHECK_POLICY_OPERATIONS.get(operation, operation)},
             f"operation-{operation}-{uuid.uuid4().hex}",
         )
         completed = self.control.wait_for_command(session.run_id, command.id, timeout)
+        if operation in CHECK_POLICY_OPERATIONS and completed.error == UNSUPPORTED_OPERATION:
+            raise RuntimeError("Update Cowork on the selected execution computer before validating or committing this task")
         if completed.error:
             raise RuntimeError(redact_text(completed.error)[:4_000])
         return completed.result or {}

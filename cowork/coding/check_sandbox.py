@@ -9,7 +9,6 @@ Only selected platform settings and explicit project variables are inherited.
 from __future__ import annotations
 
 import os
-import shutil
 import subprocess
 import sys
 import tempfile
@@ -40,6 +39,11 @@ _PLATFORM_ENVIRONMENT = {
     "SSL_CERT_FILE", "SSL_CERT_DIR", "REQUESTS_CA_BUNDLE", "NODE_EXTRA_CA_CERTS", "CURL_CA_BUNDLE",
 }
 _PROXY_VARIABLES = {"HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY"}
+# The Windows offline sandbox derives its firewall exceptions from these
+# variables, including values explicitly supplied by a project.
+_WINDOWS_OFFLINE_EXCEPTIONS = _PROXY_VARIABLES | {
+    "WS_PROXY", "WSS_PROXY", "CODEX_WINDOWS_SANDBOX_PROXY_PORTS", "CODEX_NETWORK_ALLOW_LOCAL_BINDING",
+}
 # Tools that otherwise write caches under the home folder, which the sandbox
 # keeps read-only. A per-project cache keeps them working without letting a
 # check poison a cache the person's own builds use.
@@ -242,10 +246,15 @@ def sandboxed_argv(
                 filesystem[str(path)] = access
     filesystem.update({str(Path(path).resolve()): "write" for path in storage})
     network = "enabled=true"
-    if not policy.read_only:
+    if not policy.read_only and sys.platform != "win32":
         sockets = ", ".join(f'{toml_string(str(path))}="allow"' for path in (*roots, temp))
         network += f", allow_local_binding=true, unix_sockets={{{sockets}}}"
-    if not policy.network_access:
+    windows_offline = sys.platform == "win32" and not policy.network_access
+    if windows_offline:
+        # Codex's Windows CLI launches before the managed proxy is started.
+        # Its elevated backend enforces Restricted via the offline identity.
+        network = "enabled=false"
+    elif not policy.network_access:
         # Outbound traffic goes only through Codex's proxy, which allows no
         # domain; direct connections are refused by the sandbox itself.
         network += ", domains={}"
@@ -257,7 +266,9 @@ def sandboxed_argv(
         "-c", f"permissions.checks.filesystem={{{files}}}",
         "-c", f"permissions.checks.network={{{network}}}",
     ]
-    if not policy.network_access:
+    if windows_offline:
+        command += ["-c", 'windows.sandbox="elevated"']
+    elif not policy.network_access:
         command += ["-c", "features.network_proxy=true"]
     return [*command, "--", *argv]
 
@@ -265,6 +276,8 @@ def sandboxed_argv(
 def sandbox_environment(environment: Mapping[str, str], policy: CheckPolicy) -> dict[str, str]:
     """Keep the person's own Codex settings out of the sandbox launcher."""
     result = dict(environment)
+    if sys.platform == "win32" and policy.sandboxed and not policy.network_access:
+        result = {name: value for name, value in result.items() if name.upper() not in _WINDOWS_OFFLINE_EXCEPTIONS}
     if policy.sandboxed and policy.sandbox_home is not None:
         policy.sandbox_home.mkdir(parents=True, exist_ok=True)
         result["CODEX_HOME"] = str(policy.sandbox_home)
@@ -311,11 +324,10 @@ def hook_path(git_run, root: Path, name: str) -> Path | None:
 def hook_argv(path: Path, *args: str) -> list[str]:
     if sys.platform != "win32":
         return [str(path), *args]
-    # Git for Windows runs hooks through its bundled shell.
-    shell = shutil.which("sh")
-    if shell is None:
-        raise WorkspaceError("Git's shell is not available to run this repository's commit hooks")
-    return [shell, str(path), *args]
+    # Let Git for Windows handle shebangs and its bundled interpreters.
+    # Other Git steps inherit a disabled hooksPath. Override it only for
+    # this explicit invocation of the already selected hook in the sandbox.
+    return ["git", "-c", f"core.hooksPath={path.parent}", "hook", "run", path.name, "--", *args]
 
 
 def run_sandboxed(
