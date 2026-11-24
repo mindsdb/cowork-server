@@ -39,6 +39,11 @@ _PLATFORM_ENVIRONMENT = {
     "SSL_CERT_FILE", "SSL_CERT_DIR", "REQUESTS_CA_BUNDLE", "NODE_EXTRA_CA_CERTS", "CURL_CA_BUNDLE",
 }
 _PROXY_VARIABLES = {"HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY"}
+# The Windows offline sandbox derives its firewall exceptions from these
+# variables, including values explicitly supplied by a project.
+_WINDOWS_OFFLINE_EXCEPTIONS = _PROXY_VARIABLES | {
+    "WS_PROXY", "WSS_PROXY", "CODEX_WINDOWS_SANDBOX_PROXY_PORTS", "CODEX_NETWORK_ALLOW_LOCAL_BINDING",
+}
 # Tools that otherwise write caches under the home folder, which the sandbox
 # keeps read-only. A per-project cache keeps them working without letting a
 # check poison a cache the person's own builds use.
@@ -224,10 +229,6 @@ def sandboxed_argv(
     """
     if not policy.sandboxed:
         return list(argv)
-    if sys.platform == "win32" and not policy.network_access:
-        # The pinned Windows sandbox does not enforce the required isolation
-        # from local services. Refuse before launching any task command.
-        raise WorkspaceError("Sandboxed checks with network access off are unavailable on Windows")
     temp = Path(tempfile.gettempdir()).resolve()
     filesystem: dict[str, str] = {":root": "read"}
     roots: list[Path] = []
@@ -248,7 +249,15 @@ def sandboxed_argv(
     if not policy.read_only and sys.platform != "win32":
         sockets = ", ".join(f'{toml_string(str(path))}="allow"' for path in (*roots, temp))
         network += f", allow_local_binding=true, unix_sockets={{{sockets}}}"
-    if not policy.network_access:
+    windows_offline = sys.platform == "win32" and not policy.network_access
+    if windows_offline:
+        # Codex's Windows CLI launches before the managed proxy is started, so
+        # network-off runs under its offline identity instead. The pinned
+        # version still lets that identity reach services on this computer,
+        # so a check can connect to localhost here, as a writable check can
+        # on macOS and Linux.
+        network = "enabled=false"
+    elif not policy.network_access:
         # Outbound traffic goes only through Codex's proxy, which allows no
         # domain; direct connections are refused by the sandbox itself.
         network += ", domains={}"
@@ -270,6 +279,8 @@ def sandboxed_argv(
 def sandbox_environment(environment: Mapping[str, str], policy: CheckPolicy) -> dict[str, str]:
     """Keep the person's own Codex settings out of the sandbox launcher."""
     result = dict(environment)
+    if sys.platform == "win32" and policy.sandboxed and not policy.network_access:
+        result = {name: value for name, value in result.items() if name.upper() not in _WINDOWS_OFFLINE_EXCEPTIONS}
     if policy.sandboxed and policy.sandbox_home is not None:
         policy.sandbox_home.mkdir(parents=True, exist_ok=True)
         result["CODEX_HOME"] = str(policy.sandbox_home)

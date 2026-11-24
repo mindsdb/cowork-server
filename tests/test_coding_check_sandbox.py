@@ -10,7 +10,7 @@ from pathlib import Path
 import pytest
 
 from cowork.coding.check_sandbox import (
-    CheckPolicy, GitDirectories, check_environment, filter_storage, run_sandboxed, sandboxed_argv,
+    CheckPolicy, GitDirectories, check_environment, filter_storage, run_sandboxed, sandbox_environment, sandboxed_argv,
 )
 from cowork.coding.contracts import PermissionMode, TaskWorkspace, WorkspaceKind
 from cowork.coding.project_models import CodeProject, ProjectCommand, ProjectEnvironment, ProjectFolder
@@ -125,10 +125,6 @@ def test_sandboxed_checks_follow_the_task_network_setting(
 ) -> None:
     monkeypatch.setattr(sys, "platform", platform)
     policy = CheckPolicy.for_task(PermissionMode.workspace, network_access=network_access)
-    if platform == "win32" and not network_access:
-        with pytest.raises(WorkspaceError, match="network access off"):
-            sandboxed_argv(["npm", "test"], policy, [tmp_path], codex=Path("codex"))
-        return
     argv = sandboxed_argv(["npm", "test"], policy, [tmp_path], codex=Path("codex"))
     joined = " ".join(argv)
 
@@ -139,25 +135,49 @@ def test_sandboxed_checks_follow_the_task_network_setting(
     assert ("features.network_proxy=true" in argv) == uses_proxy
     assert ("domains={}" in joined) == uses_proxy
     assert ('windows.sandbox="elevated"' in argv) == (platform == "win32")
+    windows_offline = platform == "win32" and not network_access
+    assert ("permissions.checks.network={enabled=false}" in argv) == windows_offline
+
+
+def test_windows_offline_checks_drop_proxy_firewall_exceptions(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(sys, "platform", "win32")
+    environment = {
+        "https_proxy": "http://localhost:3128", "Ws_Proxy": "http://localhost:1234",
+        "CODEX_WINDOWS_SANDBOX_PROXY_PORTS": "5555", "CODEX_NETWORK_ALLOW_LOCAL_BINDING": "1", "PATH": "bin",
+    }
+    offline = CheckPolicy.for_task(PermissionMode.workspace, network_access=False)
+    online = CheckPolicy.for_task(PermissionMode.workspace, network_access=True)
+    assert sandbox_environment(environment, offline) == {"PATH": "bin"}
+    assert sandbox_environment(environment, online) == environment
 
 
 @pytest.mark.skipif(sys.platform != "win32", reason="exercise the native Windows sandbox")
-def test_windows_native_check_network_policy(tmp_path: Path) -> None:
+@pytest.mark.parametrize("network_access", [True, False])
+def test_windows_native_checks_run_with_and_without_network_access(tmp_path: Path, network_access: bool) -> None:
+    # Network off is the default for a task, so a check has to start under it.
+    # The pinned sandbox does not keep its offline identity from services on
+    # this computer, so reaching localhost is not asserted either way.
     workspace = tmp_path / "project"
     workspace.mkdir()
-    marker = workspace / "ran.txt"
-    command = [sys.executable, "-c", "from pathlib import Path; Path('ran.txt').touch()"]
-
-    def run(network_access: bool):
-        policy = CheckPolicy.for_task(PermissionMode.workspace, network_access, sandbox_home=tmp_path / "check-sandbox")
-        return run_sandboxed(command, cwd=workspace, policy=policy, environment=check_environment(os.environ), writable=[workspace])
-
-    with pytest.raises(WorkspaceError, match="network access off"):
-        run(False)
-    assert not marker.exists()
-    result = run(True)
+    outside = tmp_path / "outside.txt"
+    script = (
+        "from pathlib import Path\n"
+        "import sys\n"
+        "Path('ran.txt').touch()\n"
+        "try:\n"
+        "    Path(sys.argv[1]).touch()\n"
+        "except OSError:\n"
+        "    print('confined')\n"
+    )
+    policy = CheckPolicy.for_task(PermissionMode.workspace, network_access, sandbox_home=tmp_path / "check-sandbox")
+    result = run_sandboxed(
+        [sys.executable, "-c", script, str(outside)],
+        cwd=workspace, policy=policy, environment=check_environment(os.environ), writable=[workspace],
+    )
     assert result.returncode == 0, result.stderr
-    assert marker.exists()
+    assert (workspace / "ran.txt").exists()
+    assert result.stdout.strip() == "confined"
+    assert not outside.exists()
 
 
 def test_hooks_may_stage_but_not_change_what_makes_git_run_programs(tmp_path: Path) -> None:
@@ -771,6 +791,33 @@ def test_filtered_git_reads_use_read_only_sandbox_and_can_export_patch(tmp_path:
     assert len(reads) == 2
 
 
+def test_windows_filtered_git_reads_reuse_the_cowork_sandbox_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from cowork.coding import check_sandbox
+    from cowork.common.settings.app_settings import get_app_settings
+
+    repo = repository(tmp_path / "repo")
+    git(repo, "config", "filter.normalize.clean", "cat")
+    manager = WorkspaceManager(tmp_path / "coding")
+    monkeypatch.setattr(get_app_settings().coding, "root_dir", str(manager.root))
+    monkeypatch.setattr(sys, "platform", "win32")
+    monkeypatch.setattr(check_sandbox, "sandbox_codex", lambda: Path("codex"))
+    real_run = subprocess.run
+    homes = []
+
+    def record(argv, **kwargs):
+        if argv[:2] == ["codex", "sandbox"]:
+            homes.append(Path(kwargs["env"]["CODEX_HOME"]))
+            return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+        return real_run(argv, **kwargs)
+
+    monkeypatch.setattr(subprocess, "run", record)
+    for operation in ("status", "diff"):
+        manager.git.run(repo, operation)
+    home = manager.root / "check-sandbox"
+    assert homes == [home, home]
+    assert home.is_dir()
+
+
 def stateful_filter_repository(tmp_path: Path) -> Path:
     """A repository whose installed filter stores content in the Git directory, as Git LFS does."""
     program = tmp_path / "bin" / "store-filter"
@@ -813,6 +860,36 @@ def test_a_filter_that_stores_content_in_the_git_directory_still_commits_and_dif
 
     assert not folder.dirty and git(repo, "log", "-1", "--format=%s") == "Folder"
     assert not task.dirty and git(worktree, "log", "-1", "--format=%s") == "Task"
+
+
+@requires_sandbox
+@pytest.mark.parametrize("kind", [WorkspaceKind.git_worktree, WorkspaceKind.direct_folder])
+def test_a_filters_first_stored_file_commits_before_its_storage_folder_exists(
+    tmp_path: Path, checks: CheckPolicy, kind: WorkspaceKind,
+) -> None:
+    repo = stateful_filter_repository(tmp_path)
+    # As in a repository that tracks files with Git LFS but has stored none yet.
+    shutil.rmtree(repo / ".git" / "lfs")
+    target = repo
+    if kind == WorkspaceKind.git_worktree:
+        target = tmp_path / "task"
+        git(repo, "worktree", "add", "-q", "-b", "task", str(target))
+    manager = WorkspaceManager(tmp_path / "root")
+
+    (target / "asset.bin").write_text("changed\n", encoding="utf-8")
+    state = manager.commit(str(target), "Change", checks, workspace_kind=kind)
+
+    assert not state.dirty and git(target, "log", "-1", "--format=%s") == "Change"
+    assert any((repo / ".git" / "lfs" / "objects").iterdir())
+
+
+def test_a_repository_without_git_lfs_gets_no_storage_folder(tmp_path: Path) -> None:
+    repo = repository(tmp_path / "repo")
+    git(repo, "config", "filter.normalize.clean", "cat")
+    manager = WorkspaceManager(tmp_path / "root")
+
+    assert manager.git.filter_storage(repo, repo / ".git") == []
+    assert not (repo / ".git" / "lfs").exists()
 
 
 def test_a_recorded_commit_is_reported_even_when_status_cannot_be_read(

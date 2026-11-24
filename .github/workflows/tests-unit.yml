@@ -229,7 +229,7 @@ jobs:
         if: runner.os == 'Windows'
         run: >-
           uv run python -m pytest -q
-          tests/test_coding_check_sandbox.py::test_windows_native_check_network_policy
+          tests/test_coding_check_sandbox.py::test_windows_native_checks_run_with_and_without_network_access
           tests/test_coding_check_sandbox.py::test_windows_hook_uses_git_interpreter_dispatch
 
       - name: Run export tests

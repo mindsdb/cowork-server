@@ -272,6 +272,24 @@ class GitRunner:
                     active = True
         return tuple(overrides), active
 
+    def filter_storage(self, cwd: Path, common: Path) -> list[Path]:
+        """Where an installed content filter may write, created if it is Git LFS's.
+
+        Git LFS makes its ``lfs`` folder the first time it stores a file. The
+        sandbox can only grant a folder that exists, and it keeps the rest of
+        a shared Git directory read-only, so that first write would fail.
+        """
+        from cowork.coding import check_sandbox
+
+        listed = self.run(cwd, "config", "--get-regexp", r"^filter\.lfs\.(clean|smudge|process)$", check=False)
+        folder = common / "lfs"
+        if listed.returncode == 0 and listed.stdout.strip() and not os.path.lexists(folder):
+            try:
+                folder.mkdir()
+            except OSError:
+                logger.warning("Could not create Git LFS storage in %s", common, exc_info=True)
+        return check_sandbox.filter_storage(common)
+
     def run(
         self,
         cwd: Path,
@@ -311,8 +329,13 @@ class GitRunner:
                     # task operation, Git reads get no writes or network.
                     from cowork.coding import check_sandbox
 
-                    home = resources.enter_context(tempfile.TemporaryDirectory(prefix="cowork-git-read-"))
-                    policy = check_sandbox.CheckPolicy.for_task(PermissionMode.read_only, False, sandbox_home=Path(home))
+                    if sys.platform == "win32":
+                        # The offline account setup marker belongs to CODEX_HOME.
+                        # Reuse it across reads to avoid repeating elevated setup.
+                        home = Path(get_app_settings().coding.root_dir) / "check-sandbox"
+                    else:
+                        home = Path(resources.enter_context(tempfile.TemporaryDirectory(prefix="cowork-git-read-")))
+                    policy = check_sandbox.CheckPolicy.for_task(PermissionMode.read_only, False, sandbox_home=home)
                     child_environment = check_sandbox.check_environment(os.environ)
                     # Snapshot diffs use an isolated index and object store.
                     for name in ("GIT_INDEX_FILE", "GIT_OBJECT_DIRECTORY", "GIT_ALTERNATE_OBJECT_DIRECTORIES"):
@@ -332,7 +355,7 @@ class GitRunner:
                             argv.remove(option)
                             break
                     common = self.run(working_directory, "rev-parse", "--git-common-dir", check=False, environment=environment)
-                    storage = check_sandbox.filter_storage((working_directory / common.stdout.strip()).resolve()) if common.returncode == 0 else []
+                    storage = self.filter_storage(working_directory, (working_directory / common.stdout.strip()).resolve()) if common.returncode == 0 else []
                     argv = check_sandbox.sandboxed_argv(argv, policy, (), storage=storage)
                 result = subprocess.run(
                     argv,
@@ -957,6 +980,8 @@ class WorkspaceManager:
             "GIT_CONFIG_VALUE_0": os.devnull,
         })
         directories = check_sandbox.git_directories(self.git.run, root)
+        # Before the grants are read, so a first Git LFS write has its folder.
+        self.git.filter_storage(root, directories.common)
         environment.update({
             "GIT_OBJECT_DIRECTORY": str(new_objects),
             "GIT_ALTERNATE_OBJECT_DIRECTORIES": str(directories.common / "objects"),
@@ -1653,7 +1678,7 @@ class WorkspaceManager:
                     ["git", *_platform_config_args(), *_host_safety_args(args), *args],
                     cwd=root, policy=checks, environment=environment, writable=[root],
                     read_only=check_sandbox.git_metadata(root),
-                    storage=check_sandbox.filter_storage(check_sandbox.git_directories(self.git.run, root).common),
+                    storage=self.git.filter_storage(root, check_sandbox.git_directories(self.git.run, root).common),
                 )
             except (OSError, subprocess.TimeoutExpired) as exc:
                 raise WorkspaceError(f"Could not check Git status: {exc}") from exc
