@@ -36,9 +36,16 @@ from typing import Annotated, TextIO
 from pydantic import AfterValidator, BaseModel, ConfigDict, Field, ValidationError
 
 # The desktop app (cowork repository) mirrors the names and numbers below,
-# under the same names: STDIN_FLAG, HANDOFF_PROTOCOL and WINDOW_PROOF_HEADER in
-# src/shared/server-launch.ts, and HEADER and CHALLENGE_HEADER in
-# src/main/app-secret.ts. Change both sides together.
+# under the same names: STDIN_FLAG, HANDOFF_PROTOCOL, WINDOW_PROOF_HEADER and
+# SERVER_REFUSAL_PREFIX in src/shared/server-launch.ts, and HEADER and
+# CHALLENGE_HEADER in src/main/app-secret.ts. It also builds the hand-off line
+# with LaunchHandoff's three keys (app_secret, auth_token and window_proof), in
+# launchStdinLine (src/shared/server-launch.ts) and in scripts/start-server.mjs.
+# Its installer builds (.github/workflows/build-macos-pkg.yml,
+# build-linux-deb.yml and build-windows-installer.yml) read the
+# HANDOFF_PROTOCOL line below from the server wheel they bake as the install
+# floor, and fail when it is missing.
+# Change both sides together.
 STDIN_FLAG = "COWORK_APP_SECRET_STDIN"
 HEADER = "X-Cowork-App-Secret"
 CHALLENGE_HEADER = "X-Cowork-App-Challenge"
@@ -48,12 +55,18 @@ WINDOW_PROOF_HEADER = "X-Cowork-Window-Proof"
 SECRET_PROTOCOL = 1
 #: STDIN_FLAG's value, and /health's app_secret_protocol, for the launch hand-off.
 HANDOFF_PROTOCOL = 2
+#: What starts the one line the server prints when it refuses to start
+#: (cowork.cli.main). The desktop finds that line in the server's output by
+#: this prefix and shows it.
+SERVER_REFUSAL_PREFIX = "cowork-server: "
 
 READ_TIMEOUT_SECONDS = 10.0
 
 _SECRET_SHAPE = re.compile(r"[0-9a-f]{32,128}")
 _CHALLENGE_SHAPE = re.compile(r"[0-9a-fA-F]{32,128}")
 _MAX_LINE = 4096
+_NO_STDIN = "no launch hand-off can arrive: the server has no stdin"
+_NOT_UTF8 = "the launch hand-off on stdin is not valid UTF-8"
 
 _log = logging.getLogger(__name__)
 _secret: str | None = None
@@ -131,25 +144,37 @@ def proof(challenge: str | None) -> str | None:
 
 
 def _read_line(*, stream: TextIO | None, timeout: float) -> str | None:
-    """One line from ``stream`` (stdin by default), or None when none arrived
-    within ``timeout``.
+    """One line of at most ``_MAX_LINE`` characters from ``stream`` (stdin by
+    default), or None when none arrived within ``timeout``.
+
+    Raises LaunchHandoffError when there is no stdin, as when the parent
+    started this process with fd 0 closed, or when stdin's bytes are not
+    UTF-8.
 
     The read runs on a daemon thread so a parent that never writes the line
     costs at most ``timeout`` at startup instead of hanging the server.
     """
     stream = sys.stdin if stream is None else stream
-    line: list[str] = []
+    if stream is None:
+        raise LaunchHandoffError(_NO_STDIN)
+    read: list[str | Exception] = []
 
-    def read() -> None:
+    def read_one() -> None:
         try:
-            line.append(stream.readline(_MAX_LINE))
-        except (OSError, ValueError):
-            line.append("")
+            read.append(stream.readline(_MAX_LINE))
+        except (OSError, ValueError) as error:
+            read.append(error)
 
-    reader = threading.Thread(target=read, name="app-secret-stdin", daemon=True)
+    reader = threading.Thread(target=read_one, name="app-secret-stdin", daemon=True)
     reader.start()
     reader.join(timeout)
-    return line[0] if line else None
+    if not read:
+        return None
+    if isinstance(read[0], UnicodeDecodeError):
+        raise LaunchHandoffError(_NOT_UTF8)
+    if isinstance(read[0], Exception):
+        return ""
+    return read[0]
 
 
 def read_from_stdin(stream: TextIO | None = None, *, timeout: float = READ_TIMEOUT_SECONDS) -> bool:
@@ -157,7 +182,11 @@ def read_from_stdin(stream: TextIO | None = None, *, timeout: float = READ_TIMEO
     default) and hold the secret it carries. Returns whether a secret is now
     held; on any failure the server runs in legacy mode."""
     global _secret
-    line = _read_line(stream=stream, timeout=timeout)
+    try:
+        line = _read_line(stream=stream, timeout=timeout)
+    except LaunchHandoffError:
+        # No stdin, or bytes that are not UTF-8: no secret, as for a bad line.
+        line = ""
     if line is None:
         _log.warning("%s is set but no app secret arrived on stdin; running without it", STDIN_FLAG)
         return False
@@ -186,6 +215,9 @@ def read_handoff_from_stdin(
     line = _read_line(stream=stream, timeout=timeout)
     if line is None:
         raise LaunchHandoffError(f"no launch hand-off arrived on stdin within {timeout:g} s")
+    if len(line) == _MAX_LINE and not line.endswith("\n"):
+        # The read stopped at its bound before the line ended.
+        raise LaunchHandoffError(f"the launch hand-off on stdin is {_MAX_LINE} characters or longer")
     if not line.strip():
         raise LaunchHandoffError("the launch hand-off on stdin is empty")
     try:
@@ -204,7 +236,13 @@ def _describe(*, error: ValidationError) -> str:
         return "the launch hand-off on stdin is not valid JSON"
     if first["type"] in ("model_type", "model_attributes_type"):
         return "the launch hand-off on stdin is not a JSON object"
+    if first["type"] == "string_unicode":
+        # Under the surrogateescape handler stdin reads bytes that are not
+        # UTF-8 as lone surrogates, which pydantic refuses for the whole line.
+        return _NOT_UTF8
     key = ".".join(str(part) for part in first["loc"])
+    if not key:
+        return "the launch hand-off on stdin is invalid"
     if first["type"] == "missing":
         return f"the launch hand-off on stdin has no {key}"
     return f"the launch hand-off on stdin has an invalid {key}"

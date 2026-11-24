@@ -210,8 +210,7 @@ class CodexEngineSession:
         # home that owns their rollout files. Keep that home under Cowork's
         # persistent data root instead of inheriting the launching shell's
         # CODEX_HOME (or the user's unrelated Codex Desktop state).
-        codex_home = codex_config.persistent_home(cowork_root)
-        codex_home.mkdir(parents=True, exist_ok=True)
+        codex_home = codex_config.prepare_home(cowork_root=cowork_root)
         self._config_path = codex_home / "config.toml"
         self._config_path.touch(exist_ok=True)
         endpoint = config.inference_base_url or codex_config.local_inference_base_url(get_app_settings().port)

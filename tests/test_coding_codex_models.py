@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import itertools
 import json
+import stat
 import sys
 import tomllib
 from dataclasses import dataclass
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
+from typing import NamedTuple
 
 import httpx
 import pytest
@@ -159,6 +161,72 @@ def test_catalog_deadline_bounds_a_trickled_response(monkeypatch, catalog):
     assert len(chunks) < len(body)
 
 
+@dataclass
+class _FakeCodexConfig:
+    cwd: str
+    env: dict
+    config_overrides: tuple
+    client_name: str
+    client_title: str
+    client_version: str = "0.147.0"
+
+
+def _install_fake_codex_sdk(*, monkeypatch, client: type) -> None:
+    """Stand in for the Codex SDK with ``client``, and turn off the steps of a
+    session start that need a real app-server."""
+    sdk = ModuleType("openai_codex.client")
+    sdk.CodexConfig = _FakeCodexConfig
+    sdk.CodexClient = client
+    monkeypatch.setitem(sys.modules, "openai_codex.client", sdk)
+    monkeypatch.setattr(codex.CodexEngineSession, "_register_skill_roots", lambda self: None)
+    monkeypatch.setattr(codex.CodexEngineSession, "_route_global_notifications", lambda self: None)
+    monkeypatch.setattr(codex.CodexEngineSession, "_app_server_pid", lambda self: None)
+    monkeypatch.setattr(codex, "terminate_descendants", lambda pid: None)
+
+
+class _FakeCodexStart(NamedTuple):
+    session: codex.CodexEngineSession
+    #: The config overrides of each app-server start, parsed.
+    started: list[dict]
+    #: The params of each thread_start.
+    thread_params: list[dict]
+
+
+def _start_fake_codex_session(*, monkeypatch, tmp_path: Path) -> _FakeCodexStart:
+    """Start a local workspace session on the fake Codex SDK, and record what
+    it asks the app-server for."""
+    started: list[dict] = []
+    thread_params: list[dict] = []
+
+    class FakeClient:
+        def __init__(self, config, approval_handler):
+            self.config = config
+
+        def start(self):
+            started.append(tomllib.loads("\n".join(self.config.config_overrides)))
+
+        def initialize(self):
+            pass
+
+        def thread_start(self, params):
+            thread_params.append(params)
+            return SimpleNamespace(thread=SimpleNamespace(id="thread"))
+
+        def close(self):
+            pass
+
+    _install_fake_codex_sdk(monkeypatch=monkeypatch, client=FakeClient)
+    session = codex.CodexEngineSession(
+        cowork_root=tmp_path, workspace=tmp_path,
+        config=EngineSessionConfig(
+            model="fable", permission_mode=PermissionMode.workspace, inference_api_key="session-inference-token",
+        ),
+        credentials=EngineCredentials(minds_url="https://upstream", minds_api_key="real-secret"),
+        existing_session_id=None, approval_handler=lambda *args: {},
+    )
+    return _FakeCodexStart(session=session, started=started, thread_params=thread_params)
+
+
 @pytest.mark.parametrize("existing_session_id", [None, "existing-thread"])
 @pytest.mark.parametrize("remote", [False, True])
 @pytest.mark.parametrize("failure", [None, "start", "initialize", "thread"])
@@ -168,15 +236,6 @@ def test_session_loads_catalog_before_start_and_cleans_up(
     requests = mock_catalog(monkeypatch, catalog)
     calls = []
     paths = []
-
-    @dataclass
-    class FakeConfig:
-        cwd: str
-        env: dict
-        config_overrides: tuple
-        client_name: str
-        client_title: str
-        client_version: str = "0.147.0"
 
     class FakeClient:
         def __init__(self, config, approval_handler):
@@ -216,14 +275,7 @@ def test_session_loads_catalog_before_start_and_cleans_up(
             assert paths[0].exists()
             calls.append("close")
 
-    sdk = ModuleType("openai_codex.client")
-    sdk.CodexConfig = FakeConfig
-    sdk.CodexClient = FakeClient
-    monkeypatch.setitem(sys.modules, "openai_codex.client", sdk)
-    monkeypatch.setattr(codex.CodexEngineSession, "_register_skill_roots", lambda self: None)
-    monkeypatch.setattr(codex.CodexEngineSession, "_route_global_notifications", lambda self: None)
-    monkeypatch.setattr(codex.CodexEngineSession, "_app_server_pid", lambda self: None)
-    monkeypatch.setattr(codex, "terminate_descendants", lambda pid: None)
+    _install_fake_codex_sdk(monkeypatch=monkeypatch, client=FakeClient)
     # A local session's key is the inference capability token
     # RuntimeManager.open_locked mints for it; a remote one's is the lease's.
     config = EngineSessionConfig(
@@ -258,54 +310,31 @@ def test_session_loads_catalog_before_start_and_cleans_up(
 def test_session_starts_on_fallback_metadata_for_unlisted_model(monkeypatch, tmp_path, catalog):
     catalog["models"][0]["slug"] = "fable-alias"
     mock_catalog(monkeypatch, catalog)
-    started = []
-    thread_params = []
-
-    @dataclass
-    class FakeConfig:
-        cwd: str
-        env: dict
-        config_overrides: tuple
-        client_name: str
-        client_title: str
-        client_version: str = "0.147.0"
-
-    class FakeClient:
-        def __init__(self, config, approval_handler):
-            self.config = config
-
-        def start(self):
-            started.append(tomllib.loads("\n".join(self.config.config_overrides)))
-
-        def initialize(self):
-            pass
-
-        def thread_start(self, params):
-            thread_params.append(params)
-            return SimpleNamespace(thread=SimpleNamespace(id="thread"))
-
-        def close(self):
-            pass
-
-    sdk = ModuleType("openai_codex.client")
-    sdk.CodexConfig = FakeConfig
-    sdk.CodexClient = FakeClient
-    monkeypatch.setitem(sys.modules, "openai_codex.client", sdk)
-    monkeypatch.setattr(codex.CodexEngineSession, "_register_skill_roots", lambda self: None)
-    monkeypatch.setattr(codex.CodexEngineSession, "_route_global_notifications", lambda self: None)
-    monkeypatch.setattr(codex.CodexEngineSession, "_app_server_pid", lambda self: None)
-    monkeypatch.setattr(codex, "terminate_descendants", lambda pid: None)
-    session = codex.CodexEngineSession(
-        cowork_root=tmp_path, workspace=tmp_path,
-        config=EngineSessionConfig(
-            model="fable", permission_mode=PermissionMode.workspace, inference_api_key="session-inference-token",
-        ),
-        credentials=EngineCredentials(minds_url="https://upstream", minds_api_key="real-secret"),
-        existing_session_id=None, approval_handler=lambda *args: {},
-    )
-    assert "model_catalog_json" not in started[0]
+    start = _start_fake_codex_session(monkeypatch=monkeypatch, tmp_path=tmp_path)
+    assert "model_catalog_json" not in start.started[0]
     # Only the catalog points the reviewer at a served model, so without it an
     # Approve for me task asks the person rather than failing every review.
-    assert thread_params[0]["approvalsReviewer"] == "user"
-    assert session._approvals_reviewer == "user"
-    session.close()
+    assert start.thread_params[0]["approvalsReviewer"] == "user"
+    assert start.session._approvals_reviewer == "user"
+    start.session.close()
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX permission bits")
+@pytest.mark.parametrize("left_by_an_earlier_start", [False, True])
+def test_a_session_start_leaves_codex_home_open_to_this_user_alone(
+    monkeypatch, tmp_path, catalog, left_by_an_earlier_start,
+):
+    """Codex's shell snapshot under codex-home records the session's
+    inference token, so each start leaves the home 0700: a new one, and one
+    an earlier start created with the default mode."""
+    mock_catalog(monkeypatch, catalog)
+    home = codex_config.persistent_home(tmp_path)
+    if left_by_an_earlier_start:
+        home.mkdir()
+        home.chmod(0o755)
+    start = _start_fake_codex_session(monkeypatch=monkeypatch, tmp_path=tmp_path)
+    try:
+        assert start.session._config_path.parent == home
+        assert stat.S_IMODE(home.stat().st_mode) == 0o700
+    finally:
+        start.session.close()

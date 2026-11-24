@@ -37,7 +37,7 @@ def main() -> None:
         try:
             app_secret.read_handoff_from_stdin()
         except app_secret.LaunchHandoffError as error:
-            raise SystemExit(f"cowork-server: {error}") from None
+            raise SystemExit(f"{app_secret.SERVER_REFUSAL_PREFIX}{error}") from None
     started_with = {name: os.environ.get(name) for name in (EXPORT_PDF_ENGINE_VAR, EXPORT_RENDER_URL_VAR)}
     try:
         from dotenv import load_dotenv

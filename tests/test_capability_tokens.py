@@ -2,10 +2,14 @@
 ``inference`` token each Code mode engine session gets from RuntimeManager."""
 from __future__ import annotations
 
+import threading
+
 import pytest
 
 from cowork import capability_tokens
-from cowork.coding.contracts import SessionCreateRequest, SessionStatus
+from cowork.coding.contracts import CodingSession, SessionCreateRequest, SessionStatus, WorkspaceKind
+from cowork.coding.engines.registry import CodingEngineRegistry
+from cowork.coding.runtime import RuntimeManager
 from tests.support.coding.service_fakes import CREDS, FakeEngine, repository, service_with, wait_for_status
 
 
@@ -149,4 +153,72 @@ class TestEngineSessions:
 
         service.runtimes.close_all()
 
+        assert _live(token) is None
+
+
+def _manager(*, tmp_path, engine: FakeEngine) -> RuntimeManager:
+    """A runtime manager of its own, so no task's turn thread touches the
+    runtimes these tests open and close."""
+    registry = CodingEngineRegistry()
+    registry.register(engine)
+    return RuntimeManager(tmp_path / "coding", registry, lambda *_args: {})
+
+
+def _session(*, tmp_path) -> CodingSession:
+    return CodingSession(
+        id="session-1",
+        title="Task",
+        engine_id=FakeEngine.id,
+        engine_adapter_version="1",
+        model="fake-model",
+        source_path=str(tmp_path / "source"),
+        workspace_path=str(tmp_path / "workspace"),
+        workspace_kind=WorkspaceKind.git_worktree,
+        skill_roots=[],
+    )
+
+
+class TestRuntimeManagerRevokes:
+    def test_reopening_a_runtime_that_closed_itself_revokes_its_token(self, tmp_path):
+        """A runtime whose app-server exited stays in the manager until the
+        next open replaces it. That open revokes the old runtime's token."""
+        engine = FakeEngine()
+        manager = _manager(tmp_path=tmp_path, engine=engine)
+        runtime = manager.open(_session(tmp_path=tmp_path), CREDS)
+        first = engine.configs[-1].inference_api_key
+
+        runtime.close()
+        manager.open(_session(tmp_path=tmp_path), CREDS)
+        second = engine.configs[-1].inference_api_key
+
+        assert second != first
+        assert _live(first) is None
+        assert _live(second) is not None
+
+    def test_an_open_that_shutdown_overtakes_revokes_its_token(self, tmp_path):
+        """close_all runs while an open waits on the app-server: the open
+        closes the runtime it got, revokes its token and refuses."""
+        engine = FakeEngine(block_open=True)
+        manager = _manager(tmp_path=tmp_path, engine=engine)
+        refusals: list[str] = []
+
+        def open_runtime() -> None:
+            try:
+                manager.open(_session(tmp_path=tmp_path), CREDS)
+            except RuntimeError as error:
+                refusals.append(str(error))
+
+        opener = threading.Thread(target=open_runtime)
+        opener.start()
+        assert engine.opened.wait(timeout=5)
+        token = engine.configs[-1].inference_api_key
+        assert _live(token) is not None
+
+        manager.close_all()
+        engine.release_open.set()
+        opener.join(timeout=5)
+
+        assert not opener.is_alive()
+        assert refusals == ["The coding runtime manager is shutting down"]
+        assert engine.closed == 1
         assert _live(token) is None

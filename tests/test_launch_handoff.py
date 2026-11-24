@@ -16,6 +16,7 @@ import os
 import subprocess
 import sys
 from pathlib import Path
+from types import MappingProxyType
 
 import pytest
 from fastapi import FastAPI
@@ -24,12 +25,14 @@ from fastapi.testclient import TestClient
 from cowork import app_secret
 from cowork.api.v1.router import api_router
 from cowork.auth_middleware import _read_token
+from cowork.common import launch_environment
 from cowork.common.settings.app_settings import get_app_settings
 
 SECRET = "ab" * 32
 TOKEN = "cd" * 32
 PROOF = "ef" * 32
 OLD_ENV_TOKEN = "0123456789abcdef" * 2
+PROCESS_ENV_TOKEN = "89" * 32
 GOOD = {"app_secret": SECRET, "auth_token": TOKEN, "window_proof": PROOF}
 
 
@@ -57,6 +60,16 @@ class TestContract:
         assert app_secret.WINDOW_PROOF_HEADER == "X-Cowork-Window-Proof"
         assert app_secret.SECRET_PROTOCOL == 1
         assert app_secret.HANDOFF_PROTOCOL == 2
+        # The desktop finds the server's refusal line in its output by this
+        # prefix, and shows the line.
+        assert app_secret.SERVER_REFUSAL_PREFIX == "cowork-server: "
+
+    def test_the_hand_off_keys_the_desktop_writes(self):
+        """The desktop builds the hand-off line with these keys, in
+        launchStdinLine (src/shared/server-launch.ts) and in
+        scripts/start-server.mjs. A key renamed on one side stops every
+        desktop launch with "has no <key>"."""
+        assert set(app_secret.LaunchHandoff.model_fields) == {"app_secret", "auth_token", "window_proof"}
 
 
 class TestRead:
@@ -118,6 +131,49 @@ class TestRead:
         assert str(refused.value) == message
         assert SECRET not in str(refused.value)
         assert app_secret.held_handoff() is None
+
+    @pytest.mark.parametrize("errors", ["strict", "surrogateescape"])
+    def test_bytes_that_are_not_utf8_are_named(self, nothing_held, errors):
+        """stdin decodes strictly under a UTF-8 locale and with surrogateescape
+        under the C locale; either way the refusal names the encoding."""
+        raw = ('{"app_secret": "' + SECRET + '", "note": "').encode() + b"\xff\xfe" + b'"}\n'
+        stream = io.TextIOWrapper(io.BytesIO(raw), encoding="utf-8", errors=errors)
+        with pytest.raises(app_secret.LaunchHandoffError) as refused:
+            app_secret.read_handoff_from_stdin(stream=stream)
+        assert str(refused.value) == "the launch hand-off on stdin is not valid UTF-8"
+        assert app_secret.held_handoff() is None
+
+    def test_no_stdin_is_named_at_once(self, nothing_held, monkeypatch):
+        """A parent that starts the server with fd 0 closed leaves sys.stdin
+        None: the refusal says so without waiting out the timeout."""
+        monkeypatch.setattr(sys, "stdin", None)
+        with pytest.raises(app_secret.LaunchHandoffError) as refused:
+            app_secret.read_handoff_from_stdin(timeout=30)
+        assert str(refused.value) == "no launch hand-off can arrive: the server has no stdin"
+        assert app_secret.held_handoff() is None
+        # The app secret alone is optional: without stdin the server runs in legacy mode.
+        assert app_secret.read_from_stdin(timeout=30) is False
+        assert app_secret.get_app_secret() is None
+
+    @pytest.mark.parametrize(
+        "line",
+        [
+            "a" * app_secret._MAX_LINE,
+            _line({**GOOD, "padding": "b" * app_secret._MAX_LINE}),
+        ],
+        ids=["bound-without-newline", "past-the-bound"],
+    )
+    def test_a_line_at_the_bound_is_named_too_long(self, nothing_held, line):
+        with pytest.raises(app_secret.LaunchHandoffError) as refused:
+            app_secret.read_handoff_from_stdin(stream=io.StringIO(line))
+        assert str(refused.value) == f"the launch hand-off on stdin is {app_secret._MAX_LINE} characters or longer"
+        assert app_secret.held_handoff() is None
+
+    def test_a_line_just_under_the_bound_is_read(self, nothing_held):
+        padded = _line({**GOOD, "padding": ""})
+        line = _line({**GOOD, "padding": "b" * (app_secret._MAX_LINE - len(padded))})
+        assert len(line) == app_secret._MAX_LINE
+        assert app_secret.read_handoff_from_stdin(stream=io.StringIO(line)).auth_token == TOKEN
 
     def test_a_parent_that_never_writes_is_refused_after_the_timeout(self, nothing_held):
         read_end, write_end = os.pipe()
@@ -190,10 +246,16 @@ class TestCreateApp:
     @pytest.mark.parametrize("require_auth", ["true", "false"])
     def test_a_held_hand_off_is_the_only_token(self, local_home, handoff_held, monkeypatch, require_auth):
         """With the hand-off the bearer check is on whatever the settings say,
-        and nothing generates, mirrors or reads the .env token."""
+        and nothing generates, mirrors or reads the .env token. A
+        COWORK_AUTH_TOKEN in the process environment, live or captured at
+        launch, is no token either."""
         from cowork import server
 
         monkeypatch.setenv("COWORK_REQUIRE_AUTH", require_auth)
+        monkeypatch.setenv("COWORK_AUTH_TOKEN", PROCESS_ENV_TOKEN)
+        monkeypatch.setattr(
+            launch_environment, "_captured", MappingProxyType({"COWORK_AUTH_TOKEN": PROCESS_ENV_TOKEN})
+        )
         get_app_settings.cache_clear()
         removed: list[Path] = []
         real_remove = server.remove_auth_token
@@ -216,6 +278,10 @@ class TestCreateApp:
             assert client.get("/api/v1/conversations/").status_code == 401
             old = client.get("/api/v1/conversations/", headers={"Authorization": f"Bearer {OLD_ENV_TOKEN}"})
             assert old.status_code == 401
+            from_process = client.get(
+                "/api/v1/conversations/", headers={"Authorization": f"Bearer {PROCESS_ENV_TOKEN}"}
+            )
+            assert from_process.status_code == 401
             authed = client.get("/api/v1/conversations/", headers={"Authorization": f"Bearer {TOKEN}"})
             assert authed.status_code == 200
         finally:
@@ -275,8 +341,14 @@ print("HELD" + json.dumps({
 """
 
 
+_ROOT = Path(__file__).resolve().parents[1]
+
+
 def _cli_env(tmp_path: Path, flag: str | None) -> dict[str, str]:
     env = {name: value for name, value in os.environ.items() if name != app_secret.STDIN_FLAG}
+    # The child runs in tmp_path, so without this it imports whatever cowork
+    # the interpreter finds, which in a shared virtualenv is another checkout.
+    env["PYTHONPATH"] = str(_ROOT)
     env["COWORK_HOME"] = str(tmp_path / "home")
     if flag is not None:
         env[app_secret.STDIN_FLAG] = flag
@@ -330,7 +402,7 @@ class TestCli:
         result = self._run(tmp_path, "2", stdin)
         assert result.returncode != 0
         assert "UVICORN_STARTED" not in result.stdout
-        assert result.stderr.strip().splitlines() == [f"cowork-server: {message}"]
+        assert result.stderr.strip().splitlines() == [f"{app_secret.SERVER_REFUSAL_PREFIX}{message}"]
 
     def test_value_2_exits_when_the_line_never_arrives(self, tmp_path):
         (tmp_path / "home").mkdir()
@@ -348,7 +420,23 @@ class TestCli:
         process.stderr.close()
         assert returncode != 0
         assert "UVICORN_STARTED" not in stdout
-        assert stderr.strip().splitlines() == ["cowork-server: no launch hand-off arrived on stdin within 1 s"]
+        assert stderr.strip().splitlines() == [
+            f"{app_secret.SERVER_REFUSAL_PREFIX}no launch hand-off arrived on stdin within 1 s"
+        ]
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="closes fd 0 in the child, which Windows can't do")
+    def test_value_2_exits_with_one_line_when_stdin_is_closed(self, tmp_path):
+        (tmp_path / "home").mkdir()
+        result = subprocess.run(
+            [sys.executable, "-c", _CLI],
+            capture_output=True, text=True, env=_cli_env(tmp_path, "2"), cwd=tmp_path, timeout=60,
+            check=False, preexec_fn=lambda: os.close(0),
+        )
+        assert result.returncode != 0
+        assert "UVICORN_STARTED" not in result.stdout
+        assert result.stderr.strip().splitlines() == [
+            f"{app_secret.SERVER_REFUSAL_PREFIX}no launch hand-off can arrive: the server has no stdin"
+        ]
 
     def test_value_1_holds_the_app_secret_alone(self, tmp_path):
         result = self._run(tmp_path, "1", _line(GOOD))

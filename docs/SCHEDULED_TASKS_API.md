@@ -67,8 +67,8 @@ default. It then ends `failed` with outcome `interrupted`.
 |---|---|---|
 | Hosted (MindsHub) | `https://cowork.mindshub.ai` (staging: `https://cowork.staging.mindshub.ai`) | An `mdb_` API key from your MindsHub account |
 | Desktop app | None a script can use | The hosted API with an `mdb_` key, or a `cowork-server` you start from a terminal |
-| `cowork-server` started from a terminal | `http://127.0.0.1:26866` | Its local token: `COWORK_AUTH_TOKEN` in `~/.cowork/.env` |
-| Self-hosted | Your deployment's address | A tester's Keycloak access token, as the runbook's scripted questions get it |
+| `cowork-server` started from a terminal | `http://127.0.0.1:26866` | Its local token: `COWORK_AUTH_TOKEN` in `~/.cowork/.env`, or in `~/.cowork-scripts/.env` when it has its own home beside the desktop app |
+| Self-hosted | Your deployment's address | A tester's Keycloak access token |
 
 Send it as `Authorization: Bearer <credential>`.
 
@@ -81,14 +81,20 @@ Send it as `Authorization: Bearer <credential>`.
   your tasks against the hosted API with an `mdb_` key, or start a server of
   your own from a terminal.
 - **`cowork-server` from a terminal.** The server writes its token to
-  `~/.cowork/.env` the first time it starts, or takes `COWORK_AUTH_TOKEN` from
-  its environment. Only processes on your machine can reach the port.
-- **Self-hosted.** Sign in with `tests/e2e/keycloak_login.py` from the
-  cowork-self-hosted repository: call `login()` once and `refresh_if_needed()`
-  before each call, as its runbook's
-  [Tokens and cost per answer](https://github.com/mindsdb/cowork-self-hosted/blob/main/docs/runbook.md#tokens-and-cost-per-answer)
-  section does for scripted questions. Password sign-in is off for testers, so
-  a script can't trade an email and password for a token.
+  `~/.cowork/.env` when it starts and finds none, or takes `COWORK_AUTH_TOKEN`
+  from its environment. Only processes on your machine can reach the port.
+  If you also run the desktop app, give this server its own home:
+  `COWORK_HOME=~/.cowork-scripts cowork-server`. The desktop app's server can
+  share `~/.cowork/.env`, and it removes the token line there each time it
+  starts, so a script that reads the token from that file then gets nothing.
+  A server with its own home keeps its own tasks, data and sign-in, and
+  writes its token to `~/.cowork-scripts/.env`.
+- **Self-hosted.** Sign the tester in the way the web app does: Keycloak's
+  authorization-code flow with PKCE, against the client the web app uses.
+  Send the access token it returns, and before each call trade the refresh
+  token for a new one if the access token is about to expire. Password
+  sign-in is off for testers, so a script can't trade an email and password
+  for a token.
 
 Keep keys and tokens out of shell history and logs. The examples read one from
 a file.
@@ -131,6 +137,13 @@ Against a `cowork-server` you started from a terminal, use
 
 ```sh
 AUTH="Authorization: Bearer $(sed -n 's/^COWORK_AUTH_TOKEN=//p' ~/.cowork/.env)"
+```
+
+If you also run the desktop app, start that server with its own home,
+`COWORK_HOME=~/.cowork-scripts cowork-server`, and read the token from there:
+
+```sh
+AUTH="Authorization: Bearer $(sed -n 's/^COWORK_AUTH_TOKEN=//p' ~/.cowork-scripts/.env)"
 ```
 
 ## Full schema

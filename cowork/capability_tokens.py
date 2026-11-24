@@ -18,7 +18,6 @@ Purposes:
 from __future__ import annotations
 
 import hashlib
-import hmac
 import secrets
 import threading
 from dataclasses import dataclass
@@ -56,18 +55,14 @@ def mint(*, purpose: CapabilityPurpose, session_id: str) -> str:
 def verify(*, token: str | None, purpose: CapabilityPurpose) -> CapabilityRecord | None:
     """The record of a live token issued for ``purpose``, or None.
 
-    Every stored hash is compared in constant time, so the answer's timing
-    says nothing about how close a guess came. A token issued for another
-    purpose answers None.
+    The store is keyed by each token's SHA-256 hash, so a lookup's timing
+    depends on the hash of the presented value, never on how close it came to
+    a live token. A token issued for another purpose answers None.
     """
     if not token:
         return None
-    digest = _digest(token=token)
-    found: CapabilityRecord | None = None
     with _lock:
-        for stored, record in _records.items():
-            if hmac.compare_digest(stored, digest):
-                found = record
+        found = _records.get(_digest(token=token))
     if found is None or found.purpose != purpose:
         return None
     return found

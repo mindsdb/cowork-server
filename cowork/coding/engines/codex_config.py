@@ -51,6 +51,21 @@ def persistent_home(cowork_root: Path) -> Path:
     return cowork_root / "codex-home"
 
 
+def prepare_home(*, cowork_root: Path) -> Path:
+    """Create the persistent Codex home, open to this OS user alone, and
+    return it.
+
+    Codex keeps thread rollouts there, and its shell snapshot, which records
+    the session's inference token (``INFERENCE_KEY_ENV``). The mode is set at
+    every start, so a home an earlier start created with the default mode is
+    closed too.
+    """
+    home = persistent_home(cowork_root)
+    home.mkdir(mode=0o700, parents=True, exist_ok=True)
+    home.chmod(0o700)
+    return home
+
+
 def user_skills_root() -> Path:
     """Locate skills installed for the user's regular Codex environment."""
     codex_home = os.environ.get("CODEX_HOME")
@@ -275,7 +290,9 @@ def prepare_launch(config: EngineSessionConfig, workspace: Path, endpoint: str) 
         # default exclusion of *KEY* names, so the policy blanks this one key.
         # A single `set` key merges with a project's own policy, where an
         # `exclude` list would replace the project's list and clash with its
-        # `filters`.
+        # `filters`. Codex's shell snapshot under codex-home still records the
+        # token as `export MINDSHUB_CODEX_API_KEY=...`, so codex-home is open
+        # to this OS user alone (prepare_home).
         f"shell_environment_policy.set.{INFERENCE_KEY_ENV}={toml_string('')}",
     ]
     if config.reasoning_effort:

@@ -333,8 +333,8 @@ def _launched_by_pre_token_desktop() -> bool:
     # host 127.0.0.1 and no COWORK_SERVER_OWNER; every token-aware build sets the
     # owner, and the Docker image binds 0.0.0.0.
     return (
-        os.environ.get("COWORK_SERVER_HOST") == "127.0.0.1"
-        and not os.environ.get("COWORK_SERVER_OWNER")
+        launch_value("COWORK_SERVER_HOST") == "127.0.0.1"
+        and not launch_value("COWORK_SERVER_OWNER")
     )
 
 
@@ -360,10 +360,10 @@ def _env_file_chain() -> list[str]:
     file server about a missing file, and a slow file server would slow every
     one of them.
     """
-    if os.environ.get("COWORK_TENANCY_MODE") == "org":
+    if launch_value("COWORK_TENANCY_MODE") == "org":
         return [".env"]
     files = [str(cowork_home() / ".env"), ".env"]
-    if not os.environ.get("COWORK_HOME"):
+    if not launch_value("COWORK_HOME"):
         # Prod (default home) still consults the legacy file, ordered BEFORE
         # <COWORK_HOME>/.env so the migrated file wins (fresh over stale).
         files.insert(0, str(Path.home() / ".anton" / ".env"))
