@@ -257,7 +257,7 @@ async def test_an_uncertain_manual_run_does_not_suppress_the_next_slot(schedule_
     assert run.status == RunStatus.failed
 
     turns.ending.reason = "completed"
-    assert [slot.slot_at for slot in _poll(schedule_id)] == [SLOT], "the freshness guard counts only successes"
+    assert [slot.slot_at for slot in _poll(schedule_id)] == [SLOT]
 
 
 # --- lastRun -----------------------------------------------------------------
