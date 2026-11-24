@@ -234,8 +234,8 @@ ALLOWLIST = (
     (
         "coding/workspace.py",
         "GitRunner.run",
-        "subprocess.run(git)",
-        "shell-free local Git operations, refused before spawn by _org_mode()",
+        "subprocess.run",
+        "fixed Git command, optionally wrapped by the bundled sandbox for filtered reads; refused in org mode",
     ),
     (
         "server.py",

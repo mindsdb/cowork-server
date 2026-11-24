@@ -258,10 +258,15 @@ def git_metadata(root: Path) -> list[Path]:
     if _org_mode():
         raise WorkspaceError("Local Code Project commands are not available on this deployment")
     paths = [root / ".git"]
-    result = subprocess.run(
-        ["git", "rev-parse", "--absolute-git-dir", "--git-common-dir"],
-        cwd=str(root), capture_output=True, text=True, check=False,
-    )
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "--absolute-git-dir", "--git-common-dir"],
+            cwd=str(root), capture_output=True, text=True, check=False,
+        )
+    except FileNotFoundError:
+        if any(os.path.lexists(folder / ".git") for folder in (root, *root.parents)):
+            raise WorkspaceError("Git is required to protect this repository during validation") from None
+        return paths
     if result.returncode == 0:
         paths.extend((root / line).resolve() for line in result.stdout.splitlines() if line.strip())
     return paths
@@ -303,12 +308,13 @@ def run_sandboxed(
     environment: Mapping[str, str],
     writable: Sequence[Path],
     git: GitDirectories | None = None,
+    read_only: Sequence[Path] = (),
     timeout: int = HOOK_TIMEOUT_SECONDS,
 ) -> subprocess.CompletedProcess[str]:
     if _org_mode():
         raise WorkspaceError("Local Code Project commands are not available on this deployment")
     return subprocess.run(
-        sandboxed_argv(argv, policy, writable, git=git),
+        sandboxed_argv(argv, policy, writable, git=git, read_only=read_only),
         cwd=str(cwd),
         env=sandbox_environment(environment, policy),
         text=True,

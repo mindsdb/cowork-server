@@ -615,7 +615,7 @@ class ProjectWorkspaceManager:
         checkpoints: list[tuple[TaskWorkspace, str]] = []
         try:
             for workspace in repositories:
-                state = self.workspaces.git_state(workspace.source_path, workspace.workspace_path)
+                state = self.workspaces.git_state(workspace.source_path, workspace.workspace_path, policy)
                 if state.dirty:
                     checkpoint = self.workspaces.commit_checkpoint(workspace.workspace_path)
                     checkpoints.append((workspace, checkpoint))
@@ -631,7 +631,7 @@ class ProjectWorkspaceManager:
                     "Some repository commits could not be restored; open the task workspaces to recover them: "
                     + "; ".join(failures)
                 ) from exc
-            reason = str(exc).strip().splitlines()[0][:300] if str(exc).strip() else ""
+            reason = str(exc).strip()[:4_000]
             raise WorkspaceError(
                 "No repositories were committed"
                 + (f": {reason}" if reason else "")

@@ -300,6 +300,8 @@ def test_staging_is_sandboxed_and_the_commit_is_recorded_on_the_host(
 
     [staging] = [argv for argv in calls if argv[-2:] == ["add", "--all"]]
     assert staging[1] == "sandbox"
+    [status] = [argv for argv in calls if "status" in argv]
+    assert status[1] == "sandbox"
     [recording] = [argv for argv in calls if "commit-tree" in argv]
     assert recording[0] == "git"
     assert not any(argv[0] == "git" and "commit" in argv for argv in calls)
@@ -389,6 +391,8 @@ def test_local_task_preserves_control_file_in_existing_linked_worktree(
     original_head = git(worktree, "rev-parse", "HEAD")
 
     def concurrent_edit(argv, **kwargs):
+        if "status" in argv:
+            return subprocess.CompletedProcess(argv, 0, stdout=" M README.md\n", stderr="")
         control_file.write_text("# user's configuration\n", encoding="utf-8")
         return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
 
@@ -638,3 +642,78 @@ def test_the_signing_program_runs_outside_the_task_folder(tmp_path: Path) -> Non
     ran_in = Path(marker.read_text(encoding="utf-8").strip())
     assert repo.resolve() != ran_in and repo.resolve() not in ran_in.parents
     assert "gpgsig" in git(repo, "cat-file", "commit", "HEAD")
+
+
+@pytest.mark.skipif(os.name == "nt", reason="the filter is a POSIX shell script")
+def test_project_commit_preserves_filters_and_runs_both_status_checks_with_task_environment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repo = repository(tmp_path / "repo")
+    manager = ProjectWorkspaceManager(WorkspaceManager(tmp_path / "coding"))
+    project = CodeProject(id="project", name="Project", folders=[ProjectFolder(id="app", name="App", path=str(repo))])
+    prepared = manager.prepare_in_place("task", project)
+    checks = manager.check_policy("project", PermissionMode.full_access, False)
+    script = repo / "normalize"
+    script.write_text("#!/bin/sh\ntr a-z A-Z\n", encoding="utf-8")
+    script.chmod(0o755)
+    git(repo, "config", "filter.normalize.clean", "./normalize")
+    (repo / ".gitattributes").write_text("*.txt filter=normalize\n", encoding="utf-8")
+    (repo / "note.txt").write_text("lowercase\n", encoding="utf-8")
+    monkeypatch.setenv("COWORK_TEST_SECRET", "server-only")
+    calls = []
+    real_run = subprocess.run
+
+    def record(argv, **kwargs):
+        if "status" in argv or argv[-2:] == ["add", "--all"]:
+            calls.append("status" if "status" in argv else "add")
+            assert "COWORK_TEST_SECRET" not in kwargs["env"]
+        return real_run(argv, **kwargs)
+
+    monkeypatch.setattr(subprocess, "run", record)
+    manager.commit(list(prepared.workspaces), "Normalize", checks)
+    assert calls == ["status", "add", "status"]
+    assert git(repo, "show", "HEAD:note.txt") == "LOWERCASE"
+
+    hook(repo, "pre-commit", "echo 'README.md needs formatting' >&2\nexit 1\n")
+    (repo / "README.md").write_text("change\n", encoding="utf-8")
+    with pytest.raises(WorkspaceError, match="README.md needs formatting"):
+        manager.commit(list(prepared.workspaces), "Rejected", checks)
+    assert git(repo, "log", "-1", "--format=%s") == "Normalize"
+
+
+def test_validation_in_plain_folder_without_git(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("PATH", str(tmp_path))
+    workspace = TaskWorkspace(
+        folder_id="app", folder_name="App", source_path=str(tmp_path), workspace_path=str(tmp_path),
+        workspace_kind=WorkspaceKind.direct_folder,
+    )
+    command = ProjectCommand(id="check", label="Check", phase="validate", argv=[sys.executable, "-c", "print('ok')"])
+    policy = CheckPolicy.for_task(PermissionMode.full_access, False)
+    result = ProjectCommandRunner._run_one(command, workspace, {}, policy)
+    assert result.return_code == 0, result.output
+
+
+@requires_sandbox
+def test_filtered_git_reads_use_read_only_sandbox_and_can_export_patch(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    repo = repository(tmp_path / "repo")
+    git(repo, "config", "filter.normalize.clean", "tr a-z A-Z")
+    (repo / ".gitattributes").write_text("README.md filter=normalize\n", encoding="utf-8")
+    (repo / "README.md").write_text("changed\n", encoding="utf-8")
+    manager = WorkspaceManager(tmp_path / "manager")
+    monkeypatch.setenv("COWORK_TEST_SECRET", "server-only")
+    real_run = subprocess.run
+    reads = []
+
+    def record(argv, **kwargs):
+        if "status" in argv or "diff" in argv:
+            assert argv[1] == "sandbox"
+            assert "COWORK_TEST_SECRET" not in kwargs["env"]
+            reads.append(argv)
+        return real_run(argv, **kwargs)
+
+    monkeypatch.setattr(subprocess, "run", record)
+    assert manager.git_state(str(repo), str(repo)).dirty
+    patch = tmp_path / "review.patch"
+    manager.git.run(repo, "diff", f"--output={patch}", "HEAD", "--", "README.md", environment={"COWORK_TEST_SECRET": "private"})
+    assert "+CHANGED" in patch.read_text()
+    assert len(reads) == 2
