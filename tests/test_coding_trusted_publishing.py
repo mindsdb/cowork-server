@@ -164,3 +164,53 @@ def test_publishing_refuses_git_lfs_rather_than_pushing_pointer_files(ready_task
     assert records[0].status == "failed"
     assert "Git LFS" in records[0].detail
     assert output(ready_task.remote, "for-each-ref") == ""
+
+
+def test_publishing_refuses_a_detached_confirmed_commit(ready_task) -> None:
+    item = ready_task.service.delivery_plan(ready_task.task.id).items[0]
+    git(ready_task.workspace, "checkout", "--detach", item.head_revision)
+    plan = ready_task.service.delivery_plan(ready_task.task.id).items[0]
+    assert plan.status == "unavailable"
+    assert plan.task_branch is None
+
+    integrations = Integrations()
+    records = ready_task.service.create_draft_pull_requests(
+        ready_task.task.id,
+        DraftPullRequestRequest(title="Delivery", drafts=[confirm(item)], confirmed=True),
+        integrations,  # type: ignore[arg-type]
+    )
+    assert records[0].status == "failed"
+    assert integrations.pushes == []
+    assert output(ready_task.remote, "for-each-ref") == ""
+
+
+@pytest.mark.parametrize("already_published", [False, True])
+def test_publishing_checks_lfs_pointers_in_outgoing_history(ready_task, already_published: bool) -> None:
+    workspace = ready_task.workspace
+    pointer = workspace / "asset.bin"
+    attributes = workspace / ".gitattributes"
+    pointer.write_text("version https://git-lfs.github.com/spec/v1\noid sha256:" + "a" * 64 + "\nsize 64\n")
+    attributes.write_text("*.bin filter=lfs -text\n")
+    ready_task.service.commit(ready_task.task.id, "Track asset")
+    pointer.unlink()
+    attributes.unlink()
+    ready_task.service.commit(ready_task.task.id, "Remove asset and tracking rule")
+    if already_published:
+        git(workspace, "push", "--no-verify", "origin", "HEAD:refs/heads/base")
+    (workspace / "README.md").write_text("ready for delivery\n")
+    ready_task.service.commit(ready_task.task.id, "Finish task")
+    item = ready_task.service.delivery_plan(ready_task.task.id).items[0]
+    integrations = Integrations()
+    records = ready_task.service.create_draft_pull_requests(
+        ready_task.task.id,
+        DraftPullRequestRequest(title="Delivery", drafts=[confirm(item)], confirmed=True),
+        integrations,  # type: ignore[arg-type]
+    )
+    if already_published:
+        assert records[0].status == "published", records[0].detail
+        assert output(ready_task.remote, "rev-parse", item.task_branch) == item.head_revision
+    else:
+        assert records[0].status == "failed"
+        assert "Git LFS" in records[0].detail
+        assert integrations.drafts == []
+        assert output(ready_task.remote, "for-each-ref") == ""

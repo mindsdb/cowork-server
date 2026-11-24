@@ -18,6 +18,11 @@ from cowork.coding.project_models import (
 from cowork.coding.workspace import GitRunner, WorkspaceError
 
 _REVISION = re.compile(r"^[0-9a-f]{40}([0-9a-f]{24})?$")
+_LFS_POINTER = re.compile(
+    r"^[0-9a-f]+ blob [0-9]+\nversion https://(?:git-lfs\.github\.com|hawser\.github\.com)/spec/v1\n"
+    r"(?:ext-[^\n]+\n)*oid sha256:[0-9a-f]{64}\nsize [0-9]+(?:\n|$)",
+    re.MULTILINE,
+)
 
 
 class ProjectDeliveryService:
@@ -65,7 +70,7 @@ class ProjectDeliveryService:
                 "origin",
                 check=False,
             ).stdout.strip() or None
-            branch = state[0] or workspace.task_branch
+            branch = state[0]
             base_branch = workspace.base_branch or self._source_branch(workspace.source_path)
             commits = self._commit_count(workspace.workspace_path, workspace.base_revision)
             existing = published.get(workspace.folder_id)
@@ -82,13 +87,15 @@ class ProjectDeliveryService:
                         )
                     except WorkspaceError as exc:
                         status_error = str(exc)[:2_000]
+            elif not branch:
+                status, detail = "unavailable", "Check out the task branch before creating its draft pull request"
             elif state[1]:
                 status, detail = "needs_commit", "Commit this folder's changes before creating its draft pull request"
             elif commits == 0:
                 status, detail = "no_changes", "No committed task changes"
             elif not remote:
                 status, detail = "unavailable", "Add an origin remote before creating a draft pull request"
-            elif not branch or not base_branch:
+            elif not base_branch:
                 status, detail = "unavailable", "The task or base branch could not be determined"
             else:
                 status, detail = "ready", ""
@@ -213,10 +220,13 @@ class ProjectDeliveryService:
                 raise WorkspaceError("The commit to publish is no longer in the task's repository")
             # Without the pre-push hook Git LFS never uploads file contents,
             # and the branch would land with pointer files in their place.
-            if self.git.run(
+            attributes = self.git.run(
                 clean, "grep", "--quiet", "-e", "filter=lfs", revision, "--", ":(glob)**/.gitattributes",
                 check=False,
-            ).returncode == 0:
+            )
+            if attributes.returncode not in (0, 1):
+                raise WorkspaceError("Could not check Git LFS tracking before publishing")
+            if attributes.returncode == 0 or self._outgoing_lfs_pointer(clean, revision, remote_url, environment):
                 raise WorkspaceError(
                     "This repository uses Git LFS, which Code mode can't publish yet. "
                     "Push the task branch yourself, then create the pull request."
@@ -231,6 +241,30 @@ class ProjectDeliveryService:
                 f"{revision}:refs/heads/{branch}",
                 environment=environment,
             )
+
+    def _outgoing_lfs_pointer(self, clean: Path, revision: str, remote_url: str, environment: dict[str, str]) -> bool:
+        # Only subtract tips the destination advertises and we can traverse locally.
+        refs = self.git.run(clean, "ls-remote", "--heads", "--", remote_url, environment=environment).stdout
+        tips = {line.split("\t", 1)[0] for line in refs.splitlines()}
+        tips = {tip for tip in tips if _REVISION.fullmatch(tip)}
+        revisions = [revision]
+        if tips:
+            known = self.git.run(
+                clean, "cat-file", "--batch-check=%(objectname) %(objecttype)", input_text="\n".join(tips) + "\n",
+            )
+            revisions.extend("^" + line.split()[0] for line in known.stdout.splitlines() if line.endswith(" commit"))
+
+        # Git LFS pointers fit in 1 KiB. Walk all parents, including merged
+        # branches, and read only small blobs, in bounded batches.
+        blobs = self.git.run(
+            clean, "rev-list", "--objects", "--no-object-names", "--filter-provided-objects", "--filter=object:type=blob",
+            "--filter=blob:limit=1025", "--stdin", input_text="\n".join(revisions) + "\n",
+        ).stdout.splitlines()
+        for start in range(0, len(blobs), 256):
+            batch = self.git.run(clean, "cat-file", "--batch", input_text="\n".join(blobs[start:start + 256]) + "\n")
+            if _LFS_POINTER.search(batch.stdout):
+                return True
+        return False
 
     def _state(self, workspace_path: str) -> tuple[str | None, bool, str | None]:
         root = self._path(workspace_path)
