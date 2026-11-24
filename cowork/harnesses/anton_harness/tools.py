@@ -41,6 +41,7 @@ from cowork.services.connectors.custom_connectors import (
     NEEDS_REBUILD_FOR_AGENT,
     UnstorableFormError,
     check_handcrafted_form,
+    custom_test_is_code_checked,
     handcrafted_form_allowed,
     has_test_requests,
     scope_is_one_persons,
@@ -935,7 +936,7 @@ async def _cowork_request_credentials(session: Any, tc_input: dict) -> str:
         known=known is not None, custom=custom, extends=extends_name is not None,
         stored_test_request=stored_test_request,
     )
-    if spec.get("_connector_id") and stored_test_request is False and not tenant_scope_required():
+    if spec.get("_connector_id") and stored_test_request is False and custom_test_is_code_checked():
         return f"request_credentials: {NEEDS_REBUILD_FOR_AGENT.format(connector_id=connector_id)}"
     if not spec.get("_connector_id") and not handcrafted:
         return (

@@ -6,16 +6,11 @@ import re
 from types import SimpleNamespace
 
 import pytest
-from anton.core.datasources.data_vault import LocalDataVault
 
-from cowork.db.scoped import LOCAL_SCOPE, TenantScope
+from cowork.db.scoped import LOCAL_SCOPE
 from cowork.handlers import probe as probe_handler
-from cowork.services.connectors.custom_connectors import USAGE_NOTES_MAX
 from cowork.services.connectors.probe import CredentialProbe, ProbeOutcome
-from cowork.services.connectors.specs._registry import registry
 from cowork.services.connectors.submissions import SubmissionStore
-
-pytestmark = pytest.mark.usefixtures("self_hosted_probe")
 
 
 def _prompt(**kw):
@@ -152,18 +147,9 @@ def test_handler_hands_the_resolved_notes_to_the_probe(monkeypatch):
 
 
 _FORM_NOTES = "Token: POST /oauth2/token. Data: POST /integration/V1/query with a QueryString body."
-_ORG_SCOPE = TenantScope(org_mode=True, org_id="org-notes", user_id="user-notes")
 
 
-def _handcrafted(notes=None, **extra) -> dict:
-    form = {"form_id": "fm_planning", "engine": "planning_api", "title": "Planning", "fields": [], **extra}
-    if notes is not None:
-        form["connector"] = {"label": "Planning", "usage_notes": notes}
-    return form
-
-
-def _probe_kwargs(monkeypatch, *, connector_id, form_spec, catalog=(None, False), scope=LOCAL_SCOPE,
-                  vault=None, custom_spec=None) -> dict:
+def _probe_kwargs(monkeypatch, *, connector_id, form_spec, catalog=(None, False)) -> dict:
     """Run one staged submission through ProbeHandler with a recording probe
     that fails at once, so nothing is saved. ``catalog`` is what
     ``_usage_notes`` answers; it already turns a catalog read error into
@@ -193,19 +179,16 @@ def _probe_kwargs(monkeypatch, *, connector_id, form_spec, catalog=(None, False)
     )
     monkeypatch.setattr("cowork.services.providers.web_tool_kwargs_for", lambda _provider: {})
     monkeypatch.setattr("anton.workspace.Workspace", lambda path: SimpleNamespace(path=path))
-    if vault is not None:
-        monkeypatch.setattr(probe_handler, "vault_for_scope", lambda _scope: vault)
     store = SubmissionStore()
     monkeypatch.setattr(probe_handler, "store", store)
     submission_id = store.stage(
         form_id=form_spec["form_id"], connector_id=connector_id, conversation_id=None,
         values={"client_id": "cid", "client_secret": "secret"}, form_spec=form_spec,
-        custom_spec=custom_spec, checked_against_stored_spec=custom_spec is not None,
     )
 
     async def drain():
         return [
-            chunk async for chunk in probe_handler.ProbeHandler(scope=scope).run(
+            chunk async for chunk in probe_handler.ProbeHandler(scope=LOCAL_SCOPE).run(
                 submission_id, connector_id, None, "", None
             )
         ]
@@ -213,56 +196,6 @@ def _probe_kwargs(monkeypatch, *, connector_id, form_spec, catalog=(None, False)
     asyncio.run(drain())
     assert len(created) == 1
     return created[0]
-
-
-def test_a_handcrafted_form_hands_its_own_notes_to_the_probe(monkeypatch):
-    kwargs = _probe_kwargs(monkeypatch, connector_id="planning_api", form_spec=_handcrafted(f"  {_FORM_NOTES}\n"))
-
-    assert kwargs["usage_notes"] == _FORM_NOTES
-    assert kwargs["notes_define_pass"] is False
-
-
-@pytest.mark.parametrize(
-    "notes", [None, "   ", 42, "x" * (USAGE_NOTES_MAX + 1)], ids=["absent", "blank", "not_text", "over_cap"],
-)
-def test_a_handcrafted_form_without_usable_notes_gives_the_probe_none(monkeypatch, notes):
-    form = _handcrafted() if notes is None else _handcrafted(notes)
-
-    kwargs = _probe_kwargs(monkeypatch, connector_id="planning_api", form_spec=form)
-
-    assert kwargs["usage_notes"] is None
-    assert kwargs["notes_define_pass"] is False
-
-
-def test_a_handcrafted_form_in_org_mode_hands_its_own_notes_to_the_probe(monkeypatch):
-    kwargs = _probe_kwargs(
-        monkeypatch, connector_id="planning_api", form_spec=_handcrafted(_FORM_NOTES), scope=_ORG_SCOPE,
-    )
-
-    assert kwargs["usage_notes"] == _FORM_NOTES
-    assert kwargs["notes_define_pass"] is False
-
-
-def test_stored_notes_win_over_a_handcrafted_forms_own(monkeypatch):
-    # Guard, passes on base too: an extends step on a stored custom id in a
-    # one-person scope, where the catalog has notes. Catches a fallback that overrides them.
-    kwargs = _probe_kwargs(
-        monkeypatch, connector_id="planning_api", form_spec=_handcrafted(_FORM_NOTES),
-        catalog=("STORED-NOTES", False),
-    )
-
-    assert kwargs["usage_notes"] == "STORED-NOTES"
-
-
-def test_an_extends_step_on_an_unknown_id_hands_its_own_notes_to_the_probe(monkeypatch, tmp_path):
-    vault = LocalDataVault(tmp_path / "vault")
-    vault.save("planning_api", "planning", {"base_url": "https://planning.example.com"})
-    form = _handcrafted(_FORM_NOTES, _extends_connection="planning", _existing_name="planning")
-
-    kwargs = _probe_kwargs(monkeypatch, connector_id="planning_api", form_spec=form, vault=vault)
-
-    assert kwargs["usage_notes"] == _FORM_NOTES
-    assert kwargs["notes_define_pass"] is False
 
 
 def test_a_stamped_built_in_submission_ignores_notes_in_its_submitted_form(monkeypatch):
@@ -273,15 +206,3 @@ def test_a_stamped_built_in_submission_ignores_notes_in_its_submitted_form(monke
 
     assert kwargs["usage_notes"] == "NOTE-langfuse"
     assert kwargs["notes_define_pass"] is True
-
-
-def test_a_stored_custom_connector_submission_ignores_notes_in_its_submitted_form(monkeypatch):
-    # Guard, passes on base too: a staged custom spec replaces the submitted
-    # form, and ConnectorForm keeps no `connector` block, so no notes survive.
-    stored = registry.get_connector("langfuse").model_dump()
-
-    kwargs = _probe_kwargs(
-        monkeypatch, connector_id="planning_api", form_spec=_handcrafted(_FORM_NOTES), custom_spec=stored,
-    )
-
-    assert kwargs["usage_notes"] is None

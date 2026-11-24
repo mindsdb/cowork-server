@@ -15,6 +15,7 @@ import pytest
 from cowork.services.connectors import custom_connect, egress
 from tests import test_custom_connect as connect
 from tests import test_pinned_get_request as pinned
+from tests._tls_origin import certificates
 
 SECRET = connect.SECRET
 _client = connect._client
@@ -162,7 +163,7 @@ async def _guarded_echo_origin(reader, writer):
 @pytest.fixture
 async def guarded_origin(tmp_path, monkeypatch):
     """A local TLS origin that wants the key, reached through the real per-send transport."""
-    server_context, client_context = pinned._certificates(tmp_path)
+    server_context, client_context, _ca_file = certificates(tmp_path, pinned._HOST)
     server = await asyncio.start_server(_guarded_echo_origin, "127.0.0.1", 0, ssl=server_context)
     port = server.sockets[0].getsockname()[1]
     monkeypatch.setattr(egress, "_RESOLVER", pinned._resolve_to("127.0.0.1", port))

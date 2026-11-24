@@ -20,6 +20,7 @@ from pydantic import ValidationError
 from sqlalchemy import false
 from sqlalchemy.exc import IntegrityError
 
+from cowork.common.settings.app_settings import get_app_settings
 from cowork.db.personal_resources import PersonalResource
 from cowork.db.scoped import ScopedSelect, ScopedSession, TenantScope, tenant_scope_required
 from cowork.models.custom_connector import CustomConnector
@@ -56,6 +57,24 @@ class UnstorableFormError(ValueError):
     """A handcrafted form that cannot be kept as a custom connector."""
 
 
+#: What a custom connector's form is answered with in org mode, where nothing tests one.
+NO_CUSTOM_IN_ORG = (
+    "Custom connectors cannot be connected in an organization yet. "
+    "Use a connector from Connect Apps and Data."
+)
+
+
+def custom_test_is_code_checked() -> bool:
+    """Whether a custom connector's connection test is decided by code, from
+    what its test request returned, and not by the model probe.
+
+    True on every local-tenancy deployment, in every scope: a single-user
+    install and one that trusts identity headers alike. False in org mode,
+    which refuses custom forms before anything is tested.
+    """
+    return get_app_settings().tenancy_mode != "org"
+
+
 def handcrafted_form_allowed(
     *, known: bool, custom: bool, extends: bool, stored_test_request: bool | None,
 ) -> bool:
@@ -79,7 +98,7 @@ def handcrafted_form_allowed(
     """
     if not known or (custom and extends):
         return True
-    return custom and stored_test_request is False and not tenant_scope_required()
+    return custom and stored_test_request is False and custom_test_is_code_checked()
 
 
 def test_request_for(form_spec: dict[str, Any], method: str | None) -> dict[str, Any] | None:
@@ -151,8 +170,7 @@ def check_handcrafted_form(form_spec: dict[str, Any]) -> None:
             "connector.usage_notes looks like it holds a credential value. "
             "Say how to authenticate (header name, scheme) without the value."
         )
-    # Self-hosted and org mode keep the model probe until their own milestone.
-    if not tenant_scope_required():
+    if custom_test_is_code_checked():
         check_test_requests(form_spec)
 
 

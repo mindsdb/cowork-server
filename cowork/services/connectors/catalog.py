@@ -11,11 +11,16 @@ from typing import Any
 
 from anton.utils.datasources import scrub_output
 
-from cowork.db.scoped import ScopedSession, tenant_scope_required
+from cowork.db.scoped import ScopedSession
 from cowork.models.custom_connector import CustomConnector
 from cowork.schemas.connectors import ConnectorSpecResponse
 from cowork.services.connectors.custom_connect import auth_summary, parse_stored
-from cowork.services.connectors.custom_connectors import has_test_requests, scope_definitions, scope_is_one_persons
+from cowork.services.connectors.custom_connectors import (
+    custom_test_is_code_checked,
+    has_test_requests,
+    scope_definitions,
+    scope_is_one_persons,
+)
 from cowork.services.connectors.custom_mcp import is_custom_mcp
 from cowork.services.connectors.specs._registry import ConnectorSpecRegistry, registry
 
@@ -44,7 +49,7 @@ def custom_connector_spec(row: CustomConnector) -> dict[str, Any]:
         "custom": True,
         # Saved before connection tests existed: a single-user install shows
         # the member the rebuild text instead of a form that cannot pass.
-        "needs_rebuild": not tenant_scope_required() and not has_test_requests(dict(row.spec)),
+        "needs_rebuild": custom_test_is_code_checked() and not has_test_requests(dict(row.spec)),
         "usage_notes": row.usage_notes,
         "form": dict(row.spec),
         "check": {"path": template.path} if (template := parse_stored(row)) else None,

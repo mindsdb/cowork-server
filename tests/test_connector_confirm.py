@@ -17,12 +17,14 @@ from pathlib import Path
 import httpx
 import pytest
 from fastapi import HTTPException
+from fastapi.testclient import TestClient
 from sqlmodel import Session, select
 
 from cowork.api.v1.endpoints.connectors import submissions as submissions_endpoint
 from cowork.api.v1.endpoints.connectors.submissions import allow_private_route, cancel_route, confirm_route
-from cowork.api.v1.permissions import SingleUserOnly
+from cowork.api.v1.permissions import DesktopOnly, SingleUserOnly
 from cowork.api.v1.route_walker import declared_permissions
+from cowork.common.settings.app_settings import get_app_settings
 from cowork.db.scoped import LOCAL_SCOPE, TenantScope
 from cowork.models.custom_connector import CustomConnector
 from cowork.schemas.connectors import ConnectorTestAnswer
@@ -70,19 +72,55 @@ class TestThePendingStore:
         assert store.pop(other, "confirm", OTHER_SCOPE) is not None
 
 
-class TestTheRoutesRunOnlyOnASingleUserInstall:
-    @pytest.mark.parametrize("path", ["/allow-private", "/confirm", "/cancel"])
-    def test_each_route_declares_single_user_only(self, path):
+class TestWhoMayAnswerATest:
+    """A person allows a private address only on their own install. Confirm
+    and cancel answer wherever a custom connector is tested, each scope for
+    its own test (TestTheStore, and the shared deployment tests in
+    test_probe_test_request.py)."""
+
+    @pytest.mark.parametrize(("path", "permission"), [
+        ("/allow-private", SingleUserOnly), ("/confirm", DesktopOnly), ("/cancel", DesktopOnly),
+    ])
+    def test_each_route_declares_who_may_call_it(self, path, permission):
         [route] = [r for r in create_app().routes if getattr(r, "path", "") == f"/api/v1/connectors/submissions{path}"]
-        assert SingleUserOnly in declared_permissions(route)
+        assert permission in declared_permissions(route)
 
-    def test_the_guard_refuses_a_shared_deployment(self, monkeypatch):
-        from cowork.api.v1.endpoints import guards
+    @pytest.fixture
+    def shared_client(self, personal_deployment, tmp_path, monkeypatch):
+        monkeypatch.setenv("COWORK_HOME", str(tmp_path / "home"))
+        get_app_settings.cache_clear()
+        return TestClient(create_app())
 
-        monkeypatch.setattr("cowork.db.scoped.tenant_scope_required", lambda: True)
-        with pytest.raises(HTTPException) as exc:
-            guards.require_single_user()
-        assert exc.value.status_code == 403
+    @pytest.fixture
+    def org_client(self, org_deployment, tmp_path, monkeypatch):
+        monkeypatch.setenv("COWORK_HOME", str(tmp_path / "home"))
+        get_app_settings.cache_clear()
+        return TestClient(create_app())
+
+    UNKNOWN = {"confirm_id": "no-such-test"}
+    PERSON = {"X-User-Id": "11111111-1111-4111-8111-111111111111", "X-Organization-Id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"}
+
+    def _shared(self, client, path, body):
+        headers = {"Authorization": "Bearer personal-deployment-test-token", **self.PERSON}
+        return client.post(f"/api/v1/connectors/submissions{path}", json=body, headers=headers)
+
+    def test_allowing_a_private_address_is_refused_on_a_shared_deployment(self, shared_client):
+        response = self._shared(shared_client, "/allow-private", {"approval_id": "no-such-test"})
+        assert response.status_code == 403
+
+    def test_confirm_runs_on_a_shared_deployment(self, shared_client):
+        response = self._shared(shared_client, "/confirm", self.UNKNOWN)
+        assert response.status_code == 404
+
+    def test_cancel_runs_on_a_shared_deployment(self, shared_client):
+        response = self._shared(shared_client, "/cancel", self.UNKNOWN)
+        assert response.status_code == 204
+
+    @pytest.mark.parametrize("path", ["/confirm", "/cancel"])
+    def test_confirm_and_cancel_are_refused_in_org_mode(self, org_client, path):
+        """DesktopOnly's require_local_tenancy gives the 403, before the body is read."""
+        response = org_client.post(f"/api/v1/connectors/submissions{path}", json=self.UNKNOWN, headers=self.PERSON)
+        assert response.status_code == 403
 
 
 def _normal(value):

@@ -191,7 +191,6 @@ class CredentialProbe:
         usage_notes: str | None = None,
         notes_define_pass: bool = False,
         web_tool_kwargs: WebToolKwargs | None = None,
-        saved_fields: list[str] | None = None,
         cell_sandbox: CellSandbox | None = None,
     ) -> None:
         self.engine = engine
@@ -210,9 +209,6 @@ class CredentialProbe:
         # The caller captures this alongside llm_client. Never re-read settings
         # here: the provider may have changed since the client was constructed.
         self.web_tool_kwargs: WebToolKwargs = {**(web_tool_kwargs or {})}
-        # Fields an earlier step saved on the connection being extended: in the
-        # .env with the rest, but not in this step's form.
-        self.saved_fields = list(saved_fields or [])
         # The policy its cells run under (cowork.code_sandbox), None with the
         # sandbox off. Set, the credentials reach the cell as its DS_* through
         # CandidateCredentialsVault instead of a plaintext file.
@@ -413,14 +409,6 @@ class CredentialProbe:
             quirks_rule = _UNTRUSTED_NOTES_RULE.format(begin=notes_begin, end=notes_end)
         else:
             quirks_rule = ""
-        saved = (
-            f"——— ALREADY SAVED ON THIS CONNECTION ———\n"
-            f"{', '.join(f'`{n}`' for n in self.saved_fields)} came from an earlier "
-            f"step and are in the .env file too. They are NOT in this form: never "
-            f"request them, and never call `set_field_status` or `remove_field` "
-            f"for them.\n\n"
-            if self.saved_fields else ""
-        )
         return (
             f"You are a connection prober for `{self.engine}`. Your only job is "
             f"to determine if the credentials we just collected actually "
@@ -437,7 +425,6 @@ class CredentialProbe:
             f"remove_field, request_extra_field) take a `method_id` "
             f"parameter — pass the method whose fields you're touching.\n\n"
             f"{roster}\n\n"
-            f"{saved}"
             f"{quirks}"
             f"——— STEPS (follow in order) ———\n"
             f"1. Call `set_status` with a short message like \"Loading credentials…\".\n"

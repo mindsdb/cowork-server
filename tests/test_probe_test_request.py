@@ -7,6 +7,7 @@ saved if anything still trusts the model.
 """
 from __future__ import annotations
 
+import base64
 import copy
 import json
 from pathlib import Path
@@ -18,18 +19,20 @@ import pytest
 from fastapi import HTTPException
 from anton.core.datasources.data_vault import LocalDataVault
 from sqlalchemy.pool import StaticPool
-from sqlmodel import Session, SQLModel, create_engine
+from sqlmodel import Session, SQLModel, create_engine, select
 
 from cowork.api.v1.endpoints.connectors import submissions as submissions_endpoint
 from cowork.common.settings.app_settings import get_app_settings
-from cowork.db.scoped import LOCAL_SCOPE, ScopedSession
+from cowork.common.settings.user_settings import use_settings_scope
+from cowork.db.personal_resources import ALL_PERSONAL_RESOURCES, PersonalResource
+from cowork.db.scoped import LOCAL_SCOPE, MissingTenantScopeError, ScopedSession, TenantScope
 from cowork.handlers import probe as probe_handler
 from cowork.harnesses.anton_harness import tools
 from cowork.models.custom_connector import CustomConnector
 from cowork.services.connectors import catalog as catalog_module
 from cowork.services.connectors import connector_test_flow, connector_test_run
 from cowork.services.connectors.catalog import ConnectorCatalog
-from cowork.schemas.connectors import SubmitFormRequest
+from cowork.schemas.connectors import ConnectorTestAnswer, SubmitFormRequest
 from cowork.services.connectors.probe import ProbeOutcome
 from cowork.services.connectors.submissions import store
 
@@ -180,6 +183,17 @@ class TestTheModelNoLongerDecides:
         assert saved.vault.list_connections() == [] and ModelSaysYes.built == 0 and api.requests == []
         [done] = of(events, "response.completed")
         assert done["response"]["status"] == "failed"
+
+    @pytest.mark.asyncio
+    async def test_in_org_mode_a_custom_connector_is_refused_and_no_model_starts(self, api, saved, monkeypatch):
+        monkeypatch.setattr(probe_handler, "custom_test_is_code_checked", lambda: False)
+
+        events = await connect(PLANNER_FORM, VALUES, saved)
+
+        assert saved.vault.list_connections() == [] and ModelSaysYes.built == 0 and api.requests == []
+        [done] = of(events, "response.completed")
+        assert done["response"]["status"] == "failed"
+        assert "cannot be connected in an organization" in json.dumps(events)
 
     @pytest.mark.asyncio
     async def test_a_built_in_connector_still_runs_the_model_probe(self, api, saved):
@@ -335,18 +349,69 @@ class TestStoredCustomConnectors:
         assert done["response"]["status"] == "retry"
 
 
-class TestSelfHostedKeepsTheModelProbe:
+def _follow_up(slug: str) -> dict:
+    return {
+        "form_id": "fm_bbbbbbbbbb", "engine": "planner", "title": "Finish",
+        "fields": [{"name": "client_secret", "label": "Client secret", "type": "password", "secret": True}],
+        "_extends_connection": slug, "test_request": copy.deepcopy(PLANNER_FORM["test_request"]),
+    }
+
+
+def _confirm_id(events) -> str:
+    [preview] = of(events, "connector.test_preview")
+    return preview["confirm_id"]
+
+
+class TestAFollowUpStepKeepsOneConnection:
     @pytest.mark.asyncio
-    @pytest.mark.usefixtures("self_hosted_probe")
-    async def test_a_stamped_stored_custom_connector_still_runs_the_model_probe(self, api, saved):
-        old = {k: v for k, v in PLANNER_FORM.items() if k not in ("test_request", "engine", "connector")}
-        custom_spec = {"id": "planner", "label": "Planner", "description": "", "category": "other",
-                       "custom": True, "form": old}
+    async def test_a_resubmitted_field_is_tested_with_its_new_value(self, api, saved):
+        saved.vault.save("planner", "planner-1", {"client_id": "planner-client", "client_secret": SECRET}, secure_keys=["client_secret"])
+        _stored(saved.engine, {k: v for k, v in PLANNER_FORM.items() if k not in ("engine", "connector")})
 
-        await connect(old, VALUES, saved, custom_spec=custom_spec)
+        await connect(_follow_up("planner-1"), {"client_secret": "rotated-secret"}, saved)
 
-        assert ModelSaysYes.built == 1 and api.requests == []
-        assert len(saved.vault.list_connections()) == 1
+        sent = base64.b64decode(api.requests[0].headers["authorization"].removeprefix("Basic ")).decode()
+        assert sent == "planner-client:rotated-secret"
+
+    @pytest.mark.asyncio
+    async def test_extending_a_missing_connection_fails_before_any_test(self, api, saved):
+        events = await connect(_follow_up("planner-gone"), {"client_secret": SECRET}, saved)
+
+        assert api.requests == [] and ModelSaysYes.built == 0
+        assert saved.vault.list_connections() == []
+        [done] = of(events, "response.completed")
+        assert done["response"]["status"] == "failed"
+        assert "No planner connection named 'planner-gone'" in json.dumps(events)
+
+    @pytest.mark.asyncio
+    async def test_a_connection_that_cannot_be_read_fails_on_the_form(self, api, saved, monkeypatch):
+        def no_scope(scope):
+            raise MissingTenantScopeError("no organization in scope")
+
+        monkeypatch.setattr(probe_handler, "vault_for_scope", no_scope)
+
+        events = await connect(_follow_up("planner-1"), {"client_secret": SECRET}, saved)
+
+        assert api.requests == []
+        [done] = of(events, "response.completed")
+        assert done["response"]["status"] == "failed"
+        assert "Could not read `planner-1`" in json.dumps(events)
+
+    @pytest.mark.asyncio
+    async def test_only_the_first_step_saves_the_connector_definition(self, api, saved):
+        first = await connect(PLANNER_FORM, VALUES, saved)
+        slug = (await submissions_endpoint.confirm_route(ConnectorTestAnswer(confirm_id=_confirm_id(first)), LOCAL_SCOPE))["saved_slug"]
+        with Session(saved.engine) as session:
+            [row] = session.exec(select(CustomConnector)).all()
+            definition = copy.deepcopy(row.spec)
+
+        second = await connect(_follow_up(slug), {"client_secret": "rotated-secret"}, saved)
+        await submissions_endpoint.confirm_route(ConnectorTestAnswer(confirm_id=_confirm_id(second)), LOCAL_SCOPE)
+
+        assert [c["name"] for c in saved.vault.list_connections()] == [slug]
+        with Session(saved.engine) as session:
+            [row] = session.exec(select(CustomConnector)).all()
+        assert row.spec == definition
 
 
 class TestAnOldConnectorCanBeBuiltAgain:
@@ -388,32 +453,185 @@ class TestAnOldConnectorCanBeBuiltAgain:
         await old_connector.submissions.submit_form(SubmitFormRequest(form_spec=PLANNER_FORM, values=VALUES), LOCAL_SCOPE)
         assert [s["form_id"] for s in old_connector.staged] == ["fm_aaaaaaaaaa"]
 
+    @pytest.fixture()
+    def old_connector_of_a_person(self, shared_deployment, monkeypatch):
+        """The same connector kept in a person's own scope, on a deployment that trusts identity headers."""
+        with Session(shared_deployment.engine) as session:
+            ScopedSession(session, PERSON).add(
+                CustomConnector(connector_id="planner", label="Planner", description="", spec=self.OLD)
+            )
+            session.commit()
+        monkeypatch.setattr(tools, "run_db", connector_test_flow.run_db)
+        staged = []
+        monkeypatch.setattr(submissions_endpoint.store, "stage", lambda **kwargs: staged.append(kwargs) or "sub_x")
+        return staged
+
+    @pytest.mark.asyncio
+    async def test_the_agent_of_a_shared_deployment_gets_the_rebuild_text(self, old_connector_of_a_person):
+        with use_settings_scope(PERSON):
+            result = await tools._cowork_request_credentials(None, {"_connector_id": "planner", **self.OLD})
+        assert "data-vault-form" not in result and "saved before connection tests existed" in result
+
+    @pytest.mark.asyncio
+    async def test_a_stamped_submission_of_it_on_a_shared_deployment_is_refused_before_it_is_staged(
+        self, old_connector_of_a_person
+    ):
+        req = SubmitFormRequest(form_spec={"_connector_id": "planner", "form_id": "planner-connector"}, values=VALUES)
+        with pytest.raises(HTTPException) as exc:
+            await submissions_endpoint.submit_form(req, PERSON)
+        assert exc.value.status_code == 422 and "saved before connection tests existed" in exc.value.detail
+        assert old_connector_of_a_person == []
+
     def test_the_catalog_marks_it_for_rebuilding_on_a_single_user_install_only(self, saved, monkeypatch):
         _stored(saved.engine, self.OLD)
         with Session(saved.engine) as session:
             assert ConnectorCatalog(ScopedSession(session, LOCAL_SCOPE)).get_connector("planner").needs_rebuild is True
-            monkeypatch.setattr(catalog_module, "tenant_scope_required", lambda: True)
+            monkeypatch.setattr(catalog_module, "custom_test_is_code_checked", lambda: False)
             assert ConnectorCatalog(ScopedSession(session, LOCAL_SCOPE)).get_connector("planner").needs_rebuild is False
 
 
-class TestSelfHostedWithTheRealSetting:
-    """The same path as a self-hosted deployment takes it: identity headers
-    trusted, so a handcrafted form needs no test request and the model probe runs."""
+PARTITION, SUB, OTHER_SUB = "p-11111111", "sub-alice", "sub-bob"
+PERSON = TenantScope(personal=True, org_id=PARTITION, user_id=SUB, personal_resources=ALL_PERSONAL_RESOURCES)
+OTHER_PERSON = TenantScope(personal=True, org_id="p-22222222", user_id=OTHER_SUB, personal_resources=ALL_PERSONAL_RESOURCES)
+PERSON_SHARING_CONNECTIONS = TenantScope(
+    personal=True, org_id=PARTITION, user_id=SUB,
+    personal_resources=ALL_PERSONAL_RESOURCES - {PersonalResource.CONNECTIONS},
+)
+SHARED_DEPLOYMENT_SCOPES = pytest.mark.parametrize(
+    "scope", [PERSON, PERSON_SHARING_CONNECTIONS, LOCAL_SCOPE],
+    ids=["personal connections", "shared connections", "operator view"],
+)
+
+
+@pytest.fixture()
+def shared_deployment(personal_deployment, monkeypatch, saved):
+    """A local deployment that trusts identity headers, through the real
+    settings, in audit mode so a call without identity is the operator view."""
+    monkeypatch.setenv("COWORK_IDENTITY_ENFORCE", "audit")
+    get_app_settings.cache_clear()
+    monkeypatch.setattr(submissions_endpoint, "run_db", connector_test_flow.run_db)
+    monkeypatch.setattr(submissions_endpoint, "vault_for_scope", lambda scope: saved.vault)
+    yield saved
+    get_app_settings.cache_clear()
+
+
+async def submit(form: dict, scope: TenantScope, saved) -> list[tuple[str, dict]]:
+    """Submit ``form`` through the route's own checks; the stream's events."""
+    response = await submissions_endpoint.submit_form(
+        SubmitFormRequest(form_spec=form, values=VALUES, conversation_id=saved.conversation_id), scope,
+    )
+    events = []
+    async for frame in response.body_iterator:
+        kind, data = frame.split("\n", 1)
+        events.append((kind.removeprefix("event: "), json.loads(data.removeprefix("data: ").strip())))
+    return events
+
+
+class TestASharedDeploymentDecidesInCode:
+    """The deployment the ticket names: local tenancy that trusts identity
+    headers, read from the real settings, in each scope a request can have."""
 
     @pytest.mark.asyncio
-    async def test_a_handcrafted_form_without_a_test_request_still_goes_to_the_model_probe(self, api, saved, monkeypatch):
-        monkeypatch.setenv("COWORK_TRUST_IDENTITY_HEADERS", "true")
-        get_app_settings.cache_clear()
-        monkeypatch.setattr(submissions_endpoint, "run_db", connector_test_flow.run_db)
-        try:
-            form = {k: v for k, v in PLANNER_FORM.items() if k != "test_request"}
-            response = await submissions_endpoint.submit_form(
-                SubmitFormRequest(form_spec=form, values=VALUES, conversation_id=saved.conversation_id), LOCAL_SCOPE,
-            )
-            _ = [chunk async for chunk in response.body_iterator]
-        finally:
-            monkeypatch.delenv("COWORK_TRUST_IDENTITY_HEADERS")
-            get_app_settings.cache_clear()
+    @SHARED_DEPLOYMENT_SCOPES
+    async def test_a_form_whose_text_calls_a_token_data_saves_nothing(self, api, shared_deployment, scope):
+        api.rows = {"access_token": ISSUED, "token_type": "bearer"}
 
-        assert ModelSaysYes.built == 1 and api.requests == []
-        assert len(saved.vault.list_connections()) == 1
+        events = await submit(PLANNER_FORM, scope, shared_deployment)
+
+        assert shared_deployment.vault.list_connections() == []
+        assert ModelSaysYes.built == 0
+        assert of(events, "connector.test_preview") == []
+        [done] = of(events, "response.completed")
+        assert done["response"]["status"] == "retry"
+
+    @pytest.mark.asyncio
+    async def test_a_form_whose_data_request_a_write_approval_rule_holds_is_not_tested(
+        self, api, shared_deployment, monkeypatch,
+    ):
+        monkeypatch.setenv("ANTON_WRITE_APPROVAL", "true")
+        monkeypatch.setenv("ANTON_WRITE_APPROVAL_HTTP", "POST https://planner.example.com/integration/**")
+
+        events = await submit(PLANNER_FORM, PERSON, shared_deployment)
+
+        assert api.requests == []
+        assert shared_deployment.vault.list_connections() == []
+        assert ModelSaysYes.built == 0
+        assert of(events, "connector.test_preview") == []
+        [done] = of(events, "response.completed")
+        assert done["response"]["status"] == "retry"
+
+    @pytest.mark.asyncio
+    @SHARED_DEPLOYMENT_SCOPES
+    async def test_a_correct_test_request_saves_once_the_person_confirms(self, api, shared_deployment, scope):
+        events = await submit(PLANNER_FORM, scope, shared_deployment)
+
+        assert shared_deployment.vault.list_connections() == [] and ModelSaysYes.built == 0
+        [preview] = of(events, "connector.test_preview")
+        assert preview["preview"]["item_count"] == 2
+        answer = await submissions_endpoint.confirm_route(ConnectorTestAnswer(confirm_id=preview["confirm_id"]), scope)
+
+        assert answer["saved_slug"]
+        [connection] = shared_deployment.vault.list_connections()
+        assert connection["engine"] == "planner"
+
+    @pytest.mark.asyncio
+    @SHARED_DEPLOYMENT_SCOPES
+    async def test_a_form_without_a_test_request_is_refused_before_anything_is_staged(
+        self, api, shared_deployment, scope, monkeypatch,
+    ):
+        staged: list = []
+        monkeypatch.setattr(submissions_endpoint.store, "stage", lambda **kwargs: staged.append(kwargs))
+        form = {k: v for k, v in PLANNER_FORM.items() if k != "test_request"}
+
+        with pytest.raises(HTTPException) as exc:
+            await submit(form, scope, shared_deployment)
+
+        assert exc.value.status_code == 422 and "test_request" in exc.value.detail
+        assert staged == [] and ModelSaysYes.built == 0 and api.requests == []
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("asker", [OTHER_PERSON, LOCAL_SCOPE], ids=["another person", "operator view"])
+    async def test_only_the_person_who_ran_the_test_confirms_it(self, api, shared_deployment, asker):
+        events = await submit(PLANNER_FORM, PERSON, shared_deployment)
+        [preview] = of(events, "connector.test_preview")
+        answer = ConnectorTestAnswer(confirm_id=preview["confirm_id"])
+
+        with pytest.raises(HTTPException) as exc:
+            await submissions_endpoint.confirm_route(answer, asker)
+
+        assert exc.value.status_code == 404
+        assert shared_deployment.vault.list_connections() == []
+        assert (await submissions_endpoint.confirm_route(answer, PERSON))["saved_slug"]
+
+    @pytest.mark.asyncio
+    async def test_a_private_api_is_tested_only_when_the_operator_listed_it(self, api, shared_deployment, monkeypatch):
+        """The self-hosted stack's egress gateway is a private address; the
+        operator's list names it, and no person is asked."""
+        monkeypatch.setattr(connector_test_run, "_own_addresses", lambda: frozenset())
+        monkeypatch.setattr(
+            connector_test_run, "_RESOLVER", lambda host, port, type=None: [(None, None, None, "", ("172.30.9.10", 443))],
+        )
+        monkeypatch.delenv(connector_test_run.ALLOWLIST_ENV, raising=False)
+        connector_test_run.private_allowlist.cache_clear()
+        try:
+            refused = await submit(PLANNER_FORM, PERSON, shared_deployment)
+            assert of(refused, "connector.private_host_request") == [] and api.requests == []
+            [done] = of(refused, "response.completed")
+            assert done["response"]["status"] == "retry"
+
+            monkeypatch.setenv(connector_test_run.ALLOWLIST_ENV, "172.30.9.10")
+            connector_test_run.private_allowlist.cache_clear()
+            allowed = await submit(PLANNER_FORM, PERSON, shared_deployment)
+            assert len(of(allowed, "connector.test_preview")) == 1
+        finally:
+            connector_test_run.private_allowlist.cache_clear()
+
+    def test_an_old_custom_connector_is_marked_for_rebuilding(self, shared_deployment):
+        old = {k: v for k, v in PLANNER_FORM.items() if k not in ("test_request", "engine", "connector")}
+        with Session(shared_deployment.engine) as session:
+            session.add(CustomConnector(
+                connector_id="planner", label="Planner", description="", spec=old,
+                org_id=PERSON.org_id, created_by=PERSON.user_id,
+            ))
+            session.commit()
+            assert ConnectorCatalog(ScopedSession(session, PERSON)).get_connector("planner").needs_rebuild is True

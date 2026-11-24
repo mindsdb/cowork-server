@@ -26,6 +26,7 @@ from cowork.api.v1.endpoints.connectors.custom import router as custom_router
 from cowork.api.v1.permissions import AuthenticatedInOrgMode, AuthenticatedOrgAdmin
 from cowork.api.v1.route_walker import declared_permissions
 from cowork.common.settings.app_settings import get_app_settings
+from cowork.db.personal_resources import ALL_PERSONAL_RESOURCES
 from cowork.db.scoped import LOCAL_SCOPE, ScopedSession, TenantScope, get_scoped_session
 from cowork.models.custom_connector import CustomConnector
 from cowork.principal import ORG_MANAGE_ROLE, Principal, get_principal
@@ -143,6 +144,25 @@ def test_replace_the_form(engine):
 
     spec = ConnectorCatalog(_scoped(engine)).get_connector("httpbin")
     assert [f.name for f in spec.form.fields] == ["api_key"]
+
+
+def test_a_shared_deployment_refuses_a_replacement_form_without_a_test_request(engine, personal_deployment):
+    """The edit route re-checks a new form as a submission does, so a form the
+    connection test could never judge is not kept there either."""
+    person = TenantScope(personal=True, org_id="p-11111111", user_id="sub-alice", personal_resources=ALL_PERSONAL_RESOURCES)
+    with Session(engine) as session:
+        session.add(CustomConnector(
+            connector_id="httpbin", label="httpbin", description="", spec=FORM,
+            org_id=person.org_id, created_by=person.user_id,
+        ))
+        session.commit()
+    old_form = {k: v for k, v in FORM.items() if k != "test_request"}
+
+    with pytest.raises(HTTPException) as exc:
+        update_custom_connector("httpbin", CustomConnectorUpdate(spec=old_form), _scoped(engine, person))
+
+    assert exc.value.status_code == 422 and "test_request" in exc.value.detail
+    assert ConnectorCatalog(_scoped(engine, person)).get_connector("httpbin").needs_rebuild is False
 
 
 def test_a_new_form_color_moves_the_directory_tile(engine):
