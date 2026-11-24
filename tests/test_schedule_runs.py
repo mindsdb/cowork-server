@@ -232,9 +232,6 @@ def test_has_running_run_ignores_manual_run_in_progress():
     assert run_service.has_running_run(schedule.id) is False
 
 
-# --- ENG-688: freshness guard — a due cron slot is skipped when a successful
-# run (typically a manual "run now") finished within the cadence window.
-
 def _finish_at(session: Session, run_id, when: datetime) -> None:
     from cowork.models.schedule import ScheduleRun
 
@@ -242,59 +239,6 @@ def _finish_at(session: Session, run_id, when: datetime) -> None:
     run.finished_at = when
     session.add(run)
     session.commit()
-
-
-def test_last_successful_finish_ignores_failures_and_running():
-    session = _session()
-    schedule = _schedule(session)
-    run_service = ScheduleRunService(ScopedSession(session, SYSTEM_SCOPE))
-
-    assert run_service.last_successful_finish(schedule.id) is None
-
-    failed = run_service.create_run(schedule.id, is_manual=True)
-    run_service.finish_run(failed.id, error="boom")
-    running = run_service.create_run(schedule.id, is_manual=False)
-    assert run_service.last_successful_finish(schedule.id) is None
-    # A schedule holds one running run at a time.
-    run_service.finish_run(running.id, error="ended")
-
-    ok = run_service.create_run(schedule.id, is_manual=True)
-    run_service.finish_run(ok.id)
-    finished = run_service.last_successful_finish(schedule.id)
-    assert finished is not None and finished.tzinfo is not None
-
-
-def test_due_slot_skipped_and_advanced_after_recent_manual_success():
-    from cowork.scheduler import _due_schedules
-
-    session = _session()
-    schedule = _schedule(session)  # daily, due at 2026-06-25 09:00 UTC
-    run_service = ScheduleRunService(ScopedSession(session, SYSTEM_SCOPE))
-
-    now = datetime(2026, 6, 25, 9, 0, 30, tzinfo=timezone.utc)
-    run = run_service.create_run(schedule.id, is_manual=True)
-    run_service.finish_run(run.id)
-    _finish_at(session, run.id, now - timedelta(minutes=50))
-
-    assert _due_schedules(ScopedSession(session, SYSTEM_SCOPE), now) == []
-    session.refresh(schedule)
-    # Slot consumed: advanced past the skipped occurrence to the next day.
-    assert schedule.next_run_at.replace(tzinfo=timezone.utc) > now
-
-
-def test_due_slot_runs_when_last_success_is_old():
-    from cowork.scheduler import _due_schedules
-
-    session = _session()
-    schedule = _schedule(session)
-    run_service = ScheduleRunService(ScopedSession(session, SYSTEM_SCOPE))
-
-    now = datetime(2026, 6, 25, 9, 0, 30, tzinfo=timezone.utc)
-    run = run_service.create_run(schedule.id, is_manual=True)
-    run_service.finish_run(run.id)
-    _finish_at(session, run.id, now - timedelta(hours=2))
-
-    assert [s.id for s in _due_schedules(ScopedSession(session, SYSTEM_SCOPE), now)] == [schedule.id]
 
 
 def _cron_success(session, run_service, schedule, slot_at, finished_at):
@@ -350,23 +294,7 @@ def test_timing_change_with_same_next_run_honors_due_slot(change):
     assert [s.id for s in scheduler._due_schedules(scoped, due)] == [task.id]
 
 
-def test_manual_success_after_timing_edit_still_suppresses_slot_on_title_save():
-    session = _session()
-    scoped = ScopedSession(session, SYSTEM_SCOPE)
-    due = datetime.now(timezone.utc) + timedelta(minutes=2)
-    task = _schedule(session, next_run_at=due + timedelta(days=1))
-    schedules = ScheduleService(scoped)
-    schedules.update_schedule(task.id, next_run_at=due)
-    runs = ScheduleRunService(scoped)
-    run = runs.create_run(task.id, is_manual=True)
-    runs.finish_run(run.id)
-    # The desktop sends every timing field on a title-only save.
-    schedules.update_schedule(task.id, title="Renamed", cadence="daily", timezone="UTC", next_run_at=due)
-    assert scheduler._due_schedules(scoped, due) == []
-
-
-def test_the_slot_after_a_late_cron_run_is_still_skipped():
-    # A catch-up run of 9:00 that finished at 9:50 already did 10:00's work.
+def test_the_slot_after_a_late_cron_run_is_still_due():
     from cowork.scheduler import _due_schedules
 
     session = _session()
@@ -376,14 +304,14 @@ def test_the_slot_after_a_late_cron_run_is_still_skipped():
     _cron_success(session, run_service, schedule, slot, slot + timedelta(minutes=50))
 
     now = slot + timedelta(hours=1, seconds=30)
-    assert _due_schedules(ScopedSession(session, SYSTEM_SCOPE), now) == []
+    assert [s.id for s in _due_schedules(ScopedSession(session, SYSTEM_SCOPE), now)] == [schedule.id]
 
 
 def test_due_slot_deferred_while_manual_run_in_flight():
     """PR #181 review issue 3: a manual run still executing when the cron
     slot comes due must block the slot — otherwise both publish the same
     output. Deferred, not consumed: the slot stays due, and once the manual
-    run finishes the freshness guard decides whether it still fires."""
+    run finishes the slot can fire."""
     from cowork.scheduler import _due_schedules
 
     session = _session()
@@ -401,8 +329,6 @@ def test_due_slot_deferred_while_manual_run_in_flight():
 
 @pytest.mark.parametrize("cadence", ["every_15_minutes", "every_30_minutes"])
 def test_a_short_cadence_runs_the_slot_right_after_a_manual_run(cadence):
-    # A freshness window would skip every other slot after a Run now at
-    # these cadences, so they have none.
     from cowork.scheduler import _due_schedules
 
     session = _session()
@@ -468,9 +394,6 @@ def test_finish_run_status_override_records_cancelled():
     finished = run_service.finish_run(run.id, status=RunStatus.cancelled)
     assert finished.status == RunStatus.cancelled
     assert finished.error is None
-    # A cancelled run is not a success: it neither blocks via the freshness
-    # guard nor counts as the last successful finish.
-    assert run_service.last_successful_finish(schedule.id) is None
 
 
 def test_has_active_run_counts_manual_runs():
@@ -1029,8 +952,7 @@ def test_execute_schedule_records_cancelled_and_consumes_slot(monkeypatch):
     assert state["last_error"] is None
     assert state["last_run_at"] is None
     # The slot is consumed — otherwise the next tick restarts the run the
-    # user just killed (a cancelled run isn't a success, so the freshness
-    # guard wouldn't block it).
+    # user just killed.
     assert state["next_advanced"] is True
 
 

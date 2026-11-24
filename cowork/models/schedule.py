@@ -18,11 +18,6 @@ class Schedule(BaseSQLModel, table=True):
         sa_type=sa.DateTime(timezone=True),  # type: ignore
         description="UTC datetime of next scheduled execution",
     )
-    timing_edited_at: datetime | None = Field(
-        default=None,
-        sa_type=sa.DateTime(timezone=True),  # type: ignore
-        description="When an edit last changed the cadence, timezone, or next run",
-    )
     enabled: bool = Field(default=True, description="Whether the schedule is active")
     project_id: UUID = Field(
         sa_column=sa.Column(
@@ -137,7 +132,7 @@ class ScheduleRun(BaseSQLModel, table=True):
     trial: bool = Field(
         default=False,
         sa_column_kwargs={"server_default": sa.false()},
-        description="A run-now that tries the task out: it leaves a one-off scheduled, and neither the freshness guard nor the failure streak counts it",
+        description="A run-now that tries the task out: it leaves the failure streak unchanged",
     )
     slot_at: datetime | None = Field(
         default=None,

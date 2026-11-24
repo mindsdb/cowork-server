@@ -1,10 +1,7 @@
 """A trial run: Run now with ``trial=true``, which tries a task out.
 
 The desktop's "Save and run once" starts one right after creating a task. It
-must not cost the task its schedule: a one-off stays scheduled for its own
-time, the slot after it still runs (the freshness guard ignores it), and the
-failure streak neither grows nor resets. Without the flag, Run now behaves as
-before.
+leaves the failure streak unchanged.
 """
 
 from __future__ import annotations
@@ -85,30 +82,10 @@ async def test_a_trial_run_leaves_a_one_off_scheduled_for_its_own_time(turns):
         _delete_schedule(one_off)
 
 
-async def test_a_plain_run_now_still_uses_a_one_off_up(turns):
-    one_off = _make_schedule(cadence="once", next_run_at=SLOT)
-    try:
-        await scheduler.execute_schedule(one_off, is_manual=True)
-
-        assert not _schedule(one_off).enabled
-        assert _poll(one_off) == []
-    finally:
-        _delete_schedule(one_off)
-
-
-# --- The freshness guard -------------------------------------------------------
-
-
 async def test_a_trial_success_does_not_suppress_the_next_slot(schedule_id, turns):
     await scheduler.execute_schedule(schedule_id, is_manual=True, trial=True)
 
     assert [slot.slot_at for slot in _poll(schedule_id)] == [SLOT]
-
-
-async def test_a_plain_run_now_success_still_suppresses_the_next_slot(schedule_id, turns):
-    await scheduler.execute_schedule(schedule_id, is_manual=True)
-
-    assert _poll(schedule_id) == []
 
 
 # --- The failure streak --------------------------------------------------------
