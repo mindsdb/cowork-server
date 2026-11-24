@@ -1190,40 +1190,39 @@ class WorkspaceManager:
         *,
         truncate: bool = False,
     ) -> Path | None:
-        untracked = [path for status, path in self._status_entries(workspace) if status == "??"]
-        if untracked:
-            # Intent-to-add makes Git include new files in the binary diff while
-            # leaving their contents unstaged and the working copy unchanged.
-            # Send NUL-delimited paths over stdin so Windows command-line limits
-            # cannot break recovery for tasks with many or unusual filenames.
-            self.git.run(
-                workspace,
-                "add",
-                "-N",
-                "--pathspec-from-file=-",
-                "--pathspec-file-nul",
-                input_text="\0".join(untracked) + "\0",
-            )
         snapshot_dir = self.snapshots_root / session_id
         snapshot_dir.mkdir(parents=True, exist_ok=True)
         snapshot = snapshot_dir / filename
-        temp = snapshot.with_suffix(".tmp")
-        try:
-            self.git.run(workspace, "diff", "--binary", f"--output={temp.resolve()}", base_revision)
-        except Exception:
-            temp.unlink(missing_ok=True)
-            raise
-        size = temp.stat().st_size
-        if not size:
-            temp.unlink()
-            return None
-        if truncate and size > MAX_TOTAL_DIFF_BYTES:
-            size = _truncate_at_file_boundary(temp, MAX_TOTAL_DIFF_BYTES)
-            snapshot.with_name(f"{filename}.truncated").write_text(SNAPSHOT_TRUNCATED_MARKER, encoding="utf-8")
+        with tempfile.TemporaryDirectory(dir=snapshot_dir) as temporary:
+            private = Path(temporary) / "index"
+            index_path = self.git.run(workspace, "rev-parse", "--path-format=absolute", "--git-path", "index")
+            index = Path(index_path.stdout.rstrip("\r\n"))
+            if index.is_file():
+                shutil.copyfile(index, private)
+            environment = {"GIT_INDEX_FILE": str(private.resolve()), "GIT_OPTIONAL_LOCKS": "0"}
+            untracked = self.git.run(
+                workspace, "ls-files", "--others", "--exclude-standard", "-z", environment=environment,
+            ).stdout
+            if untracked:
+                # Mark new files only in the private index. Treat their names
+                # literally, even when a name is also a valid Git pathspec.
+                self.git.run(
+                    workspace, "add", "-N", "--pathspec-from-file=-", "--pathspec-file-nul",
+                    input_text=untracked, environment={**environment, "GIT_LITERAL_PATHSPECS": "1"},
+                )
+            patch = Path(temporary) / "snapshot.patch"
+            self.git.run(
+                workspace, "diff", "--binary", f"--output={patch.resolve()}", base_revision, environment=environment,
+            )
+            size = patch.stat().st_size
             if not size:
-                temp.unlink()
                 return None
-        os.replace(temp, snapshot)
+            if truncate and size > MAX_TOTAL_DIFF_BYTES:
+                size = _truncate_at_file_boundary(patch, MAX_TOTAL_DIFF_BYTES)
+                snapshot.with_name(f"{filename}.truncated").write_text(SNAPSHOT_TRUNCATED_MARKER, encoding="utf-8")
+                if not size:
+                    return None
+            os.replace(patch, snapshot)
         return snapshot
 
     def _apply_patch(
