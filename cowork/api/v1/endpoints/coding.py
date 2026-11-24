@@ -129,6 +129,13 @@ from cowork.services.skills import CodeSkillService
 # one added here is closed until someone opens it, which is the opposite of
 # what inheriting OpenByDesign did. Under the code sandbox the whole surface
 # answers 403 (refuse_code_mode_in_sandbox).
+#
+# Every write route also declares WindowProof at the route, so agent code
+# holding the bearer token can't start, steer or deliver a task for the
+# person. Only the inference proxy doesn't: Codex calls it with its session's
+# inference token. tests/test_window_proof_pin.py walks every Code mode write
+# route and fails on one that neither declares WindowProof nor names its
+# caller there.
 router = APIRouter(
     dependencies=[Depends(require(LoopbackDesktopOnly)), Depends(refuse_code_mode_in_sandbox)]
 )
@@ -271,7 +278,11 @@ def workspace_cleanup():
     return _call(_service().workspaces.pending_removals.status)
 
 
-@router.post("/workspace-cleanup/retry", response_model=WorkspaceCleanupStatus)
+@router.post(
+    "/workspace-cleanup/retry",
+    response_model=WorkspaceCleanupStatus,
+    dependencies=[Depends(require(WindowProof))],
+)
 def retry_workspace_cleanup():
     return _call(_service().workspaces.pending_removals.retry)
 
@@ -292,7 +303,7 @@ def models(session: SessionDep, scope: ScopeDep, engine_id: str = Query(default=
     return {"items": _call(_service().discover_models, engine_id, _credentials(settings))}
 
 
-@router.post("/runtime/prepare-shutdown")
+@router.post("/runtime/prepare-shutdown", dependencies=[Depends(require(WindowProof))])
 def prepare_shutdown():
     """Persist resumable task state before the desktop stops the process tree."""
     return {"interrupted": _service().prepare_shutdown()}
@@ -303,12 +314,12 @@ def coding_computers():
     return _service().control.list_computers()
 
 
-@router.patch("/computers/{computer_id}")
+@router.patch("/computers/{computer_id}", dependencies=[Depends(require(WindowProof))])
 def update_coding_computer(computer_id: str, body: ComputerUpdateRequest):
     return _call(_service().control.rename_computer, computer_id, body.name)
 
 
-@router.delete("/computers/{computer_id}", status_code=204)
+@router.delete("/computers/{computer_id}", status_code=204, dependencies=[Depends(require(WindowProof))])
 def revoke_coding_computer(computer_id: str):
     _call(_service().control.revoke_computer, computer_id)
 
@@ -354,7 +365,11 @@ async def inference_proxy(path: str, request: Request, session: SessionDep, scop
     return await proxy_inference(request, path, credentials)
 
 
-@router.post("/workspace/initialize-git", response_model=WorkspaceModeOptions)
+@router.post(
+    "/workspace/initialize-git",
+    response_model=WorkspaceModeOptions,
+    dependencies=[Depends(require(WindowProof))],
+)
 def initialize_git(body: InitializeGitRequest):
     """Make a folder on this computer a Git repository so tasks on it can use a worktree."""
     return _call(_service().initialize_git, body.path)
@@ -382,27 +397,39 @@ def code_skill_document(
     return _call(_service().skill_library.document, CodeSkillService(scope), item_id, path)
 
 
-@router.post("/skills/sources", response_model=SkillLibrarySource)
+@router.post("/skills/sources", response_model=SkillLibrarySource, dependencies=[Depends(require(WindowProof))])
 def add_code_skill_source(body: SkillSourceCreateRequest):
     return _call(_service().skill_library.add, body.repository, body.branch, body.name)
 
 
-@router.post("/skills/sources/{source_id}/refresh", response_model=SkillLibrarySource)
+@router.post(
+    "/skills/sources/{source_id}/refresh",
+    response_model=SkillLibrarySource,
+    dependencies=[Depends(require(WindowProof))],
+)
 def refresh_code_skill_source(source_id: str):
     return _call(_service().skill_library.refresh, source_id)
 
 
-@router.post("/skills/sources/{source_id}/apply", response_model=SkillLibrarySource)
+@router.post(
+    "/skills/sources/{source_id}/apply",
+    response_model=SkillLibrarySource,
+    dependencies=[Depends(require(WindowProof))],
+)
 def apply_code_skill_source(source_id: str):
     return _call(_service().skill_library.apply_update, source_id)
 
 
-@router.delete("/skills/sources/{source_id}", status_code=204)
+@router.delete("/skills/sources/{source_id}", status_code=204, dependencies=[Depends(require(WindowProof))])
 def remove_code_skill_source(source_id: str):
     _call(_service().skill_library.remove, source_id)
 
 
-@router.put("/projects/{project_id}/skills/{source_id}", response_model=SkillLibraryPage)
+@router.put(
+    "/projects/{project_id}/skills/{source_id}",
+    response_model=SkillLibraryPage,
+    dependencies=[Depends(require(WindowProof))],
+)
 def update_code_project_skill_source(
     project_id: str,
     source_id: str,
@@ -416,7 +443,11 @@ def update_code_project_skill_source(
     )
 
 
-@router.put("/skills/sources/{source_id}/projects", response_model=SkillLibraryPage)
+@router.put(
+    "/skills/sources/{source_id}/projects",
+    response_model=SkillLibraryPage,
+    dependencies=[Depends(require(WindowProof))],
+)
 def update_code_skill_source_projects(
     source_id: str,
     body: SkillSourceAssignmentsRequest,
@@ -433,7 +464,7 @@ def list_code_projects():
     return _service().projects.list()
 
 
-@router.post("/projects")
+@router.post("/projects", dependencies=[Depends(require(WindowProof))])
 def create_code_project(body: ProjectCreateRequest, session: SessionDep, scope: ScopeDep):
     if body.default_reasoning_effort is not None:
         settings = _settings(session, scope)
@@ -447,7 +478,7 @@ def get_code_project(project_id: str):
     return _call(_service().projects.get, project_id)
 
 
-@router.patch("/projects/{project_id}")
+@router.patch("/projects/{project_id}", dependencies=[Depends(require(WindowProof))])
 def update_code_project(project_id: str, body: ProjectUpdateRequest, session: SessionDep, scope: ScopeDep):
     if body.default_reasoning_effort is not None:
         current = _call(_service().projects.get, project_id)
@@ -456,7 +487,7 @@ def update_code_project(project_id: str, body: ProjectUpdateRequest, session: Se
     return _call(_service().projects.update, project_id, body)
 
 
-@router.delete("/projects/{project_id}", status_code=204)
+@router.delete("/projects/{project_id}", status_code=204, dependencies=[Depends(require(WindowProof))])
 def delete_code_project(project_id: str):
     _call(_service().delete_project, project_id)
 
@@ -466,7 +497,7 @@ def inspect_code_project_folders(project_id: str):
     return {"items": _call(_service().projects.inspect_folders, project_id)}
 
 
-@router.post("/project-resources/inspect")
+@router.post("/project-resources/inspect", dependencies=[Depends(require(WindowProof))])
 def inspect_local_project_resource(body: ProjectFolder):
     return _call(_service().projects.resolve_local_resource, body)
 
@@ -519,7 +550,7 @@ def eligible_code_project_computers(
     return {"items": _call(_service().control.eligible_computers, project, scope, engine_id)}
 
 
-@router.post("/projects/{project_id}/playbook")
+@router.post("/projects/{project_id}/playbook", dependencies=[Depends(require(WindowProof))])
 def configure_code_project_playbook(project_id: str, body: PlaybookConfigureRequest):
     return _call(_service().playbooks.configure, project_id, body.repository, body.branch)
 
@@ -529,22 +560,22 @@ def code_project_playbook(project_id: str):
     return _call(_service().playbooks.status, project_id)
 
 
-@router.delete("/projects/{project_id}/playbook", status_code=204)
+@router.delete("/projects/{project_id}/playbook", status_code=204, dependencies=[Depends(require(WindowProof))])
 def remove_code_project_playbook(project_id: str):
     _call(_service().playbooks.remove, project_id)
 
 
-@router.post("/projects/{project_id}/playbook/refresh")
+@router.post("/projects/{project_id}/playbook/refresh", dependencies=[Depends(require(WindowProof))])
 def refresh_code_project_playbook(project_id: str):
     return _call(_service().playbooks.refresh, project_id)
 
 
-@router.post("/projects/{project_id}/playbook/apply")
+@router.post("/projects/{project_id}/playbook/apply", dependencies=[Depends(require(WindowProof))])
 def apply_code_project_playbook(project_id: str):
     return _call(_service().playbooks.apply_update, project_id)
 
 
-@router.post("/projects/{project_id}/playbook/items")
+@router.post("/projects/{project_id}/playbook/items", dependencies=[Depends(require(WindowProof))])
 def update_code_project_playbook_items(project_id: str, body: PlaybookItemsRequest):
     return _call(_service().playbooks.set_enabled, project_id, body.enabled_paths)
 
@@ -555,23 +586,23 @@ def code_project_integrations(project_id: str, integrations: IntegrationsDep):
     return {"items": _call(integrations.statuses, project)}
 
 
-@router.post("/projects/{project_id}/source-context")
+@router.post("/projects/{project_id}/source-context", dependencies=[Depends(require(WindowProof))])
 def read_code_project_source(project_id: str, body: SourceContextRequest, integrations: IntegrationsDep):
     project = _call(_service().projects.get, project_id)
     return _call(integrations.read, project, body)
 
 
-@router.post("/source-context")
+@router.post("/source-context", dependencies=[Depends(require(WindowProof))])
 def read_code_source(body: SourceContextRequest, integrations: IntegrationsDep):
     return _call(integrations.read, None, body)
 
 
-@router.post("/work-items/search")
+@router.post("/work-items/search", dependencies=[Depends(require(WindowProof))])
 def search_code_work(body: WorkItemSearchRequest, integrations: IntegrationsDep):
     return _call(integrations.search, None, body)
 
 
-@router.post("/projects/{project_id}/work-items/search")
+@router.post("/projects/{project_id}/work-items/search", dependencies=[Depends(require(WindowProof))])
 def search_code_project_work(project_id: str, body: WorkItemSearchRequest, integrations: IntegrationsDep):
     project = _call(_service().projects.get, project_id)
     return _call(integrations.search, project, body)
@@ -582,7 +613,7 @@ def list_sessions(include_archived: bool = Query(default=False, alias="includeAr
     return _service().list_sessions(include_archived)
 
 
-@router.post("/sessions")
+@router.post("/sessions", dependencies=[Depends(require(WindowProof))])
 def create_session(body: SessionCreateRequest, session: SessionDep, scope: ScopeDep):
     settings = _settings(session, scope)
     return _call(
@@ -682,7 +713,7 @@ def platform_status(session_id: str, session: SessionDep, scope: ScopeDep):
     )
 
 
-@router.post("/sessions/{session_id}/windows-sandbox/setup")
+@router.post("/sessions/{session_id}/windows-sandbox/setup", dependencies=[Depends(require(WindowProof))])
 def setup_windows_sandbox(session_id: str, session: SessionDep, scope: ScopeDep):
     return _call(
         _service().setup_windows_sandbox,
@@ -706,42 +737,46 @@ def update_session(session_id: str, body: SessionUpdateRequest, session: Session
     return _call(_service().update_session_config, session_id, body)
 
 
-@router.put("/sessions/{session_id}/delivery-policy")
+@router.put("/sessions/{session_id}/delivery-policy", dependencies=[Depends(require(WindowProof))])
 def update_delivery_policy(session_id: str, body: DeliveryAutomationPolicy):
     return _call(DeliveryAutomationService(_service().store).update_policy, session_id, body)
 
 
-@router.post("/sessions/{session_id}/delivery-automation/claim", response_model=DeliveryAutomationClaim)
+@router.post(
+    "/sessions/{session_id}/delivery-automation/claim",
+    response_model=DeliveryAutomationClaim,
+    dependencies=[Depends(require(WindowProof))],
+)
 def claim_delivery_automation(session_id: str, body: DeliveryAutomationClaimRequest):
     return _call(DeliveryAutomationService(_service().store).claim_fix, session_id, body)
 
 
-@router.post("/sessions/{session_id}/rename")
+@router.post("/sessions/{session_id}/rename", dependencies=[Depends(require(WindowProof))])
 def rename_session(session_id: str, body: RenameSessionRequest):
     return _call(_service().rename_session, session_id, body.title)
 
 
-@router.post("/sessions/{session_id}/archive")
+@router.post("/sessions/{session_id}/archive", dependencies=[Depends(require(WindowProof))])
 def archive_session(session_id: str):
     return _call(_service().set_archived, session_id, True)
 
 
-@router.post("/sessions/{session_id}/unarchive")
+@router.post("/sessions/{session_id}/unarchive", dependencies=[Depends(require(WindowProof))])
 def unarchive_session(session_id: str):
     return _call(_service().set_archived, session_id, False)
 
 
-@router.post("/sessions/{session_id}/pin")
+@router.post("/sessions/{session_id}/pin", dependencies=[Depends(require(WindowProof))])
 def pin_session(session_id: str):
     return _call(_service().set_pinned, session_id, True)
 
 
-@router.post("/sessions/{session_id}/unpin")
+@router.post("/sessions/{session_id}/unpin", dependencies=[Depends(require(WindowProof))])
 def unpin_session(session_id: str):
     return _call(_service().set_pinned, session_id, False)
 
 
-@router.post("/sessions/{session_id}/fork")
+@router.post("/sessions/{session_id}/fork", dependencies=[Depends(require(WindowProof))])
 def fork_session(session_id: str, session: SessionDep, scope: ScopeDep):
     return _call(
         _service().fork_session,
@@ -750,7 +785,7 @@ def fork_session(session_id: str, session: SessionDep, scope: ScopeDep):
     )
 
 
-@router.delete("/sessions/{session_id}", status_code=204)
+@router.delete("/sessions/{session_id}", status_code=204, dependencies=[Depends(require(WindowProof))])
 def delete_session(session_id: str):
     _call(_service().delete_session, session_id)
 
@@ -781,7 +816,7 @@ async def stream_events(request: Request, session_id: str, after: int = Query(de
     return StreamingResponse(generate(), media_type="text/event-stream", headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
 
-@router.post("/sessions/{session_id}/turns")
+@router.post("/sessions/{session_id}/turns", dependencies=[Depends(require(WindowProof))])
 def submit_turn(session_id: str, body: TurnRequest, session: SessionDep, scope: ScopeDep):
     return _call(
         _service().submit_turn,
@@ -792,7 +827,7 @@ def submit_turn(session_id: str, body: TurnRequest, session: SessionDep, scope: 
     )
 
 
-@router.post("/sessions/{session_id}/steer")
+@router.post("/sessions/{session_id}/steer", dependencies=[Depends(require(WindowProof))])
 def steer(session_id: str, body: TurnRequest):
     return _call(_service().steer, session_id, body.prompt, body.attachments)
 
@@ -802,22 +837,22 @@ def submit_mode_turn(session_id: str, body: ModeTurnRequest, session: SessionDep
     return _call(_service().submit_mode_turn, session_id, body, _credentials(_settings(session, scope)))
 
 
-@router.post("/sessions/{session_id}/queue")
+@router.post("/sessions/{session_id}/queue", dependencies=[Depends(require(WindowProof))])
 def queue_turn(session_id: str, body: TurnRequest):
     return _call(_service().queue_turn, session_id, body.prompt, body.attachments)
 
 
-@router.delete("/sessions/{session_id}/queue/{instruction_id}")
+@router.delete("/sessions/{session_id}/queue/{instruction_id}", dependencies=[Depends(require(WindowProof))])
 def remove_queued_turn(session_id: str, instruction_id: str):
     return _call(_service().remove_queued_turn, session_id, instruction_id)
 
 
-@router.post("/sessions/{session_id}/queue/{instruction_id}/steer")
+@router.post("/sessions/{session_id}/queue/{instruction_id}/steer", dependencies=[Depends(require(WindowProof))])
 def steer_queued_turn(session_id: str, instruction_id: str):
     return _call(_service().steer_queued_turn, session_id, instruction_id)
 
 
-@router.post("/sessions/{session_id}/queue/run")
+@router.post("/sessions/{session_id}/queue/run", dependencies=[Depends(require(WindowProof))])
 def run_next_queued(
     session_id: str,
     session: SessionDep,
@@ -832,7 +867,7 @@ def run_next_queued(
     )
 
 
-@router.post("/sessions/{session_id}/cancel")
+@router.post("/sessions/{session_id}/cancel", dependencies=[Depends(require(WindowProof))])
 def cancel(session_id: str):
     return _call(_service().cancel, session_id)
 
@@ -842,7 +877,7 @@ def answer_question(session_id: str, question_id: str, body: QuestionResponse):
     return _call(_service().answer_question, session_id, question_id, body)
 
 
-@router.post("/sessions/{session_id}/recover")
+@router.post("/sessions/{session_id}/recover", dependencies=[Depends(require(WindowProof))])
 def recover(session_id: str, body: SessionRecoverRequest):
     return _call(
         _service().recover,
@@ -862,7 +897,11 @@ def terminals(session_id: str):
     return _call(_service().terminals, session_id)
 
 
-@router.post("/sessions/{session_id}/project-actions/run", response_model=ProjectActionRunResponse)
+@router.post(
+    "/sessions/{session_id}/project-actions/run",
+    response_model=ProjectActionRunResponse,
+    dependencies=[Depends(require(WindowProof))],
+)
 def run_project_action(
     session_id: str,
     body: ProjectActionRunRequest,
@@ -882,22 +921,38 @@ def project_actions(session_id: str):
     return _call(_service().project_action_page, session_id)
 
 
-@router.post("/sessions/{session_id}/project-commands/refresh", response_model=ProjectCommandRefresh)
+@router.post(
+    "/sessions/{session_id}/project-commands/refresh",
+    response_model=ProjectCommandRefresh,
+    dependencies=[Depends(require(WindowProof))],
+)
 def refresh_project_commands(session_id: str):
     return _call(_service().refresh_project_commands, session_id)
 
 
-@router.post("/sessions/{session_id}/terminals", response_model=TerminalTabState)
+@router.post(
+    "/sessions/{session_id}/terminals",
+    response_model=TerminalTabState,
+    dependencies=[Depends(require(WindowProof))],
+)
 def create_terminal(session_id: str, body: TerminalCreateRequest):
     return _call(_service().create_terminal_tab, session_id, body.label)
 
 
-@router.patch("/sessions/{session_id}/terminals/{terminal_id}", response_model=TerminalTabState)
+@router.patch(
+    "/sessions/{session_id}/terminals/{terminal_id}",
+    response_model=TerminalTabState,
+    dependencies=[Depends(require(WindowProof))],
+)
 def rename_terminal(session_id: str, terminal_id: str, body: TerminalRenameRequest):
     return _call(_service().rename_terminal_tab, session_id, terminal_id, body.label)
 
 
-@router.delete("/sessions/{session_id}/terminals/{terminal_id}", status_code=204)
+@router.delete(
+    "/sessions/{session_id}/terminals/{terminal_id}",
+    status_code=204,
+    dependencies=[Depends(require(WindowProof))],
+)
 def delete_terminal(session_id: str, terminal_id: str):
     _call(_service().delete_terminal_tab, session_id, terminal_id)
 
@@ -907,7 +962,7 @@ def terminal_tab(session_id: str, terminal_id: str, after: int = Query(default=0
     return _call(_service().terminal_tab, session_id, terminal_id, after)
 
 
-@router.post("/sessions/{session_id}/terminals/{terminal_id}/start")
+@router.post("/sessions/{session_id}/terminals/{terminal_id}/start", dependencies=[Depends(require(WindowProof))])
 def start_terminal_tab(
     session_id: str,
     terminal_id: str,
@@ -926,17 +981,17 @@ def start_terminal_tab(
     )
 
 
-@router.post("/sessions/{session_id}/terminals/{terminal_id}/input")
+@router.post("/sessions/{session_id}/terminals/{terminal_id}/input", dependencies=[Depends(require(WindowProof))])
 def terminal_tab_input(session_id: str, terminal_id: str, body: TerminalInputRequest):
     return _call(_service().write_terminal_tab, session_id, terminal_id, body.data_base64)
 
 
-@router.post("/sessions/{session_id}/terminals/{terminal_id}/resize")
+@router.post("/sessions/{session_id}/terminals/{terminal_id}/resize", dependencies=[Depends(require(WindowProof))])
 def terminal_tab_resize(session_id: str, terminal_id: str, body: TerminalResizeRequest):
     return _call(_service().resize_terminal_tab, session_id, terminal_id, body.cols, body.rows)
 
 
-@router.post("/sessions/{session_id}/terminals/{terminal_id}/stop")
+@router.post("/sessions/{session_id}/terminals/{terminal_id}/stop", dependencies=[Depends(require(WindowProof))])
 def terminal_tab_stop(session_id: str, terminal_id: str):
     return _call(_service().stop_terminal_tab, session_id, terminal_id)
 
@@ -967,7 +1022,7 @@ def terminal(session_id: str, after: int = Query(default=0, ge=0)):
     return _call(_service().terminal, session_id, after)
 
 
-@router.post("/sessions/{session_id}/terminal/start")
+@router.post("/sessions/{session_id}/terminal/start", dependencies=[Depends(require(WindowProof))])
 def start_terminal(
     session_id: str,
     body: TerminalStartRequest,
@@ -984,17 +1039,17 @@ def start_terminal(
     )
 
 
-@router.post("/sessions/{session_id}/terminal/input")
+@router.post("/sessions/{session_id}/terminal/input", dependencies=[Depends(require(WindowProof))])
 def terminal_input(session_id: str, body: TerminalInputRequest):
     return _call(_service().write_terminal, session_id, body.data_base64)
 
 
-@router.post("/sessions/{session_id}/terminal/resize")
+@router.post("/sessions/{session_id}/terminal/resize", dependencies=[Depends(require(WindowProof))])
 def terminal_resize(session_id: str, body: TerminalResizeRequest):
     return _call(_service().resize_terminal, session_id, body.cols, body.rows)
 
 
-@router.post("/sessions/{session_id}/terminal/stop")
+@router.post("/sessions/{session_id}/terminal/stop", dependencies=[Depends(require(WindowProof))])
 def terminal_stop(session_id: str):
     return _call(_service().stop_terminal, session_id)
 
@@ -1062,7 +1117,7 @@ def diff(session_id: str):
     return {"files": _call(_service().diff, session_id)}
 
 
-@router.post("/sessions/{session_id}/review/file")
+@router.post("/sessions/{session_id}/review/file", dependencies=[Depends(require(WindowProof))])
 def review_file(session_id: str, body: ReviewFileActionRequest):
     return {
         "files": _call(
@@ -1075,12 +1130,12 @@ def review_file(session_id: str, body: ReviewFileActionRequest):
     }
 
 
-@router.post("/sessions/{session_id}/branch")
+@router.post("/sessions/{session_id}/branch", dependencies=[Depends(require(WindowProof))])
 def create_branch(session_id: str, body: BranchRequest):
     return _call(_service().create_branch, session_id, body.name)
 
 
-@router.post("/sessions/{session_id}/commit")
+@router.post("/sessions/{session_id}/commit", dependencies=[Depends(require(WindowProof))])
 def commit(session_id: str, body: CommitRequest):
     return _call(_service().commit, session_id, body.message)
 
@@ -1091,18 +1146,18 @@ def git_identity():
     return _call(_service().workspaces.git_identity)
 
 
-@router.put("/git/identity", response_model=GitIdentity)
+@router.put("/git/identity", response_model=GitIdentity, dependencies=[Depends(require(WindowProof))])
 def set_git_identity(body: GitIdentityRequest):
     """Fill in whichever of user.name / user.email is unset; configured values are kept."""
     return _call(_service().workspaces.set_git_identity, body.name, body.email)
 
 
-@router.post("/sessions/{session_id}/apply")
+@router.post("/sessions/{session_id}/apply", dependencies=[Depends(require(WindowProof))])
 def apply_to_source(session_id: str):
     return _call(_service().apply_to_source, session_id)
 
 
-@router.post("/sessions/{session_id}/validate")
+@router.post("/sessions/{session_id}/validate", dependencies=[Depends(require(WindowProof))])
 def validate_project(session_id: str):
     return {"items": _call(_service().validate_project, session_id)}
 
@@ -1112,7 +1167,7 @@ def delivery_plan(session_id: str, integrations: IntegrationsDep):
     return _call(_service().delivery_plan, session_id, integrations)
 
 
-@router.post("/sessions/{session_id}/draft-pull-requests")
+@router.post("/sessions/{session_id}/draft-pull-requests", dependencies=[Depends(require(WindowProof))])
 def create_draft_pull_requests(session_id: str, body: DraftPullRequestRequest, integrations: IntegrationsDep):
     return {
         "items": _call(
@@ -1124,16 +1179,16 @@ def create_draft_pull_requests(session_id: str, body: DraftPullRequestRequest, i
     }
 
 
-@router.post("/sessions/{session_id}/pull-request-action")
+@router.post("/sessions/{session_id}/pull-request-action", dependencies=[Depends(require(WindowProof))])
 def pull_request_action(session_id: str, body: PullRequestActionRequest, integrations: IntegrationsDep):
     return _call(_service().pull_request_action, session_id, body, integrations)
 
 
-@router.post("/sessions/{session_id}/publish")
+@router.post("/sessions/{session_id}/publish", dependencies=[Depends(require(WindowProof))])
 def publish_task_update(session_id: str, body: PublishRequest, integrations: IntegrationsDep):
     return _call(_service().publish_task_update, session_id, body, integrations)
 
 
-@router.post("/sessions/{session_id}/source-action")
+@router.post("/sessions/{session_id}/source-action", dependencies=[Depends(require(WindowProof))])
 def source_action(session_id: str, body: SourceActionRequest, integrations: IntegrationsDep):
     return _call(_service().complete_task_source, session_id, body, integrations)

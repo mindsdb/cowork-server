@@ -1,4 +1,4 @@
-"""Behaviour of the ENG-2094 permission front door's classes.
+"""Behavior of the permission front door's classes.
 
 Exercises ``require(...)`` on a tiny scratch app rather than ``create_app()``,
 so this doesn't depend on the settings singleton or

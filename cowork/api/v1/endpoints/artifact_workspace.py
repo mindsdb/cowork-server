@@ -2117,7 +2117,10 @@ async def get_agent_repair(
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
 
-@router.post("/workspace/{project_ref}/{artifact_id}/agent-repairs/release")
+@router.post(
+    "/workspace/{project_ref}/{artifact_id}/agent-repairs/release",
+    dependencies=[Depends(require(WindowProof))],
+)
 async def release_agent_repairs_for_comment(
     project_ref: str,
     artifact_id: ArtifactIdDep,
@@ -2148,7 +2151,10 @@ async def release_agent_repairs_for_comment(
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
 
-@router.post("/workspace/{project_ref}/{artifact_id}/agent-repairs/{repair_id}/cancel")
+@router.post(
+    "/workspace/{project_ref}/{artifact_id}/agent-repairs/{repair_id}/cancel",
+    dependencies=[Depends(require(WindowProof))],
+)
 async def cancel_queued_agent_repair(
     project_ref: str,
     artifact_id: ArtifactIdDep,

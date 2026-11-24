@@ -127,7 +127,7 @@ def _relayed_in_org_mode(connector_id: str) -> bool:
     return spec is not None and spec.category == _DATABASE_CATEGORY
 
 
-@router.post("/", name="submit_form")
+@router.post("/", name="submit_form", dependencies=[Depends(require(WindowProof))])
 async def submit_form_route(req: SubmitFormRequest, request: Request, scope: TenantScopeDep) -> StreamingResponse:
     """Answer one form submission.
 

@@ -374,7 +374,11 @@ class WindowProof:
     approves an agent's action, reveals or writes a credential, or changes a
     gate on what the agent may do declares this, so a caller that holds the
     bearer token and nothing else, such as agent code on the same machine,
-    can't call it.
+    can't call it. So does every Code mode route that takes a method other
+    than GET, except the routes whose callers hold a credential of their own
+    and never the proof (the inference proxies and the remote runtime's
+    routes), which CODE_MODE_WRITES_WITHOUT_THE_PROOF in
+    tests/test_window_proof_pin.py names.
 
     The check runs only while the server holds a launch hand-off
     (``app_secret.held_handoff()``), which only ``cowork-server`` started with
@@ -392,7 +396,11 @@ class WindowProof:
     Declare it at the route, with ``Depends(require(WindowProof))`` in the
     route's ``dependencies``, after the class the route or its router
     declares. That class keeps saying who the route admits where no hand-off
-    is held. WindowProof refuses, so a route that inherits it from a router
+    is held. A route that is open by design where no hand-off is held, such
+    as ``POST /settings/logout``, declares WindowProof alone, because
+    ``route_walker.contradictory_routes`` refuses ``OpenByDesign`` beside
+    another class, and tests/test_open_by_design_pin.py pins it with the open
+    routes. WindowProof refuses, so a route that inherits it from a router
     inherits a closed door, but that door is closed to every caller except
     the app: a route added later for anyone else would stop working. Declare
     it on a router only when every route on that router needs the proof.

@@ -412,17 +412,21 @@ def check_configured(session: SessionDep, scope: ScopeDep):
     return {"configured": False, "provider": ""}
 
 
-# OpenByDesign, standalone reason: what protects this route is
-# require_local_in_desktop_mode below. In org mode it is a deliberate no-op
-# (credentials are org-owned there, see the docstring) and needs no caller; in
-# local mode it DELETES every stored credential, so the desktop half takes the
-# same loopback restriction as reveal-key and /raw. The only caller is
-# Electron main's sign-out (cowork src/main/sign-out.ts), already over
-# 127.0.0.1; without the guard, a plain POST from any page or network peer
-# signs the desktop install out.
+# WindowProof, with no class before it: contradictory_routes refuses
+# OpenByDesign beside it, so tests/test_open_by_design_pin.py pins this route
+# with the open ones. In org mode the route is a deliberate no-op
+# (credentials are org-owned there, see the docstring) and needs no caller,
+# and WindowProof is a no-op there too. In local mode it DELETES every
+# stored credential, so the desktop half takes the same loopback restriction
+# as reveal-key and /raw (require_local_in_desktop_mode below), and the same
+# window proof as DELETE /{key}, so agent code holding the bearer token can't
+# sign the person out. The only caller is Electron main's sign-out (cowork
+# src/main/sign-out.ts), which sends the proof over 127.0.0.1; without the
+# loopback guard, a plain POST from any page or network peer signs the
+# desktop install out.
 @router.post(
     "/logout",
-    dependencies=[Depends(require_local_in_desktop_mode), Depends(require(OpenByDesign))],
+    dependencies=[Depends(require_local_in_desktop_mode), Depends(require(WindowProof))],
 )
 def logout_clear_credentials(session: SessionDep, scope: ScopeDep):
     """Clear all stored credentials from the DB (desktop sign-out flow, so
