@@ -15,6 +15,7 @@ import re
 import stat
 import tempfile
 import threading
+import time
 import urllib.error
 from collections import OrderedDict
 from collections.abc import Callable
@@ -353,12 +354,50 @@ class WebsiteRefused(PublishRejected):
 
     status_code: int = 409
 
-    def __init__(self, code: str) -> None:
+    def __init__(self, code: str, *, remembered: bool = False) -> None:
         super().__init__(WEBSITE_REFUSALS[code])
         self.code = code
+        # True when this server answered from _website_refusals, with no upload.
+        self.remembered = remembered
 
     def refusal(self) -> Refusal:
         return Refusal(detail=str(self), code=self.code)
+
+
+# A website re-publish the upload service refused with
+# WEBSITE_REQUIRES_OWNER_CODE, by published folder: the stamp of the entry it
+# was refused under and when this memory ends. The refusal repeats until the
+# owner saves, and each try uploads the whole bundle, so a re-publish that
+# isn't the owner's save skips it meanwhile. A successful publish of the folder
+# forgets it. Per process.
+WEBSITE_REFUSAL_TTL_S = 15 * 60.0
+_website_refusals: dict[str, tuple[tuple, float]] = {}
+
+
+def _clock() -> float:
+    return time.monotonic()
+
+
+def _entry_stamp(entry: Any) -> tuple:
+    """What identifies the stored entry a publish read; an owner's save on
+    any replica changes it."""
+    entry = entry if isinstance(entry, dict) else {}
+    return (entry.get("report_id"), entry.get("mode"), entry.get("published_mtime"), entry.get("last_md5"))
+
+
+def _website_refusal_remembered(published_dir: Path, entry: Any) -> bool:
+    remembered = _website_refusals.get(str(published_dir))
+    if remembered is None:
+        return False
+    stamp, until = remembered
+    if _clock() >= until or stamp != _entry_stamp(entry):
+        _website_refusals.pop(str(published_dir), None)
+        return False
+    return True
+
+
+def _remember_website_refusal(published_dir: Path, entry: Any) -> None:
+    _website_refusals[str(published_dir)] = (_entry_stamp(entry), _clock() + WEBSITE_REFUSAL_TTL_S)
 
 
 class UploadError(NamedTuple):
@@ -1865,6 +1904,16 @@ def publish_artifact(
                 scope=scope, owner_save=owner_save, is_fullstack=is_fullstack,
                 project_id=project_id, artifact_slug=published_dir.name,
             )
+            if not owner_save and _website_refusal_remembered(published_dir, previous):
+                logger.warning(
+                    "Skipped a website re-publish the upload service refused",
+                    extra={
+                        "event": "artifact_website_refused",
+                        "reason": WEBSITE_REQUIRES_OWNER_CODE,
+                        **log_context(project_id=project_id, artifact_slug=published_dir.name),
+                    },
+                )
+                raise WebsiteRefused(WEBSITE_REQUIRES_OWNER_CODE, remembered=True)
         canonical_artifact_key = _authorization_key(published_dir, artifacts_base, project_id, scope)
         datasource_vault = None
         if is_fullstack:
@@ -2030,7 +2079,12 @@ def publish_artifact(
                     artifact_key=canonical_artifact_key,
                     owner_side=owner_side,
                 )
-            upload_error = classify_upload_error(exc)
+            try:
+                upload_error = classify_upload_error(exc)
+            except WebsiteRefused as refused:
+                if refused.code == WEBSITE_REQUIRES_OWNER_CODE:
+                    _remember_website_refusal(published_dir, previous)
+                raise
             logger.exception("Publishing failed")
             # A 401's text ("Invalid token") says less than the credentials advice below.
             if (
@@ -2058,6 +2112,7 @@ def publish_artifact(
             if md_tmp_dir is not None:
                 md_tmp_dir.cleanup()
 
+        _website_refusals.pop(str(published_dir), None)
         # Owner-side state for the next publish, stored in the entry below and
         # never part of the response.
         password_hash = result.pop("password_hash", None)

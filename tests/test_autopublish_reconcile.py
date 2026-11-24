@@ -765,6 +765,37 @@ async def test_a_rejected_publish_fails_without_a_second_traceback(base, enabled
     assert locks.acquire(base, "rep", ttl_s=600) is True
 
 
+@pytest.mark.parametrize(
+    ("code", "remembered", "reason"),
+    [
+        ("website_requires_owner", False, "website_requires_owner"),
+        ("website_requires_owner", True, "website_refused"),
+        ("website_not_enabled", False, "website_not_enabled"),
+    ],
+)
+async def test_a_refused_website_is_a_skip_without_a_traceback(
+    base, enabled, key, monkeypatch, caplog, code, remembered, reason,
+):
+    import logging
+
+    from cowork.services.publish import WebsiteRefused
+
+    _make_published(base, "rep", entry={"mode": "website"}, mtime=1_000_000_000)
+
+    def refused(artifact, **kwargs):
+        raise WebsiteRefused(code, remembered=remembered)
+
+    monkeypatch.setattr(ap, "publish_artifact", refused)
+    with caplog.at_level(logging.WARNING, logger="cowork.services.artifact_autopublish"):
+        out = await ap.autopublish_project_artifacts(base, ORG_SCOPE, project_id=PROJECT_ID, touched={"rep"})
+
+    assert out == set()
+    assert f"result=skipped slug=rep reason={reason}" in caplog.text
+    assert "result=failed" not in caplog.text
+    assert "artifact autopublish failed" not in caplog.text
+    assert locks.acquire(base, "rep", ttl_s=600) is True
+
+
 async def test_reconciliation_reads_the_file_store_off_the_event_loop(
     base, enabled, key, publish_url, published, monkeypatch,
 ):

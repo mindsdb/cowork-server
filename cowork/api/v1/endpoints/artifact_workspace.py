@@ -507,6 +507,7 @@ async def _sync_live_artifact(
         PublishOwnedByOtherUser,
         PublishTooLarge,
         ShareOrgRequired,
+        WebsiteRefused,
         desktop_publish_credential,
         publish_artifact,
         published_artifact_access,
@@ -600,11 +601,13 @@ async def _sync_live_artifact(
         # connections in the publish dialog, so no traceback.
         logger.warning("Could not synchronize live artifact %s: new connections need approval", folder)
         return False
-    except (AccessModeChanged, ShareOrgRequired):
+    except (AccessModeChanged, ShareOrgRequired, WebsiteRefused):
         # publish_artifact logged the refusal: a mode changed after the
         # owner's last save, or MindsHub refusing a share with everyone that
         # an entry from before the rule changed still asks for. It repeats on
-        # every save until the owner saves the artifact's sharing again.
+        # every save until the owner saves the artifact's sharing again. A
+        # website refusal was logged with its code; a refusal as not the
+        # owner's is remembered for a while (cowork.services.publish._website_refusals).
         return False
     except Exception:
         logger.warning("Could not synchronize live artifact %s", folder, exc_info=True)
