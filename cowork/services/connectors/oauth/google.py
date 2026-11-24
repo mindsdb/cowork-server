@@ -721,7 +721,13 @@ class OAuthService:
             all_connections = []
             vault = None
 
-        state_data = self._store(oauth_settings)._load()
+        try:
+            state_data = self._store(oauth_settings).read_all()
+        except OSError as exc:
+            # The catalogue only shows the state, so a failed read costs the
+            # pending and last-error fields, not the page.
+            _log.warning("Could not read OAuth state for catalogue: %s", exc)
+            state_data = {}
         items = []
 
         for service_id, cfg in OAUTH_SERVICES.items():
