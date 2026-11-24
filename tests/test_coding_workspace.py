@@ -283,6 +283,22 @@ def test_apply_preflights_and_saves_recovery_patch(tmp_path: Path) -> None:
     assert (repo / "new.txt").read_text(encoding="utf-8") == "new\n"
 
 
+def test_apply_leaves_the_task_diff_as_it_was_reviewed(tmp_path: Path) -> None:
+    repo = repository(tmp_path)
+    manager = WorkspaceManager(tmp_path / "coding")
+    prepared = manager.prepare("session-apply-diff", str(repo))
+    (prepared.workspace_path / "keep.txt").write_text("from task\n", encoding="utf-8")
+    (prepared.workspace_path / "new.txt").write_text("new\n", encoding="utf-8")
+    reviewed = manager.diff(str(prepared.workspace_path), prepared.base_revision)
+
+    manager.apply_to_source("session-apply-diff", str(repo), str(prepared.workspace_path), prepared.base_revision)
+
+    # The review panel recognises an applied change by its diff, so taking the
+    # handoff patch must not turn a new file into a staged one.
+    assert manager.diff(str(prepared.workspace_path), prepared.base_revision) == reviewed
+    assert git(prepared.workspace_path, "status", "--porcelain", "new.txt") == "?? new.txt"
+
+
 def test_apply_conflict_does_not_partially_change_source(tmp_path: Path) -> None:
     repo = repository(tmp_path)
     manager = WorkspaceManager(tmp_path / "coding")

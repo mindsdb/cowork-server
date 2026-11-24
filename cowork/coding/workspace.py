@@ -1191,19 +1191,14 @@ class WorkspaceManager:
         truncate: bool = False,
     ) -> Path | None:
         untracked = [path for status, path in self._status_entries(workspace) if status == "??"]
+        # Send NUL-delimited paths over stdin so Windows command-line limits
+        # cannot break recovery for tasks with many or unusual filenames.
+        pathspec = ("--pathspec-from-file=-", "--pathspec-file-nul")
+        untracked_paths = "\0".join(untracked) + "\0"
         if untracked:
             # Intent-to-add makes Git include new files in the binary diff while
             # leaving their contents unstaged and the working copy unchanged.
-            # Send NUL-delimited paths over stdin so Windows command-line limits
-            # cannot break recovery for tasks with many or unusual filenames.
-            self.git.run(
-                workspace,
-                "add",
-                "-N",
-                "--pathspec-from-file=-",
-                "--pathspec-file-nul",
-                input_text="\0".join(untracked) + "\0",
-            )
+            self.git.run(workspace, "add", "-N", *pathspec, input_text=untracked_paths)
         snapshot_dir = self.snapshots_root / session_id
         snapshot_dir.mkdir(parents=True, exist_ok=True)
         snapshot = snapshot_dir / filename
@@ -1213,6 +1208,12 @@ class WorkspaceManager:
         except Exception:
             temp.unlink(missing_ok=True)
             raise
+        finally:
+            if untracked:
+                # Left in the index, the new files would read as staged from
+                # here on, and the task's diff would no longer match the one
+                # that was reviewed.
+                self.git.run(workspace, "reset", "--quiet", *pathspec, input_text=untracked_paths, check=False)
         size = temp.stat().st_size
         if not size:
             temp.unlink()
