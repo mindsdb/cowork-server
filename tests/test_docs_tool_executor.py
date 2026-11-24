@@ -10,7 +10,7 @@ import pytest
 
 from cowork.docs import tools as doc_tools
 from cowork.docs.model import DocError
-from cowork.docs.prompt import DOC_PROMPT, REMOTE_RETRY_RULE
+from cowork.docs.prompt import DOC_GUIDE, DOC_PROMPT, DOC_SKILL_LABEL, REMOTE_DOC_PROMPT, REMOTE_RETRY_RULE
 from cowork.docs.store import DOC_FILENAME, find_doc_folder
 from cowork.docs.tools import DOC_TOOL_NAMES, TOO_BIG_TEXT, DocToolContext, remote_doc_tool_specs, run_doc_tool
 from cowork.harnesses.anton_harness.doc_tools import build_doc_tools
@@ -124,11 +124,38 @@ def test_the_remote_specs_are_the_doc_tools_with_the_retry_rule_only_in_their_pr
         assert spec["description"] and spec["input_schema"]["type"] == "object"
         assert spec["timeout_s"] == 60
     json.dumps(specs)
-    assert {s["name"]: s.get("prompt") for s in specs} == {
-        "create_doc": DOC_PROMPT + REMOTE_RETRY_RULE, "read_doc": None, "edit_doc": None, "list_docs": None,
+    # Shaped as on the desktop: list_docs carries the short prompt, the rest wait for the skill.
+    assert {s["name"]: (s.get("prompt"), s.get("unlock_skill")) for s in specs} == {
+        "create_doc": (None, DOC_SKILL_LABEL), "read_doc": (None, DOC_SKILL_LABEL),
+        "edit_doc": (None, DOC_SKILL_LABEL), "list_docs": (REMOTE_DOC_PROMPT, None),
     }
-    assert "did not answer" in REMOTE_RETRY_RULE and "did not answer" not in DOC_PROMPT
-    assert {t.name: t.prompt for t in build_doc_tools(ctx)}["create_doc"] == DOC_PROMPT
+    assert REMOTE_DOC_PROMPT == DOC_PROMPT + REMOTE_RETRY_RULE and "did not answer" not in DOC_PROMPT
+    assert DOC_GUIDE not in REMOTE_DOC_PROMPT
+
+
+def test_a_remote_turn_with_doc_tools_brings_the_docs_skill():
+    from cowork.docs.remote import docs_skill
+    from cowork.schemas.turn_skills import TurnSkillEntry
+
+    [(label, entry)] = docs_skill().items()
+    assert label == DOC_SKILL_LABEL and set(entry.files) == {"SKILL.md"} and not entry.always_on
+    assert DOC_GUIDE in entry.files["SKILL.md"]
+    # A person's own skill of that name gives way, as a host skill wins on the desktop.
+    mine = {"docs": TurnSkillEntry(files={"SKILL.md": "mine"}), "notes": TurnSkillEntry(files={"SKILL.md": "n"})}
+    from cowork.docs.remote import RemoteDocTools
+
+    merged = RemoteDocTools.with_docs_skill(None, mine)
+    assert merged["docs"] == entry and merged["notes"] == mine["notes"]
+
+
+def test_in_process_only_list_docs_is_offered_up_front_and_the_rest_wait_for_the_docs_skill(ctx):
+    tools = {t.name: t for t in build_doc_tools(ctx)}
+    assert tools["list_docs"].prompt == DOC_PROMPT and tools["list_docs"].unlock_skill is None
+    for name in ("create_doc", "read_doc", "edit_doc"):
+        assert tools[name].unlock_skill == DOC_SKILL_LABEL and tools[name].prompt is None
+    # The always-on prompt names the skill; the writing rules stay in it.
+    assert f"`recall_skill` with the label `{DOC_SKILL_LABEL}`" in DOC_PROMPT
+    assert "Doc Markdown" in DOC_GUIDE and "Doc Markdown" not in DOC_PROMPT
 
 
 async def test_a_stale_edit_is_refused_even_when_the_doc_cannot_be_read_again(ctx, monkeypatch):

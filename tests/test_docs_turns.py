@@ -18,7 +18,7 @@ import cowork.handlers.responses as responses_mod
 from cowork.common.settings.user_settings import Provider, UserSettings
 from cowork.db.scoped import LOCAL_SCOPE, ScopedSession
 from cowork.db.session import get_open_session
-from cowork.docs.prompt import DOC_PROMPT
+from cowork.docs.prompt import DOC_PROMPT, DOC_SKILLS_ROOT
 from cowork.handlers.response_routing import DELEGATED_AGENTIC, RouteDecision
 from cowork.harnesses.anton_harness import harness
 from cowork.harnesses.anton_harness.doc_tools import DOC_TOOL_NAMES
@@ -60,6 +60,25 @@ async def test_the_doc_tools_and_their_prompt_are_there_only_when_the_client_sho
     assert (set(DOC_TOOL_NAMES) <= names) is docs
     assert names.isdisjoint(DOC_TOOL_NAMES) is not docs
     assert (DOC_PROMPT in prompts) is docs
+    # The `docs` skill, which unlocks the other doc tools, is offered with them and only with them.
+    assert (DOC_SKILLS_ROOT in config.settings.skills_extra_roots) is docs
+
+
+@pytest.mark.asyncio
+async def test_recalling_the_docs_skill_unlocks_the_doc_tools(monkeypatch):
+    """Only list_docs and the short prompt ride on every call; the skill brings the rest."""
+    from anton.core.tools.recall_skill import handle_recall_skill
+
+    config = await _chat_session_config(monkeypatch, docs=True)
+    from anton.core.session import ChatSession
+
+    session = ChatSession(config)
+    before = {t["name"] for t in session._build_tools()}
+    assert "list_docs" in before and before.isdisjoint({"create_doc", "read_doc", "edit_doc"})
+    out = await handle_recall_skill(session, {"label": "docs"})
+    after = {t["name"] for t in session._build_tools()}
+    assert {"create_doc", "read_doc", "edit_doc"} <= after
+    assert "Doc Markdown" in str(getattr(out, "content", out))
 
 
 @pytest.fixture(autouse=True)

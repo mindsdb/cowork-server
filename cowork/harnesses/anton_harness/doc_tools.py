@@ -22,7 +22,7 @@ from anton.core.tools.registry import ToolOutcome
 from anton.core.tools.tool_defs import ToolDef
 from anton.core.tools.tool_handlers import _track_artifact
 
-from cowork.docs.prompt import DOC_PROMPT
+from cowork.docs.prompt import DOC_PROMPT, DOC_SKILL_LABEL
 from cowork.docs.tools import (
     DOC_TOOL_NAMES,
     DOC_TOOL_SPECS,
@@ -102,8 +102,12 @@ def _handler(ctx: DocToolContext, name: str):
 
 
 def build_doc_tools(ctx: DocToolContext) -> list[ToolDef]:
+    """``list_docs`` is always there and carries the short docs section of the
+    system prompt; the others wait until the agent recalls the ``docs`` skill,
+    whose body is the writing guide. A tool unlocked that way stays for the
+    session, and anton re-unlocks it from the recall in a reloaded history."""
     return [
         ToolDef(name=name, description=description, input_schema=schema, handler=_handler(ctx, name),
-                **({"prompt": DOC_PROMPT} if name == "create_doc" else {}))
+                **({"prompt": DOC_PROMPT} if name == "list_docs" else {"unlock_skill": DOC_SKILL_LABEL}))
         for name, description, schema in DOC_TOOL_SPECS
     ]

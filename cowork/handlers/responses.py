@@ -3510,7 +3510,7 @@ class ResponsesHandler:
                 # a bounded, sheddable wire block. Skills travel as the
                 # caller's whole recallable set (remote_turn_skills).
                 memory=seed.memory,
-                skills=skills,
+                skills=doc_tools.with_docs_skill(skills) if doc_tools is not None else skills,
                 workspace=seed.workspace,
                 started_at=seed.started_at,
                 correlation_id=corr,

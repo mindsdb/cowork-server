@@ -118,6 +118,8 @@ async def test_the_pod_is_offered_the_doc_tools_exactly_when_its_input_carries_t
         assert [spec["name"] for spec in sent.get("host_tools") or []] == list(DOC_TOOL_NAMES)
     else:
         assert sent.get("host_tools") is None
+    # The skill that unlocks them in the pod travels with them, and only with them.
+    assert ("docs" in (sent.get("skills") or {})) is expected
 
 
 async def test_a_pod_left_without_the_doc_tools_gets_the_typed_text_alone(monkeypatch):
