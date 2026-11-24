@@ -128,6 +128,16 @@ def _has_credentials(url: str) -> bool:
     return "@" in parsed.netloc
 
 
+def filter_storage(common: Path) -> list[Path]:
+    """Where an installed content filter keeps its own copies of files.
+
+    Git LFS stores every file it cleans under ``lfs``, even when Git is only
+    comparing, so staging, status and diff all fail without write access to
+    it. The folder holds content-addressed data and nothing Git executes.
+    """
+    return [path for path in (common / "lfs",) if path.is_dir()]
+
+
 @dataclass(frozen=True)
 class GitDirectories:
     """Where a repository keeps what a hook may change and what it must not."""
@@ -163,6 +173,7 @@ class GitDirectories:
                 grants.update({entry: "read" for entry in refs.iterdir() if entry.name not in _STASH_ENTRIES})
             else:
                 grants.update({refs / name: "write" for name in _STASH_ENTRIES})
+        grants.update({path: "write" for path in filter_storage(self.common)})
         return grants
 
     def snapshot(self) -> tuple[set[Path], set[Path]]:
@@ -199,12 +210,14 @@ def sandboxed_argv(
     *,
     git: GitDirectories | None = None,
     read_only: Sequence[Path] = (),
+    storage: Sequence[Path] = (),
     codex: Path | None = None,
 ) -> list[str]:
     """Wrap a command so it runs inside the task's sandbox.
 
     ``read_only`` names paths inside a writable root that stay read-only, such
     as a repository's Git directory, which Codex protects only by default.
+    ``storage`` names filter storage that stays writable even for a read.
     """
     if not policy.sandboxed:
         return list(argv)
@@ -223,6 +236,7 @@ def sandboxed_argv(
                 if path.resolve() != path:
                     raise WorkspaceError("Cannot grant commit access through symbolic links in Git metadata")
                 filesystem[str(path)] = access
+    filesystem.update({str(Path(path).resolve()): "write" for path in storage})
     network = "enabled=true"
     if not policy.read_only:
         sockets = ", ".join(f'{toml_string(str(path))}="allow"' for path in (*roots, temp))
@@ -309,12 +323,13 @@ def run_sandboxed(
     writable: Sequence[Path],
     git: GitDirectories | None = None,
     read_only: Sequence[Path] = (),
+    storage: Sequence[Path] = (),
     timeout: int = HOOK_TIMEOUT_SECONDS,
 ) -> subprocess.CompletedProcess[str]:
     if _org_mode():
         raise WorkspaceError("Local Code Project commands are not available on this deployment")
     return subprocess.run(
-        sandboxed_argv(argv, policy, writable, git=git, read_only=read_only),
+        sandboxed_argv(argv, policy, writable, git=git, read_only=read_only, storage=storage),
         cwd=str(cwd),
         env=sandbox_environment(environment, policy),
         text=True,

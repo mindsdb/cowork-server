@@ -717,3 +717,65 @@ def test_filtered_git_reads_use_read_only_sandbox_and_can_export_patch(tmp_path:
     manager.git.run(repo, "diff", f"--output={patch}", "HEAD", "--", "README.md", environment={"COWORK_TEST_SECRET": "private"})
     assert "+CHANGED" in patch.read_text()
     assert len(reads) == 2
+
+
+def stateful_filter_repository(tmp_path: Path) -> Path:
+    """A repository whose installed filter stores content in the Git directory, as Git LFS does."""
+    program = tmp_path / "bin" / "store-filter"
+    program.parent.mkdir()
+    program.write_text(
+        "#!/bin/sh\n"
+        'store="$(cd "$(git rev-parse --git-common-dir)" && pwd)/lfs/objects"\n'
+        'mkdir -p "$store" && cat > "$store/tmp.$$" || exit 1\n'
+        'oid=$(shasum -a 256 "$store/tmp.$$" | cut -d" " -f1)\n'
+        'mv "$store/tmp.$$" "$store/$oid" && echo "pointer $oid"\n',
+        encoding="utf-8",
+    )
+    program.chmod(program.stat().st_mode | stat.S_IXUSR)
+    repo = repository(tmp_path / "repo")
+    git(repo, "config", "filter.lfs.clean", str(program))
+    git(repo, "config", "filter.lfs.smudge", "cat")
+    git(repo, "config", "filter.lfs.required", "true")
+    (repo / ".gitattributes").write_text("*.bin filter=lfs\n", encoding="utf-8")
+    (repo / "asset.bin").write_text("one\n", encoding="utf-8")
+    git(repo, "add", ".")
+    git(repo, "commit", "-q", "-m", "asset")
+    return repo
+
+
+@requires_sandbox
+def test_a_filter_that_stores_content_in_the_git_directory_still_commits_and_diffs(
+    tmp_path: Path, checks: CheckPolicy,
+) -> None:
+    repo = stateful_filter_repository(tmp_path)
+    worktree = tmp_path / "task"
+    git(repo, "worktree", "add", "-q", "-b", "task", str(worktree))
+    manager = WorkspaceManager(tmp_path / "root")
+
+    (repo / "asset.bin").write_text("changed in the folder\n", encoding="utf-8")
+    assert "asset.bin" in manager.git.run(repo, "diff", "--no-ext-diff", "HEAD").stdout
+    folder = manager.commit(str(repo), "Folder", checks, workspace_kind=WorkspaceKind.direct_folder)
+
+    (worktree / "asset.bin").write_text("changed in the task\n", encoding="utf-8")
+    task = manager.commit(str(worktree), "Task", checks, workspace_kind=WorkspaceKind.git_worktree)
+
+    assert not folder.dirty and git(repo, "log", "-1", "--format=%s") == "Folder"
+    assert not task.dirty and git(worktree, "log", "-1", "--format=%s") == "Task"
+
+
+def test_a_recorded_commit_is_reported_even_when_status_cannot_be_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repo = repository(tmp_path / "repo")
+    (repo / "README.md").write_text("changed\n", encoding="utf-8")
+    manager = WorkspaceManager(tmp_path / "root")
+
+    def unreadable(*_args, **_kwargs):
+        raise WorkspaceError("Could not check Git status")
+
+    monkeypatch.setattr(manager, "_status_lines", unreadable)
+
+    state = manager.commit(str(repo), "Change")
+
+    assert state.revision == git(repo, "rev-parse", "HEAD")
+    assert git(repo, "log", "-1", "--format=%s") == "Change"

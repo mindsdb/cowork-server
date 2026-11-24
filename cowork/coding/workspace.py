@@ -310,7 +310,9 @@ class GitRunner:
                             output = resources.enter_context(patch_path.open("wb"))
                             argv.remove(option)
                             break
-                    argv = check_sandbox.sandboxed_argv(argv, policy, ())
+                    common = self.run(working_directory, "rev-parse", "--git-common-dir", check=False, environment=environment)
+                    storage = check_sandbox.filter_storage((working_directory / common.stdout.strip()).resolve()) if common.returncode == 0 else []
+                    argv = check_sandbox.sandboxed_argv(argv, policy, (), storage=storage)
                 result = subprocess.run(
                     argv,
                     cwd=str(working_directory),  # lgtm[py/path-injection]
@@ -502,7 +504,9 @@ class WorkspaceManager:
                 warning=None if include_local_changes else inspection.warning,
             )
 
-    def git_state(self, source_path: str, workspace_path: str, checks: CheckPolicy | None = None) -> GitState:
+    def git_state(
+        self, source_path: str, workspace_path: str, checks: CheckPolicy | None = None, *, committed: bool = False,
+    ) -> GitState:
         workspace = Path(workspace_path)
         root = self._git_root(workspace)
         if root is None:
@@ -510,7 +514,15 @@ class WorkspaceManager:
         branch_result = self.git.run(root, "symbolic-ref", "--short", "-q", "HEAD", check=False)
         branch = branch_result.stdout.strip() or None
         revision = self._head_revision(root)
-        status_lines = self._status_lines(root, checks)
+        try:
+            status_lines = self._status_lines(root, checks)
+        except WorkspaceError:
+            if not committed:
+                raise
+            # The commit is already recorded, so an unreadable status must not
+            # report it as failed. Everything was staged before it was made.
+            logger.warning("Could not read Git status after committing in %s", root, exc_info=True)
+            status_lines = []
         return GitState(
             is_git=True,
             branch=branch,
@@ -805,7 +817,7 @@ class WorkspaceManager:
                 if checks is not None:
                     self._run_commit_hooks(root, message_file, checks, workspace_kind)
                 self._record_commit(root, message_file.read_text(encoding="utf-8"))
-            return self.git_state(str(root), str(root), checks)
+            return self.git_state(str(root), str(root), checks, committed=True)
 
     def check_no_operation_in_progress(self, workspace_path: str) -> None:
         """Refuse to commit over a merge, cherry-pick, revert or rebase Git is in the middle of.
@@ -1529,6 +1541,7 @@ class WorkspaceManager:
                     ["git", *_platform_config_args(), *_host_safety_args(args), *args],
                     cwd=root, policy=checks, environment=environment, writable=[root],
                     read_only=check_sandbox.git_metadata(root),
+                    storage=check_sandbox.filter_storage(check_sandbox.git_directories(self.git.run, root).common),
                 )
             except (OSError, subprocess.TimeoutExpired) as exc:
                 raise WorkspaceError(f"Could not check Git status: {exc}") from exc
