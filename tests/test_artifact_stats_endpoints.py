@@ -195,6 +195,21 @@ def _lock_is_free(folder) -> bool:
     return True
 
 
+@pytest.mark.parametrize("route", [_read, _toggle, _viewer, _delete], ids=["read", "toggle", "viewer", "delete"])
+async def test_every_stats_route_answers_unavailable_for_a_website(as_owner, keys, stats_calls, route):
+    (as_owner / ".published.json").write_text(json.dumps({"report.html": {
+        "report_id": "rid-1", "url": "https://hk1.mindshub.co/", "published": True, "mode": "website",
+    }}))
+    with pytest.raises(HTTPException) as refused:
+        await route()
+    assert (refused.value.status_code, refused.value.detail) == (
+        404, {"code": "stats_unavailable", "message": artifact_stats.WEBSITE_STATS_MESSAGE},
+    )
+    assert stats_calls == []
+    assert keys.minted == []
+    assert _lock_is_free(as_owner)
+
+
 async def test_owner_reads_stats_with_a_key_minted_for_the_request(as_owner, keys, stats_calls):
     out = await _read()
 
