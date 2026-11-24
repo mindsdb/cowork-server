@@ -53,7 +53,7 @@ from cowork.services.mindshub_client import canonical_uuid
 
 # How far each mode opens the link: a mode is wider than another when its
 # number is higher.
-_BREADTH = {AccessMode.RESTRICTED: 0, AccessMode.PASSWORD: 1, AccessMode.PUBLIC: 2}
+_BREADTH = {AccessMode.RESTRICTED: 0, AccessMode.PASSWORD: 1, AccessMode.PUBLIC: 2, AccessMode.WEBSITE: 3}
 
 
 class OwnerChoice(NamedTuple):

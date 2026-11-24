@@ -253,7 +253,7 @@ async def test_a_malformed_save_is_a_400_with_a_sentence_never_a_422(as_owner, p
     access object, as the dialog sends them."""
     refusals = [
         ({"access": {"mode": "restricted", "allowed_user_ids": "nope"}}, "allowed_user_ids must be a list."),
-        ({"access": {"mode": "everyone"}}, "mode: Input should be 'restricted', 'password' or 'public'."),
+        ({"access": {"mode": "everyone"}}, "mode: Input should be 'restricted', 'password', 'public' or 'website'."),
         ({"access": {"mode": "restricted", "org_allowed": "maybe"}}, "org_allowed must be true or false."),
         ({"access": {"mode": "restricted", "notify": "everyone"}}, "notify must be an object."),
         ({"access": {"mode": "restricted", "notify": {"emails": "a@example.com"}}}, "notify.emails must be a list."),
@@ -264,6 +264,14 @@ async def test_a_malformed_save_is_a_400_with_a_sentence_never_a_422(as_owner, p
     for body, detail in refusals:
         answer = await _put_access(body)
         assert (answer.status_code, answer.json()) == (400, {"detail": detail}), body
+    assert publish_calls == []
+
+
+async def test_a_website_save_with_another_access_field_is_a_400(as_owner, publish_calls, publish_context):
+    from cowork.schemas.artifact_access import WEBSITE_FIELDS_REFUSAL
+
+    answer = await _put_access({"access": {"mode": "website", "password": "pw"}})
+    assert (answer.status_code, answer.json()) == (400, {"detail": WEBSITE_FIELDS_REFUSAL})
     assert publish_calls == []
 
 

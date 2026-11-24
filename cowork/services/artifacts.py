@@ -661,7 +661,7 @@ def published_access_view(
 ) -> ArtifactAccessView:
     """Owner-side access state for the primary file, from `.published.json`.
 
-    The mode (public|password|restricted) plus the mode-specific state needed
+    The mode (public|password|restricted|website) plus the mode-specific state needed
     to pre-fill the publish dialog on re-publish: the password (password) and
     who a restricted artifact is shared with. The plaintext password and the
     email list are owner-only (`.published.json` never enters the published
@@ -674,7 +674,7 @@ def published_access_view(
     reads as unknown here (ArtifactAccessView.audience_unknown), even for an
     entry written before that: a card never shows a copy that could have
     gone stale or been planted, nor an empty audience it doesn't know. An
-    entry whose mode is none of the three reads as public, the mode anton's
+    entry whose mode is none of the four reads as public, the mode anton's
     publisher republishes it in.
     """
     if primary is None:

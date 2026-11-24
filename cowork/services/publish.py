@@ -1058,7 +1058,9 @@ def _publish_markdown_body(md_text: str) -> str:
 
 def kept_access(entry: Any, *, org_mode: bool) -> ArtifactAccessRequest:
     """The access a re-publish that isn't a person's save keeps (live sync,
-    autopublish, an update): the entry's mode and password. In MindsHub mode
+    autopublish, an update): the entry's mode and password. A website entry is
+    kept as a website without the owner's confirmation, so the upload service
+    keeps it only where its own row already says website (_upload_access). In MindsHub mode
     a restricted entry doesn't say who the rule shares with, so this names
     nobody and publish_artifact takes all of it from MindsHub's rule
     (_plan_access); ``owner_only`` keeps a rule that names nobody restricted

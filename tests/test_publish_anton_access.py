@@ -200,8 +200,17 @@ def test_the_agents_publish_tool_hands_anton_each_mode(artifact, anton_access, m
         # A publish that isn't restricted reads no rule and keeps its fields.
         (lambda: ArtifactAccessRequest(mode=AccessMode.PASSWORD, password="pw"), None, {"mode": "password", "password": "pw"}),
         (lambda: ArtifactAccessRequest(mode=AccessMode.PUBLIC), None, {"mode": "public"}),
+        (lambda: ArtifactAccessRequest(mode=AccessMode.WEBSITE), None, {"mode": "website"}),
+        (
+            lambda: publish.kept_access({"mode": "website", "confirmed_by_owner": True}, org_mode=True),
+            None,
+            {"mode": "website"},
+        ),
     ],
-    ids=["kept-restricted", "first-autopublish", "teams-and-people", "everyone-and-emails", "password", "public"],
+    ids=[
+        "kept-restricted", "first-autopublish", "teams-and-people", "everyone-and-emails", "password", "public",
+        "website", "kept-website",
+    ],
 )
 def test_a_publish_in_mindshub_mode_hands_anton_each_mode(anton_access, access, stored, handed):
     """``access`` is built in the test, so a caller's model that can't be
