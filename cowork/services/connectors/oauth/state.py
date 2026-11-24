@@ -6,6 +6,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
+from cowork.common.paths import dir_atomic_write, pinned_dir
+
 _log = logging.getLogger(__name__)
 
 _OUTCOME_TTL = timedelta(minutes=20)
@@ -29,9 +31,16 @@ class OAuthStateStore:
             return {}
 
     def _save(self, data: dict[str, Any]) -> None:
+        # The file holds a connector's client secret, so only the user may
+        # read it. A missing folder is created 0700; an existing one keeps its
+        # mode, since it can be a home folder the user chose. dir_atomic_write
+        # renames a new 0600 file over the old one, so an older, wider file
+        # ends at 0600 too.
+        content = json.dumps(data, indent=2).encode("utf-8")
         try:
-            self._path.parent.mkdir(parents=True, exist_ok=True)
-            self._path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+            self._path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+            with pinned_dir(self._path.parent) as folder:
+                dir_atomic_write(folder, self._path.name, content=content)
         except OSError as exc:
             _log.warning("Could not save OAuth state to %s: %s", self._path, exc)
 
