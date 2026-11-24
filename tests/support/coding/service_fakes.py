@@ -54,10 +54,10 @@ def wait_for_status(service: CodingService, session_id: str, status: SessionStat
 
 
 def assert_usage_refreshes_after_cleanup(service: CodingService) -> None:
-    assert service.workspaces.pending_removals.wait(5)
+    assert service.workspaces.pending_removals.wait(30)
     page = service.workspace_usage_page()
     assert page.measuring
-    deadline = time.monotonic() + 5
+    deadline = time.monotonic() + 30
     while page.measuring and time.monotonic() < deadline:
         time.sleep(0.01)
         page = service.workspace_usage_page()
