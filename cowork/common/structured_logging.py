@@ -84,6 +84,11 @@ EVENT_FIELDS = frozenset(
         "share",
         "step",
         "steps",
+        # A turn key mint's purpose and the lifetimes it asked for and got
+        # (cowork.turnqueue.auth_keys._request_turn_key).
+        "purpose",
+        "requested_ttl_seconds",
+        "ttl_seconds",
     ]
 )
 HEALTH_PATHS = frozenset(
