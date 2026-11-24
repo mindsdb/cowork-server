@@ -132,7 +132,7 @@ class ScheduleRun(BaseSQLModel, table=True):
     trial: bool = Field(
         default=False,
         sa_column_kwargs={"server_default": sa.false()},
-        description="A run-now that tries the task out: it leaves a one-off scheduled, and neither the freshness guard nor the failure streak counts it",
+        description="A run-now that tries the task out: it leaves the failure streak unchanged",
     )
     slot_at: datetime | None = Field(
         default=None,

@@ -52,6 +52,8 @@ from cowork.services.connectors.specs._registry import ConnectorSpecRegistry, re
 
 if TYPE_CHECKING:
     from cowork.schemas.artifact_access import ArtifactAccessRequest
+    from cowork.services.datasource_approval import DatasourceKey
+    from cowork.services.publish import DatasourceApprovalRequired
 
 logger = logging.getLogger(__name__)
 T = TypeVar("T")
@@ -70,7 +72,11 @@ def _published_state(raw_path: str) -> dict:
     return published_state(raw_path, scope=current_settings_scope())
 
 
-def _publish_artifact(raw_path: str, access: ArtifactAccessRequest | None = None) -> dict:
+def _publish_artifact(
+    raw_path: str,
+    access: ArtifactAccessRequest | None = None,
+    approved_datasources: frozenset[DatasourceKey] | None = None,
+) -> dict:
     """Desktop publish for the agent's own `publish_or_preview` tool.
 
     Resolves the artifact, its root and the credential the same way the HTTP
@@ -86,6 +92,7 @@ def _publish_artifact(raw_path: str, access: ArtifactAccessRequest | None = None
     return publish_artifact(
         artifact, artifacts_base=artifacts_base,
         api_key=api_key, publish_url=publish_url, access=access, scope=scope,
+        approved_datasources=approved_datasources,
     )
 
 
@@ -162,7 +169,13 @@ _PUBLISH_PROMPT = (
     "  owner_only=true and no emails. Leaving emails empty WITHOUT owner_only publishes PUBLICLY.\n"
     "- Exception: when re-publishing an artifact that already has access on record and the user\n"
     "  says nothing new about access, omit these fields to keep its previous access (no need to\n"
-    "  ask again)."
+    "  ask again).\n"
+)
+# Only where full-stack apps publish: the self-hosted publisher refuses them.
+_FULLSTACK_CARD_RULE = (
+    "- Publishing a full-stack app can show the user a card listing the connections whose\n"
+    "  credentials it uploads. If they cancel, don't work around the card by editing\n"
+    "  `.published.json`, `metadata.json` or the artifact's id.\n"
 )
 COWORK_PUBLISH_DESCRIPTION = _PUBLISH_DESCRIPTION.format(
     panel="In the desktop app the user can also publish via the Live Artifacts panel",
@@ -170,7 +183,7 @@ COWORK_PUBLISH_DESCRIPTION = _PUBLISH_DESCRIPTION.format(
 COWORK_PUBLISH_PROMPT = _PUBLISH_PROMPT.format(
     heading="CONTENT SHARING POLICY (desktop chat):",
     from_chat="publishing works straight from chat when MindsHub is configured",
-)
+) + _FULLSTACK_CARD_RULE
 # A self-hosted deployment publishes to its own publisher, which takes HTML
 # and Markdown only: `publish_artifact` refuses a full-stack artifact there
 # (`FULLSTACK_PUBLISH_UNSUPPORTED`). The agent hears it before it builds one.
@@ -186,6 +199,12 @@ SELF_HOSTED_PUBLISH_DESCRIPTION = (
 SELF_HOSTED_PUBLISH_PROMPT = _PUBLISH_PROMPT.format(
     heading="CONTENT SHARING POLICY:",
     from_chat="publishing works straight from chat",
+)
+# Appended where a first publish without access raises AccessChoiceRequired:
+# a shared publish token has no owner to let in.
+FIRST_PUBLISH_ACCESS_RULE = (
+    "- This deployment can't publish a link only the user can open: never set owner_only, and\n"
+    "  on a first publish always pass access_mode, asking the user which access they want first.\n"
 )
 
 
@@ -221,6 +240,47 @@ def _resolve_publish_path(session: Any, raw_path: str) -> Path | None:
     except (OSError, RuntimeError, ValueError):
         # NUL bytes, over-long names and unknown `~user` raise here.
         return None
+
+
+_DATASOURCES_NOT_APPROVED = {
+    "cancelled": (
+        "PUBLISH FAILED: The user didn't approve sending these credentials, so nothing was published. "
+        "Don't publish it another way; ask what they'd like to change."
+    ),
+    "timeout": (
+        "PUBLISH FAILED: The user didn't answer in time, so nothing was published. "
+        "The user can publish it from the Share dialog."
+    ),
+    "unavailable": (
+        "PUBLISH FAILED: Confirmation isn't available in this conversation, so nothing was published. "
+        "The user can publish it from the Share dialog."
+    ),
+    "error": "PUBLISH FAILED: The confirmation card failed, so nothing was published.",
+}
+
+
+def _card_artifact_name(exc: DatasourceApprovalRequired, file_path: Path) -> str:
+    """The artifact the card names: the published folder the server resolved,
+    else the folder of the path the tool resolved, never the agent's `title`.
+    The agent names folders too, so only word characters, `.` and `-` show."""
+    name = exc.artifact_slug or (file_path.name if file_path.is_dir() else file_path.parent.name)
+    return re.sub(r"[^\w.-]+", "-", name)[:80] or "this app"
+
+
+async def _confirm_datasources(session: Any, artifact_name: str, pending: list[dict[str, str]]) -> str:
+    """Show the card listing the connections whose credentials a publish
+    would upload (confirm_card); only "confirmed" lets them leave."""
+    from cowork.harnesses.anton_harness.confirm_card import confirm_card
+
+    names = ", ".join(item["label"] for item in pending)
+    return await confirm_card(
+        session,
+        key="publish",
+        prompt=f'Publishing "{artifact_name}" will upload the credentials of these connections to MindsHub: {names}.',
+        confirm=("publish", "Publish", "Upload these credentials with the app"),
+        cancel_detail="Publish nothing",
+        confirm_style="primary",
+    )
 
 
 async def _cowork_publish_or_preview(session: Any, tc_input: dict):
@@ -287,7 +347,7 @@ async def _cowork_publish_or_preview(session: Any, tc_input: dict):
     if action != "publish":
         return f"publish_or_preview: unknown action '{action}'"
 
-    # Resolve the access spec: explicit tool fields > preserve previous > public.
+    # Resolve the access spec: explicit tool fields > preserve previous > the service's default.
     from pydantic import ValidationError
 
     from cowork.models.artifact_owner_choice import AccessMode
@@ -327,9 +387,10 @@ async def _cowork_publish_or_preview(session: Any, tc_input: dict):
         # mode/access_password, which would silently reset to public.
         prev = _published_owner_state(abs_path)
         try:
-            access = (
-                _access_from_state(prev) if prev.get("report_id") else ArtifactAccessRequest(mode=AccessMode.PUBLIC)
-            )
+            # None on a first publish: publish_artifact applies the default
+            # (owner-only, or a refusal where a shared publish token can't
+            # publish privately).
+            access = _access_from_state(prev) if prev.get("report_id") else None
         except ValidationError as exc:
             # The entry is a file the agent can write, so its access fields can
             # hold any type; publishing without them would change who sees it.
@@ -368,10 +429,13 @@ async def _cowork_publish_or_preview(session: Any, tc_input: dict):
 
     from fastapi import HTTPException
 
+    from cowork.services.datasource_approval import DatasourceKey
     from cowork.services.publish import (
         ARTIFACT_TOO_LARGE_MESSAGE,
         MARKDOWN_NOT_PUBLISHABLE_CODE,
         OWNED_BY_OTHER_USER_MESSAGE,
+        AccessChoiceRequired,
+        DatasourceApprovalRequired,
         MarkdownNotPublishable,
         PublishOwnedByOtherUser,
         PublishRejected,
@@ -384,7 +448,32 @@ async def _cowork_publish_or_preview(session: Any, tc_input: dict):
         # A thread of its own: a Markdown page renders in the conversion
         # process, for up to its 30 s, and the upload blocks too. This handler
         # runs on the server's event loop.
-        result = await asyncio.to_thread(_publish_artifact, abs_path, access=access)
+        try:
+            result = await asyncio.to_thread(_publish_artifact, abs_path, access=access)
+        except DatasourceApprovalRequired as exc:
+            answer = await _confirm_datasources(session, _card_artifact_name(exc, file_path), exc.pending)
+            if answer != "confirmed":
+                reason = "datasource_approval_declined" if answer == "cancelled" else f"datasource_approval_{answer}"
+                return _fail(_DATASOURCES_NOT_APPROVED[answer], reason=reason)
+            approved = frozenset(DatasourceKey(item["engine"], item["name"]) for item in exc.pending)
+            try:
+                result = await asyncio.to_thread(
+                    _publish_artifact, abs_path, access=access, approved_datasources=approved
+                )
+            except DatasourceApprovalRequired:
+                return _fail(
+                    "PUBLISH FAILED: The app's connections changed while the user was deciding, so "
+                    "nothing was published. Tell the user, and publish again only if they ask.",
+                    reason="datasource_approval_changed",
+                )
+    except AccessChoiceRequired:
+        logger.info("Cowork publish refused: no access chosen on a shared publish token")
+        return _fail(
+            "PUBLISH FAILED: This deployment can't publish a link only the user can open. "
+            "Ask the user which access they want (password, specific people, organization or "
+            "public) and call again with access_mode.",
+            reason="access_choice_required",
+        )
     except PublishOwnedByOtherUser:
         # The model can edit files, so spell out that it must not work around
         # the refusal (e.g. by dropping the stored report_id). Not a ban for the
@@ -459,17 +548,27 @@ async def _cowork_publish_or_preview(session: Any, tc_input: dict):
     view_url = result.get("url", "") if isinstance(result, dict) else ""
     report_id = inner.get("report_id") or None
     md5 = inner.get("md5") or None
+    unapproved = result.get("unapprovedDatasources") if isinstance(result, dict) else None
+    notes = ""
+    if access is None and isinstance(result, dict) and result.get("accessMode") == AccessMode.RESTRICTED:
+        notes += (
+            " Only the user can open the link; they can change who can open it in the Share dialog."
+        )
+    if unapproved:
+        notes += " It was published without the credentials of: " + ", ".join(
+            item["label"] for item in unapproved
+        ) + "."
     if not view_url:
         # Committed (the service returned) but the URL is missing — success is
         # true, external_url stays null so the ambiguity is explicit, not prose.
         return _ok(
-            "Published, but no view URL was returned.",
+            "Published, but no view URL was returned." + notes,
             resource_id=report_id,
             idempotency_key=report_id,
             content_hash=(f"md5:{md5}" if md5 else None),
         )
     return _ok(
-        f"Published successfully! View URL: {view_url}",
+        f"Published successfully! View URL: {view_url}" + notes,
         resource_id=report_id,
         external_url=view_url,
         idempotency_key=report_id,
@@ -488,18 +587,26 @@ def build_cowork_publish_tool():
     these overrides the LLM defaults to CLI-era guidance and refuses
     to call `action: 'publish'` even when the user explicitly asked.
     On a self-hosted deployment the copy names neither the desktop app
-    nor MindsHub publishing.
+    nor MindsHub publishing. Where publishes go through a shared publish
+    token, on either kind of host, the prompt also says a first publish
+    must name its access.
     """
     from anton.tools import PUBLISH_TOOL
     from anton.core.tools.tool_defs import ToolDef
 
+    from cowork.services.publish import uses_shared_publish_token
+
     self_hosted = identity_for_turn() is not None
+    prompt = SELF_HOSTED_PUBLISH_PROMPT if self_hosted else COWORK_PUBLISH_PROMPT
+    # The same scope _publish_artifact publishes in.
+    if uses_shared_publish_token(current_settings_scope()):
+        prompt += FIRST_PUBLISH_ACCESS_RULE
     return ToolDef(
         name=PUBLISH_TOOL.name,
         description=SELF_HOSTED_PUBLISH_DESCRIPTION if self_hosted else COWORK_PUBLISH_DESCRIPTION,
         input_schema=PUBLISH_TOOL.input_schema,
         handler=_cowork_publish_or_preview,
-        prompt=SELF_HOSTED_PUBLISH_PROMPT if self_hosted else COWORK_PUBLISH_PROMPT,
+        prompt=prompt,
     )
 
 

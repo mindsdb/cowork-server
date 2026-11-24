@@ -90,14 +90,17 @@ coding_service.get_coding_service = lambda: SimpleNamespace(close_all=lambda: No
 # The auth service's part of a remote turn: the turn key and the connections
 # the turn may use. Neither is reachable here, and neither is under test.
 async def _turn_key(**kwargs):
-    return {"provider": "minds-cloud", "api_key": "turn-key", "base_url": "http://127.0.0.1:9/v1"}
+    return producer.TurnLlm(
+        block={"provider": "minds-cloud", "api_key": "turn-key", "base_url": "http://127.0.0.1:9/v1"},
+        turn_key_id=None, ttl_seconds=1200,
+    )
 
 
 async def _no_connections(**kwargs):
     return None
 
 
-producer.mint_llm_block = _turn_key
+producer.mint_turn_llm = _turn_key
 producer._mint_oauth_block = _no_connections
 
 # Held because the event loop keeps only a weak reference to a task.

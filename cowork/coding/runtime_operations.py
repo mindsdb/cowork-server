@@ -17,6 +17,7 @@ from cowork.coding.contracts import (
 from cowork.coding.control_models import RuntimeCommand
 from cowork.coding.delivery import ProjectDeliveryService
 from cowork.coding.engines.base import EngineSession
+from cowork.coding.git_transport import validate_git_source
 from cowork.coding.project_models import CodeProject, ProjectCommand
 from cowork.coding.project_workspaces import (
     PreparedProjectWorkspace,
@@ -59,7 +60,7 @@ class RuntimeWorkspaceOperations:
             CHECK_POLICY_OPERATIONS["validate"]: self._validate,
             "refresh_project": self._refresh_project,
             "delivery_plan": self._delivery_plan,
-            "push_branch": self._push_branch,
+            "push_confirmed_commit": self._push_confirmed_commit,
             "terminal_page": self._terminal_page,
             "terminal_start": self._terminal_start,
             "terminal_input": self._terminal_input,
@@ -213,7 +214,7 @@ class RuntimeWorkspaceOperations:
             deliveries,
         ).model_dump(mode="json")
 
-    def _push_branch(self, payload: dict[str, object]) -> dict[str, object]:
+    def _push_confirmed_commit(self, payload: dict[str, object]) -> dict[str, object]:
         folder_id = str(payload.get("folder_id") or "")
         workspace = next(
             (item for item in self.prepared.workspaces if item.folder_id == folder_id),
@@ -222,15 +223,22 @@ class RuntimeWorkspaceOperations:
         if workspace is None or workspace.workspace_kind != WorkspaceKind.git_worktree:
             raise WorkspaceError("The selected project resource is not a Git workspace")
         root = Path(workspace.workspace_path)
-        branch = self.manager.workspaces.git.run(
-            root,
-            "branch",
-            "--show-current",
-            check=False,
-        ).stdout.strip()
-        if not branch:
-            raise WorkspaceError("Create a task branch before publishing this resource")
-        self.manager.workspaces.git.run(root, "push", "origin", f"{branch}:{branch}")
+        revision = str(payload.get("revision") or "")
+        branch = str(payload.get("task_branch") or "")
+        remote_url = str(payload.get("remote_url") or "")
+        if not all((revision, branch, remote_url)):
+            raise WorkspaceError("Review the commit, branch and repository before publishing")
+        validate_git_source(remote_url)
+        git = self.manager.workspaces.git
+        if (
+            revision != git.run(root, "rev-parse", "--verify", "HEAD").stdout.strip()
+            or branch != git.run(root, "branch", "--show-current").stdout.strip()
+            or remote_url != git.run(root, "remote", "get-url", "origin").stdout.strip()
+        ):
+            raise WorkspaceError("This folder changed after you confirmed its draft pull request. Review it and confirm again.")
+        # Authenticate with the runtime's own Git credentials. Keep the task's
+        # configuration out of the push, including remote-specific push URLs.
+        ProjectDeliveryService(git).push_commit(workspace.workspace_path, revision, branch, remote_url, {})
         return {"folder_id": folder_id, "task_branch": branch}
 
     def _terminal_page(self, payload: dict[str, object]) -> dict[str, object]:

@@ -501,6 +501,7 @@ async def _sync_live_artifact(
     """
     from cowork.services.publish import (
         AccessModeChanged,
+        DatasourceApprovalRequired,
         MarkdownNotPublishable,
         MarkdownRenderBusy,
         PublishOwnedByOtherUser,
@@ -593,6 +594,11 @@ async def _sync_live_artifact(
     except MarkdownRenderBusy:
         # Another conversion held the server's one slot; the next save tries again.
         logger.warning("Could not synchronize live artifact %s: another conversion runs", folder)
+        return False
+    except DatasourceApprovalRequired:
+        # Repeats on every save until the person approves the app's new
+        # connections in the publish dialog, so no traceback.
+        logger.warning("Could not synchronize live artifact %s: new connections need approval", folder)
         return False
     except (AccessModeChanged, ShareOrgRequired):
         # publish_artifact logged the refusal: a mode changed after the
@@ -1408,7 +1414,7 @@ async def artifact_audience(
     )
 
 
-def _push_share(scope, principal: Principal | None, notices: list) -> None:
+def _push_share(scope, principal: Principal | None, notices: list, *, artifact_ref: str) -> None:
     """Push the people the save asked to notify, the ones MindsHub emails:
     individuals by id only. People named by address alone, and the members
     of a team or the whole organization a share opens to, get no push, as
@@ -1424,6 +1430,7 @@ def _push_share(scope, principal: Principal | None, notices: list) -> None:
                 recipient_ids=notice.recipients.user_ids,
                 artifact_title=notice.artifact_title,
                 url=notice.artifact_url,
+                artifact_ref=artifact_ref,
             )
     except Exception:
         logger.warning("Could not push an artifact share", exc_info=True, extra={"event": "push_share_failed"})
@@ -1553,7 +1560,7 @@ async def _publish_live(
                 ),
                 timeout=_LIVE_PUBLISH_TIMEOUT_S,
             )
-            _push_share(scope, principal, notices)
+            _push_share(scope, principal, notices, artifact_ref=f"{source.project_id}/{artifact_id}")
             return published
         except asyncio.TimeoutError as exc:
             publish_abandoned = True

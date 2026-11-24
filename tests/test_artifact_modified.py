@@ -413,9 +413,10 @@ def test_update_endpoint_delegates(tmp_path: Path):
 
     captured = {}
 
-    def _fake_update(path, *, scope):
+    def _fake_update(path, *, scope, approved_datasources=None):
         captured["path"] = path
         captured["scope"] = scope
+        captured["approved_datasources"] = approved_datasources
         return {"status": "ok", "url": "https://4nton.ai/a/uuid-1"}
 
     with patch.object(publish_ep, "_update", _fake_update):
@@ -425,6 +426,7 @@ def test_update_endpoint_delegates(tmp_path: Path):
     assert captured["path"] == "/some/art"
     # The request's own scope, which resolves the path; no person here.
     assert captured["scope"] == LOCAL_SCOPE
+    assert captured["approved_datasources"] is None
 
 
 def test_update_endpoint_404_when_not_published(tmp_path: Path):
@@ -436,7 +438,7 @@ def test_update_endpoint_404_when_not_published(tmp_path: Path):
     app.include_router(publish_ep.router, prefix="/api/v1/publish")
     client = TestClient(app)
 
-    def _raise(path, *, scope):
+    def _raise(path, *, scope, approved_datasources=None):
         raise FileNotFoundError("No published version to update")
 
     with patch.object(publish_ep, "_update", _raise):
