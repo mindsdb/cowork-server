@@ -148,10 +148,13 @@ class GitDirectories:
 
     def grants(self) -> dict[Path, str]:
         # A linked worktree shares its object database and refs with other
-        # checkouts, so a hook may write only staging data, new objects and
-        # the stash. Only existing paths are listed: on Linux the sandbox
-        # creates a stand-in for a missing path, which Git then misreads.
-        grants = {self.common: "read", self.private: "write", self.common / "objects": "write"}
+        # checkouts, so a hook may write only staging data and the stash.
+        # The object database stays read-only: a hook could otherwise delete
+        # history every checkout depends on. New objects go to a store of
+        # the commit's own, which Cowork copies in afterwards. Only existing
+        # paths are listed: on Linux the sandbox creates a stand-in for a
+        # missing path, which Git then misreads.
+        grants = {self.common: "read", self.private: "write", self.common / "objects": "read"}
         protected = [self.common / "objects" / "info"]
         protected += [self.private / name for name in (*_GIT_CONTROL_FILES, "worktrees", "info", "refs", "logs/refs", "packed-refs", "HEAD")]
         # Only existing paths are listed on Linux, where the sandbox would

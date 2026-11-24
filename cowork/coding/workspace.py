@@ -817,14 +817,17 @@ class WorkspaceManager:
             with tempfile.TemporaryDirectory(prefix="cowork-commit-", ignore_cleanup_errors=True) as scratch:
                 message_file = Path(scratch) / "COMMIT_EDITMSG"
                 message_file.write_text(message.strip() + "\n", encoding="utf-8")
+                new_objects = Path(scratch).resolve() / "objects"
+                new_objects.mkdir()
                 if checks is None:
                     self.git.run(root, "add", "--all")
                 else:
                     self._run_sandboxed_git_step(
                         root, checks, "Staging", ["git", *_platform_config_args(), "add", "--all"], [root], workspace_kind,
+                        new_objects,
                     )
                 if checks is not None:
-                    self._run_commit_hooks(root, message_file, checks, workspace_kind)
+                    self._run_commit_hooks(root, message_file, checks, workspace_kind, new_objects)
                 self._record_commit(root, message_file.read_text(encoding="utf-8"))
             return self.git_state(str(root), str(root), checks, committed=True)
 
@@ -894,6 +897,7 @@ class WorkspaceManager:
 
     def _run_commit_hooks(
         self, root: Path, message_file: Path, checks: CheckPolicy, workspace_kind: WorkspaceKind | None,
+        new_objects: Path,
     ) -> None:
         from cowork.coding import check_sandbox
 
@@ -904,14 +908,18 @@ class WorkspaceManager:
             arguments = (str(message_file),) if name == "commit-msg" else ()
             self._run_sandboxed_git_step(
                 root, checks, f"The {name} hook", check_sandbox.hook_argv(path, *arguments), [root, message_file.parent],
-                workspace_kind,
+                workspace_kind, new_objects,
             )
 
     def _run_sandboxed_git_step(
         self, root: Path, checks: CheckPolicy, label: str, argv: list[str], writable: list[Path],
-        workspace_kind: WorkspaceKind | None,
+        workspace_kind: WorkspaceKind | None, new_objects: Path,
     ) -> None:
-        """Run a command that may change the index, under the task's permissions."""
+        """Run a command that may change the index, under the task's permissions.
+
+        The step writes new Git objects to ``new_objects`` and only reads the
+        repository's own store. Cowork copies them in when the step ends.
+        """
         from cowork.coding import check_sandbox
 
         index = self.git.run(root, "rev-parse", "--git-path", "index").stdout.strip()
@@ -927,6 +935,10 @@ class WorkspaceManager:
             "GIT_CONFIG_VALUE_0": os.devnull,
         })
         directories = check_sandbox.git_directories(self.git.run, root)
+        environment.update({
+            "GIT_OBJECT_DIRECTORY": str(new_objects),
+            "GIT_ALTERNATE_OBJECT_DIRECTORIES": str(directories.common / "objects"),
+        })
         # Local tasks may use linked worktrees the user created independently.
         task_owned = workspace_kind == WorkspaceKind.git_worktree and directories.private != directories.common
         before = directories.snapshot()
@@ -936,7 +948,7 @@ class WorkspaceManager:
                 cwd=root,
                 policy=checks,
                 environment=environment,
-                writable=writable,
+                writable=[*writable, new_objects],
                 git=directories,
                 timeout=check_sandbox.HOOK_TIMEOUT_SECONDS,
             )
@@ -957,6 +969,8 @@ class WorkspaceManager:
                         force_remove(planted_path)
                     else:
                         planted_path.unlink(missing_ok=True)
+            # Also on failure: a formatter's stash may already name them.
+            self._keep_new_objects(root, new_objects)
         if planted and task_owned:
             raise WorkspaceError(f"{label} tried to change Git's configuration, so nothing was committed")
         unexplained = sorted(str(path) for path in added_refs | (set() if task_owned else planted))
@@ -968,6 +982,30 @@ class WorkspaceManager:
         if result.returncode != 0:
             output = "\n".join(part.strip() for part in (result.stdout, result.stderr) if part.strip())
             raise WorkspaceError((f"{label} failed" + (f":\n{output}" if output else ""))[:4_000])
+
+    def _keep_new_objects(self, root: Path, new_objects: Path) -> None:
+        """Copy the objects a sandboxed step wrote into the repository.
+
+        Git repacks and unpacks them, which names each one by its real
+        content, so a step can add objects but never replace or remove one.
+        """
+        if new_objects.is_symlink() or not new_objects.is_dir():
+            raise WorkspaceError("The commit's new Git objects were moved, so nothing was committed")
+        # An alternates file would pull in objects from another store.
+        info = new_objects / "info"
+        if info.is_symlink() or info.is_file():
+            info.unlink()
+        else:
+            shutil.rmtree(info, ignore_errors=True)
+        store = {"GIT_OBJECT_DIRECTORY": str(new_objects)}
+        names = self.git.run(root, "cat-file", "--batch-all-objects", "--batch-check=%(objectname)", environment=store).stdout
+        if names.strip():
+            with tempfile.TemporaryDirectory(prefix="cowork-objects-", ignore_cleanup_errors=True) as packing:
+                pack = self.git.run(root, "pack-objects", "-q", str(Path(packing) / "new"), input_text=names, environment=store)
+                with (Path(packing) / f"new-{pack.stdout.strip()}.pack").open("rb") as handle:
+                    self.git.run(root, "unpack-objects", "-q", stdin=handle)
+        force_remove(new_objects)
+        new_objects.mkdir()
 
     def check_policy(self, owner_id: str, permission_mode: PermissionMode, network_access: bool) -> CheckPolicy:
         from cowork.coding.check_sandbox import CheckPolicy

@@ -139,7 +139,7 @@ def test_hooks_may_stage_but_not_change_what_makes_git_run_programs(tmp_path: Pa
 
     assert grants[common] == "read"
     assert grants[private] == "write"
-    assert grants[common / "objects"] == "write"
+    assert grants[common / "objects"] == "read"
     if sys.platform.startswith("linux"):
         # Linux can only grant the folder; what is already in it stays read-only.
         assert grants[common / "refs"] == "write"
@@ -828,3 +828,25 @@ def test_a_required_filter_in_the_task_still_produces_a_patch(tmp_path: Path, mo
 
     assert "+TWO" in result.stdout
     assert "server-only" not in result.stderr
+
+
+@requires_sandbox
+def test_a_hook_cannot_remove_history_other_checkouts_share(tmp_path: Path, checks: CheckPolicy) -> None:
+    repo = repository(tmp_path / "repo")
+    git(repo, "gc", "-q")
+    worktree = tmp_path / "task"
+    git(repo, "worktree", "add", "-q", "-b", "task", str(worktree))
+    objects = repo / ".git" / "objects"
+    hook = repo / ".git" / "hooks" / "pre-commit"
+    hook.write_text(f"#!/bin/sh\nrm -rf '{objects}'/pack '{objects}'/?? 2>/dev/null\nexit 0\n", encoding="utf-8")
+    hook.chmod(hook.stat().st_mode | stat.S_IXUSR)
+    before = sorted(path.name for path in (objects / "pack").iterdir())
+    (worktree / "README.md").write_text("changed\n", encoding="utf-8")
+
+    state = WorkspaceManager(tmp_path / "root").commit(
+        str(worktree), "Change", checks, workspace_kind=WorkspaceKind.git_worktree,
+    )
+
+    assert sorted(path.name for path in (objects / "pack").iterdir()) == before
+    assert not state.dirty and git(worktree, "log", "-1", "--format=%s") == "Change"
+    git(repo, "fsck", "--no-dangling")
