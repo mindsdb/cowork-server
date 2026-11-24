@@ -37,6 +37,11 @@ Seeding is versioned by `BUILTIN_SKILLS_VERSION`:
   `test_every_packaged_builtin_is_in_the_shipped_list` fails if a builtin was
   edited without running the script, and CI runs the script's `--check`: a
   pull request against its base branch, a push against the commit before it.
+  For a pull request that changes a builtin or a version constant, the
+  required `migration-freshness` check also runs it, against the tip of the
+  base branch, so a refusal there blocks the merge. If the base already
+  records your version, because another pull request bumped to it first,
+  raise the version above the one the refusal names and run the script again.
 
 On desktop, seeded copies remain ordinary editable/deletable file-backed skills.
 In org mode, packaged slugs are reserved and immutable for members, admins, and

@@ -1,0 +1,69 @@
+# run-tree-ok: the required check needs the `edited` type, which re-runs it
+# when a pull request's base changes. A retarget is then checked against the new
+# base, and the graph checks run on the head. Adding `edited` to
+# dev-build-deploy.yml would re-run the whole build on every title edit.
+name: Migration freshness
+
+# A pull request that changes a migration or a builtin skill passes only when its
+# head contains the live tip of its base branch, so the checks below run on the
+# head itself, which is the tree the merge produces. The merge ref would hide a
+# stale head by merging today's base into it. migration-freshness-refresh.yml
+# marks open pull requests stale when their base moves. GitHub-hosted and
+# secret-free, so it works on a fork PR.
+
+on:
+  pull_request:
+    types: [opened, reopened, synchronize, edited]
+
+permissions: {}
+
+# One run per pull request: a newer event supersedes an older run.
+concurrency:
+  group: ${{ github.workflow_ref }}
+  cancel-in-progress: true
+
+jobs:
+  # A required check, so it has no `needs:` and no `if:`: GitHub counts a
+  # skipped job as passing.
+  migration-freshness:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      pull-requests: read
+    steps:
+      - id: scope
+        uses: mindsdb/github-actions/migration-freshness@db1df71c808bfcba90fb688ac20fe3f88070ca9a
+        with:
+          mode: pr
+          protected-paths: |
+            cowork/db/alembic/versions/*
+            cowork/skills_builtin/*
+          constant-file: cowork/services/skills.py
+          constant-pattern: '^(CODE_)?BUILTIN_SKILLS_VERSION\s*='
+
+      - if: steps.scope.outputs.protected == 'true'
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+          # The manifest check lists every version of each builtin from history.
+          fetch-depth: 0
+
+      - name: Setup uv
+        if: steps.scope.outputs.protected == 'true'
+        uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7
+        with:
+          version: "0.11.30"
+          python-version: "3.12"
+
+      - name: Check that the migration graph has one head
+        if: steps.scope.outputs.protected == 'true'
+        run: uv run --locked python -m pytest tests/test_schema_migrations.py::test_migration_graph_has_single_head
+
+      - name: Check the builtin skills manifest
+        if: steps.scope.outputs.protected == 'true'
+        env:
+          # The head contains the base tip, so the tip is the baseline.
+          BUILTIN_SKILLS_BASELINE_REF: ${{ steps.scope.outputs.tip }}
+        run: uv run --locked python scripts/builtin_skills_shipped.py --check

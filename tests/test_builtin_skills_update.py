@@ -10,6 +10,7 @@ import importlib.util
 import json
 import os
 import shutil
+import sys
 from pathlib import Path
 
 import pytest
@@ -236,6 +237,143 @@ def test_a_change_is_compared_with_the_stores_last_version_not_the_skills():
     with pytest.raises(script.NeedsVersionBump, match="above 4"):
         script.entry_for("pdf", "pdf-edited", 4, released, store_last=4)
     assert script.entry_for("pdf", "pdf-edited", 5, released, store_last=4)["version"] == 5
+
+
+def test_the_heads_version_is_kept_only_above_the_baseline_and_not_above_the_store():
+    script = _shipped_script()
+    released = {"pdf": {"introduced": 1, "version": 3, "current": "pdf-v3"}}
+    head = {
+        "pdf": {"introduced": 1, "version": 4, "current": "pdf-v4"},
+        "new-skill": {"introduced": 4, "version": 4, "current": "n"},
+    }
+    # The head recorded this content at 4, between the baseline's 3 and the store's 5.
+    assert script.entry_for("pdf", "pdf-v4", 5, released, store_last=3, head=head)["version"] == 4
+    assert script.entry_for("new-skill", "n", 5, released, store_last=3, head=head) == {
+        "introduced": 4, "version": 4, "current": "n"}
+    # Other content than the head recorded takes the store's version.
+    assert script.entry_for("pdf", "pdf-v5", 5, released, store_last=3, head=head)["version"] == 5
+    # Not above the baseline's: the baseline's stores are already there.
+    assert script.entry_for("pdf", "pdf-v4", 5, released, store_last=4, head=head)["version"] == 5
+    stale_new = {"new-skill": {**head["new-skill"], "introduced": 3}}
+    assert script.entry_for("new-skill", "n", 5, released, store_last=3, head=stale_new)["introduced"] == 5
+    # Introduced above its own version: not a manifest the script writes.
+    inverted = {"new-skill": {**head["new-skill"], "introduced": 5}}
+    assert script.entry_for("new-skill", "n", 5, released, store_last=3, head=inverted) == {
+        "introduced": 5, "version": 5, "current": "n"}
+    # Equal to the store's: added in 4 and edited again in 5, both since the baseline.
+    edited_new = {"new-skill": {"introduced": 4, "version": 5, "current": "n2"}}
+    assert script.entry_for("new-skill", "n2", 5, released, store_last=3, head=edited_new) == {
+        "introduced": 4, "version": 5, "current": "n2"}
+    # Above the store's: the constant was lowered after the manifest was written.
+    lowered = {"pdf": {**head["pdf"], "version": 5}}
+    assert script.entry_for("pdf", "pdf-v4", 4, released, store_last=3, head=lowered)["version"] == 4
+    # No baseline manifest: the head's own manifest is not trusted.
+    assert script.entry_for("pdf", "pdf-v4", 5, {}, store_last=0, bootstrap_introduced=1, head={
+        "pdf": {"introduced": 2, "version": 4, "current": "pdf-v4"}}) == {
+        "introduced": 1, "version": 5, "current": "pdf-v4"}
+
+
+@pytest.fixture()
+def manifest_branch(tmp_path, monkeypatch):
+    """The manifest script on a scratch folder of builtins, without git.
+
+    Each call writes the given skill bodies (and a shipped.json, if given), sets
+    the store's version and the baseline manifest, runs the script as an author
+    does (it writes shipped.json) or as CI does (--check), and returns its exit
+    code and the shipped.json it leaves.
+    """
+    script = _shipped_script()
+    builtins = tmp_path / "skills_builtin"
+    builtins.mkdir()
+    shipped = builtins / "shipped.json"
+    state = {}
+    monkeypatch.setattr(script, "BUILTIN_SKILLS_DIR", builtins)
+    monkeypatch.setattr(script, "BUILTIN_SKILLS_SHIPPED", shipped)
+    monkeypatch.setattr(script, "existing_refs", lambda: [])
+    monkeypatch.setattr(script, "committed_fingerprints", lambda slug, refs: set())
+    monkeypatch.setattr(script, "version_when_added", lambda slug, refs: 1)
+    monkeypatch.setattr(script, "released_manifest", lambda: state["baseline"])
+    monkeypatch.setattr(script, "store_versions", lambda: {
+        "BUILTIN_SKILLS_VERSION": state["version"], "CODE_BUILTIN_SKILLS_VERSION": 1})
+
+    def run(bodies: dict, *, version: int, baseline: dict, manifest: dict | None = None,
+            check: bool = False) -> tuple[int, dict]:
+        for slug, body in bodies.items():
+            (builtins / slug).mkdir(exist_ok=True)
+            (builtins / slug / "SKILL.md").write_text(body)
+        if manifest is not None:
+            shipped.write_text(script.render(manifest))
+        state.update(version=version, baseline=baseline)
+        monkeypatch.setattr(sys, "argv", ["builtin_skills_shipped.py", *(["--check"] if check else [])])
+        code = script.main()
+        return code, json.loads(shipped.read_text()) if shipped.exists() else {}
+
+    return run
+
+
+def _versions(manifest: dict) -> dict:
+    return {slug: (entry["introduced"], entry["version"]) for slug, entry in manifest.items()}
+
+
+def test_a_release_pr_with_two_bumps_of_one_store_passes_against_main(manifest_branch):
+    # main after the last release: pdf and docx at 3. staging starts there.
+    _, main = manifest_branch({"pdf": "pdf v3", "docx": "docx v3"}, version=3, baseline={})
+    # PR A changes pdf and bumps 3 to 4; its check runs against staging (= main).
+    assert manifest_branch({"pdf": "pdf v4"}, version=4, baseline=main)[0] == 0
+    code, staging_a = manifest_branch({}, version=4, baseline=main, check=True)
+    assert code == 0 and _versions(staging_a) == {"pdf": (1, 4), "docx": (1, 3)}
+    # PR B changes docx. Without a bump, and then without regenerating, it fails.
+    assert manifest_branch({"docx": "docx v5"}, version=4, baseline=staging_a)[0] == 1
+    assert manifest_branch({}, version=5, baseline=staging_a, check=True)[0] == 1
+    # Bumped 4 to 5 and regenerated, it passes against staging after PR A.
+    assert manifest_branch({}, version=5, baseline=staging_a)[0] == 0
+    code, staging_b = manifest_branch({}, version=5, baseline=staging_a, check=True)
+    assert code == 0 and _versions(staging_b) == {"pdf": (1, 4), "docx": (1, 5)}
+
+    # The release PR (staging into main) is checked against main's manifest,
+    # where pdf is still 3. pdf keeps the 4 that staging recorded for it.
+    code, released = manifest_branch({}, version=5, baseline=main, check=True)
+
+    assert code == 0
+    assert released == staging_b
+
+
+def test_a_release_pr_with_a_new_builtin_and_a_later_bump_passes_against_main(manifest_branch):
+    _, main = manifest_branch({"pdf": "pdf v3", "docx": "docx v3"}, version=3, baseline={})
+    # PR A adds a builtin and bumps 3 to 4, so it is introduced in 4.
+    assert manifest_branch({"new-skill": "new v4"}, version=4, baseline=main)[0] == 0
+    code, staging_a = manifest_branch({}, version=4, baseline=main, check=True)
+    assert code == 0 and _versions(staging_a)["new-skill"] == (4, 4)
+    # PR B changes docx and bumps 4 to 5.
+    assert manifest_branch({"docx": "docx v5"}, version=5, baseline=staging_a)[0] == 0
+    code, staging_b = manifest_branch({}, version=5, baseline=staging_a, check=True)
+    assert code == 0 and _versions(staging_b)["new-skill"] == (4, 4)
+
+    # Against main, which lacks it, the builtin keeps the 4 it was introduced in.
+    code, released = manifest_branch({}, version=5, baseline=main, check=True)
+
+    assert code == 0
+    assert released == staging_b
+
+
+def test_a_main_hotfix_and_a_staging_pr_that_bump_to_the_same_version_are_refused(manifest_branch, capsys):
+    # A hotfix on main changes pdf and bumps 3 to 4, while a staging PR changes
+    # docx and also bumps 3 to 4. Stores that took the hotfix are at 4, so they
+    # would never receive the docx change: the release PR must be refused.
+    bodies = {"pdf": "pdf v3", "docx": "docx v3"}
+    _, before = manifest_branch(bodies, version=3, baseline={})
+    _, main = manifest_branch({"pdf": "pdf hotfix"}, version=4, baseline=before)
+    _, staging = manifest_branch({**bodies, "docx": "docx v4"}, version=4, baseline=before, manifest=before)
+    assert _versions(main) == {"pdf": (1, 4), "docx": (1, 3)}
+    assert _versions(staging) == {"pdf": (1, 3), "docx": (1, 4)}
+    # Syncing main into staging brings the hotfix and its manifest entry along.
+    synced = {"pdf": main["pdf"], "docx": staging["docx"]}
+    capsys.readouterr()
+
+    code, _ = manifest_branch({"pdf": "pdf hotfix"}, version=4, baseline=main, manifest=synced, check=True)
+
+    assert code == 1
+    assert "refused: docx changed: bump its store's version above 4 first" in capsys.readouterr().out
 
 
 def test_every_packaged_builtin_is_a_single_skill_file():
