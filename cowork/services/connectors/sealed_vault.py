@@ -356,7 +356,9 @@ def open_fields(*, fields: dict[str, Any], keys: MultiFernet, connection: str) -
         if key in BOOKKEEPING_FIELDS:
             opened[key] = value
             continue
-        if not isinstance(value, str):
+        # A value with nothing of a token about it was never sealed, and saying it doesn't open with
+        # the server's key would send the operator to check the key.
+        if not isinstance(value, str) or not _is_sealed_value(value=value, keys=keys):
             raise SealedRecordError(connection=connection, cause=f"its {key} field isn't sealed")
         try:
             opened[key] = json.loads(keys.decrypt(value.encode()))

@@ -188,6 +188,22 @@ def test_only_the_integer_mark_reads_as_sealed(tmp_path, mark):
         vault.load("postgres", "sales")
 
 
+def test_a_plain_value_beside_the_mark_is_named_as_not_sealed(tmp_path):
+    """A value with nothing of a token about it was never sealed, so the message names it that way
+    and doesn't send the operator to check the key."""
+    vault = SealedDataVault(tmp_path, keys=_keys(Fernet.generate_key()))
+    vault.save("postgres", "sales", {"host": "db.example", "password": CANARY})
+    path = _record_file(vault, "postgres", "sales")
+    stored = json.loads(path.read_text())
+    stored["fields"]["host"] = "db.example"
+    path.write_text(json.dumps(stored))
+
+    with pytest.raises(SealedRecordError) as raised:
+        vault.load("postgres", "sales")
+
+    assert str(raised.value) == "The saved connection postgres/sales can't be opened: its host field isn't sealed."
+
+
 def test_a_fernet_token_is_told_from_other_text_by_its_shape():
     token = Fernet(Fernet.generate_key()).encrypt(b'"value"').decode()
 

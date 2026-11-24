@@ -89,7 +89,7 @@ from cowork.services.connectors.sealed_vault import (
     record_sealing,
     seal_fields,
 )
-from cowork.services.sealing import SEALING_MARKER_KEY, row_name, sealed_setting_keys
+from cowork.services.sealing import SEALING_MARKER_KEY, row_name, sealed_setting_keys, sealing_marker_present
 
 
 class Problem(NamedTuple):
@@ -462,13 +462,22 @@ def reseal(*, managed_vault: Path | None, old_key_file: Path | None) -> str:
             + "\nRemove each one and run this again; then connect it again once Cowork starts."
         )
     if record_check.reserved:
+        # Once sealing is on, Cowork starts beside none of these: the keyed start refuses a record that
+        # isn't sealed, and a start with no key file refuses on the marker row. Only the file changes then.
+        remedy = (
+            "Cowork doesn't start beside them once sealing is on, so edit each file to drop that field, or "
+            "remove it; then run this again."
+            if sealing_marker_present()
+            else "Save each one again without that field, with Cowork started as before, or remove it; then run "
+            "this again. A connection in the managed folder can't be saved from Cowork: edit its file to drop "
+            "the field, or remove it."
+        )
         raise OperatorCommandError(
             f"These saved connections hold a field named {SEALED_FIELD} and aren't sealed, so the re-seal wrote "
             "nothing:"
             + _listed([f"{problem.path}: {problem.reason}" for problem in record_check.reserved])
-            + "\nSave each one again without that field, with Cowork started as before, or remove it; then run "
-            "this again. A connection in the managed folder can't be saved from Cowork: edit its file to drop "
-            "the field, or remove it."
+            + "\n"
+            + remedy
         )
     if record_check.too_large:
         raise OperatorCommandError(

@@ -420,6 +420,31 @@ def test_a_plain_record_with_a_field_named_like_the_mark_stops_it(deployment, ca
     assert "flag-token" not in printed
 
 
+def test_on_a_sealed_deployment_a_record_with_the_field_is_to_be_edited_or_removed(deployment, capsys):
+    """Once sealing is on, Cowork starts beside no such record: the keyed start refuses a record that
+    isn't sealed, and a start with no key file refuses on the marker row. So the remedy names the
+    file, not a save from Cowork."""
+    plain_records(deployment)
+    assert run(deployment) == 0
+    record_file = deployment["vaults"]["base"] / "acme_api-acme"
+    LocalDataVault(deployment["vaults"]["base"]).save("acme_api", "acme", {"api_token": "flag-token", SEALED_FIELD: 1})
+    before = tree(deployment["root"])
+
+    assert run(deployment) == 1
+
+    printed = capsys.readouterr().err
+    assert f"{record_file}: the field name _sealed is reserved for the sealed mark" in printed
+    assert RESERVED_HEADING in printed
+    assert (
+        "Cowork doesn't start beside them once sealing is on, so edit each file to drop that field, or remove it; "
+        "then run this again."
+    ) in printed
+    assert "with Cowork started as before" not in printed
+    assert "flag-token" not in printed
+    assert tree(deployment["root"]) == before
+    assert marker_present(deployment)
+
+
 @pytest.mark.parametrize("plain_value", ["db.example", 5432], ids=["text", "number"])
 def test_a_record_with_the_mark_beside_values_that_arent_sealed_stops_it(deployment, capsys, plain_value):
     """A sealed record with one value put back as plain text or a number. Its refusal says to
