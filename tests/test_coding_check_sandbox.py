@@ -138,6 +138,7 @@ def test_sandboxed_checks_follow_the_task_network_setting(
     uses_proxy = platform != "win32" and not network_access
     assert ("features.network_proxy=true" in argv) == uses_proxy
     assert ("domains={}" in joined) == uses_proxy
+    assert ('windows.sandbox="elevated"' in argv) == (platform == "win32")
 
 
 @pytest.mark.skipif(sys.platform != "win32", reason="exercise the native Windows sandbox")
@@ -146,6 +147,7 @@ def test_windows_native_check_network_policy(tmp_path: Path) -> None:
     workspace.mkdir()
     marker = workspace / "ran.txt"
     command = [sys.executable, "-c", "from pathlib import Path; Path('ran.txt').touch()"]
+
     def run(network_access: bool):
         policy = CheckPolicy.for_task(PermissionMode.workspace, network_access, sandbox_home=tmp_path / "check-sandbox")
         return run_sandboxed(command, cwd=workspace, policy=policy, environment=check_environment(os.environ), writable=[workspace])

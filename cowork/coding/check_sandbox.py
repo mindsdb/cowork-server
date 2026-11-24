@@ -260,7 +260,9 @@ def sandboxed_argv(
         "-c", f"permissions.checks.filesystem={{{files}}}",
         "-c", f"permissions.checks.network={{{network}}}",
     ]
-    if not policy.network_access:
+    if sys.platform == "win32":
+        command += ["-c", 'windows.sandbox="elevated"']
+    elif not policy.network_access:
         command += ["-c", "features.network_proxy=true"]
     return [*command, "--", *argv]
 
