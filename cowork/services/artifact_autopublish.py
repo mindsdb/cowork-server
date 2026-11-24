@@ -29,12 +29,12 @@ from pydantic import ValidationError
 
 from cowork.common.logger import log_context
 from cowork.db.units import run_efs, run_efs_cleanup, run_on_unit_threads
-from cowork.models.artifact_owner_choice import AccessMode
-from cowork.schemas.artifact_access import ArtifactAccessRequest
+from cowork.schemas.artifact_access import OWNER_ONLY_ACCESS, ArtifactAccessRequest
 from cowork.services.artifact_locks import LOCKS_DIRNAME, acquire, refresh, release
 from cowork.services.artifact_publish_key import PublishKey
 from cowork.services.product_permissions import ProductPermissionDenied, ProductPermissionUnavailable
 from cowork.services.publish import (
+    DatasourceApprovalRequired,
     MarkdownNotPublishable,
     MarkdownRenderBusy,
     PublishOwnedByOtherUser,
@@ -63,7 +63,7 @@ logger = logging.getLogger(__name__)
 #
 # An auto-published artifact is private to its owner until they share it,
 # which is what the Share control in the viewer changes.
-AUTOPUBLISH_ACCESS = ArtifactAccessRequest(mode=AccessMode.RESTRICTED, allowed_emails=[], owner_only=True)
+AUTOPUBLISH_ACCESS = OWNER_ONLY_ACCESS
 
 # Below this much remaining budget a publish is not started at all: entering
 # `wait_for` with a sliver of time only guarantees a timeout, an abandoned upload
@@ -500,6 +500,12 @@ async def _publish_one(
         # already logged by the classifier: a skip, not a failure.
         await _release(artifacts_base, slug, scope=scope)
         _record("skipped", slug=slug, reason="too_large")
+        return False
+    except DatasourceApprovalRequired:
+        # Only a person approves sending an app's connection credentials, and
+        # no person asked for this publish: a skip until one publishes it.
+        await _release(artifacts_base, slug, scope=scope)
+        _record("skipped", slug=slug, reason="datasource_approval_required")
         return False
     except MarkdownNotPublishable:
         # The same Markdown is refused again until it changes: a skip.

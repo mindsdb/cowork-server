@@ -116,6 +116,11 @@ class ArtifactAccessRequest(CamelRequest):
         return access
 
 
+# Only the owner: restricted with nobody named. `owner_only` is what keeps
+# anton's resolve_access from reading an empty restricted list as public.
+OWNER_ONLY_ACCESS = ArtifactAccessRequest(mode=AccessMode.RESTRICTED, allowed_emails=[], owner_only=True)
+
+
 # How each kind of wrong value reads to the person, by pydantic's error type.
 _WRONG_TYPE = {
     "list_type": "must be a list",
@@ -336,6 +341,9 @@ class ArtifactPublishResult(ArtifactAudienceView):
     # record names the old page, which stays live with the earlier version.
     replaced_link: str | None = None
     result: dict[str, Any] = Field(default_factory=dict)
+    # Saved connections the backend went without because nobody approved
+    # them: metadata.json named them after the approval check.
+    unapproved_datasources: list[dict[str, str]] = Field(default_factory=list)
 
 
 class UnpublishResult(CamelResponse):

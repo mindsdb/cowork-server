@@ -716,6 +716,32 @@ async def test_a_too_large_artifact_is_skipped_without_a_traceback(base, enabled
     assert locks.acquire(base, "rep", ttl_s=600) is True
 
 
+async def test_an_app_whose_connections_need_approval_is_skipped_without_a_traceback(
+    base, enabled, key, monkeypatch, caplog
+):
+    """Only a person can approve connections; autopublish never can."""
+    import logging
+
+    from cowork.services.publish import DatasourceApprovalRequired
+
+    _make(base, "app", files={"report.html": "<html></html>"},
+          meta={"slug": "app", "type": "html-app"})
+
+    def needs_approval(artifact, **kwargs):
+        raise DatasourceApprovalRequired([{"engine": "pg", "name": "a", "label": "pg/a"}])
+
+    monkeypatch.setattr(ap, "publish_artifact", needs_approval)
+    with caplog.at_level(logging.DEBUG, logger="cowork.services.artifact_autopublish"):
+        out = await ap.autopublish_project_artifacts(base, ORG_SCOPE, project_id=PROJECT_ID, touched={"app"})
+
+    assert out == set()
+    assert "result=skipped slug=app reason=datasource_approval_required" in caplog.text
+    assert "result=failed" not in caplog.text
+    assert "artifact autopublish failed" not in caplog.text
+    assert all(record.exc_info is None for record in caplog.records)
+    assert locks.acquire(base, "app", ttl_s=600) is True
+
+
 async def test_a_rejected_publish_fails_without_a_second_traceback(base, enabled, key, monkeypatch, caplog):
     """publish_artifact already logged the traceback; the failure line stays."""
     import logging
