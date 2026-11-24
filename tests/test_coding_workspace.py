@@ -260,9 +260,13 @@ def test_failed_snapshot_leaves_no_partial_patch_behind(tmp_path: Path) -> None:
     prepared = manager.prepare("session-snapshot-failure", str(repo))
     (prepared.workspace_path / "keep.txt").write_text("changed\n", encoding="utf-8")
 
+    (prepared.workspace_path / "extra.txt").write_text("new\n", encoding="utf-8")
+    before = git(prepared.workspace_path, "status", "--porcelain")
+
     with pytest.raises(WorkspaceError):
         manager.cleanup("session-snapshot-failure", str(repo), str(prepared.workspace_path), prepared.kind, "no-such-rev")
 
+    assert git(prepared.workspace_path, "status", "--porcelain") == before
     assert list((tmp_path / "coding" / "snapshots" / "session-snapshot-failure").iterdir()) == []
 
 
@@ -297,6 +301,38 @@ def test_apply_leaves_the_task_diff_as_it_was_reviewed(tmp_path: Path) -> None:
     # handoff patch must not turn a new file into a staged one.
     assert manager.diff(str(prepared.workspace_path), prepared.base_revision) == reviewed
     assert git(prepared.workspace_path, "status", "--porcelain", "new.txt") == "?? new.txt"
+
+
+def test_apply_preserves_staged_deletion_with_a_working_copy(tmp_path: Path) -> None:
+    repo = repository(tmp_path)
+    manager = WorkspaceManager(tmp_path / "coding")
+    prepared = manager.prepare("staged-deletion", str(repo))
+    task = prepared.workspace_path
+    git(task, "rm", "--cached", "remove.txt")
+    (task / "remove.txt").write_text("kept on disk\n", encoding="utf-8")
+
+    manager.apply_to_source("staged-deletion", str(repo), str(task), prepared.base_revision)
+
+    assert (repo / "remove.txt").read_text(encoding="utf-8") == "kept on disk\n"
+    assert git(task, "status", "--porcelain", "--", "remove.txt") == "D  remove.txt\n?? remove.txt"
+
+
+def test_apply_preserves_partial_staging_beside_a_literal_bracket_filename(tmp_path: Path) -> None:
+    repo = repository(tmp_path)
+    manager = WorkspaceManager(tmp_path / "coding")
+    prepared = manager.prepare("literal-path", str(repo))
+    task = prepared.workspace_path
+    (task / "keep.txt").write_text("staged\n", encoding="utf-8")
+    git(task, "add", "keep.txt")
+    (task / "keep.txt").write_text("working copy\n", encoding="utf-8")
+    (task / "[k]eep.txt").write_text("literal filename\n", encoding="utf-8")
+
+    manager.apply_to_source("literal-path", str(repo), str(task), prepared.base_revision)
+
+    assert git(task, "show", ":keep.txt") == "staged"
+    assert git(task, "status", "--porcelain", "--", "keep.txt") == "MM keep.txt"
+    assert (repo / "keep.txt").read_text(encoding="utf-8") == "working copy\n"
+    assert (repo / "[k]eep.txt").read_text(encoding="utf-8") == "literal filename\n"
 
 
 def test_apply_conflict_does_not_partially_change_source(tmp_path: Path) -> None:
