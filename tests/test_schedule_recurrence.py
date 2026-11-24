@@ -3,15 +3,19 @@ the month: how their runs are stepped, and how a save stores the rule."""
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 from zoneinfo import ZoneInfo
 
 import pytest
 import test_turn_pool_connections as turn_pool
 from pydantic import ValidationError
 
+from cowork import scheduler
+from cowork.common.datetime_utils import ensure_utc
 from cowork.db.scoped import SYSTEM_SCOPE
 from cowork.db.units import unit_session
 from cowork.harnesses.anton_harness.schedule_tools import describe_cadence
+from cowork.models.schedule import Schedule
 from cowork.schedule_timing import (
     advance_occurrence,
     align_to_rule,
@@ -203,3 +207,60 @@ async def test_the_api_saves_edits_and_clears_a_rule():
             daily = await client.patch(url, json={"cadence": "daily"})
             assert daily.status_code == 200, daily.text
             assert daily.json()["recurrence"] is None
+
+
+# --- the scheduler, catch-up and resume -----------------------------------
+#
+# Each path below must pass the task's rule along. A rule for every day of the
+# week steps a day at a time, so the expected slot does not depend on the day
+# the test runs, while a weekly task stepped without its rule moves a week.
+
+EVERY_DAY = {"days": ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]}
+
+
+def _just_passed() -> datetime:
+    return datetime.now(timezone.utc).replace(microsecond=0) - timedelta(minutes=1)
+
+
+def test_after_a_run_the_scheduler_steps_to_the_rules_next_day():
+    slot = _just_passed()
+    schedule = Schedule(
+        title="rule test", prompt="do the thing", cadence="weekly", recurrence=EVERY_DAY,
+        next_run_at=slot, model="default", timezone="UTC",
+    )
+
+    scheduler._advance_next_run_at(schedule, SimpleNamespace(add=lambda _row: None))
+
+    assert schedule.next_run_at == slot + timedelta(days=1)
+
+
+def test_catch_up_walks_missed_slots_by_the_rule():
+    slot = _just_passed()
+    schedule_id, _, _ = _create(
+        cadence="weekly", recurrence=EVERY_DAY, next_run_at=slot - timedelta(days=3), timezone="UTC",
+    )
+    try:
+        with unit_session(scope=SYSTEM_SCOPE) as session:
+            schedule = ScheduleService(session).get_schedule(schedule_id)
+            scheduler._catch_up(session, schedule, slot + timedelta(seconds=30))
+        with unit_session(scope=SYSTEM_SCOPE) as session:
+            schedule = ScheduleService(session).get_schedule(schedule_id)
+            # The latest of the four overdue daily slots runs; the three before it are passed over.
+            assert ensure_utc(schedule.next_run_at) == slot
+            assert schedule.missed_runs == 3
+    finally:
+        _delete(schedule_id)
+
+
+def test_resume_waits_for_the_rules_next_day():
+    slot = _just_passed()
+    schedule_id, _, _ = _create(
+        cadence="weekly", recurrence=EVERY_DAY, next_run_at=slot - timedelta(days=3), timezone="UTC",
+    )
+    try:
+        with unit_session(scope=SYSTEM_SCOPE) as session:
+            next_run, runs_now = ScheduleService(session).resume_plan(schedule_id)
+        assert not runs_now
+        assert next_run == slot + timedelta(days=1)
+    finally:
+        _delete(schedule_id)
