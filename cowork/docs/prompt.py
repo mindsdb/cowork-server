@@ -3,8 +3,8 @@ and the context blocks a turn carries ahead of the person's message.
 
 The short prompt section rides on ``list_docs``'s ``ToolDef.prompt``, so it is
 in the system prompt exactly when the doc tools are registered. The writing
-guide is the body of the ``docs`` skill (skill/docs/SKILL.md): the agent reads
-it, and gets the other doc tools, only once it recalls that skill.
+guide is the body of the ``doc-tools`` skill (skill/doc-tools/SKILL.md): the
+agent reads it, and gets the other doc tools, only once it recalls that skill.
 """
 
 from __future__ import annotations
@@ -17,8 +17,8 @@ from .model import CHART_KINDS, COLUMN_KINDS, TEXT_TYPES
 from .ops import OP_NAMES
 
 # What every turn whose client shows docs is told: when to write a doc, and
-# that the tools and the writing rules come with the `docs` skill. The rules
-# themselves (DOC_GUIDE) reach the agent only once it recalls that skill, so a
+# that the tools and the writing rules come with the `doc-tools` skill. The rules
+# themselves (the skill's body) reach the agent only once it recalls it, so a
 # turn that never touches a doc does not pay for them.
 DOC_INTRO = """\
 ## Docs
@@ -36,7 +36,7 @@ When to use one:
 DOC_RECALL_RULE = """\
 
 Doc tools:
-- Before you create, read or change a doc, call `recall_skill` with the label `docs`, once per conversation. It loads `create_doc`, `read_doc` and `edit_doc` and the rules for writing a doc. `list_docs` lists the project's docs without it.
+- Before you create, read or change a doc, call `recall_skill` with the label `doc-tools` whenever `create_doc` is not among your tools. It loads `create_doc`, `read_doc` and `edit_doc` and the rules for writing a doc. `list_docs` lists the project's docs without it.
 """
 
 DOC_VIEW_RULE = """\
@@ -45,19 +45,14 @@ DOC_VIEW_RULE = """\
 
 DOC_PROMPT = DOC_INTRO + DOC_RECALL_RULE + DOC_VIEW_RULE
 
-# The `docs` skill: a host skill root of its own, offered only to a turn whose
-# client shows docs. Its SKILL.md body is the writing guide.
+# The `doc-tools` skill: a host skill root of its own, offered only to a turn
+# whose client shows docs. Its SKILL.md body is the writing guide. The label is
+# reserved (cowork.services.skills.agent_skill_names), and a plain one such as
+# `docs` would too often be the name of a person's own skill, which shadows a
+# host skill on the desktop.
 DOC_SKILLS_ROOT = Path(__file__).parent / "skill"
-DOC_SKILL_LABEL = "docs"
-
-
-def _skill_body(path: Path) -> str:
-    text = path.read_text(encoding="utf-8")
-    # Frontmatter: the first two "---" lines.
-    return text.split("\n---\n", 1)[1] if text.startswith("---\n") else text
-
-
-DOC_GUIDE = _skill_body(DOC_SKILLS_ROOT / DOC_SKILL_LABEL / "SKILL.md")
+DOC_SKILL_LABEL = "doc-tools"
+DOC_SKILL_MD = (DOC_SKILLS_ROOT / DOC_SKILL_LABEL / "SKILL.md").read_text(encoding="utf-8")
 
 CREATE_DOC_DESCRIPTION = (
     "Create a new doc: a living document that opens beside the chat for the user to read and edit. "
@@ -279,7 +274,7 @@ CONTEXT_PREFIXES = (f"<{DOC_VIEW_TAG}>", f"<{OUTPUT_CHOICE_TAG}>")
 DOC_OUTPUT_NOTE = (
     f"<{OUTPUT_CHOICE_TAG}>doc</{OUTPUT_CHOICE_TAG}>\n"
     "The person picked Output: Doc in the composer for this message. Answer it by writing a doc "
-    "(recall the `docs` skill first if this conversation has not, then create_doc, or edit_doc on "
+    "(recall the `doc-tools` skill first if create_doc is not among your tools, then create_doc, or edit_doc on "
     "the doc they have open when the message is about that doc), "
     "then reply in chat with one or two lines that name it."
 )

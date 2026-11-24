@@ -101,7 +101,7 @@ from cowork.turnqueue.redis_client import (
 )
 from cowork.docs.prompt import CONTEXT_PREFIXES, DOC_OUTPUT_NOTE, doc_context_block
 from anton.core.artifacts.models import ARTIFACT_ID_SLUG_PREFIX_LEN
-from cowork.docs.remote import RemoteDocTools, start_remote_doc_tools
+from cowork.docs.remote import RemoteDocTools, start_remote_doc_tools, with_docs_skill
 from cowork.docs.tools import DOC_WRITE_TOOL_NAMES
 from cowork.schemas.responses import (
     Content,
@@ -3510,7 +3510,7 @@ class ResponsesHandler:
                 # a bounded, sheddable wire block. Skills travel as the
                 # caller's whole recallable set (remote_turn_skills).
                 memory=seed.memory,
-                skills=doc_tools.with_docs_skill(skills) if doc_tools is not None else skills,
+                skills=with_docs_skill(skills) if doc_tools is not None else skills,
                 workspace=seed.workspace,
                 started_at=seed.started_at,
                 correlation_id=corr,

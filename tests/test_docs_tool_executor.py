@@ -10,7 +10,7 @@ import pytest
 
 from cowork.docs import tools as doc_tools
 from cowork.docs.model import DocError
-from cowork.docs.prompt import DOC_GUIDE, DOC_PROMPT, DOC_SKILL_LABEL, REMOTE_DOC_PROMPT, REMOTE_RETRY_RULE
+from cowork.docs.prompt import DOC_PROMPT, DOC_SKILL_LABEL, DOC_SKILL_MD, REMOTE_DOC_PROMPT, REMOTE_RETRY_RULE
 from cowork.docs.store import DOC_FILENAME, find_doc_folder
 from cowork.docs.tools import DOC_TOOL_NAMES, TOO_BIG_TEXT, DocToolContext, remote_doc_tool_specs, run_doc_tool
 from cowork.harnesses.anton_harness.doc_tools import build_doc_tools
@@ -130,22 +130,26 @@ def test_the_remote_specs_are_the_doc_tools_with_the_retry_rule_only_in_their_pr
         "edit_doc": (None, DOC_SKILL_LABEL), "list_docs": (REMOTE_DOC_PROMPT, None),
     }
     assert REMOTE_DOC_PROMPT == DOC_PROMPT + REMOTE_RETRY_RULE and "did not answer" not in DOC_PROMPT
-    assert DOC_GUIDE not in REMOTE_DOC_PROMPT
+    assert "Doc Markdown" not in REMOTE_DOC_PROMPT
 
 
-def test_a_remote_turn_with_doc_tools_brings_the_docs_skill():
-    from cowork.docs.remote import docs_skill
+def test_a_remote_turn_with_doc_tools_brings_the_doc_skill(tmp_path):
+    from anton.core.memory.skills import SkillStore
+
+    from cowork.docs.remote import with_docs_skill
     from cowork.schemas.turn_skills import TurnSkillEntry
 
-    [(label, entry)] = docs_skill().items()
-    assert label == DOC_SKILL_LABEL and set(entry.files) == {"SKILL.md"} and not entry.always_on
-    assert DOC_GUIDE in entry.files["SKILL.md"]
-    # A person's own skill of that name gives way, as a host skill wins on the desktop.
-    mine = {"docs": TurnSkillEntry(files={"SKILL.md": "mine"}), "notes": TurnSkillEntry(files={"SKILL.md": "n"})}
-    from cowork.docs.remote import RemoteDocTools
-
-    merged = RemoteDocTools.with_docs_skill(None, mine)
-    assert merged["docs"] == entry and merged["notes"] == mine["notes"]
+    # A person's own skill of that name gives way; the others stay.
+    mine = {DOC_SKILL_LABEL: TurnSkillEntry(files={"SKILL.md": "mine"}), "notes": TurnSkillEntry(files={"SKILL.md": "n"})}
+    merged = with_docs_skill(mine)
+    entry = merged[DOC_SKILL_LABEL]
+    assert set(entry.files) == {"SKILL.md"} and not entry.always_on and merged["notes"] == mine["notes"]
+    assert list(with_docs_skill(None)) == [DOC_SKILL_LABEL]
+    # The recall unlocks the tools by the skill's frontmatter name, so it must be the label.
+    (tmp_path / DOC_SKILL_LABEL).mkdir()
+    (tmp_path / DOC_SKILL_LABEL / "SKILL.md").write_text(entry.files["SKILL.md"])
+    skill = SkillStore(root=tmp_path).load(DOC_SKILL_LABEL)
+    assert skill is not None and skill.label == DOC_SKILL_LABEL and "Doc Markdown" in skill.declarative_md
 
 
 def test_in_process_only_list_docs_is_offered_up_front_and_the_rest_wait_for_the_docs_skill(ctx):
@@ -155,7 +159,7 @@ def test_in_process_only_list_docs_is_offered_up_front_and_the_rest_wait_for_the
         assert tools[name].unlock_skill == DOC_SKILL_LABEL and tools[name].prompt is None
     # The always-on prompt names the skill; the writing rules stay in it.
     assert f"`recall_skill` with the label `{DOC_SKILL_LABEL}`" in DOC_PROMPT
-    assert "Doc Markdown" in DOC_GUIDE and "Doc Markdown" not in DOC_PROMPT
+    assert "Doc Markdown" in DOC_SKILL_MD and "Doc Markdown" not in DOC_PROMPT
 
 
 async def test_a_stale_edit_is_refused_even_when_the_doc_cannot_be_read_again(ctx, monkeypatch):

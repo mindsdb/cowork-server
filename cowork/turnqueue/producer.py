@@ -168,14 +168,17 @@ def _shed_skills(params: dict, *, size: int, budget: int, always_on: bool) -> in
     on-demand skills go in reverse slug order, and the always-on ones team
     skills first. The block itself stays, empty at worst: it is the pod's
     whole recallable set, so a turn that sheds skills has fewer, never a
-    fallback to a mounted skills tree."""
+    fallback to a mounted skills tree. A skill one of the request's host tools
+    waits for (``unlock_skill``) is never shed: without it that tool could
+    never be unlocked."""
     skills = params.get("skills")
     if size <= budget or not isinstance(skills, dict):
         return size
     skills = params["skills"] = dict(skills)
+    unlocking = {spec.get("unlock_skill") for spec in params.get("host_tools") or ()}
     ranked = [
         slug for slug, entry in skills.items()
-        if TurnSkillEntry.model_validate(entry).always_on is always_on
+        if slug not in unlocking and TurnSkillEntry.model_validate(entry).always_on is always_on
     ]
     for slug in reversed(ranked):
         if size <= budget:

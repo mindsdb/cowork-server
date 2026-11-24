@@ -1,6 +1,6 @@
 ---
-name: docs
-description: 'MANDATORY before creating, reading or changing a doc. Loads the doc tools and the rules for writing and changing a doc.'
+name: doc-tools
+description: 'MANDATORY before writing any report, brief, write-up, plan, spec, tracker or meeting notes the user asks for, and before reading or changing a doc. Loads create_doc, read_doc and edit_doc and the rules for writing and changing a doc.'
 metadata:
   display_name: Write and edit docs
   provenance: host

@@ -465,8 +465,8 @@ def remote_doc_tool_specs(*, timeout_s: int = DOC_TOOL_TIMEOUT_S) -> list[dict[s
     """The doc tools as a remote turn's ``host_tools`` block (see the shared wire
     contract), shaped as on the desktop: ``list_docs`` carries the short docs
     prompt, plus the rule for a call the host never answered, and the others
-    wait for the ``docs`` skill, which the turn's ``skills`` block brings
-    (RemoteDocTools.with_docs_skill). A pod that predates ``unlock_skill``
+    wait for the ``doc-tools`` skill, which the turn's ``skills`` block brings
+    (remote.with_docs_skill). A pod that predates ``unlock_skill``
     registers them all at once and still recalls the skill for its guide."""
     specs = []
     for name, description, schema in DOC_TOOL_SPECS:

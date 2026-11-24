@@ -11,7 +11,7 @@ import pytest
 
 from cowork.docs.hub import conv_topic, doc_topic, hub
 from cowork.docs.model import MAX_CHART_SERIES, MAX_METRICS
-from cowork.docs.prompt import DOC_GUIDE
+from cowork.docs.prompt import DOC_SKILL_MD
 from cowork.docs.store import DOC_FILENAME, doc_lock, find_doc_folder, list_doc_folders, list_history, load_doc, open_session
 from cowork.harnesses.anton_harness.doc_tools import DOC_TOOL_NAMES, DocToolContext, build_doc_tools
 
@@ -400,8 +400,8 @@ def test_every_field_an_op_takes_is_in_the_schema(tools):
 
 
 def test_the_guide_gives_the_limits_the_format_enforces():
-    assert f"(up to {MAX_METRICS} tiles)" in DOC_GUIDE
-    assert f"up to {MAX_CHART_SERIES} series" in DOC_GUIDE
+    assert f"(up to {MAX_METRICS} tiles)" in DOC_SKILL_MD
+    assert f"up to {MAX_CHART_SERIES} series" in DOC_SKILL_MD
 
 
 def test_an_attached_image_lands_beside_the_doc_and_another_local_path_is_refused(tmp_path):

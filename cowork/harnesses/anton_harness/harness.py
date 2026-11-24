@@ -1700,7 +1700,7 @@ class AntonHarness:
 
         ``docs``: the client shows docs, so the doc tools are registered, with
         the short docs section of the prompt (DOC_PROMPT, on ``list_docs``) and
-        the ``docs`` skill that unlocks the rest. Without it the agent never
+        the ``doc-tools`` skill that unlocks the rest. Without it the agent never
         hears of docs and writes none the client can't show.
         """
         notices: list[UUID] = []
@@ -1827,7 +1827,7 @@ class AntonHarness:
         # turn's scratch folder below).
         anton_settings.skills_extra_roots = [HOST_SKILLS_DIR]
         if docs:
-            # The `docs` skill unlocks the doc tools and holds the writing guide;
+            # The `doc-tools` skill unlocks the doc tools and holds the writing guide;
             # a client without docs never hears of it.
             from cowork.docs.prompt import DOC_SKILLS_ROOT
 

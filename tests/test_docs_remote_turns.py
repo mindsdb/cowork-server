@@ -14,7 +14,7 @@ import cowork.handlers.responses as responses_mod
 from cowork.common.settings.app_settings import get_app_settings
 from cowork.db.scoped import LOCAL_SCOPE
 from cowork.db.units import unit_session
-from cowork.docs.prompt import DOC_OUTPUT_NOTE, DOC_VIEW_TAG
+from cowork.docs.prompt import DOC_OUTPUT_NOTE, DOC_SKILL_LABEL, DOC_VIEW_TAG
 from cowork.handlers.response_routing import DELEGATED_AGENTIC, RouteDecision
 from cowork.harnesses.anton_harness import harness as harness_mod
 from cowork.server import create_app
@@ -119,7 +119,7 @@ async def test_the_pod_is_offered_the_doc_tools_exactly_when_its_input_carries_t
     else:
         assert sent.get("host_tools") is None
     # The skill that unlocks them in the pod travels with them, and only with them.
-    assert ("docs" in (sent.get("skills") or {})) is expected
+    assert (DOC_SKILL_LABEL in (sent.get("skills") or {})) is expected
 
 
 async def test_a_pod_left_without_the_doc_tools_gets_the_typed_text_alone(monkeypatch):
