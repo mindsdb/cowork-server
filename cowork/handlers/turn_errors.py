@@ -349,6 +349,14 @@ MODEL_RESTRICTED_USER_MESSAGE = (
     "Choose another model in Settings."
 )
 
+# The org's zero data retention rules the model out (deny detail `zdr_restricted`).
+# Like the admin rule, credits can't lift it, so the card offers another model.
+ZDR_RESTRICTED_CODE = "zdr_restricted"
+ZDR_RESTRICTED_USER_MESSAGE = (
+    "Zero data retention is on for your organization, so this model isn't available. "
+    "Choose another model in Settings."
+)
+
 # Every code that means "the turn died on the MODEL, and picking another one is
 # the remedy": the two legacy 403s, the live 404, and the admin model rule. They
 # share a renderer card; only its copy differs.
@@ -362,6 +370,7 @@ MODEL_UNAVAILABLE_CODES = frozenset(
         MODEL_DISABLED_CODE,
         MODEL_NOT_FOUND_CODE,
         MODEL_RESTRICTED_CODE,
+        ZDR_RESTRICTED_CODE,
     }
 )
 
@@ -405,6 +414,7 @@ _REASON_RATE_LIMITED = "rate_limited"
 # rides the `X-MindsHub-Deny-Detail` header and the body's `error.deny_detail`,
 # so a client that reads only the reason still sees the same 403 as before.
 _DENY_DETAIL_MODEL_RESTRICTED = "model_restricted"
+_DENY_DETAIL_ZDR_RESTRICTED = "zdr_restricted"
 
 # Wire-level code for a transient provider incident that didn't clear within
 # anton's retry budget (ENG-673) — the model provider (or an upstream it depends
@@ -1305,7 +1315,7 @@ def _deny_detail(*, exc: BaseException) -> _DenyDetail | None:
     return None
 
 
-def _is_model_restricted(*, exc: BaseException) -> bool:
+def _is_model_restricted(*, exc: BaseException, detail: str = _DENY_DETAIL_MODEL_RESTRICTED) -> bool:
     """Whether the MindsHub gateway refused this turn over an admin model rule.
 
     Needs a 403 carrying the ``model_restricted`` deny detail, trusted by the
@@ -1318,7 +1328,7 @@ def _is_model_restricted(*, exc: BaseException) -> bool:
     found = _deny_detail(exc=exc)
     if found is None or found.status != 403:
         return False
-    if found.detail != _DENY_DETAIL_MODEL_RESTRICTED:
+    if found.detail != detail:
         return False
     if found.from_header:
         return not _origin_is_known_third_party(found.host)
@@ -1521,6 +1531,14 @@ def _classify_turn_error(
             return MODEL_RESTRICTED_CODE, str(exc)
         return MODEL_RESTRICTED_CODE, MODEL_RESTRICTED_USER_MESSAGE
 
+    # Zero data retention rules the model out: same origin rules, same card.
+    if _is_model_restricted(exc=exc, detail=_DENY_DETAIL_ZDR_RESTRICTED):
+        if model_info is _UNSET:
+            model_info = model_unavailable_info(exc)
+        if model_info is not None and model_info[0] == ZDR_RESTRICTED_CODE and str(exc):
+            return ZDR_RESTRICTED_CODE, str(exc)
+        return ZDR_RESTRICTED_CODE, ZDR_RESTRICTED_USER_MESSAGE
+
     # Anton exhausted its rate-limit wait budget and re-raised with the code;
     # keep that verdict.
     # Read the code attribute DIRECTLY rather than via provider_overloaded_info:
@@ -1706,6 +1724,11 @@ _REMOTE_TYPE_MAPPINGS: dict[str, _RemoteTypeMapping] = {
     # name is matched exactly, so the parent's row above never catches it.
     "ModelRestrictedError": _RemoteTypeMapping(
         MODEL_RESTRICTED_CODE, MODEL_RESTRICTED_USER_MESSAGE,
+        passes_message_through=True,
+    ),
+    # Zero data retention rules the model out; anton names the model in its message.
+    "ZdrRestrictedError": _RemoteTypeMapping(
+        ZDR_RESTRICTED_CODE, ZDR_RESTRICTED_USER_MESSAGE,
         passes_message_through=True,
     ),
     PROVIDER_AUTH_ERROR_TYPE_NAME: _RemoteTypeMapping(AUTH_ERROR_CODE, AUTH_ERROR_USER_MESSAGE),
