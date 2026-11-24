@@ -403,6 +403,8 @@ class _TurnEvidence:
     # What the turn handed the browser to a person for (its hand-over's
     # reason), when it did. A scheduled run has nobody to take it.
     handed_over: str | None = None
+    # Whether a change the agent asked approval for went unapproved.
+    writes_refused: bool = False
 
 
 @dataclass(frozen=True)
@@ -454,6 +456,12 @@ def _hand_over_error(reason: str) -> str:
     )
 
 
+_WRITES_REFUSED_ERROR = (
+    "Run stopped short: a change needed approval, and a scheduled run has nobody to approve it, "
+    "so it wasn't made. Open the run to see the change, then run the task now and approve it there."
+)
+
+
 def _classify(evidence: _TurnEvidence) -> _AttemptEnd:
     """What the turn's ending says about whether its agent acted, and what to
     tell the user: the turn's own failure text when it gave one. When in doubt
@@ -464,6 +472,9 @@ def _classify(evidence: _TurnEvidence) -> _AttemptEnd:
             # The agent ends its turn once nobody takes the browser, so the
             # turn reads as finished though its work stopped at that step.
             return _AttemptEnd(outcome=AttemptOutcome.failed_during_execution, error=_hand_over_error(evidence.handed_over))
+        if evidence.writes_refused:
+            # Ranked above a limit: a lost write is the bigger surprise.
+            return _AttemptEnd(outcome=AttemptOutcome.writes_refused, error=_WRITES_REFUSED_ERROR)
         limit_error = _LIMIT_ERRORS.get(evidence.stopped_by or "")
         if limit_error:
             return _AttemptEnd(outcome=AttemptOutcome.stopped_at_limit, error=limit_error)
@@ -1157,6 +1168,7 @@ async def _execute_schedule(
                             AttemptOutcome.failed_during_execution,
                             AttemptOutcome.interrupted,
                             AttemptOutcome.stopped_at_limit,
+                            AttemptOutcome.writes_refused,
                         }
                         and not shutdown_interrupted
                     ),
@@ -1476,6 +1488,7 @@ async def _turn_evidence(conversation_id: str) -> _TurnEvidence:
         shutdown_interrupted=shutdown_interrupted,
         stopped_by=await _turn_stopped_by(conversation_id) if reason == "completed" else None,
         handed_over=await _turn_handed_over(conversation_id) if reason == "completed" else None,
+        writes_refused=reason == "completed" and await _turn_refused_writes(conversation_id),
     )
 
 
@@ -1559,6 +1572,49 @@ async def _turn_handed_over(conversation_id: str) -> str | None:
         )
         return None
     return handed_over
+
+
+# anton's write-approval cards name their question with this prefix; other
+# cards (a browser step, a plain question) aren't write approval.
+_WRITE_APPROVAL_PREFIX = "write:"
+
+
+async def _turn_refused_writes(conversation_id: str) -> bool:
+    """Whether a write-approval card the turn asked went without Approve:
+    declined, timed out, or never answered. After one goes unanswered, anton
+    refuses the turn's later writes without a card, so one is enough. False
+    when the frames can't be read.
+
+    Only call after the turn's stream has been fully drained."""
+    handle = registry.get(conversation_id)
+    if handle is None:
+        return False
+    asked: set[str] = set()
+    approved: set[str] = set()
+    try:
+        async with asyncio.timeout(_EVIDENCE_READ_TIMEOUT_SECONDS):
+            async for rec in handle.buffer.tail(0):
+                if rec.is_terminal:
+                    break
+                for event, data in _sse_frames(rec):
+                    question = data.get("question_id")
+                    if not isinstance(question, str) or not question.startswith(_WRITE_APPROVAL_PREFIX):
+                        continue
+                    if event == "response.ask_user":
+                        asked.add(question)
+                    elif (
+                        event == "response.ask_user_answered"
+                        and data.get("status") == "answered"
+                        and data.get("values") == ["approve"]
+                    ):
+                        approved.add(question)
+    except Exception:
+        logger.exception(
+            "Could not read whether the turn's writes were approved",
+            extra=log_context(conversation_id=conversation_id)
+        )
+        return False
+    return bool(asked - approved)
 
 
 async def _turn_activity(conversation_id: str) -> tuple[bool, _TurnFailure | None]:
