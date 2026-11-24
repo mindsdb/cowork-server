@@ -31,7 +31,6 @@ from types import SimpleNamespace
 
 
 import pytest
-from anton.core.datasources.data_vault import LocalDataVault
 from anton.utils.datasources import build_datasource_context
 from fastapi import HTTPException
 from fastapi.testclient import TestClient
@@ -62,6 +61,7 @@ from cowork.services.connectors.layered_vault import (
     SharedConnectionError,
 )
 from cowork.services.connectors.persist import (
+    data_vault_at,
     own_vault_for_scope,
     own_vault_root,
     persist_connection,
@@ -637,11 +637,12 @@ def test_only_registry_entries_of_existing_connections_are_read(sharing):
     assert vault.can_change("postgres", "gone")
 
 
+@pytest.mark.usefixtures("with_and_without_key_file")
 def test_an_earlier_layer_hides_a_later_same_named_one(sharing):
     # Saved before the share: a save after it would see Alice's erp and the
     # operator's warehouse, and take another name.
     own_vault_for_scope(BOB).save("postgres", "erp", {**ERP, "host": "bob.example"})
-    LocalDataVault(sharing.vault_dir).save("postgres", "warehouse", {"host": "operator.example"})
+    data_vault_at(sharing.vault_dir).save("postgres", "warehouse", {"host": "operator.example"})
     own_vault_for_scope(ALICE).save("postgres", "warehouse", {**ERP, "host": "alice-wh.example"})
     _write_registry(
         sharing,
@@ -724,9 +725,10 @@ def test_only_a_scope_with_personal_connections_reads_the_registry(sharing):
     assert _names(vault_for_scope(LOCAL_SCOPE)) == set()
 
 
+@pytest.mark.usefixtures("with_and_without_key_file")
 async def test_the_operators_own_entry_answers_the_shared_sentence(trusted, managed_dir, monkeypatch):
     get_app_settings.cache_clear()
-    LocalDataVault(managed_dir.vault_dir).save("postgres", "erp", dict(ERP))
+    data_vault_at(managed_dir.vault_dir).save("postgres", "erp", dict(ERP))
     revoked = _no_revoke(monkeypatch)
 
     await _every_change_is_refused(ALICE)

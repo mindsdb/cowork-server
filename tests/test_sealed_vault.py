@@ -1,36 +1,51 @@
 """Saved connections sealed under COWORK_KEY_FILE.
 
 Every vault the server builds goes through persist.data_vault_at: anton's
-plain LocalDataVault with no key file, a SealedDataVault with one. A sealed
-record keeps anton's layout and its bookkeeping fields, and each other value
-opens with the type and text it was saved with. A record that exists but
-won't open names the connection, and never lets a same-named connection from
-another layer answer in its place, in a turn or an app backend.
+plain LocalDataVault with no key file, a SealedDataVault with one, whichever
+path saves. A sealed record keeps anton's layout and its bookkeeping fields,
+and each other value opens with the type and text it was saved with. A record
+that exists but won't open names the connection, and never lets a same-named
+connection from another layer answer in its place, in a turn, an app backend
+or a request, which answers 409. A save whose sealed record would be too
+large to read back is refused before anything is written, and answers 422.
 """
 from __future__ import annotations
 
 import ast
+import base64
 import json
+import logging
 import os
+from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
 from anton.core.datasources.data_vault import LocalDataVault
 from cryptography.fernet import Fernet, MultiFernet
+from fastapi.testclient import TestClient
 
+import cowork.server as cowork_server
 from cowork.common.encryption import sealing_keys
 from cowork.common.settings.app_settings import get_app_settings
+from cowork.db.scoped import LOCAL_SCOPE
 from cowork.handlers.turn_errors import GENERIC_TURN_ERROR_CODE, friendly_turn_error
+from cowork.services.connectors import sealed_vault
 from cowork.services.connectors.layered_vault import LayeredDataVault
-from cowork.services.connectors.persist import data_vault_at
+from cowork.services.connectors.persist import data_vault_at, own_vault_for_scope, own_vault_root
 from cowork.services.connectors.sealed_vault import (
     SEALED_FIELD,
+    RecordTooLargeError,
     SealedDataVault,
     SealedRecordError,
+    is_fernet_token,
+    record_file_bytes,
     refuse_unopenable_connections,
 )
+from tests._logging_assertions import assert_log_fields
 
 CANARY = "zx-canary-7781"
+# The longest stamp anton's save writes: microseconds and the UTC offset.
+LONGEST_STAMP = "2026-01-01T00:00:00.000000+00:00"
 
 
 def _keys(*keys: bytes) -> MultiFernet:
@@ -39,6 +54,18 @@ def _keys(*keys: bytes) -> MultiFernet:
 
 def _record_file(vault: LocalDataVault, engine: str, name: str) -> Path:
     return vault._path_for(engine, name)
+
+
+def _change_one_sealed_value(path: Path, field: str) -> None:
+    stored = json.loads(path.read_text())
+    token = stored["fields"][field]
+    stored["fields"][field] = token[:20] + ("A" if token[20] != "A" else "B") + token[21:]
+    path.write_text(json.dumps(stored))
+
+
+def _loopback_client() -> TestClient:
+    """create_app's app, with its exception handlers, as the desktop reaches it."""
+    return TestClient(cowork_server.create_app(), base_url="http://127.0.0.1:26866", client=("127.0.0.1", 54321))
 
 
 # ── values and layout ───────────────────────────────────────────────────────
@@ -119,11 +146,7 @@ def test_a_truncated_managed_record_never_lets_an_own_same_named_one_answer(tmp_
 def test_a_changed_sealed_value_names_the_connection_and_field_never_a_value(tmp_path):
     vault = SealedDataVault(tmp_path, keys=_keys(Fernet.generate_key()))
     vault.save("postgres", "sales", {"password": CANARY})
-    path = _record_file(vault, "postgres", "sales")
-    stored = json.loads(path.read_text())
-    token = stored["fields"]["password"]
-    stored["fields"]["password"] = token[:20] + ("A" if token[20] != "A" else "B") + token[21:]
-    path.write_text(json.dumps(stored))
+    _change_one_sealed_value(_record_file(vault, "postgres", "sales"), "password")
 
     with pytest.raises(SealedRecordError) as raised:
         vault.load("postgres", "sales")
@@ -142,6 +165,38 @@ def test_an_unsealed_record_is_refused_while_a_key_is_set(tmp_path):
 
     assert "isn't sealed" in str(raised.value)
     assert CANARY not in str(raised.value)
+
+
+@pytest.mark.parametrize("mark", ["1", True, 1.0], ids=["string", "bool", "float"])
+def test_only_the_integer_mark_reads_as_sealed(tmp_path, mark):
+    """True and 1.0 equal 1 in Python, and a plain record can hold any of
+    these under a field of the mark's name."""
+    vault = SealedDataVault(tmp_path, keys=_keys(Fernet.generate_key()))
+    vault.save("postgres", "sales", {"password": CANARY})
+    path = _record_file(vault, "postgres", "sales")
+    stored = json.loads(path.read_text())
+    stored["fields"][SEALED_FIELD] = mark
+    path.write_text(json.dumps(stored))
+
+    with pytest.raises(SealedRecordError, match="isn't sealed"):
+        vault.load("postgres", "sales")
+
+
+def test_a_fernet_token_is_told_from_other_text_by_its_shape():
+    token = Fernet(Fernet.generate_key()).encrypt(b'"value"').decode()
+
+    assert is_fernet_token(value=token)
+    for value in (
+        "1",
+        CANARY,
+        token[:-4],
+        token.replace("=", "") + "A",
+        base64.urlsafe_b64encode(bytes(73)).decode(),
+        token + "\n",
+        5,
+        None,
+    ):
+        assert not is_fernet_token(value=value), value
 
 
 def test_a_linked_record_and_a_record_with_a_second_name_are_refused(tmp_path):
@@ -182,6 +237,53 @@ def test_refuse_unopenable_connections_stops_on_a_record_that_wont_open(tmp_path
         refuse_unopenable_connections(vault=vault)
 
 
+def test_a_record_that_wont_open_answers_409_naming_it_on_the_list_and_the_delete(
+    key_file, sharepoint_stores, owned_logger
+):
+    vault = own_vault_for_scope(LOCAL_SCOPE)
+    vault.save("postgres", "sales", {"password": CANARY})
+    path = _record_file(vault, "postgres", "sales")
+    _change_one_sealed_value(path, "password")
+    client = _loopback_client()
+    logged = owned_logger("cowork.common.logger", level=logging.ERROR)
+
+    listed = client.get("/api/v1/connectors/connections/")
+    deleted = client.delete("/api/v1/connectors/connections/postgres/sales")
+
+    expected = (
+        "The saved connection postgres/sales can't be opened: "
+        "its password field doesn't open with the server's key."
+    )
+    assert (listed.status_code, listed.json()) == (409, {"detail": expected})
+    assert (deleted.status_code, deleted.json()) == (409, {"detail": expected})
+    assert path.exists()
+    assert_log_fields(
+        logged.output(),
+        log_level="ERROR",
+        event="sealed_connection_unopenable",
+        connection="postgres/sales",
+        reason="its password field doesn't open with the server's key",
+    )
+    assert CANARY not in logged.output()
+
+
+def test_the_start_counts_managed_connections_as_unknown_when_one_wont_open(
+    key_file, managed_dir, caplog, owned_logger
+):
+    """create_app leaves the record to the lifespan's sealed-data check,
+    which names every one that won't open."""
+    (managed_dir.vault_dir / "postgres-broken").write_text("{not json")
+
+    owned_logger("cowork.common.logger", level=logging.INFO)
+    cowork_server.create_app()
+
+    lines = [record.getMessage() for record in caplog.records if record.name == "cowork.common.logger"]
+    assert (
+        f"managed folder: {managed_dir.root} (0 skills, an unknown number of connections, 0 shared connections)"
+        in lines
+    )
+
+
 def test_a_turn_error_names_the_connection():
     error = SealedRecordError(connection="postgres/sales", cause="its record file is a link")
 
@@ -190,6 +292,71 @@ def test_a_turn_error_names_the_connection():
         "The saved connection postgres/sales can't be opened: its record file is a link. "
         "Ask your operator: Cowork's log names it too.",
     )
+
+
+# ── a record too large to read back ─────────────────────────────────────────
+
+
+def test_the_size_helper_measures_the_file_anton_writes(tmp_path):
+    vault = LocalDataVault(tmp_path)
+    vault.save("postgres", "sales", {"password": CANARY, "_label": "Sales"}, secure_keys=["password"])
+    path = _record_file(vault, "postgres", "sales")
+    record = json.loads(path.read_text())
+
+    measured = record_file_bytes(
+        engine="postgres", name="sales", fields=record["fields"], secure_keys=record["secure_keys"], prior=record
+    )
+
+    # The helper stamps updated_at in its longest form; anton's drops a zero microsecond.
+    assert measured - path.stat().st_size == len(LONGEST_STAMP) - len(record["updated_at"])
+
+
+def test_a_save_too_large_to_read_back_is_refused_and_writes_nothing(tmp_path):
+    vault = SealedDataVault(tmp_path, keys=_keys(Fernet.generate_key()))
+    vault.save("postgres", "big", {"host": "db.example"})
+    path = _record_file(vault, "postgres", "big")
+    before = path.read_bytes()
+
+    # About 790 KB in plain text seals to over 1 MiB.
+    with pytest.raises(RecordTooLargeError) as raised:
+        vault.save("postgres", "big", {"host": "db.example", "sslrootcert": "A" * 790_000})
+
+    assert str(raised.value).startswith("The saved connection postgres/big is too large to save")
+    assert raised.value.connection == "postgres/big" and "AAAA" not in str(raised.value)
+    assert path.read_bytes() == before
+    assert [entry.name for entry in tmp_path.iterdir()] == ["postgres-big"]
+
+
+def test_every_record_the_save_writes_reads_back(monkeypatch, tmp_path):
+    """Up to the limit, one byte of plain text at a time: each save that
+    succeeds opens again, and the first that wouldn't is refused."""
+    monkeypatch.setattr(sealed_vault, "MAX_RECORD_BYTES", 4096)
+    vault = SealedDataVault(tmp_path, keys=_keys(Fernet.generate_key()))
+    saved = 0
+    for length in range(2_500, 4_096):
+        value = "A" * length
+        try:
+            vault.save("postgres", "edge", {"sslrootcert": value})
+        except RecordTooLargeError:
+            break
+        assert vault.load("postgres", "edge") == {"sslrootcert": value}
+        saved += 1
+    else:
+        pytest.fail("no save reached the limit")
+
+    assert saved > 0
+    assert _record_file(vault, "postgres", "edge").stat().st_size <= 4096
+
+
+def test_the_save_route_answers_422_for_a_record_too_large_to_read_back(key_file, sharepoint_stores):
+    response = _loopback_client().post(
+        "/api/v1/connectors/connections/save",
+        json={"connector_id": "postgres", "name": "big", "values": {"host": "db.example", "password": "A" * 790_000}},
+    )
+
+    assert response.status_code == 422, response.text
+    assert response.json()["detail"].startswith("The saved connection postgres/big is too large to save")
+    assert own_vault_for_scope(LOCAL_SCOPE).list_connections() == []
 
 
 # ── the one builder ─────────────────────────────────────────────────────────
@@ -226,23 +393,124 @@ _ALLOWED_VAULT_CALLS = {
 }
 
 
-def _vault_calls(root: Path) -> set[tuple[str, str]]:
+def _builds_local_data_vault(*, call: ast.Call, aliases: frozenset[str]) -> bool:
+    """Whether ``call`` calls anton's LocalDataVault: by a name it was
+    imported under, or as an attribute such as ``data_vault.LocalDataVault``."""
+    func = call.func
+    if isinstance(func, ast.Name):
+        return func.id in aliases
+    return isinstance(func, ast.Attribute) and func.attr == "LocalDataVault"
+
+
+def _calls_in(*, node: ast.AST, enclosing: str, aliases: frozenset[str]) -> Iterator[str]:
+    """The enclosing function's name, or ``<module>``, of each such call under
+    ``node``. A class body and a lambda belong to what encloses them."""
+    for child in ast.iter_child_nodes(node):
+        if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            yield from _calls_in(node=child, enclosing=child.name, aliases=aliases)
+            continue
+        if isinstance(child, ast.Call) and _builds_local_data_vault(call=child, aliases=aliases):
+            yield enclosing
+        yield from _calls_in(node=child, enclosing=enclosing, aliases=aliases)
+
+
+def _vault_calls(*, root: Path) -> set[tuple[str, str]]:
+    """Each place under ``root`` that builds anton's LocalDataVault directly,
+    as (file, enclosing function or ``<module>``)."""
     found = set()
     for path in sorted(root.rglob("*.py")):
         tree = ast.parse(path.read_text(encoding="utf-8"))
-        for function in ast.walk(tree):
-            if not isinstance(function, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                continue
-            for node in ast.walk(function):
-                if isinstance(node, ast.Call) and getattr(node.func, "id", None) == "LocalDataVault":
-                    found.add((path.relative_to(root.parent).as_posix(), function.name))
+        aliases = frozenset({"LocalDataVault"}) | {
+            alias.asname
+            for node in ast.walk(tree)
+            if isinstance(node, ast.ImportFrom)
+            for alias in node.names
+            if alias.name == "LocalDataVault" and alias.asname
+        }
+        file = path.relative_to(root.parent).as_posix()
+        found.update((file, enclosing) for enclosing in _calls_in(node=tree, enclosing="<module>", aliases=aliases))
     return found
 
 
 def test_every_vault_the_server_builds_goes_through_the_builder():
     root = Path(__file__).resolve().parents[1] / "cowork"
 
-    assert _vault_calls(root) <= _ALLOWED_VAULT_CALLS
+    assert _vault_calls(root=root) <= _ALLOWED_VAULT_CALLS
+
+
+def test_the_builder_guard_finds_every_way_to_build_a_plain_vault(tmp_path):
+    root = tmp_path / "cowork"
+    root.mkdir()
+    imports = (
+        "from pathlib import Path\n"
+        "from anton.core.datasources import data_vault\n"
+        "from anton.core.datasources.data_vault import LocalDataVault\n"
+        "from anton.core.datasources.data_vault import LocalDataVault as Plain\n"
+    )
+    planted = {
+        "at_import.py": "VAULT = LocalDataVault(Path('/vault'))\n",
+        "class_body.py": "class Holder:\n    VAULT = Plain(Path('/vault'))\n",
+        "lambda_body.py": "build = lambda root: data_vault.LocalDataVault(root)\n",
+        "functions.py": (
+            "def by_attribute(root):\n    return data_vault.LocalDataVault(root)\n"
+            "def by_alias(root):\n    return Plain(root)\n"
+            "async def direct(root):\n    return LocalDataVault(root)\n"
+            "def outer(root):\n    def inner():\n        return Plain(root)\n    return inner\n"
+            "def only_named(vault: LocalDataVault) -> bool:\n    return isinstance(vault, LocalDataVault)\n"
+        ),
+    }
+    for name, body in planted.items():
+        (root / name).write_text(imports + body, encoding="utf-8")
+
+    assert _vault_calls(root=root) == {
+        ("cowork/at_import.py", "<module>"),
+        ("cowork/class_body.py", "<module>"),
+        ("cowork/lambda_body.py", "<module>"),
+        ("cowork/functions.py", "by_attribute"),
+        ("cowork/functions.py", "by_alias"),
+        ("cowork/functions.py", "direct"),
+        ("cowork/functions.py", "inner"),
+    }
+
+
+@pytest.mark.parametrize("managed", [False, True], ids=["no managed folder", "managed folder"])
+@pytest.mark.parametrize("save_path", ["form", "sharepoint", "chat"])
+async def test_every_save_path_seals_under_a_key_file(
+    request, monkeypatch, key_file, sharepoint_stores, tmp_path, save_path, managed
+):
+    """The form's save, the SharePoint route and the agent's connect tool,
+    each through the vault the server builds for it. The SharePoint key check
+    and the chat's connection test pass without a network."""
+    from cowork.api.v1.endpoints.connectors import sharepoint as sharepoint_ep
+    from cowork.services.connectors.persist import persist_connection
+    from tests._turns import built_turn, connect_in_chat
+
+    if managed:
+        request.getfixturevalue("managed_dir")
+    credentials = {"host": "db.example.com", "port": "5432", "user": "u", "database": "d", "password": CANARY}
+    if save_path == "form":
+        persist_connection("postgres", None, "formsave", credentials, scope=LOCAL_SCOPE)
+    elif save_path == "sharepoint":
+        monkeypatch.setattr(sharepoint_ep, "_check", lambda key, sites: None)
+        sharepoint_ep.create_connection(
+            {
+                "name": "spsave",
+                "tenant_id": "contoso.onmicrosoft.com",
+                "client_id": "11111111-2222-3333-4444-555555555555",
+                "client_secret": CANARY,
+                "site_urls": "https://contoso.sharepoint.com/sites/team",
+            },
+            LOCAL_SCOPE,
+        )
+    else:
+        async with built_turn(monkeypatch=monkeypatch, tmp_path=tmp_path, scope=None) as turn:
+            connected = await connect_in_chat(turn, monkeypatch, known_variables=credentials)
+        assert "Connection test failed" not in connected.answer
+
+    [record] = list(own_vault_root(LOCAL_SCOPE).iterdir())
+    text = record.read_text()
+    assert CANARY not in text
+    assert f'"{SEALED_FIELD}": 1' in text
 
 
 # ── a turn and an app backend ───────────────────────────────────────────────
@@ -283,6 +551,29 @@ async def test_a_turn_stops_on_a_sealed_connection_that_wont_open(
         ("sealed_connection_unopenable", "postgres-sales")
     ]
     assert CANARY not in caplog.text
+
+
+@pytest.mark.parametrize("sealed", [False, True], ids=["no key file", "key file"])
+async def test_a_turn_leaves_out_a_custom_mcp_connection_while_no_app_secret_is_held(
+    request, monkeypatch, local_vault, tmp_path, sealed
+):
+    """The turn's vault hides custom MCP connections without the app secret
+    (app_held.turn_vault), and the sealed-connection check reads that vault."""
+    from cowork import app_secret
+    from cowork.services.connectors.custom_mcp import CUSTOM_MCP_ENGINE
+    from tests._turns import built_turn
+
+    if sealed:
+        request.getfixturevalue("key_file")
+    monkeypatch.setattr(app_secret, "_secret", None)
+    vault = data_vault_at(local_vault)
+    vault.save(CUSTOM_MCP_ENGINE, "cm-" + "0123456789abcdef" * 2, {"_method": "mcp", "_label": "Tracker"})
+    vault.save("postgres", "sales", {"password": CANARY})
+
+    async with built_turn(monkeypatch=monkeypatch, tmp_path=tmp_path, scope=None) as turn:
+        listed = [(c["engine"], c["name"]) for c in turn.config.data_vault.list_connections()]
+
+    assert listed == [("postgres", "sales")]
 
 
 async def test_an_app_backend_doesnt_start_on_a_sealed_connection_that_wont_open(

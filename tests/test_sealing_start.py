@@ -14,8 +14,9 @@ import os
 from pathlib import Path
 
 import pytest
+import sqlalchemy as sa
 from anton.core.datasources.data_vault import LocalDataVault
-from cryptography.fernet import Fernet, MultiFernet
+from cryptography.fernet import Fernet, InvalidToken, MultiFernet
 from fastapi import FastAPI
 from sqlalchemy import create_engine
 from sqlalchemy.pool import StaticPool
@@ -44,6 +45,8 @@ from cowork.services.settings import SettingService
 from tests._fakes import units_on_engine
 
 CANARY = "zx-canary-7784"
+# A person's partition folder under the shared root, which holds their vault.
+PARTITION = "5f0c7d2e-8b1a-4c3e-9d4f-2a6b8c0e1f3a"
 
 
 def _write_key_file(path: Path, *lines: bytes) -> None:
@@ -148,17 +151,27 @@ def test_the_first_key_seals_and_every_key_opens(key_file):
     assert decrypt(Fernet(old).encrypt(b"sealed-before").decode()) == "sealed-before"
 
 
-def test_a_key_file_overrides_the_legacy_key_and_never_writes_one(monkeypatch, caplog, key_file, legacy_key):
-    monkeypatch.setenv("COWORK_KEY_FILE", str(key_file))
-    monkeypatch.setenv("COWORK_MASTER_KEY", Fernet.generate_key().decode())
-    get_app_settings.cache_clear()
-    sealing_keys.cache_clear()
+def test_a_key_file_overrides_the_legacy_key_lines_in_cowork_homes_env(monkeypatch, caplog, key_file, tmp_path):
+    """The legacy key settings as lines of cowork-home's .env, which is where a
+    desktop install keeps them, not as process variables."""
+    from cowork.common.settings import app_settings
+
+    legacy_key = tmp_path / "home" / ".master_key"
+    legacy_value = Fernet.generate_key().decode()
+    env_file = tmp_path / ".env"
+    env_file.write_text(f"COWORK_MASTER_KEY={legacy_value}\nMASTER_KEY_PATH={legacy_key}\n")
+    monkeypatch.delenv("COWORK_MASTER_KEY", raising=False)
+    monkeypatch.delenv("MASTER_KEY_PATH", raising=False)
+    settings = app_settings.AppSettings(_env_file=env_file)
+    monkeypatch.setattr(app_settings, "get_app_settings", lambda: settings)
     get_fernet.cache_clear()
-    settings = get_app_settings()
+    assert (settings.master_key, settings.master_key_path) == (legacy_value, str(legacy_key))
 
     token = encrypt(CANARY)
 
     assert Fernet(key_file.read_bytes().strip()).decrypt(token.encode()) == CANARY.encode()
+    with pytest.raises(InvalidToken):
+        Fernet(legacy_value).decrypt(token.encode())
     assert not legacy_key.exists()
     with caplog.at_level(logging.WARNING):
         warn_ignored_key_settings(
@@ -251,6 +264,26 @@ def test_the_start_passes_when_everything_sealed_opens(key_file, base_vault, sto
     sealing.refuse_unopenable_sealed_data()
 
 
+@pytest.mark.skipif(os.geteuid() == 0, reason="root searches any folder")
+@pytest.mark.parametrize("unsearchable", ["partition", "shared root"])
+def test_the_start_names_a_vault_the_server_cant_search(key_file, base_vault, tmp_path, unsearchable):
+    shared_root = tmp_path / "shared"
+    partition = shared_root / PARTITION
+    (partition / "data-vault").mkdir(parents=True)
+    if unsearchable == "partition":
+        locked, named = partition, partition / "data-vault"
+    else:
+        locked, named = shared_root, shared_root
+    locked.chmod(0)
+    try:
+        with pytest.raises(sealing.SealedDataError) as raised:
+            sealing.refuse_unopenable_sealed_data()
+    finally:
+        locked.chmod(0o700)
+
+    assert f"vault {named}: can't be read (EACCES)" in str(raised.value)
+
+
 def test_an_org_start_with_a_key_file_reads_no_vault(monkeypatch, org_deployment, key_file):
     monkeypatch.setattr(sealing, "vault_roots", lambda: pytest.fail("an org start must not read a vault"))
 
@@ -293,6 +326,47 @@ def test_no_key_file_and_plain_or_broken_records_start_as_today(legacy_key, base
     sealing.refuse_sealed_state_without_key_file()
 
 
+@pytest.mark.parametrize("mark", ["1", True, 1.0, 1], ids=["string", "bool", "float", "int"])
+def test_no_key_file_and_a_plain_record_with_a_field_named_like_the_mark_start_as_today(legacy_key, base_vault, mark):
+    """A person can ask the agent to save a custom connection with a variable
+    named _sealed. Its record stays plain, whatever that variable holds, so
+    the start and the first legacy key go ahead as before."""
+    LocalDataVault(base_vault).save("acme_api", "acme", {"_sealed": mark, "api_token": CANARY})
+
+    sealing.refuse_sealed_state_without_key_file()
+    encrypt(CANARY)
+
+    assert legacy_key.exists()
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root searches any folder")
+@pytest.mark.parametrize("unsearchable", ["partition", "shared root"])
+def test_no_key_file_and_a_folder_the_server_cant_search_starts_with_a_warning(
+    legacy_key, base_vault, tmp_path, owned_logger, unsearchable
+):
+    """A start that never turned sealing on reads no vault it can't search,
+    and says which folder it skipped."""
+    from tests._logging_assertions import assert_log_fields
+
+    shared_root = tmp_path / "shared"
+    partition = shared_root / PARTITION
+    (partition / "data-vault").mkdir(parents=True)
+    if unsearchable == "partition":
+        locked, skipped = partition, partition / "data-vault"
+    else:
+        locked, skipped = shared_root, shared_root
+    logged = owned_logger(sealing.logger.name, level=logging.WARNING)
+    locked.chmod(0)
+    try:
+        sealing.refuse_sealed_state_without_key_file()
+    finally:
+        locked.chmod(0o700)
+
+    assert_log_fields(
+        logged.output(), log_level="WARNING", event="vault_unreadable", vault_folder=str(skipped), reason="EACCES"
+    )
+
+
 def test_the_legacy_key_is_never_made_beside_a_sealed_deployment(legacy_key, base_vault, stored_rows):
     stored_rows(sealing.SEALING_MARKER_KEY, "1")
 
@@ -322,6 +396,117 @@ async def test_the_start_stops_before_migrations_without_a_key_file(monkeypatch,
     monkeypatch.setattr(server, "run_dev_setup", lambda: pytest.fail("the check runs before migrations"))
 
     with pytest.raises(KeyFileError):
+        async with server.lifespan(FastAPI()):
+            pass
+
+    assert not legacy_key.exists()
+
+
+# ── without a key file: an older or not yet made database starts as today ───
+
+# The revision before the settings table gained its scope column
+# (a3f9c2e8b1d4), as a desktop last started before then has it.
+BEFORE_SETTINGS_SCOPE = "f7d2b9e4a1c6"
+
+
+class _PastTheChecks(Exception):
+    """Stops a start at the step after the sealing checks and migrations."""
+
+
+@pytest.fixture
+def start_past_the_checks(monkeypatch, tmp_path):
+    """The lifespan through its real migrations and both sealing checks, on a
+    home of the test's own, stopped at the step after them. Returns the steps
+    that ran."""
+    for name, folder in (
+        ("COWORK_HOME", "home"),
+        ("COWORK_PROJECTS_DIR", "projects"),
+        ("COWORK_SKILLS_DIR", "skills"),
+        ("COWORK_MEMORY_DIR", "memory"),
+    ):
+        monkeypatch.setenv(name, str(tmp_path / folder))
+    get_app_settings.cache_clear()
+    ran: list[str] = []
+    migrate = server.run_dev_setup
+
+    def run_dev_setup() -> None:
+        ran.append("dev_setup")
+        migrate()
+
+    def stop(*_args) -> None:
+        raise _PastTheChecks
+
+    monkeypatch.setattr(server, "run_dev_setup", run_dev_setup)
+    monkeypatch.setattr(server, "consume_pending_credential_clear", stop)
+
+    async def start() -> list[str]:
+        with pytest.raises(_PastTheChecks):
+            async with server.lifespan(FastAPI()):
+                pass
+        return ran
+
+    return start
+
+
+def _database_at(monkeypatch, *, path: Path, revision: str) -> str:
+    """A SQLite database at ``path``, migrated to ``revision``, that the server reads."""
+    from alembic import command
+
+    from cowork.db.migrations import _alembic_config
+
+    uri = f"sqlite:///{path}"
+    monkeypatch.setenv("DATABASE_URI", uri)
+    get_app_settings.cache_clear()
+    config = _alembic_config(uri)
+    with get_engine(uri).begin() as connection:
+        config.attributes["connection"] = connection
+        command.upgrade(config, revision)
+    return uri
+
+
+def _settings_columns(uri: str) -> set[str]:
+    return {column["name"] for column in sa.inspect(get_engine(uri)).get_columns(Setting.__tablename__)}
+
+
+async def test_no_key_file_and_a_database_from_before_the_scope_column_migrates(
+    monkeypatch, legacy_key, base_vault, tmp_path, start_past_the_checks
+):
+    uri = _database_at(monkeypatch, path=tmp_path / "older.db", revision=BEFORE_SETTINGS_SCOPE)
+    assert "scope" not in _settings_columns(uri)
+
+    assert await start_past_the_checks() == ["dev_setup"]
+
+    assert "scope" in _settings_columns(uri)
+
+
+async def test_no_key_file_and_a_database_folder_not_made_yet_migrates(
+    monkeypatch, legacy_key, base_vault, tmp_path, start_past_the_checks
+):
+    """A desktop organization's first start: run_dev_setup makes the folder."""
+    database = tmp_path / "orgs" / "org-123" / "cowork.db"
+    monkeypatch.setenv("DATABASE_URI", f"sqlite:///{database}")
+    get_app_settings.cache_clear()
+
+    assert await start_past_the_checks() == ["dev_setup"]
+
+    assert database.is_file()
+
+
+async def test_no_key_file_and_the_marker_in_a_database_from_before_the_scope_column_refuses(
+    monkeypatch, legacy_key, base_vault, tmp_path
+):
+    uri = _database_at(monkeypatch, path=tmp_path / "older.db", revision=BEFORE_SETTINGS_SCOPE)
+    with get_engine(uri).begin() as connection:
+        connection.execute(
+            sa.text(
+                "INSERT INTO settings (id, key, value, created_at, modified_at) "
+                "VALUES (lower(hex(randomblob(16))), :key, '1', datetime('now'), datetime('now'))"
+            ),
+            {"key": sealing.SEALING_MARKER_KEY},
+        )
+    monkeypatch.setattr(server, "run_dev_setup", lambda: pytest.fail("the check runs before migrations"))
+
+    with pytest.raises(KeyFileError, match="Sealing was turned on"):
         async with server.lifespan(FastAPI()):
             pass
 

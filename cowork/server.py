@@ -66,6 +66,7 @@ from cowork.services.live_apps import live_app_slot_paths
 from cowork.services.product_permissions import ProductPermissionUnavailable, report_permission_unavailable
 from cowork.schemas.refusals import TURN_IN_PROGRESS, Refusal
 from cowork.services.connectors.layered_vault import SharedConnectionError
+from cowork.services.connectors.sealed_vault import RecordTooLargeError, SealedRecordError
 from cowork.streaming import ServerShuttingDown, TurnInProgress, registry
 from cowork.streaming.registry import TURN_SHUTDOWN_GRACE_SECONDS
 from cowork.streaming.turn_claim import TurnClaimUnavailable
@@ -1070,6 +1071,23 @@ def create_app() -> FastAPI:
     async def _shared_connection(request, exc: SharedConnectionError):
         return JSONResponse({"detail": exc.detail}, status_code=403)
 
+    # A sealed connection whose record won't open, read by a request: a list,
+    # a delete, or a turn's scrubbing registration. Its message names the
+    # connection and the cause, never a value.
+    @app.exception_handler(SealedRecordError)
+    async def _sealed_connection_unopenable(request, exc: SealedRecordError):
+        logger.error(
+            "A saved connection can't be opened",
+            extra={"event": "sealed_connection_unopenable", "connection": exc.connection, "reason": exc.cause},
+        )
+        return JSONResponse({"detail": str(exc)}, status_code=409)
+
+    # A save whose sealed record would be larger than the vault reads back
+    # (SealedDataVault.save). Its message names the connection and the sizes.
+    @app.exception_handler(RecordTooLargeError)
+    async def _record_too_large(request, exc: RecordTooLargeError):
+        return JSONResponse({"detail": str(exc)}, status_code=422)
+
     # Bearer-token auth. On by default in local mode (see AppSettings.
     # require_auth). Token is auto-generated on first startup when
     # COWORK_AUTH_TOKEN is not set, then persisted to <cowork_home>/.env so
@@ -1152,11 +1170,17 @@ def create_app() -> FastAPI:
             ) from error
         from cowork.services.connectors.persist import data_vault_at
 
+        try:
+            managed_connections = str(len(data_vault_at(managed.vault_dir).list_connections()))
+        except SealedRecordError:
+            # The lifespan's sealed-data check names every record that won't
+            # open (refuse_unopenable_sealed_data); this count leaves it to that.
+            managed_connections = "an unknown number of"
         logger.info(
-            "managed folder: %s (%d skills, %d connections, %d shared connections)",
+            "managed folder: %s (%d skills, %s connections, %d shared connections)",
             managed.root,
             len(managed.skill_slugs()),
-            len(data_vault_at(managed.vault_dir).list_connections()),
+            managed_connections,
             len(shared_connections.root),
         )
 
