@@ -560,6 +560,8 @@ class GitState(BaseModel):
     detached: bool = False
     dirty: bool = False
     status_lines: list[str] = Field(default_factory=list)
+    # False when Git could not be asked, so ``dirty`` is unknown, not clean.
+    status_checked: bool = True
     worktree_path: str
     source_path: str
 

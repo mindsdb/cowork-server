@@ -282,12 +282,19 @@ class GitRunner:
             drivers, active_filters = (), False
             if args and args[0] not in _SETTINGS_ONLY_COMMANDS:
                 drivers, active_filters = self._filter_settings(working_directory)
+            sandboxed_read = args[:1] in {("status",), ("diff",)} and bool(
+                drivers or active_filters or (working_directory / ".gitmodules").exists()
+            )
+            if sandboxed_read:
+                # A read keeps the repository's filters, so a required one
+                # still converts content. It runs them inside the sandbox.
+                drivers = ()
             argv = ["git", *_platform_config_args(), *_host_safety_args(args), *drivers, *args]
             with ExitStack() as resources:
                 output = subprocess.PIPE
-                if args[:1] in {("status",), ("diff",)} and (active_filters or (working_directory / ".gitmodules").exists()):
-                    # An installed filter or a submodule can load project code.
-                    # Outside a task operation, Git reads get no writes or network.
+                if sandboxed_read:
+                    # A filter or a submodule can run project code. Outside a
+                    # task operation, Git reads get no writes or network.
                     from cowork.coding import check_sandbox
 
                     home = resources.enter_context(tempfile.TemporaryDirectory(prefix="cowork-git-read-"))
@@ -520,16 +527,18 @@ class WorkspaceManager:
             if not committed:
                 raise
             # The commit is already recorded, so an unreadable status must not
-            # report it as failed. Everything was staged before it was made.
+            # report it as failed. A hook may have left changes behind, so the
+            # state says the rest is unknown instead of clean.
             logger.warning("Could not read Git status after committing in %s", root, exc_info=True)
-            status_lines = []
+            status_lines = None
         return GitState(
             is_git=True,
             branch=branch,
             revision=revision,
             detached=branch is None,
             dirty=bool(status_lines),
-            status_lines=status_lines,
+            status_lines=status_lines or [],
+            status_checked=status_lines is not None,
             worktree_path=str(root),
             source_path=source_path,
         )
@@ -861,7 +870,12 @@ class WorkspaceManager:
         if parent and tree == git("rev-parse", f"{parent}^{{tree}}").stdout.strip():
             raise WorkspaceError("There are no changes to commit")
         arguments = ["commit-tree", tree, *(("-p", parent) if parent else ())]
-        if git("config", "--type=bool", "--get", "commit.gpgSign", check=False).stdout.strip() == "true":
+        signing = git("config", "--type=bool", "--get", "commit.gpgSign", check=False)
+        if signing.returncode not in (0, 1):
+            # Unset exits 1. Anything else is a setting Git itself would refuse
+            # to commit with, so it must not become an unsigned commit.
+            raise WorkspaceError(signing.stderr.strip() or "Could not read the commit signing setting")
+        if signing.stdout.strip() == "true":
             self._refuse_task_signing_program(root)
             arguments.append("-S")
         revision = git(*arguments, input_text=message).stdout.strip()

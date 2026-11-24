@@ -135,7 +135,8 @@ def filter_storage(common: Path) -> list[Path]:
     comparing, so staging, status and diff all fail without write access to
     it. The folder holds content-addressed data and nothing Git executes.
     """
-    return [path for path in (common / "lfs",) if path.is_dir()]
+    # A link here would turn the grant into write access wherever it points.
+    return [path for path in (common / "lfs",) if path.is_dir() and path.resolve() == path]
 
 
 @dataclass(frozen=True)

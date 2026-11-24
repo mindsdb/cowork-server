@@ -9,7 +9,7 @@ from pathlib import Path
 
 import pytest
 
-from cowork.coding.check_sandbox import CheckPolicy, GitDirectories, check_environment, sandboxed_argv
+from cowork.coding.check_sandbox import CheckPolicy, GitDirectories, check_environment, filter_storage, sandboxed_argv
 from cowork.coding.contracts import PermissionMode, TaskWorkspace, WorkspaceKind
 from cowork.coding.project_models import CodeProject, ProjectCommand, ProjectEnvironment, ProjectFolder
 from cowork.coding.project_workspaces import ProjectCommandRunner, ProjectWorkspaceManager
@@ -778,4 +778,53 @@ def test_a_recorded_commit_is_reported_even_when_status_cannot_be_read(
     state = manager.commit(str(repo), "Change")
 
     assert state.revision == git(repo, "rev-parse", "HEAD")
+    assert not state.status_checked
     assert git(repo, "log", "-1", "--format=%s") == "Change"
+
+
+def test_redirected_filter_storage_is_never_granted(tmp_path: Path) -> None:
+    repo = repository(tmp_path / "repo")
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (repo / ".git" / "lfs").symlink_to(outside, target_is_directory=True)
+    policy = CheckPolicy.for_task(PermissionMode.read_only, False)
+
+    storage = filter_storage((repo / ".git").resolve())
+    profile = " ".join(sandboxed_argv(["true"], policy, (), storage=storage, codex=Path("codex")))
+
+    assert storage == []
+    assert str(outside.resolve()) not in profile
+
+
+def test_an_invalid_signing_setting_stops_the_commit(tmp_path: Path) -> None:
+    repo = repository(tmp_path / "repo")
+    head = git(repo, "rev-parse", "HEAD")
+    git(repo, "config", "commit.gpgSign", "maybe")
+    (repo / "README.md").write_text("changed\n", encoding="utf-8")
+
+    with pytest.raises(WorkspaceError, match="commit.gpgsign"):
+        WorkspaceManager(tmp_path / "root").commit(str(repo), "Change")
+
+    assert git(repo, "rev-parse", "HEAD") == head
+
+
+@requires_sandbox
+def test_a_required_filter_in_the_task_still_produces_a_patch(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    repo = repository(tmp_path / "repo")
+    script = repo / "tools" / "clean.sh"
+    script.parent.mkdir()
+    script.write_text('#!/bin/sh\nprintf "%s" "${COWORK_TEST_SECRET:-hidden}" >&2\ntr a-z A-Z\n', encoding="utf-8")
+    script.chmod(script.stat().st_mode | stat.S_IXUSR)
+    (repo / ".gitattributes").write_text("*.txt filter=upper\n", encoding="utf-8")
+    git(repo, "config", "filter.upper.clean", "./tools/clean.sh")
+    git(repo, "config", "filter.upper.required", "true")
+    (repo / "note.txt").write_text("one\n", encoding="utf-8")
+    git(repo, "add", ".")
+    git(repo, "commit", "-q", "-m", "filtered")
+    (repo / "note.txt").write_text("two\n", encoding="utf-8")
+    monkeypatch.setenv("COWORK_TEST_SECRET", "server-only")
+
+    result = WorkspaceManager(tmp_path / "root").git.run(repo, "diff", "--no-ext-diff", "HEAD")
+
+    assert "+TWO" in result.stdout
+    assert "server-only" not in result.stderr
