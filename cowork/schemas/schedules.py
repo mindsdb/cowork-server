@@ -194,6 +194,10 @@ class ScheduleRunResponse(CamelResponse):
     outcome: AttemptOutcome | None = None
     # The pinned model that could not be served before using the account default.
     unavailable_model: str | None = None
+    # The cron slot the run was for; a run that started well after it was
+    # missed or delayed (the app closed, the computer asleep). None on a
+    # manual run.
+    slot_at: datetime | None = None
     created_at: datetime | None
 
     @computed_field
