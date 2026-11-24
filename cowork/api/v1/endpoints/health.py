@@ -180,6 +180,8 @@ def health() -> dict:
         # through signed links (cowork/draft_host). The web client reads it at
         # boot and then opens an HTML draft by link instead of through srcdoc.
         "draft_links": get_app_settings().draft_links_enabled(),
+        # Whether the Share panel offers "Public website" (MindsHub mode only).
+        "artifact_websites": _org_mode and get_app_settings().artifact_websites_enabled(),
         "minds_runtime_credential_required": _minds_runtime_credential_required(
             settings, org_mode=_org_mode
         ),

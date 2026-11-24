@@ -820,13 +820,42 @@ def _refuse_linked_partitions(settings: AppSettings) -> None:
         )
 
 
+ARTIFACT_WEBSITES_VARIABLE = "COWORK_ARTIFACT_WEBSITES"
+
+
+def _artifact_websites_gap() -> str | None:
+    """What the installed anton lacks of the website mode, or None."""
+    try:
+        from anton import publish_access
+    except ImportError:
+        return "has no anton.publish_access"
+    if getattr(publish_access, "WEBSITE_MODE", None) != "website":
+        return "has no publish_access.WEBSITE_MODE"
+    return None
+
+
+def _check_artifact_websites_startup(settings: AppSettings) -> None:
+    """Raise RuntimeError where websites are on and the installed anton reads
+    a kept `website` entry as public, which would turn a site into a public
+    link on its next automatic re-publish."""
+    if settings.artifact_websites != "on":
+        return
+    gap = _artifact_websites_gap()
+    if gap is not None:
+        raise RuntimeError(
+            f"{ARTIFACT_WEBSITES_VARIABLE}=on needs an anton with the website mode. The installed "
+            f"anton {gap}. Install the anton this cowork-server pins, or set {ARTIFACT_WEBSITES_VARIABLE}=off."
+        )
+
+
 def check_startup(settings: AppSettings, *, remote_turns: bool) -> None:
     """Refuse to start where the agent's code would run unlocked, and say
     what a shared project leaves shared.
 
     Raises RuntimeError, naming COWORK_CODE_SANDBOX and the fix: identity
     headers with the sandbox off; live apps without what keeps each app to
-    its launcher (_check_live_apps_startup); and with ``landlock``, org tenancy, remote
+    its launcher (_check_live_apps_startup); COWORK_ARTIFACT_WEBSITES=on on an
+    anton without the website mode (_check_artifact_websites_startup); and with ``landlock``, org tenancy, remote
     turns, private connections with shared projects, an anton without the launcher or whose policy model refuses this
     server's policy, a kernel below the Landlock floor, a link at one of
     cowork-home's own entries (_COWORK_HOME_ENTRIES), a link at a person's
@@ -843,6 +872,7 @@ def check_startup(settings: AppSettings, *, remote_turns: bool) -> None:
             "(kernel 6.2 or later)."
         )
     _check_live_apps_startup(settings)
+    _check_artifact_websites_startup(settings)
     if settings.code_sandbox != "landlock":
         return
     if settings.tenancy_mode == "org":

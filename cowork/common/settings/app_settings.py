@@ -1457,6 +1457,28 @@ class AppSettings(Settings):
             "Defaults off so deploying protocol support cannot expose it."
         ),
     )
+    artifact_websites: Literal["off", "on"] = Field(
+        default="off",
+        validation_alias=AliasChoices("COWORK_ARTIFACT_WEBSITES"),
+        description=(
+            "'on' lets an artifact's owner publish it as a public website from the "
+            "Share panel. MindsHub mode only: publish_artifact refuses a website "
+            "elsewhere whatever this says. Re-publishes of an existing website go on "
+            "with 'off'. create_app refuses 'on' on an anton without the website mode."
+        ),
+    )  # COWORK_ARTIFACT_WEBSITES
+
+    @field_validator("artifact_websites", mode="before")
+    @classmethod
+    def _blank_artifact_websites_is_off(cls, v: object) -> object:
+        if isinstance(v, str):
+            return v.strip().lower() or "off"
+        return v
+
+    def artifact_websites_enabled(self) -> bool:
+        """Whether the owner's save may turn an artifact into a public website."""
+        return self.artifact_websites == "on"
+
     # Draft-preview links. Org web only. All six values together turn the
     # signed draft links on; any one missing leaves previews on the srcdoc
     # path (see draft_links_enabled).

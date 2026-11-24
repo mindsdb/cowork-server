@@ -317,6 +317,15 @@ and `kubectl set env` lasts only until the next deploy.
 no-principal path and leaves the boundary refusing anyway, so it is never the
 right lever here.
 
+`COWORK_ARTIFACT_WEBSITES` offers "Public website" in the Share panel of org
+mode. `values-dev.yaml` and `values-staging.yaml` set it to `"on"`;
+`values-prod.yaml` leaves the code default `off` until mindshub_services serves
+websites in prod. PR environments take base values, so they stay off. Turn it
+on only where mindshub_services runs with `ArtifactWebsites=on`: elsewhere the
+owner's save gets 409 `website_not_enabled` from the upload service. The server
+refuses to start with `on` on an anton without the website mode. Setting it back
+to `off` keeps existing websites re-publishing and only stops new ones.
+
 Deploy this server only with the capability-aware Cowork client image. An older
 client does not send the expected-organization header and receives 426. The
 current client also sends no header until its access token carries a readable

@@ -234,6 +234,26 @@ def test_custom_api_turns_are_off_in_the_code_and_the_base_and_on_only_where_lis
         )
 
 
+WEBSITES_FLAG = "COWORK_ARTIFACT_WEBSITES"
+# Environments where mindshub_services serves websites (ArtifactWebsites=on);
+# prod joins once spec section 8's prerequisites are met.
+WEBSITES_ENVIRONMENTS: frozenset[str] = frozenset({"dev", "staging"})
+
+
+def test_websites_are_off_in_the_code_and_the_base_and_on_only_where_listed(base, monkeypatch):
+    """A PR environment, which renders the base alone, offers no websites."""
+    monkeypatch.delenv(WEBSITES_FLAG, raising=False)
+    assert AppSettings().artifact_websites_enabled() is False
+    assert not [e for e in base if e.name == WEBSITES_FLAG]
+    for env_values in ENVIRONMENTS:
+        environment = env_values.stem.removeprefix("values-")
+        declared = [e for e in _env(env_values) if e.name == WEBSITES_FLAG]
+        if environment in WEBSITES_ENVIRONMENTS:
+            assert [e.value for e in declared] == ["on"], f"{env_values.name} must turn websites on"
+        else:
+            assert declared == [], f"{env_values.name} turns websites on"
+
+
 def test_datasource_methods_are_offered_exactly_where_the_gate_passed(base):
     """The list of methods a deployment may run, empty until a gate says
     otherwise, and set only where grants are on."""

@@ -34,7 +34,10 @@ def _user_settings(**overrides):
 
 def _app_settings(**overrides):
     """A stand-in for AppSettings with every attribute `health()` reads."""
-    fields = {"owner": "", "tenancy_mode": "local", "draft_links_enabled": lambda: False}
+    fields = {
+        "owner": "", "tenancy_mode": "local", "draft_links_enabled": lambda: False,
+        "artifact_websites_enabled": lambda: False,
+    }
     fields.update(overrides)
     return SimpleNamespace(**fields)
 
