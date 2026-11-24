@@ -10,6 +10,7 @@ from unittest import mock
 import pytest
 from fastapi import HTTPException
 
+from cowork.common.settings.app_settings import get_app_settings
 from cowork.harnesses.anton_harness import tools as htools
 from cowork.services.publish import PublishOwnedByOtherUser, UploadServiceUnavailable
 
@@ -448,3 +449,104 @@ async def test_harness_publishes_in_a_thread_off_the_event_loop(tmp_path):
         )
 
     assert threads and threads[0] != threading.get_ident()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("tool_input", [{}, {"access_mode": "public"}, {"access_mode": "password", "password": "pw"}])
+async def test_the_tool_never_republishes_a_website(tmp_path, tool_input):
+    """Whatever access the model asks for, a website stays as its owner set
+    it: the tool publishes nothing and says where the site is and that the
+    Share panel changes who opens it."""
+    f = _artifact(tmp_path)
+    fake = mock.Mock(return_value={"url": "https://v/r/1"})
+    entry = {"report_id": "r1", "url": "https://hk1.mindshub.co/", "published": True, "mode": "website"}
+    with mock.patch.object(htools, "_publish_artifact", fake), \
+         mock.patch.object(htools, "_published_owner_state", return_value=entry):
+        out = await htools._cowork_publish_or_preview(
+            _session(tmp_path), {"file_path": str(f), "action": "publish", "title": "Launch page", **tool_input},
+        )
+    fake.assert_not_called()
+    assert _text(out) == htools._website_answer("Launch page", "https://hk1.mindshub.co/")
+    assert "https://hk1.mindshub.co/" in _text(out)
+    assert "Share panel" in _text(out)
+
+
+@pytest.fixture
+def websites_offered(monkeypatch):
+    """Sets tenancy and COWORK_ARTIFACT_WEBSITES; the settings cache is
+    cleared after the change and at teardown."""
+
+    def set_to(tenancy_mode: str, websites: str) -> None:
+        monkeypatch.setenv("COWORK_TENANCY_MODE", tenancy_mode)
+        monkeypatch.setenv("COWORK_ARTIFACT_WEBSITES", websites)
+        get_app_settings.cache_clear()
+
+    yield set_to
+    get_app_settings.cache_clear()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("tenancy_mode", "websites", "offered"),
+    [("org", "on", True), ("org", "off", False), ("local", "on", False)],
+)
+async def test_a_request_for_a_website_is_answered_by_where_websites_exist(
+    tmp_path, websites_offered, tenancy_mode, websites, offered,
+):
+    """Where the Share panel offers "Public website", the answer points
+    there; elsewhere it says websites are not available here."""
+    websites_offered(tenancy_mode, websites)
+    f = _artifact(tmp_path)
+    fake = mock.Mock(return_value={"url": "https://v/r/1"})
+    with mock.patch.object(htools, "_publish_artifact", fake), \
+         mock.patch.object(htools, "_published_owner_state", return_value={}):
+        out = await htools._cowork_publish_or_preview(
+            _session(tmp_path), {"file_path": str(f), "action": "publish", "access_mode": "website"},
+        )
+    fake.assert_not_called()
+    expected = htools.WEBSITE_REQUEST_ANSWER if offered else htools.WEBSITES_UNAVAILABLE_ANSWER
+    assert _text(out) == expected
+    assert ("Public website" in _text(out)) is offered
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("action", ["ask", "preview"])
+async def test_checking_a_website_never_suggests_publishing_it(tmp_path, action):
+    f = _artifact(tmp_path)
+    state = {"report_id": "r1", "url": "https://hk1.mindshub.co/", "published": True}
+    entry = {**state, "mode": "website"}
+    with mock.patch.object(htools, "_published_state", return_value=state), \
+         mock.patch.object(htools, "_published_owner_state", return_value=entry):
+        out = await htools._cowork_publish_or_preview(
+            _session(tmp_path), {"file_path": str(f), "action": action, "title": "Launch page"},
+        )
+    assert _text(out) == htools._website_answer("Launch page", "https://hk1.mindshub.co/")
+    assert "action='publish'" not in _text(out)
+
+
+@pytest.mark.asyncio
+async def test_an_unpublished_website_entry_publishes_as_asked(tmp_path):
+    """A website the owner took down (published false) is no live site:
+    an explicit publish goes ahead."""
+    f = _artifact(tmp_path)
+    fake = mock.Mock(return_value={"url": "https://v/r/1"})
+    entry = {"report_id": "r1", "url": "", "published": False, "mode": "website"}
+    with mock.patch.object(htools, "_publish_artifact", fake), \
+         mock.patch.object(htools, "_published_owner_state", return_value=entry):
+        await htools._cowork_publish_or_preview(
+            _session(tmp_path), {"file_path": str(f), "action": "publish", "access_mode": "public"},
+        )
+    _, kwargs = fake.call_args
+    assert kwargs["access"].publisher_access() == {"mode": "public"}
+
+
+@pytest.mark.parametrize(
+    ("tenancy_mode", "websites", "told"),
+    [("org", "on", True), ("org", "off", False), ("local", "on", False)],
+)
+def test_the_prompt_tells_the_model_about_websites_where_the_share_panel_offers_them(
+    websites_offered, tenancy_mode, websites, told,
+):
+    websites_offered(tenancy_mode, websites)
+    prompt = htools.build_cowork_publish_tool().prompt
+    assert (htools.WEBSITE_PUBLISH_PROMPT in prompt) is told
