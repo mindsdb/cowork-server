@@ -87,7 +87,7 @@ DRAFTS_FLAG = "COWORK_TURN_CONNECTOR_DRAFTS_ENABLED"
 CUSTOM_API_FLAG = "COWORK_TURN_CUSTOM_API_ENABLED"
 # Environments where auth, the inference gateway and the pod's anton serve custom
 # API connections; the change that turns one on adds it here and to its values file.
-CUSTOM_API_ENVIRONMENTS: frozenset[str] = frozenset({"staging"})
+CUSTOM_API_ENVIRONMENTS: frozenset[str] = frozenset({"staging", "prod"})
 # The exact methods each enabled environment offers.
 OFFERED_METHODS: dict[str, frozenset[str]] = {
     "staging": frozenset({"mysql:host-password", "postgres:host-port"}),
