@@ -354,6 +354,8 @@ async def _cowork_publish_or_preview(session: Any, tc_input: dict):
 
     abs_path = str(file_path)
 
+    from cowork.models.artifact_owner_choice import AccessMode
+
     # 'ask'/'preview' are non-destructive: report current publish state so the
     # LLM can choose publish-vs-re-publish. State is resolved by the service so
     # fullstack (.published.json at the artifact root) and static (next to the
@@ -366,12 +368,11 @@ async def _cowork_publish_or_preview(session: Any, tc_input: dict):
     # even when explicitly asked. The wording below makes clear it CAN act.
     if action in ("ask", "preview"):
         state = _published_state(abs_path)
+        # A website is kept live by saves; the tool never re-publishes it.
+        owner_state = _published_owner_state(abs_path)
+        if owner_state.get("mode") == AccessMode.WEBSITE and owner_state.get("published", True) is not False:
+            return _website_answer(title, str(state.get("url") or owner_state.get("url") or ""))
         if state.get("published") and state.get("url"):
-            from cowork.models.artifact_owner_choice import AccessMode
-
-            # A website is kept live by saves; the tool never re-publishes it.
-            if _published_owner_state(abs_path).get("mode") == AccessMode.WEBSITE:
-                return _website_answer(title, state["url"])
             return (
                 f"{title} is already published at {state['url']}. "
                 f"It is also visible inline + in the Live Artifacts panel. "
@@ -396,17 +397,16 @@ async def _cowork_publish_or_preview(session: Any, tc_input: dict):
     # Resolve the access spec: explicit tool fields > preserve previous > the service's default.
     from pydantic import ValidationError
 
-    from cowork.models.artifact_owner_choice import AccessMode
     from cowork.schemas.artifact_access import ArtifactAccessRequest, access_refusal
 
     access_mode = tc_input.get("access_mode")
-    if access_mode == AccessMode.WEBSITE:
-        return _website_request_answer()
     # NOTE: _published_owner_state (not _published_state): the latter drops
     # mode/access_password, which would silently reset to public.
     prev = _published_owner_state(abs_path)
     if prev.get("mode") == AccessMode.WEBSITE and prev.get("published", True) is not False:
         return _website_answer(title, str(prev.get("url") or ""))
+    if access_mode == AccessMode.WEBSITE:
+        return _website_request_answer()
     if access_mode == "password":
         pw = (tc_input.get("password") or "").strip()
         if not pw:
@@ -436,6 +436,9 @@ async def _cowork_publish_or_preview(session: Any, tc_input: dict):
         access = ArtifactAccessRequest(mode=AccessMode.PUBLIC)
     else:
         # No access fields: preserve the artifact's previous access on re-publish.
+        # A taken-down website can't be rebuilt from its entry: only its owner publishes one.
+        if prev.get("mode") == AccessMode.WEBSITE:
+            return _website_request_answer()
         try:
             # None on a first publish: publish_artifact applies the default
             # (owner-only, or a refusal where a shared publish token can't

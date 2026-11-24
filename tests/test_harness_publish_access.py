@@ -550,3 +550,49 @@ def test_the_prompt_tells_the_model_about_websites_where_the_share_panel_offers_
     websites_offered(tenancy_mode, websites)
     prompt = htools.build_cowork_publish_tool().prompt
     assert (htools.WEBSITE_PUBLISH_PROMPT in prompt) is told
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("tenancy_mode", "websites"), [("org", "on"), ("local", "on")])
+async def test_a_taken_down_website_is_not_republished_without_access(
+    tmp_path, websites_offered, tenancy_mode, websites,
+):
+    websites_offered(tenancy_mode, websites)
+    f = _artifact(tmp_path)
+    fake = mock.Mock(return_value={"url": "https://v/r/1"})
+    entry = {"report_id": "r1", "url": "", "published": False, "mode": "website"}
+    with mock.patch.object(htools, "_publish_artifact", fake), \
+         mock.patch.object(htools, "_published_owner_state", return_value=entry):
+        out = await htools._cowork_publish_or_preview(
+            _session(tmp_path), {"file_path": str(f), "action": "publish"},
+        )
+    fake.assert_not_called()
+    assert _text(out) == htools._website_request_answer()
+
+
+@pytest.mark.asyncio
+async def test_a_request_for_a_website_on_a_live_website_says_it_is_one(tmp_path, websites_offered):
+    websites_offered("org", "on")
+    f = _artifact(tmp_path)
+    fake = mock.Mock(return_value={"url": "https://v/r/1"})
+    entry = {"report_id": "r1", "url": "https://hk1.mindshub.co/", "published": True, "mode": "website"}
+    with mock.patch.object(htools, "_publish_artifact", fake), \
+         mock.patch.object(htools, "_published_owner_state", return_value=entry):
+        out = await htools._cowork_publish_or_preview(
+            _session(tmp_path),
+            {"file_path": str(f), "action": "publish", "access_mode": "website", "title": "Launch page"},
+        )
+    fake.assert_not_called()
+    assert _text(out) == htools._website_answer("Launch page", "https://hk1.mindshub.co/")
+
+
+@pytest.mark.asyncio
+async def test_checking_a_website_does_not_need_the_published_state_url(tmp_path):
+    f = _artifact(tmp_path)
+    entry = {"report_id": "r1", "url": "https://hk1.mindshub.co/", "published": True, "mode": "website"}
+    with mock.patch.object(htools, "_published_state", return_value={"published": True}), \
+         mock.patch.object(htools, "_published_owner_state", return_value=entry):
+        out = await htools._cowork_publish_or_preview(
+            _session(tmp_path), {"file_path": str(f), "action": "ask", "title": "Launch page"},
+        )
+    assert _text(out) == htools._website_answer("Launch page", "https://hk1.mindshub.co/")

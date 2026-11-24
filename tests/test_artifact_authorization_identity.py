@@ -2653,6 +2653,16 @@ async def test_a_remembered_website_refusal_ends_after_its_ttl(
     assert len(attempts) == 2
 
 
+def test_remembering_a_website_refusal_drops_expired_ones(tmp_path, monkeypatch, fresh_website_refusals):
+    publish_service = fresh_website_refusals
+    now = [1000.0]
+    monkeypatch.setattr(publish_service, "_clock", lambda: now[0])
+    publish_service._remember_website_refusal(tmp_path / "a", {})
+    now[0] += publish_service.WEBSITE_REFUSAL_TTL_S + 1
+    publish_service._remember_website_refusal(tmp_path / "b", {})
+    assert list(publish_service._website_refusals) == [str(tmp_path / "b")]
+
+
 @pytest.mark.asyncio
 async def test_other_website_refusals_are_retried(
     issuer, scope, local_id, owned_artifact, monkeypatch, websites_on, fresh_website_refusals,

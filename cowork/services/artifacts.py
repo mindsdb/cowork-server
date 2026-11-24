@@ -661,21 +661,18 @@ def published_access_view(
 ) -> ArtifactAccessView:
     """Owner-side access state for the primary file, from `.published.json`.
 
-    The mode (public|password|restricted|website) plus the mode-specific state needed
-    to pre-fill the publish dialog on re-publish: the password (password) and
-    who a restricted artifact is shared with. The plaintext password and the
-    email list are owner-only (`.published.json` never enters the published
-    bundle), so callers must only return this to the artifact's owner (the
+    The mode (public|password|restricted|website) plus the mode-specific state needed to pre-fill
+    the publish dialog on re-publish: the password (password) and who a restricted artifact is
+    shared with. The plaintext password and the email list are owner-only (`.published.json` never
+    enters the published bundle), so callers must only return this to the artifact's owner (the
     local/authenticated session).
 
-    In MindsHub mode the entry doesn't say who a restricted artifact is
-    shared with: MindsHub's rule is the one record of it, which GET /access
-    reads (cowork.services.publish.stored_artifact_rule). So the audience
-    reads as unknown here (ArtifactAccessView.audience_unknown), even for an
-    entry written before that: a card never shows a copy that could have
-    gone stale or been planted, nor an empty audience it doesn't know. An
-    entry whose mode is none of the four reads as public, the mode anton's
-    publisher republishes it in.
+    In MindsHub mode the entry doesn't say who a restricted artifact is shared with: MindsHub's rule
+    is the one record of it, which GET /access reads (cowork.services.publish.stored_artifact_rule).
+    So the audience reads as unknown here (ArtifactAccessView.audience_unknown), even for an entry
+    written before that: a card never shows a copy that could have gone stale or been planted, nor
+    an empty audience it doesn't know. An entry whose mode is none of the four reads as public, the
+    mode anton's publisher republishes it in.
     """
     if primary is None:
         return ArtifactAccessView()

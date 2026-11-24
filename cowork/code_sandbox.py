@@ -849,19 +849,18 @@ def _check_artifact_websites_startup(settings: AppSettings) -> None:
 
 
 def check_startup(settings: AppSettings, *, remote_turns: bool) -> None:
-    """Refuse to start where the agent's code would run unlocked, and say
-    what a shared project leaves shared.
+    """Refuse to start where the agent's code would run unlocked, and say what a shared project leaves
+    shared.
 
-    Raises RuntimeError, naming COWORK_CODE_SANDBOX and the fix: identity
-    headers with the sandbox off; live apps without what keeps each app to
-    its launcher (_check_live_apps_startup); COWORK_ARTIFACT_WEBSITES=on on an
-    anton without the website mode (_check_artifact_websites_startup); and with ``landlock``, org tenancy, remote
-    turns, private connections with shared projects, an anton without the launcher or whose policy model refuses this
-    server's policy, a kernel below the Landlock floor, a link at one of
-    cowork-home's own entries (_COWORK_HOME_ENTRIES), a link at a person's
-    partition folder or one of its stores (_refuse_linked_partitions), or a
-    self-test that can't confirm a denied path is denied. Then creates the
-    shared folder.
+    Raises RuntimeError, naming COWORK_CODE_SANDBOX and the fix: identity headers with the sandbox
+    off; live apps without what keeps each app to its launcher (_check_live_apps_startup);
+    COWORK_ARTIFACT_WEBSITES=on on an anton without the website mode
+    (_check_artifact_websites_startup); and with ``landlock``, org tenancy, remote turns, private
+    connections with shared projects, an anton without the launcher or whose policy model refuses
+    this server's policy, a kernel below the Landlock floor, a link at one of cowork-home's own
+    entries (_COWORK_HOME_ENTRIES), a link at a person's partition folder or one of its stores
+    (_refuse_linked_partitions), or a self-test that can't confirm a denied path is denied. Then
+    creates the shared folder.
     """
     if settings.trust_identity_headers and settings.code_sandbox == "off":
         raise RuntimeError(

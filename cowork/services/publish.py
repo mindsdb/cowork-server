@@ -349,8 +349,10 @@ WEBSITE_REFUSALS = {
 class WebsiteRefused(PublishRejected):
     """A website publish refused before anything changed: by html_upload, or
     by publish_artifact before the upload. The same publish is refused again
-    until the artifact's access changes, so autopublish does not retry it.
-    ``status_code`` and ``code`` are what a route answers, with refusal()."""
+    until the artifact's access changes. Autopublish remembers only
+    website_requires_owner (for WEBSITE_REFUSAL_TTL_S, or until a successful publish);
+    the other codes are retried on its next pass. ``status_code`` and ``code`` are what a
+    route answers, with refusal()."""
 
     status_code: int = 409
 
@@ -397,7 +399,10 @@ def _website_refusal_remembered(published_dir: Path, entry: Any) -> bool:
 
 
 def _remember_website_refusal(published_dir: Path, entry: Any) -> None:
-    _website_refusals[str(published_dir)] = (_entry_stamp(entry), _clock() + WEBSITE_REFUSAL_TTL_S)
+    now = _clock()
+    for key in [k for k, (_, until) in _website_refusals.items() if until <= now]:
+        del _website_refusals[key]
+    _website_refusals[str(published_dir)] = (_entry_stamp(entry), now + WEBSITE_REFUSAL_TTL_S)
 
 
 class UploadError(NamedTuple):
@@ -1137,19 +1142,16 @@ def _publish_markdown_body(md_text: str) -> str:
 
 
 def kept_access(entry: Any, *, org_mode: bool) -> ArtifactAccessRequest:
-    """The access a re-publish that isn't a person's save keeps (live sync,
-    autopublish, an update): the entry's mode and password. A website entry is
-    kept as a website without the owner's confirmation, so the upload service
-    keeps it only where its own row already says website (_upload_access). In MindsHub mode
-    a restricted entry doesn't say who the rule shares with, so this names
-    nobody and publish_artifact takes all of it from MindsHub's rule
-    (_plan_access); ``owner_only`` keeps a rule that names nobody restricted
-    to its owner, never public. The pod can write the entry, so in MindsHub
-    mode publish_artifact checks the mode this builds before anything
-    uploads: one that isn't restricted while MindsHub still holds a rule, or
-    one wider than the sharing the owner last chose
-    (cowork.services.artifact_owner_choice), is refused (AccessModeChanged).
-    Elsewhere the entry is the record (anton's access_from_owner_side)."""
+    """The access a re-publish that isn't a person's save keeps (live sync, autopublish, an update):
+    the entry's mode and password. A website entry is kept as a website without the owner's
+    confirmation, so the upload service keeps it only where its own row already says website
+    (_upload_access). In MindsHub mode a restricted entry doesn't say who the rule shares with, so
+    this names nobody and publish_artifact takes all of it from MindsHub's rule (_plan_access);
+    ``owner_only`` keeps a rule that names nobody restricted to its owner, never public. The pod can
+    write the entry, so in MindsHub mode publish_artifact checks the mode this builds before
+    anything uploads: one that isn't restricted while MindsHub still holds a rule, or one wider than
+    the sharing the owner last chose (cowork.services.artifact_owner_choice), is refused
+    (AccessModeChanged). Elsewhere the entry is the record (anton's access_from_owner_side)."""
     publisher_access = access_from_owner_side(entry)
     if org_mode and publisher_access.get("mode") == AccessMode.RESTRICTED:
         # The entry's audience fields aren't the record here, so they are
