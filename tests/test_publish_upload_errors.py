@@ -18,6 +18,8 @@ from cowork.services.publish import (
     ShareOrgRequired,
     UploadError,
     UploadServiceUnavailable,
+    WEBSITE_REFUSALS,
+    WebsiteRefused,
     _publisher_http_detail,
     _read_http_error_body,
     classify_upload_error,
@@ -222,3 +224,29 @@ def test_a_throttled_answer_takes_its_text_from_message(body, expected):
 def test_publisher_http_detail_falls_back_to_the_exception_text():
     exc = _http_error(404, b"", "Not Found")
     assert _publisher_http_detail(exc) == str(exc)
+
+
+@pytest.mark.parametrize(
+    "code",
+    ["website_requires_publish_key", "website_not_supported", "website_requires_owner", "website_not_enabled"],
+)
+def test_a_website_refusal_is_its_own_refusal(code):
+    """html_upload answers a refused website with 400 and one of four codes.
+    Each is a WebsiteRefused: its own text, a 409 and the code a route
+    answers, and a PublishRejected, so callers that show a rejected
+    publish's text keep working."""
+    with pytest.raises(WebsiteRefused) as error:
+        classify_upload_error(_http_error(400, {"error": "access/mode", "code": code}))
+    assert isinstance(error.value, PublishRejected)
+    assert (error.value.code, str(error.value)) == (code, WEBSITE_REFUSALS[code])
+    assert (error.value.status_code, error.value.refusal().model_dump()) == (
+        409, {"detail": WEBSITE_REFUSALS[code], "code": code},
+    )
+
+
+def test_a_website_refusal_is_logged_with_its_code(caplog):
+    with caplog.at_level(logging.WARNING, logger="cowork.services.publish"):
+        with pytest.raises(WebsiteRefused):
+            classify_upload_error(_http_error(400, {"error": "x", "code": "website_requires_owner"}))
+    [record] = [r for r in caplog.records if "Publish service answered HTTP 400" in r.getMessage()]
+    assert record.reason == "website_requires_owner"

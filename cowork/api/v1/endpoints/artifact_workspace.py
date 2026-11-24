@@ -1514,7 +1514,7 @@ async def _publish_live(
     the access and stored rule come from *plan*, run under the lock. Shared by
     the Share dialog's save and Publish changes (ENG-4595), with the same
     refusals mapped to the same statuses."""
-    from cowork.services.publish import PublishRejected, PublisherUnavailable, ShareOrgRequired
+    from cowork.services.publish import PublishRejected, PublisherUnavailable, ShareOrgRequired, WebsiteRefused
     from cowork.services.publish import publish_artifact as _publish_bundle
     from cowork.services.artifact_access import ArtifactAccessRefused, ArtifactAccessUnavailable
     from cowork.services.artifact_locks import refresh
@@ -1583,9 +1583,9 @@ async def _publish_live(
     # PublisherUnavailable and PublishRejected are RuntimeErrors, so they come first.
     except PublisherUnavailable as exc:
         raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(exc)) from exc
-    except ShareOrgRequired as exc:
-        # This server's check or MindsHub refused the share with everyone, so
-        # nothing was published: a 403 the app can tell apart by its code.
+    except (ShareOrgRequired, WebsiteRefused) as exc:
+        # Refused before anything was published: the status and the code the
+        # app tells apart (403 share_org_required, 409 for a website).
         return JSONResponse(exc.refusal().model_dump(), status_code=exc.status_code)
     except PublishRejected as exc:
         raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=str(exc)) from exc

@@ -20,6 +20,7 @@ from cowork.services import artifact_stats as _stats
 from cowork.services.publish import (
     PublisherUnavailable,
     ShareOrgRequired,
+    WebsiteRefused,
     activate_version as _activate_version,
     desktop_publish_context as _desktop_context,
     desktop_publish_credential as _desktop_credential,
@@ -154,8 +155,8 @@ def publish_artifact(req: _PublishBody, request: Request, scope: ScopeDep):
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
     except (PublisherUnavailable, DatasourceApprovalUnavailable) as e:
         raise HTTPException(status_code=503, detail=str(e))
-    except ShareOrgRequired as e:
-        # MindsHub refused the share with everyone and nothing was published.
+    except (ShareOrgRequired, WebsiteRefused) as e:
+        # Refused before anything was published; the app reads the code.
         return JSONResponse(e.refusal().model_dump(), status_code=e.status_code)
     except RuntimeError as e:
         raise HTTPException(status_code=502, detail=str(e))
@@ -174,8 +175,8 @@ def update_artifact(req: _UpdateBody, request: Request, scope: ScopeDep):
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
     except (PublisherUnavailable, DatasourceApprovalUnavailable) as e:
         raise HTTPException(status_code=503, detail=str(e))
-    except ShareOrgRequired as e:
-        # MindsHub refused the share with everyone and nothing was published.
+    except (ShareOrgRequired, WebsiteRefused) as e:
+        # Refused before anything was published; the app reads the code.
         return JSONResponse(e.refusal().model_dump(), status_code=e.status_code)
     except RuntimeError as e:
         raise HTTPException(status_code=502, detail=str(e))

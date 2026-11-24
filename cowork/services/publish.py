@@ -324,6 +324,43 @@ class AccessModeChanged(PublishRejected):
         super().__init__("The artifact's sharing changed outside the Share dialog")
 
 
+# html_upload's refusals of a website publish (400, field access/mode), which
+# publish_artifact also raises itself before an upload that would get one.
+WEBSITE_REQUIRES_PUBLISH_KEY_CODE = "website_requires_publish_key"
+WEBSITE_NOT_SUPPORTED_CODE = "website_not_supported"
+WEBSITE_REQUIRES_OWNER_CODE = "website_requires_owner"
+WEBSITE_NOT_ENABLED_CODE = "website_not_enabled"
+WEBSITE_REFUSALS = {
+    WEBSITE_REQUIRES_PUBLISH_KEY_CODE: (
+        "A public website can only be published from an organization's Share panel in Cowork."
+    ),
+    WEBSITE_NOT_SUPPORTED_CODE: "Only static artifacts can be published as a public website.",
+    WEBSITE_REQUIRES_OWNER_CODE: (
+        "Only the artifact's owner can make it a public website, by choosing \"Public website\" "
+        "in the Share panel."
+    ),
+    WEBSITE_NOT_ENABLED_CODE: (
+        "Public websites are turned off on this deployment. Choose another access option in the Share panel."
+    ),
+}
+
+
+class WebsiteRefused(PublishRejected):
+    """A website publish refused before anything changed: by html_upload, or
+    by publish_artifact before the upload. The same publish is refused again
+    until the artifact's access changes, so autopublish does not retry it.
+    ``status_code`` and ``code`` are what a route answers, with refusal()."""
+
+    status_code: int = 409
+
+    def __init__(self, code: str) -> None:
+        super().__init__(WEBSITE_REFUSALS[code])
+        self.code = code
+
+    def refusal(self) -> Refusal:
+        return Refusal(detail=str(self), code=self.code)
+
+
 class UploadError(NamedTuple):
     """An upload-service answer `classify_upload_error` left to its caller."""
 
@@ -368,7 +405,8 @@ def classify_upload_error(exc: Exception) -> UploadError | None:
     (`auth_unavailable`); any other 503 is the upload service itself. A 403 is
     a denial with `permission_denied`, and MindsHub's refusal of a share with
     everyone with SHARE_ORG_REQUIRED_CODE (ShareOrgRequired, its reason,
-    clipped, as the text). Every other HTTP answer comes back as an
+    clipped, as the text). A 400 with one of html_upload's website codes is
+    WebsiteRefused. Every other HTTP answer comes back as an
     UploadError; a failure that got no HTTP answer returns None.
 
     A failed asynchronous job (`PublishJobFailed`) carries the status /upload
@@ -387,6 +425,7 @@ def classify_upload_error(exc: Exception) -> UploadError | None:
             PublishTooLarge,
             UploadServiceUnavailable,
             ShareOrgRequired,
+            WebsiteRefused,
         ),
     ):
         raise exc
@@ -404,8 +443,10 @@ def classify_upload_error(exc: Exception) -> UploadError | None:
         return None
     status = exc.code
     body, code, error = _read_http_error_body(exc)
-    typed: HTTPException | ShareOrgRequired | None = None
-    if status == 413:
+    typed: HTTPException | ShareOrgRequired | WebsiteRefused | None = None
+    if status == 400 and code in WEBSITE_REFUSALS:
+        typed = WebsiteRefused(code)
+    elif status == 413:
         typed = PublishTooLarge()
     elif status == 503:
         typed = ProductPermissionUnavailable() if code == "auth_unavailable" else UploadServiceUnavailable()

@@ -467,3 +467,22 @@ def test_a_report_the_owner_record_refuses_is_logged_orphaned_and_not_kept(tmp_p
         )
     assert not published_json.exists()
     assert any("orphaned_publish" in r.getMessage() for r in caplog.records)
+
+
+def test_a_refused_website_on_the_desktop_update_route_is_409_with_its_code():
+    from cowork.services.publish import WEBSITE_REFUSALS, WEBSITE_REQUIRES_PUBLISH_KEY_CODE, WebsiteRefused
+
+    refused = WebsiteRefused(WEBSITE_REQUIRES_PUBLISH_KEY_CODE)
+    with _patch_context(), patch.object(publish_ep, "_update", side_effect=refused):
+        res = _client().post("/api/v1/publish/update", json={"path": "/some/art"})
+    assert res.status_code == 409
+    assert res.json() == {
+        "detail": WEBSITE_REFUSALS[WEBSITE_REQUIRES_PUBLISH_KEY_CODE], "code": WEBSITE_REQUIRES_PUBLISH_KEY_CODE,
+    }
+
+
+def test_the_desktop_publish_route_takes_no_website_mode():
+    with _patch_context(), patch.object(publish_ep, "_publish") as published:
+        res = _client().post("/api/v1/publish/", json={"path": "/some/art", "access": {"mode": "website"}})
+    assert res.status_code == 422
+    published.assert_not_called()

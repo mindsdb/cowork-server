@@ -1370,3 +1370,20 @@ async def test_on_the_desktop_the_audience_is_the_owners_less_the_password(
     assert (out["accessMode"], out["accessEmails"], out["names"]) == ("restricted", ["a@example.com"], True)
     assert "accessPassword" not in out
     assert stored_rule.reads == [] and stored_rule.held_reads == []
+
+
+async def test_a_website_refusal_is_a_409_with_its_code(as_owner, publish_context, monkeypatch):
+    """However the publish ends in a website refusal, the Share dialog gets
+    its sentence and code, never the 502 of a failed publish."""
+    from cowork.services.publish import WEBSITE_REFUSALS, WEBSITE_REQUIRES_OWNER_CODE, WebsiteRefused
+
+    def refused(*args, **kwargs):
+        raise WebsiteRefused(WEBSITE_REQUIRES_OWNER_CODE)
+
+    monkeypatch.setattr("cowork.services.publish.publish_artifact", refused)
+    answer = await aw.set_artifact_access(
+        "proj", ARTIFACT_ID, aw._AccessBody(access={"mode": "public"}), ORG_SCOPE, _REQUEST,
+        principal=_REQUEST.state.principal,
+    )
+    assert _answer(answer) == (409, {"detail": WEBSITE_REFUSALS[WEBSITE_REQUIRES_OWNER_CODE], "code": WEBSITE_REQUIRES_OWNER_CODE})
+    assert _lock_is_free(as_owner)
