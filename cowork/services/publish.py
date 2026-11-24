@@ -1621,6 +1621,47 @@ def pending_datasources(raw_path: str, *, scope: TenantScope | None) -> list[dic
     return datasource_labels(vault, pending) if pending else []
 
 
+CONFIRMED_BY_OWNER_FIELD = "confirmed_by_owner"
+
+
+def _refuse_a_website(
+    *, scope: TenantScope | None, owner_save: bool, is_fullstack: bool, project_id: str | None, artifact_slug: str,
+) -> None:
+    """Raise WebsiteRefused for a website publish this server never sends:
+    outside MindsHub mode (only its publish key can carry one), for a
+    full-stack artifact, or as the owner's save while websites are off here.
+    Any other website publish goes to the upload service, which keeps a
+    website only where its own access row already says so."""
+    if scope is None or not scope.org_mode:
+        code = WEBSITE_REQUIRES_PUBLISH_KEY_CODE
+    elif is_fullstack:
+        code = WEBSITE_NOT_SUPPORTED_CODE
+    elif owner_save and not get_app_settings().artifact_websites_enabled():
+        code = WEBSITE_NOT_ENABLED_CODE
+    else:
+        return
+    logger.warning(
+        "Refused a website publish before upload",
+        extra={
+            "event": "artifact_website_refused",
+            "reason": code,
+            **log_context(project_id=project_id, artifact_slug=artifact_slug),
+        },
+    )
+    raise WebsiteRefused(code)
+
+
+def _upload_access(effective_access: dict[str, Any], *, owner_save: bool) -> dict[str, Any]:
+    """The access block anton's publisher sends. Only the owner's own save of
+    a website carries CONFIRMED_BY_OWNER_FIELD, which lets the upload service
+    create a website; every other publish goes without it, whatever reached
+    this far."""
+    access = {key: value for key, value in effective_access.items() if key != CONFIRMED_BY_OWNER_FIELD}
+    if owner_save and access.get("mode") == AccessMode.WEBSITE:
+        access[CONFIRMED_BY_OWNER_FIELD] = True
+    return access
+
+
 def publish_artifact(
     artifact: Path,
     *,
@@ -1714,6 +1755,11 @@ def publish_artifact(
     entry names no key for can't be checked: either is refused
     (AccessModeChanged) and logged before anything is uploaded.
 
+    A website publish is refused here outside MindsHub mode, for a full-stack
+    artifact, and as the owner's save while COWORK_ARTIFACT_WEBSITES is off
+    (_refuse_a_website). Only the owner's save sends confirmed_by_owner
+    (_upload_access).
+
     In MindsHub mode the owner's save also records the mode it publishes in
     (cowork.services.artifact_owner_choice), where the pod can't write, and
     every other publish is checked against that record before anything
@@ -1758,6 +1804,11 @@ def publish_artifact(
     # them only to answer 400.
     if is_fullstack and not is_mindshub_publish_url(publish_url):
         raise ValueError(FULLSTACK_PUBLISH_UNSUPPORTED)
+    if access is not None and access.mode is AccessMode.WEBSITE:
+        _refuse_a_website(
+            scope=scope, owner_save=owner_save, is_fullstack=is_fullstack,
+            project_id=project_id, artifact_slug=published_dir.name,
+        )
 
     try:
         from anton.publisher import ArtifactOwnedByOtherUserError, StatePublishBlocked, publish
@@ -1929,7 +1980,7 @@ def publish_artifact(
                 report_id=report_id,
                 publish_url=publish_url,
                 ssl_verify=ssl_verify,
-                access=plan.effective_access,
+                access=_upload_access(plan.effective_access, owner_save=owner_save),
                 access_version=plan.access_version,
                 pwd_version=plan.pwd_version,
                 artifact_key=canonical_artifact_key,

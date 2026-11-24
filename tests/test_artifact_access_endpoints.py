@@ -27,6 +27,7 @@ from fastapi import FastAPI, HTTPException
 # publish_calls holds the fake, for every later test in the run.
 import cowork.services.artifact_autopublish  # noqa: F401
 from cowork.api.v1.endpoints import artifact_workspace as aw
+from cowork.common.settings.app_settings import get_app_settings
 from cowork.db.scoped import TenantScope, get_tenant_scope
 from cowork.schemas.artifact_access import ArtifactAccessRequest
 from cowork.principal import ORG_MANAGE_ROLE, Principal
@@ -1386,4 +1387,62 @@ async def test_a_website_refusal_is_a_409_with_its_code(as_owner, publish_contex
         principal=_REQUEST.state.principal,
     )
     assert _answer(answer) == (409, {"detail": WEBSITE_REFUSALS[WEBSITE_REQUIRES_OWNER_CODE], "code": WEBSITE_REQUIRES_OWNER_CODE})
+    assert _lock_is_free(as_owner)
+
+
+@pytest.fixture
+def websites_setting(monkeypatch):
+    """Sets COWORK_ARTIFACT_WEBSITES; the settings cache is cleared after each
+    change and at teardown, even when the test fails."""
+
+    def set_to(value: str) -> None:
+        monkeypatch.setenv("COWORK_ARTIFACT_WEBSITES", value)
+        get_app_settings.cache_clear()
+
+    yield set_to
+    get_app_settings.cache_clear()
+
+
+async def test_a_website_save_while_websites_are_off_is_a_409_and_publishes_nothing(
+    as_owner, publish_context, monkeypatch, websites_setting,
+):
+    from unittest import mock
+
+    from cowork.services.publish import WEBSITE_NOT_ENABLED_CODE, WEBSITE_REFUSALS
+
+    websites_setting("off")
+    upload = mock.Mock()
+    monkeypatch.setattr("anton.publisher.publish", upload)
+
+    refused = await aw.set_artifact_access(
+        "proj", ARTIFACT_ID, aw._AccessBody(access={"mode": "website"}), ORG_SCOPE, _REQUEST,
+        principal=_REQUEST.state.principal,
+    )
+
+    assert _answer(refused) == (409, {"detail": WEBSITE_REFUSALS[WEBSITE_NOT_ENABLED_CODE], "code": WEBSITE_NOT_ENABLED_CODE})
+    upload.assert_not_called()
+    assert not (as_owner / ".published.json").exists()
+    assert _lock_is_free(as_owner)
+
+
+async def test_the_upload_services_website_refusal_of_a_save_is_a_409_with_its_code(
+    as_owner, publish_context, monkeypatch, websites_setting,
+):
+    from cowork.services.publish import WEBSITE_REFUSALS, WEBSITE_REQUIRES_PUBLISH_KEY_CODE
+
+    websites_setting("on")
+    _upload_service_answers(
+        monkeypatch, 400, "Bad Request",
+        json.dumps({"error": "access/mode", "code": WEBSITE_REQUIRES_PUBLISH_KEY_CODE}).encode(),
+    )
+
+    refused = await aw.set_artifact_access(
+        "proj", ARTIFACT_ID, aw._AccessBody(access={"mode": "website"}), ORG_SCOPE, _REQUEST,
+        principal=_REQUEST.state.principal,
+    )
+
+    assert _answer(refused) == (
+        409, {"detail": WEBSITE_REFUSALS[WEBSITE_REQUIRES_PUBLISH_KEY_CODE], "code": WEBSITE_REQUIRES_PUBLISH_KEY_CODE},
+    )
+    assert not (as_owner / ".published.json").exists()
     assert _lock_is_free(as_owner)

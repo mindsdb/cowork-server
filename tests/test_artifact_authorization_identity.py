@@ -2450,3 +2450,133 @@ async def test_a_member_who_may_review_reads_the_owners_audience_without_the_pas
     }
     reads = [body for path, body in issuer.calls if path.endswith("/read/")]
     assert reads and all(body["owner_keycloak_id"] == scope.user_id for body in reads)
+
+
+SITE_URL = "https://hk1-staging.mindshub.co/"
+
+
+@pytest.fixture
+def websites_setting(monkeypatch):
+    """Sets COWORK_ARTIFACT_WEBSITES for the test; the settings cache is
+    cleared after each change and again at teardown, even when the test fails."""
+
+    def set_to(value: str) -> None:
+        monkeypatch.setenv("COWORK_ARTIFACT_WEBSITES", value)
+        get_app_settings.cache_clear()
+
+    yield set_to
+    get_app_settings.cache_clear()
+
+
+@pytest.fixture
+def websites_on(websites_setting):
+    websites_setting("on")
+
+
+def _website_refusal_records(caplog):
+    return [
+        r for r in caplog.records
+        if r.name == "cowork.services.publish" and getattr(r, "event", None) == "artifact_website_refused"
+    ]
+
+
+def test_the_owners_website_save_confirms_it_to_the_upload_service(
+    issuer, scope, local_id, owned_artifact, monkeypatch, websites_on
+):
+    """Only the owner's save sends confirmed_by_owner. The site's URL from
+    html_upload reaches the result and the entry, the entry never stores the
+    confirmation, and the owner's record says website."""
+    from cowork.models.artifact_owner_choice import AccessMode
+    from cowork.services.artifact_owner_choice import OwnerChoice
+
+    _session, project, _conversation, folder = owned_artifact
+    run, uploads = _org_publisher(issuer, folder, scope, project, monkeypatch, view_url=SITE_URL)
+
+    result = run({"mode": "website"}, owner_save=True)
+
+    assert uploads[-1]["access"] == {"mode": "website", "confirmed_by_owner": True}
+    assert (result["accessMode"], result["url"]) == ("website", SITE_URL)
+    entry = _entry(folder)
+    assert (entry["mode"], entry["url"]) == ("website", SITE_URL)
+    assert "confirmed_by_owner" not in entry
+    assert _owner_choice(result["artifactKey"], scope) == OwnerChoice(AccessMode.WEBSITE, published=True)
+
+
+def test_the_owners_website_save_is_refused_while_websites_are_off(
+    issuer, scope, local_id, owned_artifact, monkeypatch, caplog, websites_setting
+):
+    from cowork.services.publish import WEBSITE_NOT_ENABLED_CODE, WebsiteRefused
+
+    websites_setting("off")
+    _session, project, _conversation, folder = owned_artifact
+    run, uploads = _org_publisher(issuer, folder, scope, project, monkeypatch)
+
+    with caplog.at_level(logging.WARNING, logger="cowork.services.publish"):
+        with pytest.raises(WebsiteRefused) as refused:
+            run({"mode": "website"}, owner_save=True)
+
+    assert refused.value.code == WEBSITE_NOT_ENABLED_CODE
+    assert uploads == []
+    assert not (folder / ".published.json").exists()
+    [record] = _website_refusal_records(caplog)
+    assert record.reason == WEBSITE_NOT_ENABLED_CODE
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("setting", ("on", "off"))
+@pytest.mark.parametrize("how", ("live_sync", "autopublish"))
+async def test_a_website_is_kept_on_republish_without_the_owners_confirmation(
+    issuer, scope, local_id, owned_artifact, monkeypatch, websites_setting, how, setting
+):
+    """Live sync and autopublish keep an existing website, with the setting
+    on or off, and never send confirmed_by_owner: html_upload keeps a
+    website only where its own row already says so."""
+    _session, project, _conversation, folder = owned_artifact
+    websites_setting("on")
+    run, uploads = _org_publisher(issuer, folder, scope, project, monkeypatch, view_url=SITE_URL)
+    run({"mode": "website"}, owner_save=True)
+    websites_setting(setting)
+
+    assert await _republish(how, folder, scope, project, monkeypatch) is True
+    assert uploads[-1]["access"] == {"mode": "website"}
+
+
+@pytest.mark.asyncio
+async def test_an_entry_an_agent_rewrites_to_a_website_is_never_confirmed(
+    issuer, scope, local_id, owned_artifact, monkeypatch, websites_on
+):
+    """An artifact its owner never saved has no owner record. An agent
+    rewrites its entry to a website, with confirmed_by_owner and another
+    site's key. Autopublish sends the website without the confirmation, so
+    html_upload refuses it unless its own row already says website."""
+    _session, project, _conversation, folder = owned_artifact
+    run, uploads = _org_publisher(issuer, folder, scope, project, monkeypatch)
+    run({"mode": "public"})
+    _plant_entry(folder, mode="website", confirmed_by_owner=True, artifact_key=artifact_key(uuid4().hex))
+
+    assert await _autopublish_once(folder, scope, project) is True
+    assert uploads[-1]["access"] == {"mode": "website"}
+
+
+@pytest.mark.asyncio
+async def test_a_forged_confirmation_in_the_previous_entry_never_reaches_the_upload(
+    issuer, scope, local_id, owned_artifact, monkeypatch, websites_on
+):
+    """publish_artifact hands anton the entry, which the pod can write, as
+    previous_access. A forged confirmed_by_owner there never reaches the
+    request /upload gets: anton's real publisher builds the body."""
+    _session, project, _conversation, folder = owned_artifact
+    run, _uploads = _org_publisher(issuer, folder, scope, project, monkeypatch, view_url=SITE_URL)
+    run({"mode": "website"}, owner_save=True)
+    _plant_entry(folder, confirmed_by_owner=True)
+    sent = []
+
+    def request(url, api_key, **kwargs):
+        sent.append(json.loads(kwargs["payload"]))
+        return json.dumps({"view_url": SITE_URL, "report_id": "report-1"})
+
+    monkeypatch.setattr("anton.publisher.publish", _ANTON_PUBLISH)
+    fake_minds_requests(monkeypatch, request)
+
+    assert await _autopublish_once(folder, scope, project) is True
+    assert sent[-1]["access"] == {"mode": "website"}

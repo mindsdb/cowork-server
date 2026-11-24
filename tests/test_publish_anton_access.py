@@ -29,6 +29,7 @@ from cowork.harnesses.anton_harness import tools as htools
 from cowork.models.artifact_owner_choice import AccessMode
 from cowork.schemas.artifact_access import ArtifactAccessRequest
 from cowork.services import publish
+from cowork.services.publish import WEBSITE_REFUSALS, WEBSITE_REQUIRES_PUBLISH_KEY_CODE, WebsiteRefused
 from cowork.services.artifact_autopublish import AUTOPUBLISH_ACCESS
 from tests._org_sharing import BOB, TEAM_ENG, TEAM_OPS, artifact_rule
 
@@ -218,3 +219,38 @@ def test_a_publish_in_mindshub_mode_hands_anton_each_mode(anton_access, access, 
     publish._plan_access(None, access(), None, stored=stored)
 
     assert anton_access == [handed]
+
+
+def test_a_website_outside_mindshub_mode_is_refused_before_anton(artifact, anton_access, monkeypatch):
+    upload = mock.Mock()
+    monkeypatch.setattr("anton.publisher.publish", upload)
+
+    with pytest.raises(WebsiteRefused) as refused:
+        publish.publish_artifact(
+            artifact, artifacts_base=artifact.parent, api_key="desktop-key", publish_url=PUBLISH_URL,
+            access=ArtifactAccessRequest(mode=AccessMode.WEBSITE), scope=LOCAL_SCOPE,
+        )
+
+    assert refused.value.code == WEBSITE_REQUIRES_PUBLISH_KEY_CODE
+    assert anton_access == []
+    upload.assert_not_called()
+
+
+def test_the_desktop_update_of_an_entry_rewritten_to_a_website_is_refused(artifact, anton_access, monkeypatch):
+    (artifact / ".published.json").write_text(json.dumps({"index.html": {
+        "report_id": "r1", "url": "https://view.example/r/1", "published": True, "mode": "website",
+    }}))
+    monkeypatch.setattr(
+        publish, "desktop_artifact_and_base", lambda raw, *, scope: publish.DesktopArtifact(artifact, artifact.parent),
+    )
+    monkeypatch.setattr(publish, "desktop_publish_credential", lambda: ("desktop-key", PUBLISH_URL))
+
+    answer = routes.update_artifact(
+        routes._UpdateBody(path=str(artifact)), Request({"type": "http", "headers": []}), LOCAL_SCOPE,
+    )
+
+    assert answer.status_code == 409
+    assert json.loads(answer.body) == {
+        "detail": WEBSITE_REFUSALS[WEBSITE_REQUIRES_PUBLISH_KEY_CODE], "code": WEBSITE_REQUIRES_PUBLISH_KEY_CODE,
+    }
+    assert anton_access == []
