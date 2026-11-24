@@ -501,6 +501,7 @@ async def _sync_live_artifact(
     """
     from cowork.services.publish import (
         AccessModeChanged,
+        DatasourceApprovalRequired,
         MarkdownNotPublishable,
         MarkdownRenderBusy,
         PublishOwnedByOtherUser,
@@ -593,6 +594,11 @@ async def _sync_live_artifact(
     except MarkdownRenderBusy:
         # Another conversion held the server's one slot; the next save tries again.
         logger.warning("Could not synchronize live artifact %s: another conversion runs", folder)
+        return False
+    except DatasourceApprovalRequired:
+        # Repeats on every save until the person approves the app's new
+        # connections in the publish dialog, so no traceback.
+        logger.warning("Could not synchronize live artifact %s: new connections need approval", folder)
         return False
     except (AccessModeChanged, ShareOrgRequired):
         # publish_artifact logged the refusal: a mode changed after the
