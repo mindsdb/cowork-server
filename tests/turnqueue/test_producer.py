@@ -3118,6 +3118,26 @@ async def test_host_tools_reach_the_job_only_for_an_interactive_turn(monkeypatch
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("interactive", [True, False])
+async def test_a_skill_only_dropped_host_tools_wait_for_is_dropped_with_them(monkeypatch, interactive):
+    """It would unlock nothing in the pod; the caller's other skills stay."""
+    from cowork.schemas.turn_skills import TurnSkillEntry
+
+    fake = FakeRedis(replies=[("scratchpad:reply:conv-1", _reply("turn_completed", {}))])
+    monkeypatch.setattr(prod, "get_redis", lambda: fake)
+    monkeypatch.setattr(prod, "_new_correlation_id", lambda: "r")
+    host_tools = [{"name": "edit_doc", "description": "Edit a doc.", "input_schema": {"type": "object"},
+                   "unlock_skill": "doc-tools"}]
+    skills = {"doc-tools": TurnSkillEntry(files={"SKILL.md": "guide"}),
+              "notes": TurnSkillEntry(files={"SKILL.md": "n"})}
+    await _drain(prod.stream_remote_replies(conversation_id="conv-1", org_id=None, user_id=None,
+                                            input_text="hi", model="m", interactive=interactive,
+                                            host_tools=host_tools, skills=skills))
+    params = json.loads(fake.added[0][1]["payload"])["params"]
+    assert sorted(params["skills"]) == (["doc-tools", "notes"] if interactive else ["notes"])
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("can_manage,expected", [(True, True), (False, False)])
 async def test_host_tools_reach_the_job_only_for_a_persistent_workspace(monkeypatch, can_manage, expected):
     """Without artifact.manage the caller may not change artifacts, and the turn end

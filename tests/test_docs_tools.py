@@ -11,7 +11,7 @@ import pytest
 
 from cowork.docs.hub import conv_topic, doc_topic, hub
 from cowork.docs.model import MAX_CHART_SERIES, MAX_METRICS
-from cowork.docs.prompt import DOC_PROMPT
+from cowork.docs.prompt import DOC_SKILL_MD
 from cowork.docs.store import DOC_FILENAME, doc_lock, find_doc_folder, list_doc_folders, list_history, load_doc, open_session
 from cowork.harnesses.anton_harness.doc_tools import DOC_TOOL_NAMES, DocToolContext, build_doc_tools
 
@@ -55,10 +55,10 @@ def _steps(defs, session, name, **args):
     return asyncio.run(_drain(defs[name].handler(session, args)))[0]
 
 
-def test_the_four_tools_are_built_and_create_doc_carries_the_prompt(tools):
+def test_the_four_tools_are_built_and_list_docs_carries_the_prompt(tools):
     defs, _session, _ = tools
     assert tuple(defs) == DOC_TOOL_NAMES
-    assert "## Docs" in defs["create_doc"].prompt
+    assert "## Docs" in defs["list_docs"].prompt
     for name in DOC_TOOL_NAMES:
         assert defs[name].input_schema["type"] == "object"
 
@@ -399,9 +399,9 @@ def test_every_field_an_op_takes_is_in_the_schema(tools):
     assert "3 weeks" in next(b for b in blocks if b["type"] == "callout")["text"]
 
 
-def test_the_prompt_gives_the_limits_the_format_enforces():
-    assert f"(up to {MAX_METRICS} tiles)" in DOC_PROMPT
-    assert f"up to {MAX_CHART_SERIES} series" in DOC_PROMPT
+def test_the_guide_gives_the_limits_the_format_enforces():
+    assert f"(up to {MAX_METRICS} tiles)" in DOC_SKILL_MD
+    assert f"up to {MAX_CHART_SERIES} series" in DOC_SKILL_MD
 
 
 def test_an_attached_image_lands_beside_the_doc_and_another_local_path_is_refused(tmp_path):

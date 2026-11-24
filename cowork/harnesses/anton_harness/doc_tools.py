@@ -22,7 +22,7 @@ from anton.core.tools.registry import ToolOutcome
 from anton.core.tools.tool_defs import ToolDef
 from anton.core.tools.tool_handlers import _track_artifact
 
-from cowork.docs.prompt import DOC_PROMPT
+from cowork.docs.prompt import DOC_PROMPT, DOC_SKILL_LABEL
 from cowork.docs.tools import (
     DOC_TOOL_NAMES,
     DOC_TOOL_SPECS,
@@ -102,8 +102,10 @@ def _handler(ctx: DocToolContext, name: str):
 
 
 def build_doc_tools(ctx: DocToolContext) -> list[ToolDef]:
+    """``list_docs`` carries the docs prompt; the others wait for the
+    ``doc-tools`` skill (cowork.docs.prompt)."""
     return [
         ToolDef(name=name, description=description, input_schema=schema, handler=_handler(ctx, name),
-                **({"prompt": DOC_PROMPT} if name == "create_doc" else {}))
+                **({"prompt": DOC_PROMPT} if name == "list_docs" else {"unlock_skill": DOC_SKILL_LABEL}))
         for name, description, schema in DOC_TOOL_SPECS
     ]

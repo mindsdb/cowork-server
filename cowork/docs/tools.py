@@ -32,14 +32,14 @@ from cowork.docs.model import TEXT_TYPES, Doc, DocError, block_text_for_search, 
 from cowork.docs.prompt import (
     CREATE_DOC_DESCRIPTION,
     CREATE_DOC_SCHEMA,
-    DOC_PROMPT,
     EDIT_DOC_DESCRIPTION,
     EDIT_DOC_SCHEMA,
     LIST_DOCS_DESCRIPTION,
     LIST_DOCS_SCHEMA,
     READ_DOC_DESCRIPTION,
     READ_DOC_SCHEMA,
-    REMOTE_RETRY_RULE,
+    DOC_SKILL_LABEL,
+    REMOTE_DOC_PROMPT,
 )
 from cowork.docs.service import announce, apply, create_doc
 from cowork.docs.store import NewDoc, find_doc_folder, list_doc_folders, load_doc
@@ -462,15 +462,17 @@ async def run_doc_tool(
 
 
 def remote_doc_tool_specs(*, timeout_s: int = DOC_TOOL_TIMEOUT_S) -> list[dict[str, Any]]:
-    """The doc tools as a remote turn's ``host_tools`` block (see the shared wire
-    contract). ``create_doc`` carries the prompt, as its ToolDef does on the
-    desktop, plus the rule for a call the host never answered."""
+    """The doc tools as a remote turn's ``host_tools`` block, shaped as on the
+    desktop (cowork.docs.prompt), plus the rule for a call the host never
+    answered. A pod that predates ``unlock_skill`` registers them all at once."""
     specs = []
     for name, description, schema in DOC_TOOL_SPECS:
         spec: dict[str, Any] = {"name": name, "description": description, "input_schema": schema,
                                 "timeout_s": timeout_s}
-        if name == "create_doc":
-            spec["prompt"] = DOC_PROMPT + REMOTE_RETRY_RULE
+        if name == "list_docs":
+            spec["prompt"] = REMOTE_DOC_PROMPT
+        else:
+            spec["unlock_skill"] = DOC_SKILL_LABEL
         specs.append(spec)
     return specs
 

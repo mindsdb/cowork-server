@@ -26,10 +26,12 @@ from cowork.common.settings.user_settings import use_settings_scope
 from cowork.db.units import DatabaseBusy, run_efs, unit_session
 from cowork.docs.images import MAX_IMAGE_BYTES
 from cowork.docs.model import DocError
+from cowork.docs.prompt import DOC_SKILL_LABEL, DOC_SKILL_MD
 from cowork.docs.store import doc_lock, doc_subfolder, read_metadata
 from cowork.docs.tools import TOO_BIG_TEXT, DocToolContext, remote_doc_tool_specs, run_doc_tool
 from cowork.services.artifact_identity import _write_metadata
 from cowork.services.artifact_ownership import artifact_root_for_base, record_artifact_owner
+from cowork.schemas.turn_skills import TurnSkillEntry, TurnSkills
 from cowork.services.artifact_permissions import artifact_capabilities
 from cowork.turnqueue.host_tools import MAX_RESULT_BYTES, EmitStep, HostCall, HostToolOutcome, HostToolRunner
 
@@ -242,6 +244,13 @@ class RemoteDocTools:
     writes: RemoteDocWrites
     context: DocToolContext
     specs: list[dict[str, Any]]
+
+
+def with_docs_skill(skills: TurnSkills | None) -> TurnSkills:
+    """The turn's skills plus the ``doc-tools`` skill, which unlocks every doc
+    tool but list_docs in the pod. It replaces a person's skill of the same
+    name, and the producer never sheds it (turnqueue.producer._shed_skills)."""
+    return {**(skills or {}), DOC_SKILL_LABEL: TurnSkillEntry(files={"SKILL.md": DOC_SKILL_MD})}
 
 
 def start_remote_doc_tools(

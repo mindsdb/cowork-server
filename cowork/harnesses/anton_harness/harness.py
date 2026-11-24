@@ -1698,9 +1698,10 @@ class AntonHarness:
         (_build_turn_session). The live-app stops its prompt tells ride on the
         result; a build that fails hands them back (release_stop_notices).
 
-        ``docs``: the client shows docs, so the doc tools are registered, and
-        with them ``create_doc``'s prompt section (DOC_PROMPT). Without it the
-        agent never hears of docs and writes none the client can't show.
+        ``docs``: the client shows docs, so the doc tools are registered, with
+        the short docs section of the prompt (DOC_PROMPT, on ``list_docs``) and
+        the ``doc-tools`` skill that unlocks the rest. Without it the agent never
+        hears of docs and writes none the client can't show.
         """
         notices: list[UUID] = []
         try:
@@ -1825,6 +1826,12 @@ class AntonHarness:
         # skills others share with them after those (both linked into the
         # turn's scratch folder below).
         anton_settings.skills_extra_roots = [HOST_SKILLS_DIR]
+        if docs:
+            # The `doc-tools` skill unlocks the doc tools and holds the writing guide;
+            # a client without docs never hears of it.
+            from cowork.docs.prompt import DOC_SKILLS_ROOT
+
+            anton_settings.skills_extra_roots.append(DOC_SKILLS_ROOT)
 
         user = await run_on_unit_threads(get_user_settings)
         _overlay_user_settings(anton_settings, user)
