@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import os
 import shutil
-import socket
 import stat
 import subprocess
 import sys
@@ -11,7 +10,7 @@ from pathlib import Path
 import pytest
 
 from cowork.coding.check_sandbox import (
-    CheckPolicy, GitDirectories, check_environment, filter_storage, run_sandboxed, sandbox_environment, sandboxed_argv,
+    CheckPolicy, GitDirectories, check_environment, filter_storage, run_sandboxed, sandboxed_argv,
 )
 from cowork.coding.contracts import PermissionMode, TaskWorkspace, WorkspaceKind
 from cowork.coding.project_models import CodeProject, ProjectCommand, ProjectEnvironment, ProjectFolder
@@ -126,6 +125,10 @@ def test_sandboxed_checks_follow_the_task_network_setting(
 ) -> None:
     monkeypatch.setattr(sys, "platform", platform)
     policy = CheckPolicy.for_task(PermissionMode.workspace, network_access=network_access)
+    if platform == "win32" and not network_access:
+        with pytest.raises(WorkspaceError, match="network access off"):
+            sandboxed_argv(["npm", "test"], policy, [tmp_path], codex=Path("codex"))
+        return
     argv = sandboxed_argv(["npm", "test"], policy, [tmp_path], codex=Path("codex"))
     joined = " ".join(argv)
 
@@ -135,50 +138,24 @@ def test_sandboxed_checks_follow_the_task_network_setting(
     uses_proxy = platform != "win32" and not network_access
     assert ("features.network_proxy=true" in argv) == uses_proxy
     assert ("domains={}" in joined) == uses_proxy
-    windows_offline = platform == "win32" and not network_access
-    assert ('windows.sandbox="elevated"' in argv) == windows_offline
-    assert ("permissions.checks.network={enabled=false}" in argv) == windows_offline
 
 
-def test_windows_offline_checks_drop_proxy_firewall_exceptions(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(sys, "platform", "win32")
-    environment = {
-        "https_proxy": "http://localhost:3128", "Ws_Proxy": "http://localhost:1234",
-        "CODEX_WINDOWS_SANDBOX_PROXY_PORTS": "5555", "CODEX_NETWORK_ALLOW_LOCAL_BINDING": "1", "PATH": "bin",
-    }
-    offline = CheckPolicy.for_task(PermissionMode.workspace, network_access=False)
-    online = CheckPolicy.for_task(PermissionMode.workspace, network_access=True)
-    assert sandbox_environment(environment, offline) == {"PATH": "bin"}
-    assert sandbox_environment(environment, online) == environment
-
-
-@pytest.mark.skipif(sys.platform != "win32", reason="exercise the native Windows firewall and sandbox identities")
+@pytest.mark.skipif(sys.platform != "win32", reason="exercise the native Windows sandbox")
 def test_windows_native_check_network_policy(tmp_path: Path) -> None:
-    # The same live listener is the positive control and the restricted target.
-    # Checking the child's own output distinguishes a firewall denial from a
-    # sandbox that failed to start (e.g. offline account setup was denied).
-    script = (
-        "import socket, sys\n"
-        "try:\n"
-        "    socket.create_connection(('127.0.0.1', int(sys.argv[1])), timeout=3).close()\n"
-        "except OSError:\n"
-        "    print('blocked')\n"
-        "else:\n"
-        "    print('connected')\n"
-    )
     workspace = tmp_path / "project"
     workspace.mkdir()
-    with socket.create_server(("127.0.0.1", 0)) as listener:
-        command = [sys.executable, "-c", script, str(listener.getsockname()[1])]
-        for network_access, expected in [(True, "connected"), (False, "blocked")]:
-            policy = CheckPolicy.for_task(
-                PermissionMode.workspace, network_access, sandbox_home=tmp_path / "check-sandbox",
-            )
-            result = run_sandboxed(
-                command, cwd=workspace, policy=policy, environment=check_environment(os.environ), writable=[workspace],
-            )
-            assert result.returncode == 0, result.stderr
-            assert result.stdout.strip() == expected
+    marker = workspace / "ran.txt"
+    command = [sys.executable, "-c", "from pathlib import Path; Path('ran.txt').touch()"]
+    def run(network_access: bool):
+        policy = CheckPolicy.for_task(PermissionMode.workspace, network_access, sandbox_home=tmp_path / "check-sandbox")
+        return run_sandboxed(command, cwd=workspace, policy=policy, environment=check_environment(os.environ), writable=[workspace])
+
+    with pytest.raises(WorkspaceError, match="network access off"):
+        run(False)
+    assert not marker.exists()
+    result = run(True)
+    assert result.returncode == 0, result.stderr
+    assert marker.exists()
 
 
 def test_hooks_may_stage_but_not_change_what_makes_git_run_programs(tmp_path: Path) -> None:
@@ -790,33 +767,6 @@ def test_filtered_git_reads_use_read_only_sandbox_and_can_export_patch(tmp_path:
     manager.git.run(repo, "diff", f"--output={patch}", "HEAD", "--", "README.md", environment={"COWORK_TEST_SECRET": "private"})
     assert "+CHANGED" in patch.read_text()
     assert len(reads) == 2
-
-
-def test_windows_filtered_git_reads_reuse_the_cowork_sandbox_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    from cowork.coding import check_sandbox
-    from cowork.common.settings.app_settings import get_app_settings
-
-    repo = repository(tmp_path / "repo")
-    git(repo, "config", "filter.normalize.clean", "cat")
-    manager = WorkspaceManager(tmp_path / "coding")
-    monkeypatch.setattr(get_app_settings().coding, "root_dir", str(manager.root))
-    monkeypatch.setattr(sys, "platform", "win32")
-    monkeypatch.setattr(check_sandbox, "sandbox_codex", lambda: Path("codex"))
-    real_run = subprocess.run
-    homes = []
-
-    def record(argv, **kwargs):
-        if argv[:2] == ["codex", "sandbox"]:
-            homes.append(Path(kwargs["env"]["CODEX_HOME"]))
-            return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
-        return real_run(argv, **kwargs)
-
-    monkeypatch.setattr(subprocess, "run", record)
-    for operation in ("status", "diff"):
-        manager.git.run(repo, operation)
-    home = manager.root / "check-sandbox"
-    assert homes == [home, home]
-    assert home.is_dir()
 
 
 def stateful_filter_repository(tmp_path: Path) -> Path:

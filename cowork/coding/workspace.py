@@ -311,13 +311,8 @@ class GitRunner:
                     # task operation, Git reads get no writes or network.
                     from cowork.coding import check_sandbox
 
-                    if sys.platform == "win32":
-                        # The offline account setup marker belongs to CODEX_HOME.
-                        # Reuse it across reads to avoid repeating elevated setup.
-                        home = Path(get_app_settings().coding.root_dir) / "check-sandbox"
-                    else:
-                        home = Path(resources.enter_context(tempfile.TemporaryDirectory(prefix="cowork-git-read-")))
-                    policy = check_sandbox.CheckPolicy.for_task(PermissionMode.read_only, False, sandbox_home=home)
+                    home = resources.enter_context(tempfile.TemporaryDirectory(prefix="cowork-git-read-"))
+                    policy = check_sandbox.CheckPolicy.for_task(PermissionMode.read_only, False, sandbox_home=Path(home))
                     child_environment = check_sandbox.check_environment(os.environ)
                     # Snapshot diffs use an isolated index and object store.
                     for name in ("GIT_INDEX_FILE", "GIT_OBJECT_DIRECTORY", "GIT_ALTERNATE_OBJECT_DIRECTORIES"):
