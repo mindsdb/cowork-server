@@ -163,14 +163,23 @@ def refuse_sealed_state_without_key_file() -> None:
 
 def sealed_setting_keys() -> frozenset[str]:
     """The settings keys whose rows the server stores sealed: each sensitive setting and each
-    channel's secret credential."""
+    first-party channel's secret credential.
+
+    It loads the channel plugins into a registry of its own, so the re-seal command, which never
+    builds the app, reads the same set as the server's start check. The process-wide registry
+    fills only in create_app (cowork.server._install_channels), and stays as it is."""
+    from cowork.channels.registry import PluginRegistry, load_first_party_plugins
     from cowork.services.channels import secret_credential_keys
 
+    registry = PluginRegistry()
+    load_first_party_plugins(registry)
     sensitive = frozenset(key for key in UserSettings.model_fields if UserSettings.field_is_sensitive(key))
-    return sensitive | secret_credential_keys()
+    return sensitive | secret_credential_keys(registry=registry)
 
 
-def _row_name(row: Setting) -> str:
+def row_name(row: Setting) -> str:
+    """A settings row by its key and whose it is: global, an organization's,
+    or a person's in an organization."""
     if row.scope is None:
         return f"setting {row.key} (global)"
     if row.scope == "org":
@@ -194,7 +203,7 @@ def refuse_unopenable_sealed_data() -> None:
         try:
             keys.decrypt(row.value.encode())
         except InvalidToken:
-            failures.append(_row_name(row))
+            failures.append(row_name(row))
     if get_app_settings().tenancy_mode != "org":
         try:
             roots = vault_roots()

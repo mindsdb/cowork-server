@@ -9,8 +9,8 @@ person's listing opens no record in another person's partition.
 
 from __future__ import annotations
 
+import errno
 import os
-import stat
 from collections import Counter, defaultdict
 from collections.abc import Iterable, Iterator
 from contextlib import ExitStack, contextmanager
@@ -21,25 +21,15 @@ from uuid import UUID
 from anton.core.datasources.data_vault import LocalDataVault, _slug_env_prefix
 from pydantic import AliasPath, BaseModel, ConfigDict, Field, ValidationError
 
-from cowork.common.paths import (
-    O_NOFOLLOW,
-    O_NONBLOCK,
-    PinnedDir,
-    dir_open,
-    dir_scandir,
-    open_pinned_child,
-    pinned_dir,
-    read_bounded,
-)
 from cowork.code_sandbox import PlantedLinkError, refuse_planted_links
+from cowork.common.paths import PinnedDir, dir_scandir, open_pinned_child, pinned_dir
+from cowork.common.record_files import MAX_RECORD_BYTES, RecordFileError, read_record_bytes
 from cowork.common.settings.app_settings import get_app_settings
 from cowork.db.personal_resources import PersonalResource
 from cowork.db.scoped import LOCAL_SCOPE
 from cowork.managed import MAX_REGISTRY_BYTES, SharedConnection, SharedConnections, managed_folder
 from cowork.ops import OperatorCommandError, Person, require_trusted_identity
 from cowork.services.connectors.persist import own_vault_root
-
-MAX_RECORD_BYTES = 1 << 20
 
 
 class RecordMetadata(BaseModel):
@@ -86,23 +76,20 @@ class ConnectionInventory(BaseModel):
     connections: tuple[ConnectionInventoryRow, ...]
 
 
-def _vault_filename(engine: str, name: str) -> str:
+def vault_filename(engine: str, name: str) -> str:
+    """The file name anton's vault stores ``engine``/``name`` under."""
     # Runtime reads resolve registry names through this same filename helper.
     # Different names (sales.db and sales_db) can reach one stored record.
     return LocalDataVault(Path("."))._path_for(engine, name).name
 
 
 def _read(d: PinnedDir, name: str, *, limit: int) -> bytes:
-    fd = dir_open(d, name, os.O_RDONLY | O_NOFOLLOW | O_NONBLOCK)
     try:
-        info = os.fstat(fd)
-        if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
-            raise OperatorCommandError("Connection inventory refuses linked or non-regular records.")
-        if info.st_size > limit:
-            raise OperatorCommandError("Connection inventory record exceeds the read limit.")
-        return b"".join(read_bounded(fd, info.st_size))
-    finally:
-        os.close(fd)
+        return read_record_bytes(directory=d, name=name, limit=limit)
+    except RecordFileError as error:
+        if error.errno == errno.EFBIG:
+            raise OperatorCommandError("Connection inventory record exceeds the read limit.") from None
+        raise OperatorCommandError("Connection inventory refuses linked or non-regular records.") from None
 
 
 def _records(d: PinnedDir) -> list[RecordMetadata]:
@@ -122,7 +109,7 @@ def _records(d: PinnedDir) -> list[RecordMetadata]:
             record = RecordMetadata.model_validate_json(raw)
         except ValidationError:
             raise OperatorCommandError("Connection inventory found a malformed vault record.") from None
-        if _vault_filename(record.engine, record.name) != name:
+        if vault_filename(record.engine, record.name) != name:
             raise OperatorCommandError("Connection inventory found a record with a noncanonical filename.")
         records.append(record)
     return records
@@ -265,10 +252,10 @@ def connection_inventory(*, person: Person | None = None) -> ConnectionInventory
             ))
     shares: dict[tuple[str, str], list[SharedConnection]] = defaultdict(list)
     for entry in registry.root:
-        shares[entry.partition_id, _vault_filename(entry.engine, entry.name)].append(entry)
+        shares[entry.partition_id, vault_filename(entry.engine, entry.name)].append(entry)
     for partition, records in partitions.items():
         for record in records:
-            key = (partition, _vault_filename(record.engine, record.name))
+            key = (partition, vault_filename(record.engine, record.name))
             stored.add(key)
             registered = shares.get(key, [])
             creator = str(record.creator) if record.creator is not None else None
@@ -289,7 +276,7 @@ def connection_inventory(*, person: Person | None = None) -> ConnectionInventory
                 notes=notes,
             ))
     for entry in registry.root:
-        if (entry.partition_id, _vault_filename(entry.engine, entry.name)) not in stored:
+        if (entry.partition_id, vault_filename(entry.engine, entry.name)) not in stored:
             rows.append(ConnectionInventoryRow(
                 engine=entry.engine, name=entry.name, origin="registry",
                 user_id=entry.user_id, partition_id=entry.partition_id,
@@ -300,7 +287,7 @@ def connection_inventory(*, person: Person | None = None) -> ConnectionInventory
     counts = Counter((row.origin, row.partition_id, row.prefix) for row in rows if row.origin != "registry")
     first_share = {}
     for entry in registry.root:
-        if (entry.partition_id, _vault_filename(entry.engine, entry.name)) in stored:
+        if (entry.partition_id, vault_filename(entry.engine, entry.name)) in stored:
             first_share.setdefault((entry.engine, entry.name), entry.partition_id)
     shared_prefixes = Counter(_slug_env_prefix(engine, name) for engine, name in first_share)
     result = []

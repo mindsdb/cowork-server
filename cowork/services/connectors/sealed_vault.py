@@ -22,7 +22,6 @@ import errno
 import json
 import os
 import re
-import stat
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -30,7 +29,8 @@ from typing import Any
 from anton.core.datasources.data_vault import DataVault, LocalDataVault
 from cryptography.fernet import InvalidToken, MultiFernet
 
-from cowork.common.paths import O_NOFOLLOW, O_NONBLOCK, open_fd, read_bounded
+from cowork.common.paths import pinned_dir
+from cowork.common.record_files import MAX_RECORD_BYTES, RecordFileError, read_record_bytes
 from cowork.services.connectors.layered_vault import CREATED_BY_FIELD
 
 # Fields that describe a connection rather than hold its credentials. They stay
@@ -48,7 +48,6 @@ BOOKKEEPING_FIELDS = frozenset(
 )
 SEALED_FIELD = "_sealed"
 SEALED_VERSION = 1
-MAX_RECORD_BYTES = 1 << 20
 # A Fernet token's fixed parts: the version byte, the timestamp, the IV and
 # the HMAC. The ciphertext between them is one or more 16-byte AES blocks.
 _FERNET_VERSION = 0x80
@@ -159,12 +158,7 @@ class SealedDataVault(LocalDataVault):
         *,
         secure_keys: list[str] | None = None,
     ) -> Path:
-        sealed: dict[str, Any] = {
-            key: value if key in BOOKKEEPING_FIELDS else self._seal(value=value)
-            for key, value in credentials.items()
-            if key != SEALED_FIELD
-        }
-        sealed[SEALED_FIELD] = SEALED_VERSION
+        sealed = seal_fields(fields=credentials, keys=self._keys)
         size = record_file_bytes(
             engine=engine,
             name=name,
@@ -231,8 +225,18 @@ class SealedDataVault(LocalDataVault):
             if not entry.name.endswith(".tmp") and not entry.is_dir(follow_symlinks=False)
         ]
 
-    def _seal(self, *, value: Any) -> str:
-        return self._keys.encrypt(json.dumps(value).encode()).decode()
+
+def seal_fields(*, fields: dict[str, Any], keys: MultiFernet) -> dict[str, Any]:
+    """``fields`` as SealedDataVault.save writes them: each value outside the
+    bookkeeping fields sealed under ``keys``' first key as its JSON text, a
+    field named SEALED_FIELD dropped, and the sealed mark added."""
+    sealed: dict[str, Any] = {
+        key: value if key in BOOKKEEPING_FIELDS else keys.encrypt(json.dumps(value).encode()).decode()
+        for key, value in fields.items()
+        if key != SEALED_FIELD
+    }
+    sealed[SEALED_FIELD] = SEALED_VERSION
+    return sealed
 
 
 def open_fields(*, fields: dict[str, Any], keys: MultiFernet, connection: str) -> dict[str, Any]:
@@ -264,28 +268,23 @@ def open_fields(*, fields: dict[str, Any], keys: MultiFernet, connection: str) -
 def read_record_file(*, path: Path, connection: str) -> dict[str, Any] | None:
     """The record at ``path``, or None when no file is there. A link, a
     file with a second name, or anything that isn't a readable JSON record
-    raises."""
+    raises. It reads through the folder's descriptor
+    (cowork.common.record_files.read_record_bytes), up to MAX_RECORD_BYTES,
+    the bound the save checks too."""
     try:
-        fd = open_fd(path, os.O_RDONLY | O_NOFOLLOW | O_NONBLOCK)
+        with pinned_dir(path.parent) as folder:
+            raw = read_record_bytes(directory=folder, name=path.name, limit=MAX_RECORD_BYTES)
     except (FileNotFoundError, NotADirectoryError):
         return None
+    except RecordFileError as error:
+        cause = "is too large" if error.errno == errno.EFBIG else "isn't a regular file with one name"
+        raise SealedRecordError(connection=connection, cause=f"its record file {cause}") from None
     except OSError as error:
         if error.errno == errno.ELOOP:
             raise SealedRecordError(connection=connection, cause="its record file is a link") from None
         raise SealedRecordError(
             connection=connection, cause=f"its record file can't be read ({errno_name(error=error)})"
         ) from None
-    try:
-        info = os.fstat(fd)
-        if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
-            raise SealedRecordError(
-                connection=connection, cause="its record file isn't a regular file with one name"
-            )
-        if info.st_size > MAX_RECORD_BYTES:
-            raise SealedRecordError(connection=connection, cause="its record file is too large")
-        raw = b"".join(read_bounded(fd, info.st_size))
-    finally:
-        os.close(fd)
     try:
         record = json.loads(raw)
     except ValueError:

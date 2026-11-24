@@ -26,6 +26,7 @@ from fastapi.testclient import TestClient
 
 import cowork.server as cowork_server
 from cowork.common.encryption import sealing_keys
+from cowork.common.record_files import MAX_RECORD_BYTES
 from cowork.common.settings.app_settings import get_app_settings
 from cowork.db.scoped import LOCAL_SCOPE
 from cowork.handlers.turn_errors import GENERIC_TURN_ERROR_CODE, friendly_turn_error
@@ -294,6 +295,50 @@ def test_a_turn_error_names_the_connection():
     )
 
 
+# ── reading a record file ───────────────────────────────────────────────────
+
+
+@pytest.mark.parametrize(
+    ("kind", "cause"),
+    [
+        ("link", "its record file is a link"),
+        ("second-name", "its record file isn't a regular file with one name"),
+        ("fifo", "its record file isn't a regular file with one name"),
+        ("too-large", "its record file is too large"),
+        pytest.param(
+            "unreadable",
+            "its record file can't be read (EACCES)",
+            marks=pytest.mark.skipif(os.geteuid() == 0, reason="root reads any file"),
+        ),
+    ],
+)
+def test_the_record_reader_names_why_it_refuses_a_file(tmp_path, kind, cause):
+    path = tmp_path / "postgres-sales"
+    target = tmp_path / "elsewhere"
+    target.write_text(json.dumps({"engine": "postgres", "name": "sales", "fields": {"password": CANARY}}))
+    if kind == "link":
+        path.symlink_to(target)
+    elif kind == "second-name":
+        os.link(target, path)
+    elif kind == "fifo":
+        os.mkfifo(path)
+    elif kind == "too-large":
+        path.write_bytes(b" " * (MAX_RECORD_BYTES + 1))
+    else:
+        path.write_text(target.read_text())
+        path.chmod(0)
+
+    with pytest.raises(SealedRecordError) as raised:
+        sealed_vault.read_record_file(path=path, connection="postgres/sales")
+
+    assert raised.value.cause == cause and CANARY not in str(raised.value)
+
+
+def test_the_record_reader_answers_none_where_no_file_is(tmp_path):
+    assert sealed_vault.read_record_file(path=tmp_path / "postgres-sales", connection="postgres/sales") is None
+    assert sealed_vault.read_record_file(path=tmp_path / "gone" / "postgres-sales", connection="postgres/sales") is None
+
+
 # ── a record too large to read back ─────────────────────────────────────────
 
 
@@ -389,7 +434,7 @@ def test_with_a_key_file_the_server_builds_sealed_vaults(key_file, tmp_path):
 _ALLOWED_VAULT_CALLS = {
     ("cowork/services/connectors/persist.py", "data_vault_at"),
     ("cowork/services/connectors/probe.py", "run"),
-    ("cowork/ops/connection_inventory.py", "_vault_filename"),
+    ("cowork/ops/connection_inventory.py", "vault_filename"),
 }
 
 
