@@ -376,6 +376,25 @@ async def test_proxy_keeps_a_model_outside_the_tier_apart_from_a_rejected_creden
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "upstream",
+    [
+        {"json": {"error": {"message": "ZDR", "code": "permission_denied", "deny_detail": "zdr_restricted"}}},
+        {"json": {"error": {"message": "ZDR"}}, "headers": {"x-mindshub-deny-detail": "zdr_restricted"}},
+    ],
+    ids=["body-detail", "header"],
+)
+async def test_proxy_names_a_zdr_refusal_instead_of_asking_to_sign_in(monkeypatch: pytest.MonkeyPatch, upstream) -> None:
+    _mock_upstream(monkeypatch, [httpx.Response(403, **upstream)])
+
+    response = await _proxy()
+
+    assert response.status_code == 400
+    assert response.headers["x-mindshub-error-code"] == "zdr_restricted"
+    assert json.loads(response.body)["error"]["code"] == "zdr_restricted"
+
+
+@pytest.mark.asyncio
 async def test_proxy_keeps_reading_an_unexplained_403_as_a_rejected_credential(monkeypatch: pytest.MonkeyPatch) -> None:
     _mock_upstream(monkeypatch, [httpx.Response(403, json={"error": {"message": "Forbidden", "code": "budget_exceeded"}})])
 
