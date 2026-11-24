@@ -18,6 +18,11 @@ class Schedule(BaseSQLModel, table=True):
         sa_type=sa.DateTime(timezone=True),  # type: ignore
         description="UTC datetime of next scheduled execution",
     )
+    timing_edited_at: datetime | None = Field(
+        default=None,
+        sa_type=sa.DateTime(timezone=True),  # type: ignore
+        description="When an edit last changed the cadence, timezone, or next run",
+    )
     enabled: bool = Field(default=True, description="Whether the schedule is active")
     project_id: UUID = Field(
         sa_column=sa.Column(

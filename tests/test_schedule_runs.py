@@ -244,23 +244,24 @@ def _finish_at(session: Session, run_id, when: datetime) -> None:
     session.commit()
 
 
-def test_last_successful_run_ignores_failures_and_running():
+def test_last_successful_finish_ignores_failures_and_running():
     session = _session()
     schedule = _schedule(session)
     run_service = ScheduleRunService(ScopedSession(session, SYSTEM_SCOPE))
 
-    assert run_service.last_successful_run(schedule.id) is None
+    assert run_service.last_successful_finish(schedule.id) is None
 
     failed = run_service.create_run(schedule.id, is_manual=True)
     run_service.finish_run(failed.id, error="boom")
     running = run_service.create_run(schedule.id, is_manual=False)
-    assert run_service.last_successful_run(schedule.id) is None
+    assert run_service.last_successful_finish(schedule.id) is None
     # A schedule holds one running run at a time.
     run_service.finish_run(running.id, error="ended")
 
     ok = run_service.create_run(schedule.id, is_manual=True)
     run_service.finish_run(ok.id)
-    assert run_service.last_successful_run(schedule.id).id == ok.id
+    finished = run_service.last_successful_finish(schedule.id)
+    assert finished is not None and finished.tzinfo is not None
 
 
 def test_due_slot_skipped_and_advanced_after_recent_manual_success():
@@ -302,25 +303,66 @@ def _cron_success(session, run_service, schedule, slot_at, finished_at):
     _finish_at(session, run.id, finished_at)
 
 
-@pytest.mark.parametrize(("cadence", "last_slot", "edited_to"), [
-    # An hourly task that ran at 9:00, moved to five past.
-    ("hourly", datetime(2026, 6, 25, 9, 0, tzinfo=timezone.utc), datetime(2026, 6, 25, 9, 5, tzinfo=timezone.utc)),
-    # A daily task that ran at 8:30, moved to 9:05 the same day.
-    ("daily", datetime(2026, 6, 25, 8, 30, tzinfo=timezone.utc), datetime(2026, 6, 25, 9, 5, tzinfo=timezone.utc)),
+@pytest.mark.parametrize(("old_cadence", "new_cadence", "manual", "slot_age"), [
+    ("hourly", "hourly", False, 5),   # Move the minute of an hourly task.
+    ("daily", "daily", False, 35),
+    ("daily", "hourly", False, 60),   # The new time aligns with the new cadence.
+    ("daily", "once", False, 5),
+    ("daily", "daily", True, 5),
 ])
-def test_a_slot_set_by_an_edit_runs_right_after_a_cron_run(cadence, last_slot, edited_to):
-    from cowork.scheduler import _due_schedules
+def test_edit_after_success_dispatches_new_slot_and_other_due_tasks(
+    old_cadence, new_cadence, manual, slot_age, monkeypatch,
+):
+    from unittest.mock import Mock
+
+    from cowork.schedule_timing import advance_occurrence
 
     session = _session()
-    schedule = _schedule(session, cadence=cadence, next_run_at=last_slot)
-    run_service = ScheduleRunService(ScopedSession(session, SYSTEM_SCOPE))
-    _cron_success(session, run_service, schedule, last_slot, last_slot + timedelta(minutes=1))
-    schedule.next_run_at = edited_to
-    session.add(schedule)
-    session.commit()
+    scoped = ScopedSession(session, SYSTEM_SCOPE)
+    due = datetime.now(timezone.utc) + timedelta(minutes=1)
+    previous_slot = due - timedelta(minutes=slot_age)
+    original_next = advance_occurrence(old_cadence, previous_slot, "UTC")
+    task = _schedule(session, cadence=old_cadence, next_run_at=original_next)
+    runs = ScheduleRunService(scoped)
+    run = runs.create_run(task.id, is_manual=manual, slot_at=None if manual else previous_slot)
+    runs.finish_run(run.id)
 
-    now = edited_to + timedelta(seconds=30)
-    assert [s.id for s in _due_schedules(ScopedSession(session, SYSTEM_SCOPE), now)] == [schedule.id]
+    ScheduleService(scoped).update_schedule(task.id, cadence=new_cadence, next_run_at=due)
+    other = _schedule(session, next_run_at=due)
+    clock = Mock(wraps=datetime)
+    clock.now.return_value = due + timedelta(seconds=5)
+    monkeypatch.setattr(scheduler, "datetime", clock)
+    assert {(slot.schedule_id, slot.slot_at) for slot in scheduler._poll(scoped)} == {
+        (task.id, due), (other.id, due),
+    }
+
+
+@pytest.mark.parametrize("change", [{"cadence": "weekly"}, {"timezone": "Europe/Skopje"}])
+def test_timing_change_with_same_next_run_honors_due_slot(change):
+    session = _session()
+    scoped = ScopedSession(session, SYSTEM_SCOPE)
+    due = datetime.now(timezone.utc) + timedelta(minutes=2)
+    task = _schedule(session, next_run_at=due)
+    runs = ScheduleRunService(scoped)
+    run = runs.create_run(task.id, is_manual=True)
+    runs.finish_run(run.id)
+    ScheduleService(scoped).update_schedule(task.id, **change)
+    assert [s.id for s in scheduler._due_schedules(scoped, due)] == [task.id]
+
+
+def test_manual_success_after_timing_edit_still_suppresses_slot_on_title_save():
+    session = _session()
+    scoped = ScopedSession(session, SYSTEM_SCOPE)
+    due = datetime.now(timezone.utc) + timedelta(minutes=2)
+    task = _schedule(session, next_run_at=due + timedelta(days=1))
+    schedules = ScheduleService(scoped)
+    schedules.update_schedule(task.id, next_run_at=due)
+    runs = ScheduleRunService(scoped)
+    run = runs.create_run(task.id, is_manual=True)
+    runs.finish_run(run.id)
+    # The desktop sends every timing field on a title-only save.
+    schedules.update_schedule(task.id, title="Renamed", cadence="daily", timezone="UTC", next_run_at=due)
+    assert scheduler._due_schedules(scoped, due) == []
 
 
 def test_the_slot_after_a_late_cron_run_is_still_skipped():
@@ -428,7 +470,7 @@ def test_finish_run_status_override_records_cancelled():
     assert finished.error is None
     # A cancelled run is not a success: it neither blocks via the freshness
     # guard nor counts as the last successful finish.
-    assert run_service.last_successful_run(schedule.id) is None
+    assert run_service.last_successful_finish(schedule.id) is None
 
 
 def test_has_active_run_counts_manual_runs():

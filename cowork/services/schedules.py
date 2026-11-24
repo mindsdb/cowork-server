@@ -140,9 +140,12 @@ class ScheduleService:
         # missed one-off back on, and the `enabled` the editor sent with the
         # old state must not pause it again.
         was_on = _runs_on_its_own(schedule)
+        previous_timing = (schedule.cadence, schedule.timezone, _utc(schedule.next_run_at))
         for field, value in kwargs.items():
             if value is not None and hasattr(schedule, field):
                 setattr(schedule, field, value)
+        if (schedule.cadence, schedule.timezone, _utc(schedule.next_run_at)) != previous_timing:
+            schedule.timing_edited_at = datetime.now(timezone.utc)
         if (
             schedule.missed_at is not None
             and _utc(schedule.next_run_at) > datetime.now(timezone.utc)
@@ -489,11 +492,12 @@ class ScheduleRunService:
             return False
         return self._running_run(schedule_id) is not None
 
-    def last_successful_run(self, schedule_id: UUID) -> ScheduleRun | None:
-        """The schedule's most recent successful run (manual or cron), or None
-        if it never succeeded. Used by the scheduler's freshness guard to skip
-        a due slot right after e.g. a manual run. A trial run doesn't count: it
-        tries the task out, so the slot after it still runs.
+    def last_successful_finish(self, schedule_id: UUID) -> datetime | None:
+        """When the schedule's most recent successful run (manual or cron)
+        finished, or None if it never succeeded. Used by the scheduler's
+        freshness guard to skip a due slot right after e.g. a manual run. A
+        trial run doesn't count: it tries the task out, so the slot after it
+        still runs.
         """
         run = self.session.exec(
             self.session.select(ScheduleRun)
@@ -503,7 +507,10 @@ class ScheduleRunService:
             .order_by(ScheduleRun.finished_at.desc())  # type: ignore[union-attr]
             .limit(1)
         ).first()
-        return run if run is not None and run.finished_at is not None else None
+        if run is None or run.finished_at is None:
+            return None
+        finished = run.finished_at
+        return finished if finished.tzinfo else finished.replace(tzinfo=timezone.utc)
 
     def still_exists(self, conversation_id: UUID | None) -> UUID | None:
         """The conversation id back, or None once the conversation is gone.

@@ -27,7 +27,7 @@ from cowork.db.scoped import (
 from cowork.db.units import FilesystemBusy, run_db
 from cowork.handlers.turn_errors import MODEL_UNAVAILABLE_CODES
 from cowork.models.schedule import Schedule, ScheduleRun
-from cowork.schedule_timing import advance_occurrence, missed_slots, next_future_occurrence
+from cowork.schedule_timing import missed_slots, next_future_occurrence
 from cowork.schemas.schedules import AttemptOutcome, Cadence, RunStatus, RunTrigger, resolve_schedule_model
 from cowork.services.schedules import (
     AbandonedTurn,
@@ -1594,28 +1594,22 @@ def _ran_recently(schedule: Schedule, run_service: ScheduleRunService, now: date
     window = _FRESHNESS_WINDOW_SECONDS.get(schedule.cadence)
     if not window:
         return False
-    last = run_service.last_successful_run(schedule.id)
-    if last is None or (now - ensure_utc(last.finished_at)).total_seconds() >= window:
+    last = run_service.last_successful_finish(schedule.id)
+    if last is None:
         return False
-    # A cron run's next slot lies on the grid that run's slot starts. A due
-    # slot off that grid was set by an edit after the run, so the user asked
-    # for it and it runs.
-    return last.slot_at is None or _follows_on_grid(schedule, ensure_utc(last.slot_at))
-
-
-def _follows_on_grid(schedule: Schedule, slot_at: datetime) -> bool:
-    due = ensure_utc(schedule.next_run_at)
-    cursor = slot_at
-    while cursor < due:
-        cursor = advance_occurrence(schedule.cadence, cursor, schedule.timezone)
-    return cursor == due
+    # An explicit timing edit promises a new slot even if the previous run
+    # just finished. A later success can suppress the slot as usual.
+    edited = ensure_utc(schedule.timing_edited_at)
+    if edited is not None and last < edited:
+        return False
+    return (now - last).total_seconds() < window
 
 
 def _due_schedules(session, now: datetime) -> list[Schedule]:
     """Enabled schedules whose slot is due and should actually execute.
 
-    A due slot with a successful run inside the freshness window is skipped
-    and advanced to its next occurrence instead of returned.
+    A recent success skips a due slot unless the user changed the timing
+    after that success.
     """
     run_service = ScheduleRunService(session)
     due: list[Schedule] = []
