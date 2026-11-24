@@ -298,10 +298,10 @@ def test_publish_description_says_what_to_pass_not_where_artifacts_live():
     assert "open_artifact" not in description
 
 
-# The publish tool's description and prompt at staging 8b1ecf4, before
-# deployment identity support. Hosts without COWORK_DEPLOYMENT_KIND keep them.
+# The publish tool's description and prompt as hosts without
+# COWORK_DEPLOYMENT_KIND get them; update the hashes when that text changes.
 DEFAULT_DESCRIPTION_SHA256 = "5bae1e84c433d3e09c5b572e6b1e60221143a30086a8e71b4898e2239149a6b1"
-DEFAULT_PROMPT_SHA256 = "5e040dfeaca047ee2307d953989e2282106f6972c8d7aaf4655301e50ec1e73a"
+DEFAULT_PROMPT_SHA256 = "7445d67a5666f5ee19660dbab859b663a0dda921185143dbb34f69e05c89af5c"
 
 
 @pytest.mark.asyncio
