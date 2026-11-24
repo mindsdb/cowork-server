@@ -813,12 +813,10 @@ def test_filtered_git_reads_use_read_only_sandbox_and_can_export_patch(tmp_path:
 
 def test_windows_filtered_git_reads_reuse_the_cowork_sandbox_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     from cowork.coding import check_sandbox
-    from cowork.common.settings.app_settings import get_app_settings
 
     repo = repository(tmp_path / "repo")
     git(repo, "config", "filter.normalize.clean", "cat")
     manager = WorkspaceManager(tmp_path / "coding")
-    monkeypatch.setattr(get_app_settings().coding, "root_dir", str(manager.root))
     monkeypatch.setattr(sys, "platform", "win32")
     monkeypatch.setattr(check_sandbox, "sandbox_codex", lambda: Path("codex"))
     real_run = subprocess.run

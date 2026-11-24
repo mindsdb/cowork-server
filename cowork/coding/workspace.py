@@ -239,6 +239,10 @@ def _host_safety_args(args: tuple[str, ...]) -> tuple[str, ...]:
 class GitRunner:
     """Shell-free Git boundary shared by macOS and Windows."""
 
+    # Where sandboxed reads keep the sandbox's own state, set by the manager
+    # that owns the coding root. Without one, each read uses a fresh folder.
+    sandbox_home: Path | None = None
+
     @staticmethod
     def _working_directory(path: Path) -> Path:
         """Resolve the user-selected local folder before giving it to Git.
@@ -347,10 +351,10 @@ class GitRunner:
                     # task operation, Git reads get no writes or network.
                     from cowork.coding import check_sandbox
 
-                    if sys.platform == "win32":
+                    if sys.platform == "win32" and self.sandbox_home is not None:
                         # The offline account setup marker belongs to CODEX_HOME.
                         # Reuse it across reads to avoid repeating elevated setup.
-                        home = Path(get_app_settings().coding.root_dir) / "check-sandbox"
+                        home = self.sandbox_home
                     else:
                         home = Path(resources.enter_context(tempfile.TemporaryDirectory(prefix="cowork-git-read-")))
                     policy = check_sandbox.CheckPolicy.for_task(PermissionMode.read_only, False, sandbox_home=home)
@@ -410,6 +414,8 @@ class WorkspaceManager:
         self.legacy_worktrees_root = root / "worktrees"
         self.snapshots_root = root / "snapshots"
         self.git = git or GitRunner()
+        if getattr(self.git, "sandbox_home", None) is None:
+            self.git.sandbox_home = root / "check-sandbox"
         self.local_copies = LocalCopyManager(root, self.worktrees_root)
         # Under the coding root so moving a task folder here is a same-disk rename.
         self.pending_removals = PendingRemovals(root / "pending-removal")
