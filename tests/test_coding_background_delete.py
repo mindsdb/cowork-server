@@ -5,6 +5,7 @@ from __future__ import annotations
 import shutil
 import subprocess
 import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -87,6 +88,46 @@ def test_deleting_a_worktree_task_drops_its_git_registration(tmp_path: Path, blo
     assert service.workspaces.pending_removals.wait(30)
     assert not any(service.workspaces.pending_removals.root.iterdir())
     assert (repo / "README.md").read_text(encoding="utf-8") == "base\n"
+
+
+def test_storage_usage_refreshes_once_a_deleted_task_is_removed(tmp_path: Path, blocked_remover) -> None:
+    _started, release = blocked_remover
+    repo = repository(tmp_path)
+    service = service_with(tmp_path, FakeEngine())
+    session = create(service, repo)
+    service.delete_session(session.id)
+    assert service.workspace_usage.measure().removed_task_bytes > 0
+
+    release.set()
+    assert service.workspaces.pending_removals.wait(30)
+
+    page = service.workspace_usage_page()
+    assert page.measuring
+    deadline = time.monotonic() + 30
+    while page.measuring and time.monotonic() < deadline:
+        time.sleep(0.01)
+        page = service.workspace_usage_page()
+    assert not page.measuring
+    assert page.removed_task_bytes == 0
+
+
+def test_a_failing_drained_callback_does_not_stop_later_removals(tmp_path: Path) -> None:
+    pending = PendingRemovals(tmp_path / "pending")
+    calls: list[None] = []
+
+    def fail() -> None:
+        calls.append(None)
+        raise RuntimeError("listener failed")
+
+    pending.on_drained = fail
+    for name in ("first", "second"):
+        folder = tmp_path / name
+        folder.mkdir()
+        assert pending.discard(folder)
+        assert pending.wait(30)
+
+    assert len(calls) == 2
+    assert not any(pending.root.iterdir())
 
 
 def test_deleting_an_in_place_task_moves_nothing(tmp_path: Path) -> None:

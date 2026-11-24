@@ -545,6 +545,8 @@ def measure_before_discard(monkeypatch: pytest.MonkeyPatch, service: CodingServi
 
 
 def assert_usage_refreshes_after_cleanup(service: CodingService) -> None:
+    # Discarded folders wait in pending removals, which count as removed-task storage.
+    assert service.workspaces.pending_removals.wait(5)
     page = service.workspace_usage_page()
     assert page.measuring
     deadline = time.monotonic() + 5
