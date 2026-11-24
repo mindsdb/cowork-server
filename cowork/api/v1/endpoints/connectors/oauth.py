@@ -6,7 +6,7 @@ from typing import Annotated, Any
 
 from fastapi import APIRouter, Body, Depends, HTTPException, Query, Request, status
 from fastapi.responses import HTMLResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict, Field
 
 from cowork.api.v1.permissions import AuthenticatedInOrgMode, LoopbackDesktopOnly, OpenByDesign, require
 from cowork.common.settings.app_settings import ConnectorSettings, OAuthSettings, get_app_settings
@@ -311,6 +311,24 @@ async def oauth_status(request: Request, scope: ScopeDep, state: str = Query(...
     if outcome.get("status") in {"success", "error"}:
         oauth_service.clear_outcome(state, settings)
     return outcome
+
+
+class OAuthFinishRequest(BaseModel):
+    """The one-time completion id auth put in the finish page's address fragment."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    completion: str = Field(min_length=1, max_length=64)
+
+
+# AuthenticatedInOrgMode: forwards to auth_proxy.proxy_finish, which binds the
+# sign-in to the caller's own session; auth refuses anyone but its starter.
+@router.post("/finish", dependencies=[Depends(require(AuthenticatedInOrgMode))])
+async def finish_oauth(body: OAuthFinishRequest, request: Request, scope: ScopeDep):
+    """Finish a web sign-in for the member who started it. Org mode only: the desktop finishes on its own loopback."""
+    if not scope.org_mode:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="not available outside org deployments")
+    return await auth_proxy.proxy_finish(body.completion, request, OAuthSettings())
 
 
 # OpenByDesign, standalone reason: this is the OAuth provider's own redirect

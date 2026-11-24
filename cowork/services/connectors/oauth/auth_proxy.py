@@ -117,6 +117,16 @@ async def proxy_status(state: str, request: Request, settings: OAuthSettings) ->
     )
 
 
+async def proxy_finish(completion: str, request: Request, settings: OAuthSettings) -> dict:
+    # keep_code: the finish page tells "started by someone else" apart from an
+    # expired link by auth's code (login_not_yours, wrong_organization, expired,
+    # failed), which auth names `error`; it arrives as detail.code.
+    return await _relay(
+        "POST", "/v1/oauth/finish", request=request, settings=settings,
+        json_body={"completion": completion}, keep_code=True, code_key="error",
+    )
+
+
 async def proxy_catalogue(request: Request, settings: OAuthSettings) -> dict:
     # auth's counterpart to OAuthService.get_catalogue() — same shape
     # ({"items": [...]}), scoped server-side to the caller's own org/user
