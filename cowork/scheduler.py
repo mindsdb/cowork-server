@@ -848,7 +848,11 @@ async def _execute_schedule(
     trial = trigger == RunTrigger.trial
     from cowork.handlers.responses import ResponsesHandler
     from cowork.schemas.responses import ResponsesRequest
-    from cowork.services.product_permissions import ProductPermissionUnavailable, require_product_permission
+    from cowork.services.product_permissions import (
+        ProductPermissionUnavailable,
+        report_permission_unavailable,
+        require_product_permission,
+    )
 
     try:
         run_id = run_id or await run_db(
@@ -1104,6 +1108,9 @@ async def _execute_schedule(
             "Schedule run failed: %s", str(exc),
             extra=log_context(schedule_id=schedule_id, conversation_id=conversation_id),
         )
+        if isinstance(exc, ProductPermissionUnavailable):
+            # The run's error is this answer; say why auth couldn't verify it.
+            report_permission_unavailable(exc)
         if end is not None and end.outcome not in {AttemptOutcome.completed, AttemptOutcome.cancelled}:
             # A bookkeeping failure must not erase an already observed failure.
             outcome = end.outcome

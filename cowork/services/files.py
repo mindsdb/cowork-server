@@ -381,6 +381,8 @@ async def store_file(
     database, each in a worker thread of its own: no pooled connection waits on
     the file server, and the event loop waits for neither.
     """
+    from cowork.services.content_safety import check_file_bytes
+    await check_file_bytes(data, content_type=content_type or '', purpose='input', scope=scope)
     file = File(
         filename=filename,
         content_type=content_type or "application/octet-stream",

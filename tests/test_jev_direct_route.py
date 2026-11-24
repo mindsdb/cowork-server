@@ -24,6 +24,12 @@ from cowork.handlers.response_routing import (
 )
 from cowork.handlers.responses import ResponsesHandler
 from cowork.streaming.registry import TurnLifecycle
+from cowork.turnqueue.producer import TurnLlm
+
+def _gate_minted(base_url: str) -> dict:
+    """The turn context the routing gate hands on: the key it minted, at ``base_url``."""
+    return {"llm": TurnLlm(block={"base_url": base_url, "api_key": "turn"}, turn_key_id=None, ttl_seconds=1200)}
+
 
 _TOOL_ROWS = [
     {"role": "user", "content": "Build me a dashboard of our 2025 sales."},
@@ -251,7 +257,7 @@ def test_jev_gate_leaves_other_providers_on_the_llm_gate(monkeypatch):
 def test_jev_gate_is_off_when_the_organization_opted_out(monkeypatch):
     handler = _gate(monkeypatch, _settings(enabled=False), stored_key="k")
 
-    assert handler._jev_gate({"llm": {"base_url": "https://x/v1", "api_key": "turn"}}) == "off"
+    assert handler._jev_gate(_gate_minted("https://x/v1")) == "off"
 
 
 def test_jev_gate_without_a_key_falls_back_to_the_llm_gate(monkeypatch):
@@ -263,7 +269,7 @@ def test_jev_gate_without_a_key_falls_back_to_the_llm_gate(monkeypatch):
 @pytest.mark.asyncio
 @pytest.mark.parametrize(("turn_llm", "stored_key", "target"), [
     # A remote turn asks on the key the gate minted for it.
-    ({"llm": {"base_url": "https://minds.example/v1", "api_key": "turn"}}, "stored",
+    (_gate_minted("https://minds.example/v1"), "stored",
      jev_route.JevTarget(url="https://minds.example/v1/decisions", api_key="turn", mindshub_gateway=True)),
     # The desktop asks on the stored key, at the chat base URL.
     (None, "stored", jev_route.JevTarget(url="https://api.mindshub.ai/v1/decisions", api_key="stored", mindshub_gateway=True)),
@@ -635,7 +641,7 @@ def test_answer_binding_uses_the_composer_pick_on_the_minted_key(monkeypatch):
     handler = _gate(monkeypatch, _settings(model="sonnet-5-5"))
     binding = handler._answer_binding(
         model="opus-5-5", reasoning_effort="high",
-        turn_llm={"llm": {"base_url": "https://minds.example/v1", "api_key": "turn"}},
+        turn_llm=_gate_minted("https://minds.example/v1"),
     )
 
     assert binding.model == "opus-5-5"
@@ -811,6 +817,36 @@ async def test_produce_answer_streams_then_saves_the_turn(monkeypatch):
         ("assistant", "Revenue was $4.81M, up 14.2%.", False, "cowork-direct"),
     ]
     assert created["user_message_id"]
+
+
+@pytest.mark.asyncio
+async def test_moderated_direct_answer_finishes_and_releases_its_resources(monkeypatch):
+    from unittest.mock import AsyncMock
+    from cowork.db.scoped import LOCAL_SCOPE
+    from cowork.handlers import responses
+    from cowork.services import content_safety
+
+    monkeypatch.setenv("COWORK_CONTENT_SAFETY_REQUIRED", "true")
+    check = AsyncMock()
+    revoke = AsyncMock()
+    monkeypatch.setattr(content_safety, "check_content", check)
+    monkeypatch.setattr(responses, "revoke_turn_key_quietly", revoke)
+    conversation_id = await _conversation()
+    answer = await _answer(["First ", "second."])
+    close = AsyncMock(wraps=answer.close)
+    monkeypatch.setattr(answer, "close", close)
+    _, buffer, produce = await _produce(
+        monkeypatch, conversation_id, answer, gate_key={"correlation_id": "corr-gate"},
+    )
+
+    await produce
+
+    check.assert_awaited_once_with("First second.", purpose="output", scope=LOCAL_SCOPE)
+    deltas = [_payload(f)["delta"] for f in buffer.frames if f.startswith("event: response.output_text.delta")]
+    assert deltas == ["First second."]
+    assert buffer.status == "completed"
+    close.assert_awaited_once_with()
+    revoke.assert_awaited_once_with("corr-gate")
 
 
 @pytest.mark.asyncio
@@ -1037,7 +1073,7 @@ async def test_an_own_decision_model_routes_any_provider(monkeypatch, planning, 
     own = {"url": " https://api.typesafe.ai/v1/systemone ", "key": "own-key", "model": "jev-latest"}
     handler = _gate(monkeypatch, _settings(planning=planning, enabled=enabled, own=own), stored_key="minds")
 
-    seen = await _asked(monkeypatch, handler, {"llm": {"base_url": "https://minds/v1", "api_key": "turn"}})
+    seen = await _asked(monkeypatch, handler, _gate_minted("https://minds/v1"))
 
     # Posted to as given: hosts serve the same body at different paths.
     assert seen["target"] == jev_route.JevTarget(url="https://api.typesafe.ai/v1/systemone", api_key="own-key")
@@ -1061,7 +1097,7 @@ def test_answer_binding_runs_on_the_users_own_provider(monkeypatch):
     monkeypatch.setattr(responses, "build_llm_client", lambda **_k: SimpleNamespace(planning_provider=planning))
 
     binding = handler._answer_binding(
-        model=None, turn_llm={"llm": {"base_url": "https://minds.example/v1", "api_key": "turn"}},
+        model=None, turn_llm=_gate_minted("https://minds.example/v1"),
     )
 
     assert (binding.provider, binding.model, binding.label) == (planning, "claude-opus-5-5", "anthropic")

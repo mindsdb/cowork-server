@@ -37,7 +37,7 @@ def _listing(*, zdr: bool) -> MindsModelListing:
     reasons = {ZDR_MODEL: "wallet_empty"}
     if zdr:
         reasons[MINDS_FREE_MODEL] = "zdr_restricted"
-    return MindsModelListing([MINDS_FREE_MODEL, ZDR_MODEL], {}, enabled, {}, {}, {}, {}, reasons, {})
+    return MindsModelListing([MINDS_FREE_MODEL, ZDR_MODEL], {}, enabled, {}, {}, {}, {}, reasons, {}, {})
 
 
 def _mode(monkeypatch, mode: str) -> None:

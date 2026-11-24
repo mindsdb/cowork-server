@@ -66,7 +66,6 @@ async def remote_turn_events(
     turn_rows: list,
     turn_id: int = 0,
     correlation_id: str | None = None,
-    llm: dict | None = None,
 ):
     """Yields the same stream format_responses_stream renders for local turns.
     Mutates turn_rows in place; raises RemoteTurnFailed on a worker failure.
@@ -152,7 +151,6 @@ async def remote_turn_events(
             started_at=inputs.started_at,
             skills=skills,
             correlation_id=correlation_id,
-            llm=llm,
         ):
             if kind == "progress" and data.get("phase") == "workspace_authorized":
                 artifact_writes_allowed = data.get("workspace_mode") == "persistent"

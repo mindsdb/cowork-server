@@ -1,3 +1,5 @@
+import logging
+import os
 from collections.abc import Mapping
 from contextlib import ExitStack
 from functools import partial
@@ -50,6 +52,8 @@ from cowork.services.shared_projects import SharedProjectFiles
 # requirement visible to a route walker instead of something only
 # discoverable by reading scoped.py.
 router = APIRouter(dependencies=[Depends(require(AuthenticatedInOrgMode))])
+
+logger = logging.getLogger(__name__)
 
 
 def _project_memory_slot_has_content(
@@ -670,7 +674,151 @@ async def delete_project(
     scope: TenantScopeDep,
     principal: Principal | None = Depends(get_principal),
 ):
+    await _take_down_published_pages(scope, project_id=project_id, principal=principal)
     return await run_efs_unit(partial(_delete_project, project_id=project_id, principal=principal), scope=scope)
+
+
+_TAKE_DOWN_FAILED = (
+    "Could not take down the published page of {name}, so the project was not "
+    "deleted. Try again in a moment."
+)
+
+
+def _take_down_plan(session: ScopedSession, *, project_id: UUID, principal: Principal | None):
+    """The roots of a project its delete takes published pages down from,
+    once the caller may delete it: the checks `_delete_project` makes before
+    it changes anything, so a refused delete takes no page down. Every
+    member's legacy conversation roots are included, since the delete removes
+    them all.
+
+    None when the delete leaves the project's folder in place (a folder the
+    user chose, or a stored path that is not the derived one): its artifacts
+    stay on disk, so their pages stay up too."""
+    from cowork.services.artifact_roots import plan_project_roots
+
+    service = ProjectService(session)
+    try:
+        project = service.get_project(project_id)
+        if project.name == GENERAL_PROJECT:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="The General project is immutable",
+            )
+        if session.scope.org_mode:
+            SharedResourceAccess(session, principal).require_change(
+                project.created_by,
+                detail="Only the project creator or an organization admin can delete this project",
+            )
+        service._refuse_while_others_use(project_id)
+        if not _delete_removes_folder(service, project):
+            return None
+        return plan_project_roots(session, project_id, include_other_members=True)
+    except ProjectNotFoundError as e:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e)) from e
+    except ProjectInUseError as e:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e)) from e
+
+
+def _delete_removes_folder(service: ProjectService, project) -> bool:
+    """Whether `delete_project` removes this project's folder: only when its
+    stored path is the derived one (the same test the delete makes). A folder
+    the user chose, or one at a path that does not match, is left in place."""
+    path = Path(project.path)
+    if not path.exists():
+        return True
+    try:
+        safe = service._project_path(project.name)
+    except ValueError:
+        return False
+    return safe.resolve() == path.resolve()
+
+
+def _published_folders(plan) -> list[tuple[object, str]]:
+    """(source, folder name) of each artifact folder under the plan's roots
+    whose publish record still names a live page. A root that fails to list
+    raises (``strict``): a page left up under a folder about to be removed
+    would have nothing left pointing at it."""
+    from cowork.services.artifact_roots import discover_roots
+    from cowork.services.artifacts import has_live_pages
+
+    found: list[tuple[object, str]] = []
+    for source in discover_roots(plan, strict=True).unfiltered():
+        try:
+            entries = list(os.scandir(source.base))
+        except FileNotFoundError:
+            continue
+        for entry in sorted(entries, key=lambda item: item.name):
+            if entry.is_dir(follow_symlinks=False) and has_live_pages(Path(entry.path)):
+                found.append((source, entry.name))
+    return found
+
+
+async def _take_down_published_pages(
+    scope, *, project_id: UUID, principal: Principal | None
+) -> None:
+    """Take down every published page of the project's artifacts before its
+    files go, with the take-down an artifact delete uses, so the pages, their
+    access rules and their viewer analytics are purged upstream.
+
+    Like an artifact delete, a page that fails to come down aborts: the
+    project and its files stay, the pages already down stay recorded as down,
+    and the error says which artifact failed, so a retry finishes the job.
+    """
+    from cowork.api.v1.endpoints.artifacts import take_down_credential
+    from cowork.db.units import FilesystemBusy, run_efs
+    from cowork.services.artifacts import take_down_artifact_pages
+
+    plan = await run_efs_unit(
+        partial(_take_down_plan, project_id=project_id, principal=principal), scope=scope
+    )
+    if plan is None:
+        return
+    try:
+        folders = await run_efs(partial(_published_folders, plan), scope=scope)
+    except OSError as e:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Could not read the project's artifacts, so the project was not deleted. Try again in a moment.",
+        ) from e
+    if not folders:
+        return
+    publish_url, api_key = await take_down_credential(scope)
+    for source, folder_name in folders:
+        try:
+            await take_down_artifact_pages(
+                source=source,
+                folder_name=folder_name,
+                api_key=api_key,
+                publish_url=publish_url,
+                scope=scope,
+            )
+        except FileNotFoundError:
+            # Gone, or not an artifact folder (no metadata.json): nothing to pin.
+            continue
+        except (HTTPException, FilesystemBusy):
+            raise
+        except OSError:
+            # The folder or its root could not be opened safely (a link, a
+            # replaced directory): the same refusal an artifact delete answers
+            # 404 to. Aborting here would leave the project undeletable.
+            logger.warning(
+                "orphaned_publish project=%s folder=%s reason=folder_unopenable",
+                project_id,
+                folder_name,
+                exc_info=True,
+            )
+            continue
+        except ValueError as e:
+            # No publish credential on desktop: the page cannot come down.
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"{_TAKE_DOWN_FAILED.format(name=repr(folder_name))} ({e})",
+            ) from e
+        except Exception as e:
+            raise HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                detail=_TAKE_DOWN_FAILED.format(name=repr(folder_name)),
+            ) from e
 
 
 def _delete_project(

@@ -8,8 +8,8 @@ artifact's chat as a normal agent turn, which the app sends itself.
 
 This module holds what the route needs around that:
 
-* ``anton_quick_edit()``: the installed anton's router and quick editor, or
-  None. Imported lazily and feature-detected, so the server keeps working with
+* ``anton_quick_edit()``: the installed anton's router and quick editor (and,
+  when it has one, its quick reply), or None. Imported lazily and feature-detected, so the server keeps working with
   an anton that has neither; the route then answers 501 and the capability
   ``canQuickEdit`` is false.
 * ``quick_edit_available()``: the setting and the anton support together.
@@ -87,6 +87,17 @@ class AntonQuickEdit:
     # which. None when this anton has neither: decisions are then unavailable.
     decisions_available: Callable[..., Any] | None = None
     decisions_config: Callable[..., Any] | None = None
+    # reply.answer_request(message, *, llm, name, description, data, outline,
+    # recent_changes, history, chat) -> str: a short answer in the bar for a
+    # message routed ``reply``, "" to hand it to the agent. None when this
+    # anton has none.
+    answer_request: Callable[..., Any] | None = None
+
+    @property
+    def can_reply(self) -> bool:
+        """Whether the router may answer ``reply``: only when this anton's
+        route_request takes ``allow_reply`` and it has answer_request."""
+        return self.answer_request is not None and "allow_reply" in self.route_extras
 
 
 def anton_quick_edit() -> AntonQuickEdit | None:
@@ -133,11 +144,27 @@ def anton_quick_edit() -> AntonQuickEdit | None:
         route_extras=frozenset(params & ROUTE_EXTRAS),
         decisions_available=_callable(router, "decisions_available"),
         decisions_config=_callable(router, "decisions_config"),
+        answer_request=_answer_request(),
     )
 
 
+def _answer_request() -> Callable[..., Any] | None:
+    """anton's quick reply (``artifact_editor.reply.answer_request``), or None."""
+    try:
+        import anton.core.artifact_editor.reply  # noqa: F401
+
+        reply = sys.modules["anton.core.artifact_editor.reply"]
+    except Exception:
+        return None
+    return _callable(reply, "answer_request") if reply is not None else None
+
+
 #: route_request's optional context, passed only when this anton takes it.
-ROUTE_EXTRAS = frozenset({"name", "description", "data", "outline", "history", "recent_changes", "chat"})
+ROUTE_EXTRAS = frozenset({
+    "name", "description", "data", "outline", "history", "recent_changes", "chat", "allow_reply",
+})
+#: The router's context answer_request reads too.
+REPLY_CONTEXT = ("name", "description", "data", "outline", "recent_changes", "history", "chat")
 #: From describe_artifact(folder).
 DESCRIBED_EXTRAS = ("name", "description", "data", "outline")
 #: The artifact's latest revision summaries the router reads.

@@ -15,7 +15,7 @@ import time
 import uuid
 from datetime import datetime
 from functools import partial
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, NamedTuple
 
 import httpx
 from pydantic import BaseModel, ConfigDict, ValidationError
@@ -24,10 +24,14 @@ from redis.exceptions import RedisError
 from cowork.build_info import KEY_ANTON_VERSION, account_ids, build_trace_metadata, surface
 from cowork.handlers.turn_errors import (
     BUDGET_EXCEEDED_CODE,
+    MODEL_NOT_IN_TIER_CODE,
     RESET_AT_CODES,
+    WINDOW_ALLOWANCE_EXHAUSTED_CODE,
     clean_budget_model,
     clean_budget_period,
     clean_budget_scope,
+    clean_plan_window,
+    clean_required_tier,
     WORKER_UNRESPONSIVE_TYPE_NAME,
     remote_error_label,
     remote_turn_error,
@@ -43,6 +47,9 @@ from cowork.services.connectors.notion_pages import describe_project_pages
 from cowork.services.connectors.specs._registry import registry
 from cowork.services.product_permissions import require_product_permission
 from cowork.turnqueue.auth_keys import (
+    CUSTOM_GRANTS_ROUTE,
+    DATASOURCE_CONNECTIONS_ROUTE,
+    DATASOURCE_GRANTS_ROUTE,
     list_active_connections,
     list_custom_api_connections,
     list_verified_datasource_connections,
@@ -287,11 +294,27 @@ def _build_llm_block(api_key: str, settings: TurnQueueSettings, user_coding_mode
     return block
 
 
-async def _mint_llm_block_with_turn_key_id(
+class TurnLlm(NamedTuple):
+    """A web or channel turn's llm block, with what the job needs to know about its key."""
+
+    block: dict
+    #: The key's public prefix, which auth binds datasource and custom API
+    #: grants to; None when neither setting is on.
+    turn_key_id: str | None
+    #: The lifetime auth minted the key for: the turn's, or the untimed one
+    #: when auth refused that (auth_keys._request_turn_key).
+    ttl_seconds: int
+
+
+async def mint_turn_llm(
     *, org_id: str | None, user_id: str | None, correlation_id: str, settings: TurnQueueSettings,
     workspace_id: str | None = None, coding_model: str | None = None,
-) -> tuple[dict, str]:
-    """As mint_llm_block, also returning the key's public prefix the datasource grants bind to."""
+) -> TurnLlm:
+    """Mint a turn's key for its lifetime and build the job's `llm` block.
+
+    The routing gate and stream_remote_replies both mint through here, so the
+    job always knows the lifetime auth gave the key.
+    """
     minted = await mint_turn_key_details(
         user_id=user_id,
         org_id=org_id,
@@ -300,7 +323,11 @@ async def _mint_llm_block_with_turn_key_id(
         settings=settings,
         workspace_id=workspace_id,
     )
-    return _build_llm_block(minted.key, settings, coding_model), minted.prefix
+    return TurnLlm(
+        block=_build_llm_block(minted.key, settings, coding_model),
+        turn_key_id=minted.prefix if settings.needs_turn_key_id else None,
+        ttl_seconds=minted.ttl_seconds,
+    )
 
 
 async def _mint_oauth_block(*, org_id: str | None, user_id: str | None,
@@ -308,7 +335,7 @@ async def _mint_oauth_block(*, org_id: str | None, user_id: str | None,
                             settings: TurnQueueSettings) -> dict | None:
     """Build everything the job's `oauth` block needs except the turn key —
     the list of connections anton is allowed to use this turn. Deliberately
-    doesn't take the turn key `mint_llm_block` mints: this function's own
+    doesn't take the turn key `mint_turn_llm` mints: this function's own
     network call (listing active connections) never uses it, only the final
     block does, so the caller runs the two mints concurrently and folds the
     turn key in afterward instead of sequencing this behind the llm mint.
@@ -542,12 +569,12 @@ def _oauth_connections_wire(connections: list[dict]) -> list[dict]:
     return [{k: v for k, v in c.items() if k != "picked_files"} for c in connections]
 
 
-def _refuse_datasource_grants(reason: str) -> product_permissions.ProductPermissionUnavailable:
+def _refuse_datasource_grants(reason: str, *, route: str) -> product_permissions.ProductPermissionUnavailable:
     """Name the failed check for the operator, who otherwise sees the same
     permission_unavailable for an outage, a malformed row and a bad binding.
-    The reason is a fixed phrase: never the key, the producer secret or a row."""
-    logger.warning("[producer] datasource grants refused: %s", reason)
-    return product_permissions.ProductPermissionUnavailable()
+    ``route`` is the auth call whose answer failed the check, or the one it
+    skipped. The reason is a fixed phrase: never the key, the producer secret or a row."""
+    return product_permissions.permission_unavailable(route=route, cause=reason)
 
 
 def _datasource_connection_refs(
@@ -563,7 +590,9 @@ def _datasource_connection_refs(
     seen: set[int] = set()
     for connection in connections:
         if not isinstance(connection, dict):
-            raise _refuse_datasource_grants("listing carries a connection that is not an object")
+            raise _refuse_datasource_grants(
+                "listing carries a connection that is not an object", route=DATASOURCE_CONNECTIONS_ROUTE,
+            )
         connection_id = connection.get("id")
         credential_version = connection.get("credential_version")
         if (
@@ -573,7 +602,9 @@ def _datasource_connection_refs(
             or not connection["name"]
             or connection.get("status") != "verified"
         ):
-            raise _refuse_datasource_grants("listing carries a connection without verified metadata")
+            raise _refuse_datasource_grants(
+                "listing carries a connection without verified metadata", route=DATASOURCE_CONNECTIONS_ROUTE,
+            )
         if (connection.get("connector_id"), connection.get("name")) in disabled_keys:
             continue
         if (
@@ -585,7 +616,9 @@ def _datasource_connection_refs(
             or credential_version < 1
             or connection_id in seen
         ):
-            raise _refuse_datasource_grants("listing carries a malformed or repeated connection reference")
+            raise _refuse_datasource_grants(
+                "listing carries a malformed or repeated connection reference", route=DATASOURCE_CONNECTIONS_ROUTE,
+            )
         seen.add(connection_id)
         ref = {"connection_id": connection_id, "credential_version": credential_version}
         if with_labels:
@@ -593,7 +626,9 @@ def _datasource_connection_refs(
         refs.append(ref)
     # Auth caps what is registered, so the cap applies after the disabled ones are gone.
     if len(refs) > MAX_DATASOURCE_CONNECTIONS:
-        raise _refuse_datasource_grants("more enabled connections than a grant set may hold")
+        raise _refuse_datasource_grants(
+            "more enabled connections than a grant set may hold", route=DATASOURCE_CONNECTIONS_ROUTE,
+        )
     return refs
 
 
@@ -627,7 +662,9 @@ async def _mint_datasource_block(*, org_id: str | None, user_id: str | None,
     # A datasource-enabled dispatch without the key prefix is a producer
     # misconfiguration; it fails here rather than reaching auth without it.
     if not isinstance(turn_key_id, str) or not turn_key_id.strip():
-        raise _refuse_datasource_grants("dispatch carries no turn key prefix")
+        raise _refuse_datasource_grants(
+            "dispatch carries no turn key prefix", route=DATASOURCE_CONNECTIONS_ROUTE,
+        )
     try:
         connections = await list_verified_datasource_connections(
             org_id=org_id, user_id=user_id, turn_key_id=turn_key_id, settings=settings
@@ -662,10 +699,12 @@ async def _mint_datasource_block(*, org_id: str | None, user_id: str | None,
         or response.get("audience") != "datasource-gateway"
         or response.get("purpose") != "execute"
     ):
-        raise _refuse_datasource_grants("grant response binding does not match this turn")
+        raise _refuse_datasource_grants(
+            "grant response binding does not match this turn", route=DATASOURCE_GRANTS_ROUTE,
+        )
     grants = response.get("grants")
     if not isinstance(grants, list):
-        raise _refuse_datasource_grants("grant response carries no grant list")
+        raise _refuse_datasource_grants("grant response carries no grant list", route=DATASOURCE_GRANTS_ROUTE)
     returned = {
         (grant.get("connection_id"), grant.get("credential_version"))
         for grant in grants
@@ -673,7 +712,9 @@ async def _mint_datasource_block(*, org_id: str | None, user_id: str | None,
     }
     expected = {(ref["connection_id"], ref["credential_version"]) for ref in refs}
     if returned != expected or len(grants) != len(expected):
-        raise _refuse_datasource_grants("grants differ from the requested connection references")
+        raise _refuse_datasource_grants(
+            "grants differ from the requested connection references", route=DATASOURCE_GRANTS_ROUTE,
+        )
     return {"protocol_version": 1, "connections": refs}
 
 
@@ -722,9 +763,9 @@ def _custom_api_connection_refs(connections: list[dict], disabled: list[dict] | 
 
 
 def _refuse_custom_api(reason: str) -> product_permissions.ProductPermissionUnavailable:
-    """Name the failed check for the operator; a fixed phrase, never a key or a row."""
-    logger.warning("[producer] custom API connections refused: %s", reason)
-    return product_permissions.ProductPermissionUnavailable()
+    """Name the failed check of auth's grant answer for the operator; a fixed
+    phrase, never a key or a row."""
+    return product_permissions.permission_unavailable(route=CUSTOM_GRANTS_ROUTE, cause=reason)
 
 
 async def _mint_custom_api_block(*, scope: TenantScope, correlation_id: str, turn_key_id: str | None,
@@ -1098,8 +1139,8 @@ async def _scoped_browser_block(
 
 
 async def _admit_decisions_proxy(
-    r, browser_block: dict | None, *, turn_key: str, org_id: str | None, user_id: str | None,
-    correlation_id: str, settings: TurnQueueSettings,
+    r, browser_block: dict | None, *, turn_key: str, turn_key_ttl_seconds: int, org_id: str | None,
+    user_id: str | None, correlation_id: str,
 ) -> dict | None:
     """The browser block as the job carries it. One that names the decisions
     proxy (the organization's own decision model, through this server) needs
@@ -1114,7 +1155,7 @@ async def _admit_decisions_proxy(
             raise ValueError("no turn key or identity to record")
         await decisions_proxy.admit(
             r, turn_key=turn_key, org_id=org_id, user_id=user_id, correlation_id=correlation_id,
-            ttl_seconds=settings.turn_key_lifetime_seconds,
+            ttl_seconds=turn_key_ttl_seconds,
         )
     except Exception as exc:
         logger.warning(
@@ -1142,8 +1183,7 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
                                 workspace: RemoteWorkspace | None = None,
                                 correlation_id: str | None = None,
                                 run_id: str | None = None,
-                                llm: dict | None = None,
-                                turn_key_id: str | None = None,
+                                llm: TurnLlm | None = None,
                                 disabled: list[dict] | None = None,
                                 started_at: str | None = None,
                                 interactive: bool = False,
@@ -1159,7 +1199,8 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
     exactly one terminal: turn_completed, or turn_failed (classified with the
     same (code, message) the caller streams and persists; synthesized locally
     when the worker goes quiet past the idle timeout).
-    `correlation_id`/`llm` reuse a turn key the routing gate already minted.
+    `correlation_id`/`llm` reuse a turn key the routing gate already minted
+    (mint_turn_llm), with its prefix and the lifetime auth minted it for.
     `interactive` tells the pod it may ask `ask_user` questions (web UI turns;
     channel turns never).
     `tool_messages` tells the pod the client renders a tool's message to the
@@ -1187,10 +1228,17 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
     `zdr_on` is the caller's ZDR answer when the handler already has it; None reads it here."""
     settings = TurnQueueSettings()
     scope = scope_for_identity(org_id=org_id, user_id=user_id)
-    await require_product_permission(scope, "product.execute")
-    workspace_mode = (
-        "persistent" if await product_permissions.has_product_permission(scope, "artifact.manage") else "ephemeral"
-    )
+    try:
+        await require_product_permission(scope, "product.execute")
+        workspace_mode = (
+            "persistent" if await product_permissions.has_product_permission(scope, "artifact.manage")
+            else "ephemeral"
+        )
+    except product_permissions.ProductPermissionUnavailable as exc:
+        # Raised to every caller, a channel turn and a scheduled run among
+        # them, so it is logged here, before any of them answers it.
+        product_permissions.report_permission_unavailable(exc)
+        raise
     r = get_redis()
     corr = correlation_id or _new_correlation_id()
     # A flag left by an earlier turn would cancel this one on its first line,
@@ -1228,16 +1276,15 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
             org_id=org_id, user_id=user_id, disabled=disabled, correlation_id=corr,
             settings=settings, workspace_id=workspace_id,
         )
-        if llm:
-            llm_block = llm
+        if llm is not None:
+            llm_block, turn_key_id, key_ttl_seconds = llm
             oauth_connections, connector_key = await oauth_connections_coro
         else:
-            mint_llm = _mint_llm_block_with_turn_key_id if settings.needs_turn_key_id else mint_llm_block
             # Both run to the end, so a connector key minted beside a failed
             # turn-key mint is known here and revoked rather than left live.
             llm_result, oauth_result = await asyncio.gather(
-                mint_llm(org_id=org_id, user_id=user_id, correlation_id=corr, settings=settings,
-                         workspace_id=workspace_id, coding_model=turn_coding_model(user_settings)),
+                mint_turn_llm(org_id=org_id, user_id=user_id, correlation_id=corr, settings=settings,
+                              workspace_id=workspace_id, coding_model=turn_coding_model(user_settings)),
                 oauth_connections_coro,
                 return_exceptions=True,
             )
@@ -1248,10 +1295,7 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
                 if connector_key:
                     await _revoke_turn_key_at_turn_end(corr, settings)
                 raise llm_result
-            if settings.needs_turn_key_id:
-                llm_block, turn_key_id = llm_result
-            else:
-                llm_block = llm_result
+            llm_block, turn_key_id, key_ttl_seconds = llm_result
         # Independent auth round trips, run together so custom connections add
         # no turn start time. Both run to the end; the datasource failure wins.
         datasource_result, custom_api_result = await asyncio.gather(
@@ -1272,7 +1316,8 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
             if isinstance(result, BaseException):
                 raise result
         datasource_block, custom_api_connections = datasource_result, custom_api_result
-    except product_permissions.ProductPermissionUnavailable:
+    except product_permissions.ProductPermissionUnavailable as exc:
+        product_permissions.report_permission_unavailable(exc)
         logger.warning(
             "[producer] turn setup unavailable conversation=%s correlation_id=%s", conversation_id, corr,
             exc_info=True,
@@ -1318,8 +1363,8 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
         project_id=workspace.project_id if workspace is not None else None, zdr_on=zdr_on,
     )
     browser_block = await _admit_decisions_proxy(
-        r, browser_block, turn_key=llm_block.get("api_key", ""), org_id=org_id, user_id=user_id,
-        correlation_id=corr, settings=settings,
+        r, browser_block, turn_key=llm_block.get("api_key", ""), turn_key_ttl_seconds=key_ttl_seconds,
+        org_id=org_id, user_id=user_id, correlation_id=corr,
     )
 
     # Org-relative, never absolute. cowork-server sees the shared tree at
@@ -1361,7 +1406,10 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
                 zdr_on = True
         jev_decisions = jev_decisions and not zdr_on
         jev_classify = jev_classify and not zdr_on
-    time_limit = settings.time_limit_seconds
+    # A key shorter than the time-limited window comes from an auth that
+    # refused that window (auth_keys._request_turn_key), so the turn runs
+    # untimed: no "Keep going" ask the key couldn't outlive.
+    time_limit = settings.time_limit_seconds if key_ttl_seconds >= settings.turn_key_lifetime_seconds else 0
     offer_connector_drafts = bool(
         connector_drafts and settings.connector_drafts_enabled and scope.org_mode and user_id
     )
@@ -1607,6 +1655,11 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
                         budget_scope = clean_budget_scope(data.pop("budget_scope", None))
                         budget_period = clean_budget_period(data.pop("budget_period", None))
                         budget_model = clean_budget_model(data.pop("budget_model", None))
+                        # ENG-4186: which plan window is spent, and which tier
+                        # covers a model the plan does not. Each kept for its
+                        # own code only, like the budget fields.
+                        window = clean_plan_window(data.pop("window", None))
+                        required_tier = clean_required_tier(data.pop("required_tier", None))
                         code, message = remote_turn_error(data.get("error"), budget_scope, budget_period, budget_model)
                         data = {**data, "code": code, "message": message}
                         reset_at = _remote_reset_at(code=code, value=data.pop("reset_at", None))
@@ -1618,6 +1671,10 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
                             data["budget_period"] = budget_period
                         if code == BUDGET_EXCEEDED_CODE and budget_model is not None:
                             data["budget_model"] = budget_model
+                        if code == WINDOW_ALLOWANCE_EXHAUSTED_CODE and window is not None:
+                            data["window"] = window
+                        if code == MODEL_NOT_IN_TIER_CODE and required_tier is not None:
+                            data["required_tier"] = required_tier
                         logger.warning(
                             "Remote turn failed conversation=%s correlation_id=%s error_type=%s error_code=%s",
                             conversation_id, corr, remote_error_label(error=data.get("error")), code,

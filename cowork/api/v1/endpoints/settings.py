@@ -859,6 +859,14 @@ async def recommended_models(
     # today's locked, add-credits treatment.
     model_disabled_reasons: dict[str, str] = {}
 
+    # `modelCoveredByTier` maps a model id to the cheapest subscription tier
+    # whose included allowance covers it: "free", "plus" or "pro" (ENG-4186).
+    # Display-only, since the wallet pays for any model on any tier: the
+    # picker shows the tier on covered rows and offers it as the upgrade on a
+    # `model_not_in_tier` lock. Filled from the MindsHub listing only, like
+    # `modelDisabledReasons`. A model absent from it has no tier to show.
+    model_covered_by_tier: dict[str, str] = {}
+
     # `modelLabels` maps a model id → MindsHub's human-readable display label.
     # Display-only: the picker uses this to render the option text, but the id
     # remains the value used for selection/storage/resolution everywhere else.
@@ -984,6 +992,7 @@ async def recommended_models(
         model_enabled.update(live_enabled)
         model_enabled.update(listing.image_models)
         model_disabled_reasons.update(listing.disabled_reasons)
+        model_covered_by_tier.update(listing.covered_by_tier)
         model_labels.update(live_labels)
         model_providers.update(listing.providers)
         model_families.update(listing.families)
@@ -1036,7 +1045,8 @@ async def recommended_models(
         _fill_missing(model_enabled, live_enabled)
         _fill_missing(model_labels, live_labels)
         # modelDisabledReasons is left alone on purpose: only MindsHub may say
-        # an admin restricted a model (see where it is declared above).
+        # an admin restricted a model (see where it is declared above). So is
+        # modelCoveredByTier: only MindsHub knows which tier covers a model.
         # Same precedence for the grouping metadata, for the same reason: a BYO
         # endpoint must not be able to move a MindsHub model into another vendor's
         # section or relabel it as an old version of something. But here the
@@ -1136,6 +1146,7 @@ async def recommended_models(
         "modelEfforts": model_efforts,
         "modelEnabled": model_enabled,
         "modelDisabledReasons": model_disabled_reasons,
+        "modelCoveredByTier": model_covered_by_tier,
         # The refresh_scope values this server honours, for a newer UI on an older server.
         "refreshScopes": list(_REFRESH_SCOPES),
         "modelLabels": model_labels,
