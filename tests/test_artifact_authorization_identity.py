@@ -2580,3 +2580,18 @@ async def test_a_forged_confirmation_in_the_previous_entry_never_reaches_the_upl
 
     assert await _autopublish_once(folder, scope, project) is True
     assert sent[-1]["access"] == {"mode": "website"}
+
+
+def test_a_republish_without_access_of_a_live_website_is_sent_without_the_confirmation(
+    issuer, scope, local_id, owned_artifact, monkeypatch, websites_on
+):
+    _session, project, _conversation, folder = owned_artifact
+    run, uploads = _org_publisher(issuer, folder, scope, project, monkeypatch, view_url=SITE_URL)
+    run({"mode": "website"}, owner_save=True)
+
+    publish_artifact(
+        folder, artifacts_base=folder.parent, api_key="key", publish_url="https://view.test",
+        scope=scope, project_id=str(project.id), access=None,
+    )
+
+    assert uploads[-1]["access"] == {"mode": "website"}

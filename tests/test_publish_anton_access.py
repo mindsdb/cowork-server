@@ -254,3 +254,20 @@ def test_the_desktop_update_of_an_entry_rewritten_to_a_website_is_refused(artifa
         "detail": WEBSITE_REFUSALS[WEBSITE_REQUIRES_PUBLISH_KEY_CODE], "code": WEBSITE_REQUIRES_PUBLISH_KEY_CODE,
     }
     assert anton_access == []
+
+
+def test_a_desktop_publish_without_access_of_a_website_entry_is_refused(artifact, anton_access, monkeypatch):
+    entry = {"index.html": {"report_id": "r1", "url": "https://view.example/r/1", "published": True, "mode": "website"}}
+    (artifact / ".published.json").write_text(json.dumps(entry))
+    upload = mock.Mock()
+    monkeypatch.setattr("anton.publisher.publish", upload)
+
+    with pytest.raises(WebsiteRefused) as refused:
+        publish.publish_artifact(
+            artifact, artifacts_base=artifact.parent, api_key="desktop-key", publish_url=PUBLISH_URL,
+            access=None, scope=LOCAL_SCOPE,
+        )
+
+    assert refused.value.code == WEBSITE_REQUIRES_PUBLISH_KEY_CODE
+    upload.assert_not_called()
+    assert json.loads((artifact / ".published.json").read_text()) == entry

@@ -1804,7 +1804,7 @@ def publish_artifact(
     # them only to answer 400.
     if is_fullstack and not is_mindshub_publish_url(publish_url):
         raise ValueError(FULLSTACK_PUBLISH_UNSUPPORTED)
-    if access is not None and access.mode is AccessMode.WEBSITE:
+    if access is not None and access.mode == AccessMode.WEBSITE:
         _refuse_a_website(
             scope=scope, owner_save=owner_save, is_fullstack=is_fullstack,
             project_id=project_id, artifact_slug=published_dir.name,
@@ -1858,6 +1858,13 @@ def publish_artifact(
         access = default_publish_access(
             access, password, report_id=report_id, previous=previous, scope=scope
         )
+        # A republish without an access keeps the entry's mode, which can be a
+        # website: the gate applies to the mode the publish resolves to.
+        if access is not None and access.mode == AccessMode.WEBSITE:
+            _refuse_a_website(
+                scope=scope, owner_save=owner_save, is_fullstack=is_fullstack,
+                project_id=project_id, artifact_slug=published_dir.name,
+            )
         canonical_artifact_key = _authorization_key(published_dir, artifacts_base, project_id, scope)
         datasource_vault = None
         if is_fullstack:
