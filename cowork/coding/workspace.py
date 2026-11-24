@@ -282,35 +282,31 @@ class GitRunner:
         from cowork.coding import check_sandbox
 
         folder = common / "lfs"
-        if not os.path.lexists(folder) and self._tracks_lfs_files(cwd, common):
+        if not os.path.lexists(folder) and self._tracks_lfs_files(cwd):
             try:
                 folder.mkdir()
             except OSError:
                 logger.warning("Could not create Git LFS storage in %s", common, exc_info=True)
         return check_sandbox.filter_storage(common)
 
-    def _tracks_lfs_files(self, cwd: Path, common: Path) -> bool:
-        """Whether this repository assigns the ``lfs`` filter to any path.
+    def _tracks_lfs_files(self, cwd: Path) -> bool:
+        """Whether Git assigns the ``lfs`` filter to any file in this checkout.
 
         Installing Git LFS configures its filter for every repository on the
-        computer, so the setting alone says nothing about this one.
+        computer, so the setting alone says nothing about this one. Git is
+        asked about each path, because attributes also come from files
+        outside the checkout and a mention in a comment assigns nothing.
+        Neither command runs a filter.
         """
         configured = self.run(cwd, "config", "--get-regexp", r"^filter\.lfs\.(clean|smudge|process)$", check=False)
         if configured.returncode != 0 or not configured.stdout.strip():
             return False
-        listed = self.run(
-            cwd, "ls-files", "-z", "--cached", "--others", "--exclude-standard", "--", ":(glob)**/.gitattributes", check=False,
-        )
-        names = [name for name in listed.stdout.split("\0") if name] if listed.returncode == 0 else [".gitattributes"]
-        for path in (common / "info" / "attributes", *(cwd / name for name in names)):
-            try:
-                if path.is_symlink() or not path.is_file() or path.stat().st_size > 1_000_000:
-                    continue
-                if "filter=lfs" in path.read_text(encoding="utf-8", errors="replace"):
-                    return True
-            except OSError:
-                continue
-        return False
+        listed = self.run(cwd, "ls-files", "-z", "--cached", "--others", "--exclude-standard", check=False)
+        if listed.returncode != 0 or not listed.stdout:
+            return False
+        assigned = self.run(cwd, "check-attr", "-z", "--stdin", "filter", input_text=listed.stdout, check=False)
+        # Each answer is a path, the attribute's name and its value.
+        return assigned.returncode == 0 and "lfs" in assigned.stdout.split("\0")[2::3]
 
     def run(
         self,

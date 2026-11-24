@@ -903,20 +903,37 @@ def test_a_filters_first_stored_file_commits_before_its_storage_folder_exists(
     assert any((repo / ".git" / "lfs" / "objects").iterdir())
 
 
-def test_a_repository_that_tracks_nothing_with_git_lfs_gets_no_storage_folder(tmp_path: Path) -> None:
-    # Installing Git LFS configures its filter for every repository.
+def lfs_installed_repository(tmp_path: Path) -> tuple[Path, WorkspaceManager]:
+    """A repository on a computer with Git LFS installed, which configures its filter everywhere."""
     repo = repository(tmp_path / "repo")
     git(repo, "config", "filter.lfs.clean", "git-lfs clean -- %f")
     git(repo, "config", "filter.lfs.process", "git-lfs filter-process")
-    (repo / ".gitattributes").write_text("*.txt text\n", encoding="utf-8")
-    manager = WorkspaceManager(tmp_path / "root")
+    (repo / "asset.bin").write_text("content\n", encoding="utf-8")
+    return repo, WorkspaceManager(tmp_path / "root")
 
+
+def test_a_repository_that_tracks_nothing_with_git_lfs_gets_no_storage_folder(tmp_path: Path) -> None:
+    repo, manager = lfs_installed_repository(tmp_path)
+    # A comment that mentions the filter assigns it to nothing.
+    (repo / ".gitattributes").write_text("# was: *.bin filter=lfs -text\n*.txt text\n", encoding="utf-8")
+
+    assert git(repo, "check-attr", "filter", "asset.bin").endswith("unspecified")
     assert manager.git.filter_storage(repo, repo / ".git") == []
     assert not (repo / ".git" / "lfs").exists()
 
-    nested = repo / "assets"
-    nested.mkdir()
-    (nested / ".gitattributes").write_text("*.bin filter=lfs -text\n", encoding="utf-8")
+
+@pytest.mark.parametrize("source", ["nested", "outside"])
+def test_git_lfs_storage_is_made_wherever_git_takes_the_rule_from(tmp_path: Path, source: str) -> None:
+    repo, manager = lfs_installed_repository(tmp_path)
+    if source == "nested":
+        (repo / "assets").mkdir()
+        (repo / "asset.bin").rename(repo / "assets" / "asset.bin")
+        (repo / "assets" / ".gitattributes").write_text("*.bin filter=lfs -text\n", encoding="utf-8")
+    else:
+        # The person's own attributes file, outside the checkout.
+        attributes = tmp_path / "attributes"
+        attributes.write_text("*.bin filter=lfs -text\n", encoding="utf-8")
+        git(repo, "config", "core.attributesFile", str(attributes))
 
     assert manager.git.filter_storage(repo, repo / ".git") == [repo / ".git" / "lfs"]
 
