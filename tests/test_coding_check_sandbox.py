@@ -5,6 +5,7 @@ import shutil
 import stat
 import subprocess
 import sys
+import uuid
 from pathlib import Path
 
 import pytest
@@ -152,32 +153,51 @@ def test_windows_offline_checks_drop_proxy_firewall_exceptions(monkeypatch: pyte
 
 
 @pytest.mark.skipif(sys.platform != "win32", reason="exercise the native Windows sandbox")
-@pytest.mark.parametrize("network_access", [True, False])
-def test_windows_native_checks_run_with_and_without_network_access(tmp_path: Path, network_access: bool) -> None:
-    # Network off is the default for a task, so a check has to start under it.
-    # The pinned sandbox does not keep its offline identity from services on
-    # this computer, so reaching localhost is not asserted either way.
+def test_windows_native_checks_run_with_and_without_network_access(tmp_path: Path) -> None:
+    # Network off is the default for a task, so a check has to start under it
+    # and still be kept from other computers. The pinned sandbox does not keep
+    # its offline identity from services on this computer, so localhost is not
+    # asserted. The network-on run is the control: it proves the endpoint is
+    # reachable from the sandbox, so a blocked offline run is the policy.
     workspace = tmp_path / "project"
     workspace.mkdir()
-    outside = tmp_path / "outside.txt"
+    # Outside every folder the policy grants, which includes the temp folder
+    # pytest works in. This process can write there, so a refusal inside the
+    # sandbox comes from the sandbox.
+    outside = Path.home() / f".cowork-check-sandbox-{uuid.uuid4().hex}"
+    outside.touch()
+    outside.unlink()
     script = (
         "from pathlib import Path\n"
-        "import sys\n"
-        "Path('ran.txt').touch()\n"
+        "import socket, sys\n"
+        "Path('ran.txt').write_text('ran')\n"
         "try:\n"
         "    Path(sys.argv[1]).touch()\n"
         "except OSError:\n"
         "    print('confined')\n"
+        "else:\n"
+        "    print('escaped')\n"
+        "try:\n"
+        "    socket.create_connection(('github.com', 443), timeout=10).close()\n"
+        "except OSError:\n"
+        "    print('blocked')\n"
+        "else:\n"
+        "    print('connected')\n"
     )
-    policy = CheckPolicy.for_task(PermissionMode.workspace, network_access, sandbox_home=tmp_path / "check-sandbox")
-    result = run_sandboxed(
-        [sys.executable, "-c", script, str(outside)],
-        cwd=workspace, policy=policy, environment=check_environment(os.environ), writable=[workspace],
-    )
-    assert result.returncode == 0, result.stderr
-    assert (workspace / "ran.txt").exists()
-    assert result.stdout.strip() == "confined"
-    assert not outside.exists()
+    try:
+        for network_access, expected in [(True, "connected"), (False, "blocked")]:
+            (workspace / "ran.txt").unlink(missing_ok=True)
+            policy = CheckPolicy.for_task(PermissionMode.workspace, network_access, sandbox_home=tmp_path / "check-sandbox")
+            result = run_sandboxed(
+                [sys.executable, "-c", script, str(outside)],
+                cwd=workspace, policy=policy, environment=check_environment(os.environ), writable=[workspace],
+            )
+            assert result.returncode == 0, result.stderr
+            assert (workspace / "ran.txt").exists()
+            assert result.stdout.split() == ["confined", expected]
+            assert not outside.exists()
+    finally:
+        outside.unlink(missing_ok=True)
 
 
 def test_hooks_may_stage_but_not_change_what_makes_git_run_programs(tmp_path: Path) -> None:
@@ -883,13 +903,22 @@ def test_a_filters_first_stored_file_commits_before_its_storage_folder_exists(
     assert any((repo / ".git" / "lfs" / "objects").iterdir())
 
 
-def test_a_repository_without_git_lfs_gets_no_storage_folder(tmp_path: Path) -> None:
+def test_a_repository_that_tracks_nothing_with_git_lfs_gets_no_storage_folder(tmp_path: Path) -> None:
+    # Installing Git LFS configures its filter for every repository.
     repo = repository(tmp_path / "repo")
-    git(repo, "config", "filter.normalize.clean", "cat")
+    git(repo, "config", "filter.lfs.clean", "git-lfs clean -- %f")
+    git(repo, "config", "filter.lfs.process", "git-lfs filter-process")
+    (repo / ".gitattributes").write_text("*.txt text\n", encoding="utf-8")
     manager = WorkspaceManager(tmp_path / "root")
 
     assert manager.git.filter_storage(repo, repo / ".git") == []
     assert not (repo / ".git" / "lfs").exists()
+
+    nested = repo / "assets"
+    nested.mkdir()
+    (nested / ".gitattributes").write_text("*.bin filter=lfs -text\n", encoding="utf-8")
+
+    assert manager.git.filter_storage(repo, repo / ".git") == [repo / ".git" / "lfs"]
 
 
 def test_a_recorded_commit_is_reported_even_when_status_cannot_be_read(
