@@ -12,6 +12,7 @@ import pytest
 from tests.support.coding.service_fakes import (
     CREDS,
     FakeEngine,
+    assert_usage_refreshes_after_cleanup,
     repository,
     service_with,
     wait_for_status,
@@ -543,15 +544,3 @@ def measure_before_discard(monkeypatch: pytest.MonkeyPatch, service: CodingServi
 
     monkeypatch.setattr(service.workspaces, "discard_recovery", measure_then_discard)
 
-
-def assert_usage_refreshes_after_cleanup(service: CodingService) -> None:
-    # Discarded folders wait in pending removals, which count as removed-task storage.
-    assert service.workspaces.pending_removals.wait(5)
-    page = service.workspace_usage_page()
-    assert page.measuring
-    deadline = time.monotonic() + 5
-    while page.measuring and time.monotonic() < deadline:
-        time.sleep(0.01)
-        page = service.workspace_usage_page()
-    assert not page.measuring
-    assert page.removed_task_bytes == 0

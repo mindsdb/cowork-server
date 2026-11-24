@@ -5,11 +5,19 @@ from __future__ import annotations
 import shutil
 import subprocess
 import threading
-import time
 from pathlib import Path
+from unittest.mock import Mock
 
 import pytest
-from tests.support.coding.service_fakes import CREDS, FakeEngine, copy_folders_without_git, repository, service_with, wait_for_status
+from tests.support.coding.service_fakes import (
+    CREDS,
+    FakeEngine,
+    assert_usage_refreshes_after_cleanup,
+    copy_folders_without_git,
+    repository,
+    service_with,
+    wait_for_status,
+)
 
 from cowork.coding import pending_removals as pending_module
 from cowork.coding.contracts import SessionCreateRequest, SessionStatus, WorkspaceKind, WorkspaceMode
@@ -99,34 +107,19 @@ def test_storage_usage_refreshes_once_a_deleted_task_is_removed(tmp_path: Path, 
     assert service.workspace_usage.measure().removed_task_bytes > 0
 
     release.set()
-    assert service.workspaces.pending_removals.wait(30)
-
-    page = service.workspace_usage_page()
-    assert page.measuring
-    deadline = time.monotonic() + 30
-    while page.measuring and time.monotonic() < deadline:
-        time.sleep(0.01)
-        page = service.workspace_usage_page()
-    assert not page.measuring
-    assert page.removed_task_bytes == 0
+    assert_usage_refreshes_after_cleanup(service)
 
 
 def test_a_failing_drained_callback_does_not_stop_later_removals(tmp_path: Path) -> None:
     pending = PendingRemovals(tmp_path / "pending")
-    calls: list[None] = []
-
-    def fail() -> None:
-        calls.append(None)
-        raise RuntimeError("listener failed")
-
-    pending.on_drained = fail
+    pending.on_drained = Mock(side_effect=RuntimeError("listener failed"))
     for name in ("first", "second"):
         folder = tmp_path / name
         folder.mkdir()
         assert pending.discard(folder)
         assert pending.wait(30)
 
-    assert len(calls) == 2
+    assert pending.on_drained.call_count == 2
     assert not any(pending.root.iterdir())
 
 
