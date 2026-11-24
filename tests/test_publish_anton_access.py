@@ -140,13 +140,13 @@ def test_the_desktop_publish_route_without_access_hands_anton_none(artifact, ant
             {"report_id": "r", "mode": "restricted", "emails": ["a@x.com"], "org_allowed": False, "owner_only": False},
             {"mode": "restricted", "emails": ["a@x.com"], "org_allowed": False, "owner_only": False},
         ),
-        ({}, {}, {"mode": "public"}),
+        ({}, {}, {"mode": "restricted", "emails": [], "owner_only": True}),
     ],
     ids=["public", "password", "restricted", "owner-only", "keeps-password", "keeps-restricted", "first-publish"],
 )
 def test_the_agents_publish_tool_hands_anton_each_mode(artifact, anton_access, monkeypatch, tool_input, kept, handed):
     """The tool's explicit fields, else the access the artifact keeps, else
-    public."""
+    the service's default (owner-only)."""
     monkeypatch.setattr(
         publish, "desktop_publish_context",
         lambda raw, *, scope: (artifact, artifact.parent, "desktop-key", PUBLISH_URL),
