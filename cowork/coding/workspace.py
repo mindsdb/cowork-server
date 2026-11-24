@@ -696,7 +696,7 @@ class WorkspaceManager:
             raise WorkspaceError("Review actions require a Git task workspace")
         with self._mutation_lock:
             if action == "stage":
-                self.git.run(root, "add", "--", path)
+                self._add(root, "--", path)
                 return
             if action == "unstage":
                 result = self.git.run(root, "restore", "--staged", "--", path, check=False)
@@ -820,7 +820,7 @@ class WorkspaceManager:
                 new_objects = Path(scratch).resolve() / "objects"
                 new_objects.mkdir()
                 if checks is None:
-                    self.git.run(root, "add", "--all")
+                    self._add(root, "--all")
                 else:
                     self._run_sandboxed_git_step(
                         root, checks, "Staging", ["git", *_platform_config_args(), "add", "--all"], [root], workspace_kind,
@@ -868,7 +868,8 @@ class WorkspaceManager:
         message = git("stripspace", input_text=message).stdout
         if not message.strip():
             raise WorkspaceError("Commit message cannot be empty")
-        tree = git("write-tree").stdout.strip()
+        index = self.git.run(root, "rev-parse", "--path-format=absolute", "--git-path", "index").stdout.strip()
+        tree = self._write_tree(root, Path(index))
         parent = git("rev-parse", "--verify", "--quiet", "HEAD^{commit}", check=False).stdout.strip()
         if parent and tree == git("rev-parse", f"{parent}^{{tree}}").stdout.strip():
             raise WorkspaceError("There are no changes to commit")
@@ -913,7 +914,7 @@ class WorkspaceManager:
 
     def _run_sandboxed_git_step(
         self, root: Path, checks: CheckPolicy, label: str, argv: list[str], writable: list[Path],
-        workspace_kind: WorkspaceKind | None, new_objects: Path,
+        workspace_kind: WorkspaceKind | None, new_objects: Path, *, environment: dict[str, str] | None = None,
     ) -> None:
         """Run a command that may change the index, under the task's permissions.
 
@@ -923,9 +924,11 @@ class WorkspaceManager:
         from cowork.coding import check_sandbox
 
         index = self.git.run(root, "rev-parse", "--git-path", "index").stdout.strip()
+        extra = environment or {}
         environment = check_sandbox.check_environment(os.environ, cache_root=checks.cache_root)
         environment.update({
             "GIT_INDEX_FILE": str((root / index).resolve()),
+            **extra,
             "GIT_EDITOR": ":",
             "GIT_TERMINAL_PROMPT": "0",
             "GIT_ALLOW_PROTOCOL": ALLOWED_GIT_PROTOCOLS,
@@ -942,6 +945,7 @@ class WorkspaceManager:
         # Local tasks may use linked worktrees the user created independently.
         task_owned = workspace_kind == WorkspaceKind.git_worktree and directories.private != directories.common
         before = directories.snapshot()
+        result, failure = None, None
         try:
             result = check_sandbox.run_sandboxed(
                 argv,
@@ -953,35 +957,61 @@ class WorkspaceManager:
                 timeout=check_sandbox.HOOK_TIMEOUT_SECONDS,
             )
         except subprocess.TimeoutExpired as exc:
-            raise WorkspaceError(f"{label} did not finish in time") from exc
+            failure = WorkspaceError(f"{label} did not finish in time")
+            failure.__cause__ = exc
         except OSError as exc:
-            raise WorkspaceError(f"{label} could not run: {exc}") from exc
-        finally:
-            # However the step ended, a new control file must not reach the
-            # next host-side Git command, where it would run code outside the
-            # sandbox. A task worktree's own Git directory has no other
-            # writer, so what appears there is removed. Anywhere else Cowork
-            # cannot tell who made it, so it stops and leaves it in place.
-            planted, added_refs = directories.left_behind(before)
-            if task_owned:
-                for planted_path in planted:
-                    if planted_path.is_dir() and not planted_path.is_symlink():
-                        force_remove(planted_path)
-                    else:
-                        planted_path.unlink(missing_ok=True)
-            # Also on failure: a formatter's stash may already name them.
-            self._keep_new_objects(root, new_objects)
-        if planted and task_owned:
-            raise WorkspaceError(f"{label} tried to change Git's configuration, so nothing was committed")
+            failure = WorkspaceError(f"{label} could not run: {exc}")
+            failure.__cause__ = exc
+        # However the step ended, a new control file must not reach a
+        # host-side Git command, where it would run code outside the sandbox.
+        # A task worktree's own Git directory has no other writer, so what
+        # appears there is removed. Anywhere else Cowork cannot tell who made
+        # it, so it leaves it in place and stops before running Git again.
+        planted, added_refs = directories.left_behind(before)
+        if task_owned:
+            for planted_path in planted:
+                if planted_path.is_dir() and not planted_path.is_symlink():
+                    force_remove(planted_path)
+                else:
+                    planted_path.unlink(missing_ok=True)
         unexplained = sorted(str(path) for path in added_refs | (set() if task_owned else planted))
         if unexplained:
             raise WorkspaceError(
                 f"Git files appeared while {label.lower()} ran, so nothing was committed: {', '.join(unexplained)}. "
                 "Cowork left them in place. Remove any you didn't create, then commit again."
-            )
+            ) from failure
+        # Also after a failure: a formatter's stash may already name them.
+        self._keep_new_objects(root, new_objects)
+        if planted:
+            raise WorkspaceError(f"{label} tried to change Git's configuration, so nothing was committed") from failure
+        if failure is not None:
+            raise failure
         if result.returncode != 0:
             output = "\n".join(part.strip() for part in (result.stdout, result.stderr) if part.strip())
             raise WorkspaceError((f"{label} failed" + (f":\n{output}" if output else ""))[:4_000])
+
+    def _add(self, root: Path, *args: str, environment: dict[str, str] | None = None) -> None:
+        """Stage files outside a commit.
+
+        A filter script in the task is code the agent can edit, so with one
+        configured the staging runs sandboxed with the filter in place. Host
+        Git would have to switch the filter off, which fails a required one.
+        """
+        scripted, _ = self.git._filter_settings(self.git._working_directory(root))
+        if not scripted:
+            self.git.run(root, "add", *args, environment=environment)
+            return
+        from cowork.coding.check_sandbox import CheckPolicy
+
+        # No task is at hand here, so this is the narrowest policy that can stage.
+        policy = CheckPolicy.for_task(PermissionMode.workspace, False, sandbox_home=self.root / "check-sandbox")
+        with tempfile.TemporaryDirectory(prefix="cowork-stage-", ignore_cleanup_errors=True) as scratch:
+            new_objects = Path(scratch).resolve() / "objects"
+            new_objects.mkdir()
+            self._run_sandboxed_git_step(
+                root, policy, "Staging", ["git", *_platform_config_args(), "add", *args], [root], None, new_objects,
+                environment=environment,
+            )
 
     def _keep_new_objects(self, root: Path, new_objects: Path) -> None:
         """Copy the objects a sandboxed step wrote into the repository.
@@ -1320,6 +1350,23 @@ class WorkspaceManager:
             if not any(part in _SELF_REBUILDING_CACHES for part in PurePosixPath(path.rstrip("/")).parts)
         ]
 
+    def _write_tree(self, root: Path, index: Path) -> str:
+        """Write an index as a tree without reading the working files.
+
+        Writing an index makes Git re-read any file whose timestamp matches
+        it, through the repository's filters. From an empty folder Git finds
+        no such file, so no filter runs on the host. It works on a copy,
+        because that rewrite would also make Git stop re-checking those
+        files, and a later status or staging could then miss an edit.
+        """
+        git_dir = self.git.run(root, "rev-parse", "--absolute-git-dir").stdout.strip()
+        with tempfile.TemporaryDirectory(prefix="cowork-tree-", ignore_cleanup_errors=True) as scratch:
+            copy, neutral = Path(scratch) / "index", Path(scratch) / "empty"
+            neutral.mkdir()
+            if index.is_file():
+                shutil.copy2(index, copy)
+            return self.git.run(neutral, "write-tree", environment={"GIT_DIR": git_dir, "GIT_INDEX_FILE": str(copy)}).stdout.strip()
+
     def _save_worktree_state(self, worktree: Path, head: str) -> tuple[str, str]:
         """Commit the staged state and the working files without touching the task's index.
 
@@ -1337,12 +1384,12 @@ class WorkspaceManager:
             if index_path.is_file():
                 shutil.copy2(index_path, private)
             environment = {"GIT_INDEX_FILE": str(private), "GIT_OPTIONAL_LOCKS": "0", **identity}
-            index_tree = self.git.run(worktree, "write-tree", environment=environment).stdout.strip()
+            index_tree = self._write_tree(worktree, private)
             index_commit = self.git.run(
                 worktree, "commit-tree", index_tree, "-p", head, "-m", "Cowork: staged changes", environment=environment,
             ).stdout.strip()
-            self.git.run(worktree, "add", "--all", "--", ".", environment=environment)
-            files_tree = self.git.run(worktree, "write-tree", environment=environment).stdout.strip()
+            self._add(worktree, "--all", "--", ".", environment=environment)
+            files_tree = self._write_tree(worktree, private)
             files_commit = self.git.run(
                 worktree, "commit-tree", files_tree, "-p", index_commit, "-m", "Cowork: working files",
                 environment=environment,

@@ -356,8 +356,9 @@ def test_what_a_step_plants_in_a_task_worktree_is_removed_however_it_ends(
     assert git(worktree, "log", "-1", "--format=%s") == "base"
 
 
+@pytest.mark.parametrize("outcome", [0, 1, subprocess.TimeoutExpired(["hook"], 3)])
 def test_a_control_file_in_a_local_folder_is_reported_and_left_in_place(
-    tmp_path: Path, checks: CheckPolicy, monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path, checks: CheckPolicy, monkeypatch: pytest.MonkeyPatch, outcome,
 ) -> None:
     # A local folder's Git directory is the person's repository; another tool
     # may have written there at the same moment.
@@ -365,11 +366,24 @@ def test_a_control_file_in_a_local_folder_is_reported_and_left_in_place(
 
     repo = repository(tmp_path / "repo")
     (repo / "README.md").write_text("changed\n", encoding="utf-8")
-    monkeypatch.setattr(check_sandbox, "run_sandboxed", plant_then(0))
+    monkeypatch.setattr(check_sandbox, "run_sandboxed", plant_then(outcome))
+    manager = WorkspaceManager(tmp_path / "root")
+    host_git = []
+    real_run = manager.git.run
+    monkeypatch.setattr(manager, "_keep_new_objects", lambda *_args: host_git.append("objects"))
+
+    def record(cwd, *args, **kwargs):
+        if (repo / ".git" / "config.worktree").exists():
+            host_git.append(args)
+        return real_run(cwd, *args, **kwargs)
+
+    monkeypatch.setattr(manager.git, "run", record)
 
     with pytest.raises(WorkspaceError, match="Cowork left them in place"):
-        WorkspaceManager(tmp_path / "root").commit(str(repo), "Change", checks)
+        manager.commit(str(repo), "Change", checks)
 
+    # Host Git must not run against a repository holding a file Cowork can't vouch for.
+    assert host_git == []
     assert (repo / ".git" / "config.worktree").exists()
     assert git(repo, "log", "-1", "--format=%s") == "base"
 
@@ -850,3 +864,47 @@ def test_a_hook_cannot_remove_history_other_checkouts_share(tmp_path: Path, chec
     assert sorted(path.name for path in (objects / "pack").iterdir()) == before
     assert not state.dirty and git(worktree, "log", "-1", "--format=%s") == "Change"
     git(repo, "fsck", "--no-dangling")
+
+
+@requires_sandbox
+def test_a_required_filter_in_the_task_can_stage_and_be_saved_for_release(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repo = repository(tmp_path / "repo")
+    script = repo / "tools" / "clean.sh"
+    script.parent.mkdir()
+    script.write_text('#!/bin/sh\nprintf "%s" "${COWORK_TEST_SECRET:-hidden}" > "$(dirname "$0")/seen"\ntr a-z A-Z\n', encoding="utf-8")
+    script.chmod(script.stat().st_mode | stat.S_IXUSR)
+    (repo / ".gitattributes").write_text("*.txt filter=upper\n", encoding="utf-8")
+    git(repo, "config", "filter.upper.clean", "./tools/clean.sh")
+    git(repo, "config", "filter.upper.required", "true")
+    (repo / "note.txt").write_text("one\n", encoding="utf-8")
+    monkeypatch.setenv("COWORK_TEST_SECRET", "server-only")
+    manager = WorkspaceManager(tmp_path / "root")
+
+    manager.review_file_action(str(repo), "note.txt", "stage")
+    _index, files = manager._save_worktree_state(repo, git(repo, "rev-parse", "HEAD"))
+
+    assert git(repo, "show", ":note.txt") == "ONE"
+    assert git(repo, "show", f"{files}:note.txt") == "ONE"
+    assert (script.parent / "seen").read_text(encoding="utf-8") == "hidden"
+
+
+def test_an_edit_made_right_after_staging_is_still_reported(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # Same size, same second: Git can only tell by re-reading the file, which
+    # it stops doing if recording the commit rewrites the index.
+    repo = repository(tmp_path / "repo")
+    (repo / "README.md").write_text("task\n", encoding="utf-8")
+    manager = WorkspaceManager(tmp_path / "root")
+    record = manager._record_commit
+
+    def edit_then_record(root, message):
+        (repo / "README.md").write_text("late\n", encoding="utf-8")
+        record(root, message)
+
+    monkeypatch.setattr(manager, "_record_commit", edit_then_record)
+
+    state = manager.commit(str(repo), "Change")
+
+    assert git(repo, "show", "HEAD:README.md") == "task"
+    assert state.dirty
