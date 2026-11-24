@@ -1,0 +1,343 @@
+# An artifact journal written by cowork-server at staging dc0fcd42, before
+# its records had models, for tests/test_artifact_revision_journal_compat.py.
+# Each later build must read it, answer as dc0fcd42 did, and write back each
+# record it changes with the same keys.
+#
+# Written through dc0fcd42's own calls: current_source (a system capture),
+# save_source (a manual edit), create_agent_repair then cancel_agent_repair
+# (repair `cancelled`), create_agent_repair then capture_agent_revision after
+# an agent edit (repair `ready`), write_journal_file (comments.json),
+# enable_draft_review (the grant), and a save the process died in: its blob,
+# pending-source-write.json and source landed, the manifest didn't.
+#
+# `artifact` holds the folder's own files, `journal` its `.revisions` tree,
+# and `expected` what dc0fcd42 answered on a copy: list_revisions (which
+# finishes the pending save first), revision_with_content for each revision,
+# active_agent_repair, agent_repair_detail for the ready repair, and
+# draft_review_grant.
+
+ids:
+  cancelled_repair: a74c8086-19cb-4982-adf2-c8d3d63d9ab5
+  ready_repair: f0ee20a9-6949-4673-9c55-038cf0e11ca3
+  pending_revision: 5b73e5aa-5688-41bf-85e6-ad3bd5271f63
+artifact:
+  metadata.json: |
+    {
+      "id": "a1b2c3d455b35c158a3eb604d329d24d",
+      "slug": "report",
+      "name": "Report",
+      "type": "document",
+      "primary": "brief.md"
+    }
+  brief.md: |
+    # Owner edit
+journal:
+  blobs/797e649f79050c5aae111c0f55d82376a57d7b3a227af67be93c3158c2e1999f: |
+    # Second
+  blobs/9deb94158e91742ee59a098729128779da85eef76b28890b6c0cb64401537a29: |
+    # First
+  blobs/df5b8da383eb4d64fc0d37bd110d244735a856c92a1b5f55b0c45259fd19745a: |
+    # Owner edit
+  blobs/fdbb79475d0ab829ce6aae69001df3889e198b5ceca239a48d25c541be3c9f44: |
+    # Agent fix
+  comments.json: |-
+    [
+      {
+        "id": "thread-2",
+        "status": "open",
+        "body": "Say what changed"
+      }
+    ]
+  draft-review.json: |-
+    {
+      "version": 1,
+      "scope": "organization",
+      "orgId": "org-1",
+      "enabledBy": "alice",
+      "enabledAt": "2026-11-02T17:39:21+00:00"
+    }
+  manifest.json: |
+    {
+      "version": 1,
+      "revisions": [
+        {
+          "id": "f064c53a-8dd7-4e1f-82b1-68af2f0ce9fa",
+          "number": 1,
+          "artifactId": "a1b2c3d455b35c158a3eb604d329d24d",
+          "path": "brief.md",
+          "createdAt": "2026-11-02T17:39:21+00:00",
+          "actor": {
+            "kind": "system",
+            "id": null
+          },
+          "summary": "Captured current draft",
+          "baseRevisionId": null,
+          "contentHash": "9deb94158e91742ee59a098729128779da85eef76b28890b6c0cb64401537a29",
+          "bytes": 8,
+          "conversationId": null,
+          "commentThreadIds": []
+        },
+        {
+          "id": "5d0592bd-23ed-458b-9b2f-6eed8708f33c",
+          "number": 2,
+          "artifactId": "a1b2c3d455b35c158a3eb604d329d24d",
+          "path": "brief.md",
+          "createdAt": "2026-11-02T17:39:21+00:00",
+          "actor": {
+            "kind": "manual",
+            "id": "alice"
+          },
+          "summary": "Edited artifact",
+          "baseRevisionId": "f064c53a-8dd7-4e1f-82b1-68af2f0ce9fa",
+          "contentHash": "797e649f79050c5aae111c0f55d82376a57d7b3a227af67be93c3158c2e1999f",
+          "bytes": 9,
+          "conversationId": null,
+          "commentThreadIds": []
+        },
+        {
+          "id": "c30e685b-7258-48a1-b804-932c7b8ded57",
+          "number": 3,
+          "artifactId": "a1b2c3d455b35c158a3eb604d329d24d",
+          "path": "brief.md",
+          "createdAt": "2026-11-02T17:39:21+00:00",
+          "actor": {
+            "kind": "agent",
+            "id": null
+          },
+          "summary": "Agent updated artifact",
+          "baseRevisionId": "5d0592bd-23ed-458b-9b2f-6eed8708f33c",
+          "contentHash": "fdbb79475d0ab829ce6aae69001df3889e198b5ceca239a48d25c541be3c9f44",
+          "bytes": 12,
+          "conversationId": "turn-2",
+          "commentThreadIds": [
+            "thread-2"
+          ]
+        }
+      ]
+    }
+  pending-source-write.json: |
+    {
+      "version": 1,
+      "path": "brief.md",
+      "beforeContentHash": "fdbb79475d0ab829ce6aae69001df3889e198b5ceca239a48d25c541be3c9f44",
+      "revision": {
+        "id": "5b73e5aa-5688-41bf-85e6-ad3bd5271f63",
+        "number": 4,
+        "artifactId": "a1b2c3d455b35c158a3eb604d329d24d",
+        "path": "brief.md",
+        "createdAt": "2026-11-02T17:39:21+00:00",
+        "actor": {
+          "kind": "manual",
+          "id": "alice"
+        },
+        "summary": "Edited artifact",
+        "baseRevisionId": "c30e685b-7258-48a1-b804-932c7b8ded57",
+        "contentHash": "df5b8da383eb4d64fc0d37bd110d244735a856c92a1b5f55b0c45259fd19745a",
+        "bytes": 13,
+        "conversationId": null,
+        "commentThreadIds": []
+      }
+    }
+  repairs/a74c8086-19cb-4982-adf2-c8d3d63d9ab5.json: |
+    {
+      "id": "a74c8086-19cb-4982-adf2-c8d3d63d9ab5",
+      "artifactId": "a1b2c3d455b35c158a3eb604d329d24d",
+      "path": "brief.md",
+      "baseRevisionId": "5d0592bd-23ed-458b-9b2f-6eed8708f33c",
+      "baseContentHash": "797e649f79050c5aae111c0f55d82376a57d7b3a227af67be93c3158c2e1999f",
+      "commentThreadId": "thread-1",
+      "selector": "h1",
+      "thread": [
+        {
+          "id": "c1",
+          "author": "alice",
+          "body": "A shorter title"
+        }
+      ],
+      "conversationId": "turn-1",
+      "status": "cancelled",
+      "revisionId": null,
+      "createdAt": "2026-11-02T17:39:21+00:00",
+      "updatedAt": "2026-11-02T17:39:21+00:00"
+    }
+  repairs/f0ee20a9-6949-4673-9c55-038cf0e11ca3.json: |
+    {
+      "id": "f0ee20a9-6949-4673-9c55-038cf0e11ca3",
+      "artifactId": "a1b2c3d455b35c158a3eb604d329d24d",
+      "path": "brief.md",
+      "baseRevisionId": "5d0592bd-23ed-458b-9b2f-6eed8708f33c",
+      "baseContentHash": "797e649f79050c5aae111c0f55d82376a57d7b3a227af67be93c3158c2e1999f",
+      "commentThreadId": "thread-2",
+      "selector": null,
+      "thread": [
+        {
+          "id": "c2",
+          "author": "alice",
+          "body": "Say what changed"
+        }
+      ],
+      "conversationId": "turn-2",
+      "status": "ready",
+      "revisionId": "c30e685b-7258-48a1-b804-932c7b8ded57",
+      "createdAt": "2026-11-02T17:39:21+00:00",
+      "updatedAt": "2026-11-02T17:39:21+00:00"
+    }
+expected:
+  revisions:
+  - id: 5b73e5aa-5688-41bf-85e6-ad3bd5271f63
+    number: 4
+    artifactId: a1b2c3d455b35c158a3eb604d329d24d
+    path: brief.md
+    createdAt: '2026-11-02T17:39:21+00:00'
+    actor:
+      kind: manual
+      id: alice
+    summary: Edited artifact
+    baseRevisionId: c30e685b-7258-48a1-b804-932c7b8ded57
+    contentHash: df5b8da383eb4d64fc0d37bd110d244735a856c92a1b5f55b0c45259fd19745a
+    bytes: 13
+    conversationId: null
+    commentThreadIds: []
+  - id: c30e685b-7258-48a1-b804-932c7b8ded57
+    number: 3
+    artifactId: a1b2c3d455b35c158a3eb604d329d24d
+    path: brief.md
+    createdAt: '2026-11-02T17:39:21+00:00'
+    actor:
+      kind: agent
+      id: null
+    summary: Agent updated artifact
+    baseRevisionId: 5d0592bd-23ed-458b-9b2f-6eed8708f33c
+    contentHash: fdbb79475d0ab829ce6aae69001df3889e198b5ceca239a48d25c541be3c9f44
+    bytes: 12
+    conversationId: turn-2
+    commentThreadIds:
+    - thread-2
+  - id: 5d0592bd-23ed-458b-9b2f-6eed8708f33c
+    number: 2
+    artifactId: a1b2c3d455b35c158a3eb604d329d24d
+    path: brief.md
+    createdAt: '2026-11-02T17:39:21+00:00'
+    actor:
+      kind: manual
+      id: alice
+    summary: Edited artifact
+    baseRevisionId: f064c53a-8dd7-4e1f-82b1-68af2f0ce9fa
+    contentHash: 797e649f79050c5aae111c0f55d82376a57d7b3a227af67be93c3158c2e1999f
+    bytes: 9
+    conversationId: null
+    commentThreadIds: []
+  - id: f064c53a-8dd7-4e1f-82b1-68af2f0ce9fa
+    number: 1
+    artifactId: a1b2c3d455b35c158a3eb604d329d24d
+    path: brief.md
+    createdAt: '2026-11-02T17:39:21+00:00'
+    actor:
+      kind: system
+      id: null
+    summary: Captured current draft
+    baseRevisionId: null
+    contentHash: 9deb94158e91742ee59a098729128779da85eef76b28890b6c0cb64401537a29
+    bytes: 8
+    conversationId: null
+    commentThreadIds: []
+  contents:
+    5b73e5aa-5688-41bf-85e6-ad3bd5271f63: |
+      # Owner edit
+    c30e685b-7258-48a1-b804-932c7b8ded57: |
+      # Agent fix
+    5d0592bd-23ed-458b-9b2f-6eed8708f33c: |
+      # Second
+    f064c53a-8dd7-4e1f-82b1-68af2f0ce9fa: |
+      # First
+  active_repair:
+    id: f0ee20a9-6949-4673-9c55-038cf0e11ca3
+    artifactId: a1b2c3d455b35c158a3eb604d329d24d
+    path: brief.md
+    baseRevisionId: 5d0592bd-23ed-458b-9b2f-6eed8708f33c
+    baseContentHash: 797e649f79050c5aae111c0f55d82376a57d7b3a227af67be93c3158c2e1999f
+    commentThreadId: thread-2
+    selector: null
+    thread:
+    - id: c2
+      author: alice
+      body: Say what changed
+    conversationId: turn-2
+    status: ready
+    revisionId: c30e685b-7258-48a1-b804-932c7b8ded57
+    createdAt: '2026-11-02T17:39:21+00:00'
+    updatedAt: '2026-11-02T17:39:21+00:00'
+    superseded: true
+  repair_detail:
+    repair:
+      id: f0ee20a9-6949-4673-9c55-038cf0e11ca3
+      artifactId: a1b2c3d455b35c158a3eb604d329d24d
+      path: brief.md
+      baseRevisionId: 5d0592bd-23ed-458b-9b2f-6eed8708f33c
+      baseContentHash: 797e649f79050c5aae111c0f55d82376a57d7b3a227af67be93c3158c2e1999f
+      commentThreadId: thread-2
+      selector: null
+      thread:
+      - id: c2
+        author: alice
+        body: Say what changed
+      conversationId: turn-2
+      status: ready
+      revisionId: c30e685b-7258-48a1-b804-932c7b8ded57
+      createdAt: '2026-11-02T17:39:21+00:00'
+      updatedAt: '2026-11-02T17:39:21+00:00'
+      superseded: true
+    compare:
+      before:
+        id: 5d0592bd-23ed-458b-9b2f-6eed8708f33c
+        number: 2
+        artifactId: a1b2c3d455b35c158a3eb604d329d24d
+        path: brief.md
+        createdAt: '2026-11-02T17:39:21+00:00'
+        actor:
+          kind: manual
+          id: alice
+        summary: Edited artifact
+        baseRevisionId: f064c53a-8dd7-4e1f-82b1-68af2f0ce9fa
+        contentHash: 797e649f79050c5aae111c0f55d82376a57d7b3a227af67be93c3158c2e1999f
+        bytes: 9
+        conversationId: null
+        commentThreadIds: []
+        content: |
+          # Second
+      after:
+        id: c30e685b-7258-48a1-b804-932c7b8ded57
+        number: 3
+        artifactId: a1b2c3d455b35c158a3eb604d329d24d
+        path: brief.md
+        createdAt: '2026-11-02T17:39:21+00:00'
+        actor:
+          kind: agent
+          id: null
+        summary: Agent updated artifact
+        baseRevisionId: 5d0592bd-23ed-458b-9b2f-6eed8708f33c
+        contentHash: fdbb79475d0ab829ce6aae69001df3889e198b5ceca239a48d25c541be3c9f44
+        bytes: 12
+        conversationId: turn-2
+        commentThreadIds:
+        - thread-2
+        content: |
+          # Agent fix
+  grant:
+    version: 1
+    scope: organization
+    orgId: org-1
+    enabledBy: alice
+    enabledAt: '2026-11-02T17:39:21+00:00'
+
+# Values dc0fcd42 also wrote that the journal above doesn't hold. Rejecting a
+# repair the agent's code planted saved its commentThreadId as is in the
+# rejection's revision, in the pending write and then the manifest, even when
+# it was null or not text.
+planted_thread_rejections:
+  - id: no-thread
+    commentThreadIds: [null]
+  - id: thread-as-a-number
+    commentThreadIds: [5]
+  - id: thread-as-true
+    commentThreadIds: [true]

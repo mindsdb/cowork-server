@@ -1,0 +1,20 @@
+{
+  "description": "POST {router}/sessions/{id}/decline, sent with the person's own credential when they skip a step the browser held, and the router's answer. The router drops the held step and any approval already recorded for it, and answers the same for a pending id it no longer holds.",
+  "examples": {
+    "decline a held step": {
+      "where": "POST /sessions/{id}/decline",
+      "kind": "request",
+      "body": {
+        "pending_id": "pa-0123456789abcdef01234567"
+      }
+    },
+    "declined": {
+      "where": "POST /sessions/{id}/decline",
+      "kind": "response",
+      "status": 200,
+      "body": {
+        "declined": true
+      }
+    }
+  }
+}

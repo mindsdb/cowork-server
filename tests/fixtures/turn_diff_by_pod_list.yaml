@@ -1,0 +1,18 @@
+# Cases for tests/test_turn_diff_by_pod_list.py.
+
+# Names a pod's artifacts_touched list can carry that are not one artifact
+# folder directly below the artifacts base. The test makes `link`, a link to
+# a folder outside the base, and `linkmeta`, a folder whose metadata.json
+# links to that folder's, and adds the outside folder's absolute path. The
+# diff claims none of them, and writes nothing outside the base.
+hostile_names:
+  - "../outside"
+  - "../../proj/.anton/outside"
+  - "a\0b"
+  - link
+  - linkmeta
+  - "."
+  - ".."
+  - ""
+  - "good/"
+  - "good\\x"

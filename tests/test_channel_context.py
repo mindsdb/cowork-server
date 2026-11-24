@@ -11,7 +11,7 @@ from types import SimpleNamespace
 
 import cowork.services.artifact_autopublish as autopublish
 import cowork.services.task_objects as task_objects
-from cowork.harnesses.anton_harness.harness import AntonHarness, _turn_style_context
+from cowork.harnesses.anton_harness.harness import AntonHarness, BuiltChatSession, _turn_style_context
 from cowork.harnesses.base import ChannelContext
 
 UI_LEAD = (
@@ -99,7 +99,6 @@ class _FakeSession:
 
 def test_stream_response_forwards_channel_context(monkeypatch):
     monkeypatch.setattr(task_objects, "snapshot_artifact_state", lambda *_a, **_k: (set(), {}))
-    monkeypatch.setattr(task_objects, "index_turn_artifacts", lambda *_a, **_k: ([], set(), None))
     monkeypatch.setattr(task_objects, "cards_for_slugs", lambda *_a, **_k: [])
 
     async def _no_autopublish(*_a, **_k):
@@ -110,10 +109,10 @@ def test_stream_response_forwards_channel_context(monkeypatch):
 
     async def _fake_build(
         self, conversation, model=None, reasoning_effort=None, disabled_connections=None, channel_context=None,
-        tool_messages=False,
+        tool_messages=False, interactive=True, ui_locale=None,
     ):
         received["channel_context"] = channel_context
-        return _FakeSession(), None, None
+        return BuiltChatSession(session=_FakeSession(), turn_scratch_dir=None, seed_info=None, learns=True)
 
     monkeypatch.setattr(AntonHarness, "_build_chat_session", _fake_build)
     conversation = SimpleNamespace(

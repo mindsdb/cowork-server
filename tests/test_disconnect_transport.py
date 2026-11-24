@@ -220,7 +220,7 @@ async def test_disconnect_after_admission_before_the_first_frame_cancels(transpo
     before_created = asyncio.Event()
 
     class BeforeCreated(PausedHarness):
-        async def formatter(self, stream, model, event_sink):
+        async def formatter(self, stream, model, event_sink, **_kwargs):
             before_created.set()
             await asyncio.Event().wait()
             yield "unreachable"
@@ -362,7 +362,7 @@ async def test_disconnect_stops_a_real_executing_scratchpad_cell_within_ten_seco
     from anton.core.backends.manager import ScratchpadManager
 
     from cowork.common.chat_session import drain_scratchpad_closes
-    from cowork.harnesses.anton_harness.harness import AntonHarness
+    from cowork.harnesses.anton_harness.harness import AntonHarness, BuiltChatSession
 
     server = transport_server
     conversation_id = str(uuid4())
@@ -397,7 +397,7 @@ async def test_disconnect_stops_a_real_executing_scratchpad_cell_within_ten_seco
             yield "unreachable"
 
     async def build_session(self, conversation, **_kwargs):
-        return CellSession(), None, None
+        return BuiltChatSession(session=CellSession(), turn_scratch_dir=None, seed_info=None, learns=True)
 
     monkeypatch.setattr(AntonHarness, "_build_chat_session", build_session)
     monkeypatch.setattr(responses_mod, "get_harness", lambda _name: AntonHarness())

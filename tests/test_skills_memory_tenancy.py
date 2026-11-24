@@ -172,12 +172,12 @@ async def test_global_memory_isolated_per_org(memory_env):
     a = _memory_service(engine, _org(ORG_A))
     b = _memory_service(engine, _org(ORG_B))
 
-    await a.update_memory(scope="global", category="rules", content="A's rules")
-    assert (await a.get_memory(scope="global", category="rules")).content.strip() == "A's rules"
+    a.update_memory_sync(scope="global", category="rules", content="A's rules")
+    assert a.get_memory_sync(scope="global", category="rules").content.strip() == "A's rules"
     # org B sees empty, and its write doesn't touch A's file
-    assert (await b.get_memory(scope="global", category="rules")).content.strip() == ""
-    await b.update_memory(scope="global", category="rules", content="B's rules")
-    assert (await a.get_memory(scope="global", category="rules")).content.strip() == "A's rules"
+    assert b.get_memory_sync(scope="global", category="rules").content.strip() == ""
+    b.update_memory_sync(scope="global", category="rules", content="B's rules")
+    assert a.get_memory_sync(scope="global", category="rules").content.strip() == "A's rules"
     # on disk: two distinct org-keyed files
     assert (_global_dir(root, ORG_A) / "rules.md").is_file()
     assert (_global_dir(root, ORG_B) / "rules.md").is_file()
@@ -187,7 +187,7 @@ async def test_global_memory_isolated_per_org(memory_env):
 async def test_global_memory_local_mode_unchanged(memory_env):
     engine, root = memory_env
     local = _memory_service(engine, LOCAL_SCOPE)
-    await local.update_memory(scope="global", category="rules", content="local rules")
+    local.update_memory_sync(scope="global", category="rules", content="local rules")
     assert (root / "memory" / "rules.md").is_file()   # no org segment
 
 
@@ -292,7 +292,7 @@ def test_inprocess_harness_memory_root_is_user_keyed(memory_env):
 async def test_turn_memory_payload_is_org_scoped(memory_env, tmp_path):
     from cowork.services.memory import build_turn_memory
     engine, _ = memory_env
-    await _memory_service(engine, _org(ORG_A)).update_memory(
+    _memory_service(engine, _org(ORG_A)).update_memory_sync(
         scope="global", category="rules", content="A's rules")
 
     project = tmp_path / "proj-a"
@@ -445,11 +445,11 @@ async def test_global_memory_is_not_shared_between_teammates(memory_env):
     alice = _memory_service(engine, _org(ORG_A, "alice"))
     bob = _memory_service(engine, _org(ORG_A, "bob"))
 
-    await alice.update_memory(scope="global", category="profile", content="Name: Alice")
-    assert (await bob.get_memory(scope="global", category="profile")).content.strip() == ""
+    alice.update_memory_sync(scope="global", category="profile", content="Name: Alice")
+    assert bob.get_memory_sync(scope="global", category="profile").content.strip() == ""
 
-    await bob.update_memory(scope="global", category="profile", content="Name: Bob")
-    assert (await alice.get_memory(scope="global", category="profile")).content.strip() == "Name: Alice"
+    bob.update_memory_sync(scope="global", category="profile", content="Name: Bob")
+    assert alice.get_memory_sync(scope="global", category="profile").content.strip() == "Name: Alice"
 
     assert (_global_dir(root, ORG_A, "alice") / "profile.md").is_file()
     assert (_global_dir(root, ORG_A, "bob") / "profile.md").is_file()
@@ -463,10 +463,10 @@ async def test_project_memory_is_shared_between_teammates(memory_env, tmp_path):
 
     alice = _memory_service(engine, _org(ORG_A, "alice"))
     bob = _memory_service(engine, _org(ORG_A, "bob"))
-    await alice.update_memory(
+    alice.update_memory_sync(
         scope="project", category="rules", content="Deploy on green only", project_id=project)
 
-    got = await bob.get_memory(scope="project", category="rules", project_id=project)
+    got = bob.get_memory_sync(scope="project", category="rules", project_id=project)
     assert got.content.strip() == "Deploy on green only"
 
 

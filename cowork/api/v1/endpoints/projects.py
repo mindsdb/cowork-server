@@ -1,11 +1,16 @@
+import logging
+import os
+from collections.abc import Mapping
 from contextlib import ExitStack
+from functools import partial
 from pathlib import Path
 from uuid import UUID, uuid4
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 
 from cowork.api.v1.permissions import AuthenticatedInOrgMode, require
-from cowork.db.scoped import ScopedSessionDep
+from cowork.db.scoped import ScopedSession, TenantScopeDep
+from cowork.db.units import run_db, run_efs_unit
 from cowork.harnesses.memory.registry import MemorySlot
 from cowork.harnesses.memory.store import PROJECT_SLOTS, ProjectMemoryStore
 from cowork.models.project import Project
@@ -31,20 +36,24 @@ from cowork.services.shared_resources import (
     PROJECT_MEMORY,
     SKILL,
     SKILL_PROJECT_REFERENCES,
+    AttributionSnapshot,
     ResourceDeletion,
     SharedResourceAccess,
     project_memory_resource_key,
     project_resource_key,
 )
 from cowork.services.skills import SkillService
+from cowork.services.shared_projects import SharedProjectFiles
 
 
-# AuthenticatedInOrgMode, declared explicitly: ScopedSessionDep already fails
+# AuthenticatedInOrgMode, declared explicitly: a ScopedSession already fails
 # closed on its own (MissingTenantScopeError -> 401, cowork/db/scoped.py)
 # whenever org mode has no org in scope. Declaring it too makes the
 # requirement visible to a route walker instead of something only
 # discoverable by reading scoped.py.
 router = APIRouter(dependencies=[Depends(require(AuthenticatedInOrgMode))])
+
+logger = logging.getLogger(__name__)
 
 
 def _project_memory_slot_has_content(
@@ -207,24 +216,40 @@ def _guard_project_memory_for_move(
         )
 
 
-def _project_response(project: Project, access: SharedResourceAccess) -> dict:
+def _project_response(
+    project: Project,
+    access: SharedResourceAccess,
+    *,
+    snapshots: Mapping[str, AttributionSnapshot] | None = None,
+) -> dict:
+    """One project as the API returns it.
+
+    ``snapshots`` is every project attribution row, as a listing reads them
+    once (SharedResourceAccess.snapshots); without it, this reads the one row.
+    """
     key = project_resource_key(project.id)
-    if access.org_mode and access.has_trusted_actor:
+    snapshot = access.listed_snapshot(PROJECT, key, snapshots)
+    if (
+        access.org_mode
+        and access.has_trusted_actor
+        and snapshot is not None
+        and snapshot.may_be_recoverable()
+    ):
         access.recover_stale_claim(
             PROJECT,
             key,
             resource_exists=lambda: access.session.get(Project, project.id) is not None,
         )
-    pending = access.claim_is_pending(PROJECT, key)
+        snapshot = access.snapshot(PROJECT, key)
+    pending = snapshot is not None and snapshot.pending
     creator_id = project.created_by
     is_general = project.name == GENERAL_PROJECT
     can_change = not pending and not is_general and access.can_change(creator_id)
     directory_is_external = ProjectService(access.session).directory_is_external(project)
     return {
         **project.model_dump(),
-        "attribution": access.attribution(
-            PROJECT,
-            key,
+        "attribution": access.attribution_of(
+            snapshot,
             fallback_creator_id=project.created_by,
             fallback_modified_at=project.modified_at,
         ),
@@ -240,19 +265,50 @@ def _project_response(project: Project, access: SharedResourceAccess) -> dict:
 
 
 @router.get("/", response_model=list[ProjectResponse])
-def list_projects(
-    session: ScopedSessionDep,
+async def list_projects(
+    scope: TenantScopeDep,
     principal: Principal | None = Depends(get_principal),
 ):
+    # In org tenancy, once the org's general row exists, the listing reads rows
+    # only: a database unit, which file store slots held by stuck artifact
+    # lookups cannot refuse, and which a stuck mount cannot hold. The org's
+    # first listing makes the general folder, which is file store work.
+    listed = await run_db(partial(_list_projects, principal=principal), scope=scope)
+    if listed is None:
+        listed = await run_efs_unit(partial(_list_projects, principal=principal, provision=True), scope=scope)
+    return listed
+
+
+def _list_projects(
+    session: ScopedSession,
+    *,
+    principal: Principal | None,
+    provision: bool = False,
+) -> list[dict | ProjectResponse] | None:
+    # None in org tenancy when the org has no general project yet and
+    # `provision` is off: making it is file store work, which a database unit
+    # must not do. Outside org tenancy the general project's folder is on a
+    # local disk, so it is checked here as before.
     service = ProjectService(session)
-    # Bootstrap site: adopt the seeded GENERAL project into this org before
-    # the first listing (no-op in local mode / once claimed).
-    service.ensure_general_for_scope()
+    if provision or not session.scope.org_mode:
+        # Bootstrap site: adopt the seeded GENERAL project into this org before
+        # the first listing (no-op in local mode / once claimed).
+        service.ensure_general_for_scope()
+    elif service.get_project_by_name_or_none(GENERAL_PROJECT) is None:
+        return None
     access = SharedResourceAccess(session, principal)
-    return [_project_response(project, access) for project in service.list_projects()]
+    projects = service.list_visible_projects()
+    # Read after the projects: create_project commits its claim
+    # (SharedResourceAccess.reserve_claim) before ProjectService.create_project
+    # commits the project row, so every listed project's claim is in this read.
+    snapshots = access.snapshots(PROJECT)
+    owned = [
+        _project_response(project, access, snapshots=snapshots) for project in projects
+    ]
+    return [*owned, *SharedProjectFiles(session).list_projects()]
 
 
-def require_local_for_chosen_folder(
+async def require_local_for_chosen_folder(
     body: ProjectCreateRequest, request: Request
 ) -> None:
     """A caller-chosen project folder is only accepted over loopback.
@@ -261,11 +317,12 @@ def require_local_for_chosen_folder(
     the server user can reach, so this has to hold on a deployment that is
     local-mode but not local-only.
 
-    The configured host can't carry it: the image passes ``--host 0.0.0.0`` on
-    argv and sets no ``COWORK_SERVER_HOST``, so ``AppSettings.host`` still
-    reads its loopback default inside the container. ``require_local`` checks
-    the accepted socket's own address, which a forwarded header cannot rewrite,
-    and the service refuses org deployments outright as a second layer.
+    ``require_local`` carries it, because it reads the socket the request
+    landed on, not only the peer address an ``X-Forwarded-For`` rewrites. The
+    configured host can't: the image's CMD passes ``--host 0.0.0.0`` on argv
+    and sets no ``COWORK_SERVER_HOST``, so ``AppSettings.host`` still reads its
+    loopback default inside the container. The service refuses org
+    deployments outright as a second layer.
     """
     if body.path is None:
         return
@@ -288,10 +345,19 @@ def require_local_for_chosen_folder(
     response_model=ProjectResponse,
     dependencies=[Depends(require_local_for_chosen_folder)],
 )
-def create_project(
+async def create_project(
     body: ProjectCreateRequest,
-    session: ScopedSessionDep,
+    scope: TenantScopeDep,
     principal: Principal | None = Depends(get_principal),
+):
+    return await run_efs_unit(partial(_create_project, body=body, principal=principal), scope=scope)
+
+
+def _create_project(
+    session: ScopedSession,
+    *,
+    body: ProjectCreateRequest,
+    principal: Principal | None,
 ):
     access = SharedResourceAccess(session, principal)
     access.require_actor()
@@ -358,11 +424,23 @@ def create_project(
 
 
 @router.patch("/{project_id}", response_model=ProjectResponse)
-def update_project(
+async def update_project(
     project_id: UUID,
     body: ProjectUpdateRequest,
-    session: ScopedSessionDep,
+    scope: TenantScopeDep,
     principal: Principal | None = Depends(get_principal),
+):
+    return await run_efs_unit(
+        partial(_update_project, project_id=project_id, body=body, principal=principal), scope=scope
+    )
+
+
+def _update_project(
+    session: ScopedSession,
+    *,
+    project_id: UUID,
+    body: ProjectUpdateRequest,
+    principal: Principal | None,
 ):
     service = ProjectService(session)
     access = SharedResourceAccess(session, principal)
@@ -601,10 +679,163 @@ def update_project(
 
 
 @router.delete("/{project_id}", status_code=status.HTTP_204_NO_CONTENT)
-def delete_project(
+async def delete_project(
     project_id: UUID,
-    session: ScopedSessionDep,
+    scope: TenantScopeDep,
     principal: Principal | None = Depends(get_principal),
+):
+    await _take_down_published_pages(scope, project_id=project_id, principal=principal)
+    return await run_efs_unit(partial(_delete_project, project_id=project_id, principal=principal), scope=scope)
+
+
+_TAKE_DOWN_FAILED = (
+    "Could not take down the published page of {name}, so the project was not "
+    "deleted. Try again in a moment."
+)
+
+
+def _take_down_plan(session: ScopedSession, *, project_id: UUID, principal: Principal | None):
+    """The roots of a project its delete takes published pages down from,
+    once the caller may delete it: the checks `_delete_project` makes before
+    it changes anything, so a refused delete takes no page down. Every
+    member's legacy conversation roots are included, since the delete removes
+    them all.
+
+    None when the delete leaves the project's folder in place (a folder the
+    user chose, or a stored path that is not the derived one): its artifacts
+    stay on disk, so their pages stay up too."""
+    from cowork.services.artifact_roots import plan_project_roots
+
+    service = ProjectService(session)
+    try:
+        project = service.get_project(project_id)
+        if project.name == GENERAL_PROJECT:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="The General project is immutable",
+            )
+        if session.scope.org_mode:
+            SharedResourceAccess(session, principal).require_change(
+                project.created_by,
+                detail="Only the project creator or an organization admin can delete this project",
+            )
+        service._refuse_while_others_use(project_id)
+        if not _delete_removes_folder(service, project):
+            return None
+        return plan_project_roots(session, project_id, include_other_members=True)
+    except ProjectNotFoundError as e:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e)) from e
+    except ProjectInUseError as e:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e)) from e
+
+
+def _delete_removes_folder(service: ProjectService, project) -> bool:
+    """Whether `delete_project` removes this project's folder: only when its
+    stored path is the derived one (the same test the delete makes). A folder
+    the user chose, or one at a path that does not match, is left in place."""
+    path = Path(project.path)
+    if not path.exists():
+        return True
+    try:
+        safe = service._project_path(project.name)
+    except ValueError:
+        return False
+    return safe.resolve() == path.resolve()
+
+
+def _published_folders(plan) -> list[tuple[object, str]]:
+    """(source, folder name) of each artifact folder under the plan's roots
+    whose publish record still names a live page. A root that fails to list
+    raises (``strict``): a page left up under a folder about to be removed
+    would have nothing left pointing at it."""
+    from cowork.services.artifact_roots import discover_roots
+    from cowork.services.artifacts import has_live_pages
+
+    found: list[tuple[object, str]] = []
+    for source in discover_roots(plan, strict=True).unfiltered():
+        try:
+            entries = list(os.scandir(source.base))
+        except FileNotFoundError:
+            continue
+        for entry in sorted(entries, key=lambda item: item.name):
+            if entry.is_dir(follow_symlinks=False) and has_live_pages(Path(entry.path)):
+                found.append((source, entry.name))
+    return found
+
+
+async def _take_down_published_pages(
+    scope, *, project_id: UUID, principal: Principal | None
+) -> None:
+    """Take down every published page of the project's artifacts before its
+    files go, with the take-down an artifact delete uses, so the pages, their
+    access rules and their viewer analytics are purged upstream.
+
+    Like an artifact delete, a page that fails to come down aborts: the
+    project and its files stay, the pages already down stay recorded as down,
+    and the error says which artifact failed, so a retry finishes the job.
+    """
+    from cowork.api.v1.endpoints.artifacts import take_down_credential
+    from cowork.db.units import FilesystemBusy, run_efs
+    from cowork.services.artifacts import take_down_artifact_pages
+
+    plan = await run_efs_unit(
+        partial(_take_down_plan, project_id=project_id, principal=principal), scope=scope
+    )
+    if plan is None:
+        return
+    try:
+        folders = await run_efs(partial(_published_folders, plan), scope=scope)
+    except OSError as e:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Could not read the project's artifacts, so the project was not deleted. Try again in a moment.",
+        ) from e
+    if not folders:
+        return
+    publish_url, api_key = await take_down_credential(scope)
+    for source, folder_name in folders:
+        try:
+            await take_down_artifact_pages(
+                source=source,
+                folder_name=folder_name,
+                api_key=api_key,
+                publish_url=publish_url,
+                scope=scope,
+            )
+        except FileNotFoundError:
+            # Gone, or not an artifact folder (no metadata.json): nothing to pin.
+            continue
+        except (HTTPException, FilesystemBusy):
+            raise
+        except OSError:
+            # The folder or its root could not be opened safely (a link, a
+            # replaced directory): the same refusal an artifact delete answers
+            # 404 to. Aborting here would leave the project undeletable.
+            logger.warning(
+                "orphaned_publish project=%s folder=%s reason=folder_unopenable",
+                project_id,
+                folder_name,
+                exc_info=True,
+            )
+            continue
+        except ValueError as e:
+            # No publish credential on desktop: the page cannot come down.
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"{_TAKE_DOWN_FAILED.format(name=repr(folder_name))} ({e})",
+            ) from e
+        except Exception as e:
+            raise HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                detail=_TAKE_DOWN_FAILED.format(name=repr(folder_name)),
+            ) from e
+
+
+def _delete_project(
+    session: ScopedSession,
+    *,
+    project_id: UUID,
+    principal: Principal | None,
 ):
     service = ProjectService(session)
     access = SharedResourceAccess(session, principal)

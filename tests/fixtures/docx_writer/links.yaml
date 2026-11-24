@@ -1,0 +1,34 @@
+# One <a> per case, inside "<p>Before <a href=...>link text</a> after.</p>".
+# target: the hyperlink relationship's Target, or null when the writer must
+# keep the text and emit no hyperlink.
+- {name: https, href: "https://example.com/report?q=1#top", target: "https://example.com/report?q=1#top"}
+- {name: http, href: "http://example.com/", target: "http://example.com/"}
+- {name: mailto, href: "mailto:someone@example.com", target: "mailto:someone@example.com"}
+- {name: uppercase_scheme, href: "HTTPS://example.com/a", target: "https://example.com/a"}
+- {name: surrounding_whitespace, href: "  https://example.com/b  ", target: "https://example.com/b"}
+- {name: javascript, href: "javascript:alert(1)", target: null}
+- {name: javascript_mixed_case_and_tab, href: " JaVa\tScRiPt:alert(1)", target: null}
+- {name: vbscript, href: "vbscript:msgbox(1)", target: null}
+- {name: file_uri, href: "file:///etc/passwd", target: null}
+# Each of these has a host, so only the scheme check refuses it. Word opens a
+# file or smb link to a server on click, which can send the user's
+# credentials there.
+- {name: file_uri_with_host, href: "file://server/share/report.docx", target: null}
+- {name: smb_with_host, href: "smb://server/share", target: null}
+- {name: ftp_with_host, href: "ftp://example.com/x", target: null}
+- {name: data_uri, href: "data:text/html;base64,PHNjcmlwdD5hbGVydCgxKTwvc2NyaXB0Pg==", target: null}
+- {name: relative_path, href: "notes/other.html", target: null}
+- {name: scheme_relative, href: "//example.com/x", target: null}
+- {name: http_without_host, href: "http:/etc/passwd", target: null}
+- {name: unc_path, href: "\\\\server\\share\\file.txt", target: null}
+- {name: empty_mailto, href: "mailto:", target: null}
+- {name: broken_ipv6_host, href: "http://[::1/x", target: null}
+- {name: fragment_only, href: "#section", target: null}
+# A Target must be a valid URI, so every character RFC 3986 doesn't allow as
+# it is gets percent-encoded. Escapes already there stay as they are.
+- {name: space_quote_and_angles, href: 'https://example.com/a b"c<d>', target: "https://example.com/a%20b%22c%3Cd%3E"}
+- {name: braces_bar_backslash_caret_backtick, href: 'https://example.com/{e}|f\g^h`i', target: "https://example.com/%7Be%7D%7Cf%5Cg%5Eh%60i"}
+- {name: non_ascii, href: "https://example.com/ü?q=é", target: "https://example.com/%C3%BC?q=%C3%A9"}
+- {name: lone_percent, href: "https://example.com/100%", target: "https://example.com/100%25"}
+- {name: escapes_and_reserved_kept, href: "https://example.com/a%20b;c=d?x=%2F&y=[1]#f!", target: "https://example.com/a%20b;c=d?x=%2F&y=[1]#f!"}
+- {name: junk_in_the_host, href: "https://a<b/", target: "https://a%3Cb/"}

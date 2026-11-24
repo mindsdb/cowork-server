@@ -1,4 +1,6 @@
 """The turn index: which turn is current for a conversation, readable anywhere."""
+import time
+
 import fakeredis.aioredis
 import pytest
 
@@ -18,9 +20,9 @@ async def test_records_and_reads_back_a_turn(fake_redis):
         "c1", turn_id=4, correlation_id="corr-1", org_id="o1", user_id="u1")
 
     turn = await turn_index.get_turn("c1")
-    assert int(turn["turn_id"]) == 4
-    assert turn["correlation_id"] == "corr-1"
-    assert turn["org_id"] == "o1"
+    assert (turn.turn_id, turn.correlation_id, turn.org_id, turn.user_id) == (4, "corr-1", "o1", "u1")
+    assert turn.run_id is None and turn.saved_question is False and turn.released_at is None
+    assert turn.started_at <= time.time()
 
 
 @pytest.mark.asyncio
@@ -33,8 +35,7 @@ async def test_a_new_turn_replaces_the_previous_one(fake_redis):
         "c1", turn_id=2, correlation_id="corr-2", org_id=None, user_id=None)
 
     turn = await turn_index.get_turn("c1")
-    assert int(turn["turn_id"]) == 2
-    assert turn["correlation_id"] == "corr-2"
+    assert (turn.turn_id, turn.correlation_id) == (2, "corr-2")
 
 
 @pytest.mark.asyncio
@@ -70,9 +71,9 @@ async def test_list_returns_every_recorded_turn(fake_redis):
     await turn_index.record_turn(
         "c2", turn_id=1, correlation_id="corr-2", org_id="o2", user_id=None)
 
-    turns = {t["conversation_id"]: t for t in await turn_index.list_turns()}
+    turns = dict(await turn_index.list_turns())
     assert set(turns) == {"c1", "c2"}
-    assert turns["c2"]["org_id"] == "o2"
+    assert turns["c2"].org_id == "o2"
 
 
 @pytest.mark.asyncio
@@ -85,8 +86,8 @@ async def test_list_pairs_each_turn_with_its_own_conversation_and_prunes_only_ex
 
     turns = await turn_index.list_turns()
 
-    assert sorted((t["conversation_id"], t["turn_id"], t["correlation_id"]) for t in turns) == [
-        (f"c{n}", str(n), f"corr-{n}") for n in (0, 2, 3, 5)
+    assert sorted((cid, t.turn_id, t.correlation_id) for cid, t in turns) == [
+        (f"c{n}", n, f"corr-{n}") for n in (0, 2, 3, 5)
     ]
     assert await fake_redis.smembers("cowork:turns") == {"c0", "c2", "c3", "c5"}
 
@@ -114,7 +115,7 @@ async def test_list_reads_every_turn_in_one_round_trip(fake_redis, monkeypatch):
 
     monkeypatch.setattr(fake_redis, "hgetall", per_member)
 
-    assert {t["conversation_id"] for t in await turn_index.list_turns()} == {"c0", "c1", "c2"}
+    assert {t.conversation_id for t in await turn_index.list_turns()} == {"c0", "c1", "c2"}
 
 
 @pytest.mark.asyncio
@@ -139,7 +140,7 @@ async def test_a_turn_is_recorded_in_one_transaction(fake_redis, monkeypatch):
         "c1", turn_id=3, correlation_id="corr-3", org_id=None, user_id=None)
 
     assert transactions == [True]
-    assert (await turn_index.get_turn("c1"))["correlation_id"] == "corr-3"
+    assert (await turn_index.get_turn("c1")).correlation_id == "corr-3"
     assert 0 < await fake_redis.ttl("cowork:turn:c1") <= turn_index.TURN_INDEX_TTL_SECONDS
     assert await fake_redis.sismember("cowork:turns", "c1") == 1
 
@@ -186,7 +187,7 @@ async def test_a_turn_recorded_after_the_read_keeps_its_member(fake_redis, monke
     assert await turn_index.list_turns() == []
     assert await fake_redis.sismember("cowork:turns", "c1") == 1
     # The prune that skipped c1 left c2 too; the next list removes it.
-    assert [t["correlation_id"] for t in await turn_index.list_turns()] == ["new-c1"]
+    assert [t.entry.correlation_id for t in await turn_index.list_turns()] == ["new-c1"]
     assert await fake_redis.smembers("cowork:turns") == {"c1"}
 
 
@@ -205,7 +206,7 @@ async def test_a_turn_recorded_after_the_prune_checked_its_hash_keeps_its_member
 
     assert await turn_index.list_turns() == []
     assert await fake_redis.sismember("cowork:turns", "c1") == 1
-    assert [t["correlation_id"] for t in await turn_index.list_turns()] == ["new-c1"]
+    assert [t.entry.correlation_id for t in await turn_index.list_turns()] == ["new-c1"]
 
 
 def test_discard_conversation_forgets_the_turn(monkeypatch, tmp_path):
@@ -246,13 +247,9 @@ async def test_a_turns_owner_is_read_from_its_hash_as_a_typed_model(fake_redis):
     await turn_index.record_turn("c1", turn_id=1, correlation_id="corr-1", org_id="o1", user_id="u1")
     await turn_index.record_turn("c2", turn_id=1, correlation_id="corr-2", org_id=None, user_id=None)
 
-    assert turn_index.TurnOwner.from_index(await turn_index.get_turn("c1")) == turn_index.TurnOwner(
-        org_id="o1", user_id="u1"
-    )
+    assert (await turn_index.get_turn("c1")).owner == turn_index.TurnOwner(org_id="o1", user_id="u1")
     # record_turn writes "" for a missing id, which reads back as None.
-    assert turn_index.TurnOwner.from_index(await turn_index.get_turn("c2")) == turn_index.TurnOwner(
-        org_id=None, user_id=None
-    )
+    assert (await turn_index.get_turn("c2")).owner == turn_index.TurnOwner(org_id=None, user_id=None)
 
 
 def test_the_owner_check_reads_the_typed_owner_and_fails_closed():
@@ -261,10 +258,72 @@ def test_the_owner_check_reads_the_typed_owner_and_fails_closed():
     from cowork.db.scoped import LOCAL_SCOPE, TenantScope
 
     person = TenantScope(personal=True, org_id="o1", user_id="u1", personal_resources=ALL_PERSONAL_RESOURCES)
-    owner = turn_index.TurnOwner.from_index
+
+    def owner(fields: dict):
+        return turn_index.TurnIndexEntry.from_index({"turn_id": "1", "correlation_id": "corr-1", **fields}).owner
 
     assert _owner_matches(owner({"org_id": "o1", "user_id": "u1"}), person)
     assert not _owner_matches(owner({"org_id": "o1", "user_id": "u2"}), person)
     # A hash missing its user denies the real owner rather than opening up.
     assert not _owner_matches(owner({"org_id": "o1"}), person)
     assert _owner_matches(owner({}), LOCAL_SCOPE)
+
+
+@pytest.mark.asyncio
+async def test_a_stamp_lands_only_on_its_own_runs_entry(fake_redis):
+    """Run A's claim lingered and another replica cleared it, so run B's
+    entry replaced A's. A's late stamp used to be able to land on B's entry,
+    and a start at B's number would then be refused as stale on every
+    replica until the entry expired, although B saved nothing."""
+    await turn_index.record_turn(
+        "c1", turn_id=6, correlation_id="corr-b", org_id=None, user_id=None, run_id="run-b")
+
+    assert await turn_index.stamp_question(conversation_id="c1", run_id="run-a", released=True) is False
+    stored = await fake_redis.hgetall(turn_index.turn_key("c1"))
+    assert "saved_question" not in stored and "released_at" not in stored
+    assert (await turn_index.get_turn("c1")).makes_stale(turn_id=6, now=time.time()) is False
+
+    assert await turn_index.stamp_question(conversation_id="c1", run_id="run-b", released=False) is True
+    stored = await fake_redis.hgetall(turn_index.turn_key("c1"))
+    assert stored["saved_question"] == "1" and "released_at" not in stored
+    assert (await turn_index.get_turn("c1")).makes_stale(turn_id=6, now=time.time()) is True
+
+
+@pytest.mark.asyncio
+async def test_a_stamp_written_at_the_release_notes_its_time_and_no_stamp_recreates_a_forgotten_entry(fake_redis):
+    await turn_index.record_turn(
+        "c1", turn_id=6, correlation_id="corr-b", org_id=None, user_id=None, run_id="run-b")
+    before = time.time()
+
+    assert await turn_index.stamp_question(conversation_id="c1", run_id="run-b", released=True) is True
+
+    released_at = (await turn_index.get_turn("c1")).released_at
+    assert before <= released_at <= time.time()
+    await turn_index.forget_turn("c1")
+    assert await turn_index.stamp_question(conversation_id="c1", run_id="run-b", released=True) is False
+    assert await fake_redis.exists(turn_index.turn_key("c1")) == 0
+
+
+def test_only_a_run_that_saved_its_question_makes_a_start_at_or_below_its_number_stale():
+    entry = turn_index.TurnIndexEntry(turn_id=3, run_id="run-a", correlation_id="corr-a", saved_question=True)
+
+    assert [entry.makes_stale(turn_id=n, now=1.0) for n in (2, 3, 4)] == [True, True, False]
+    assert entry.model_copy(update={"saved_question": False}).makes_stale(turn_id=3, now=1.0) is False
+    # A channel turn's entry names no run.
+    assert entry.model_copy(update={"run_id": None}).makes_stale(turn_id=3, now=1.0) is False
+
+
+def test_a_stamp_stops_refusing_a_window_after_its_run_released_its_claim():
+    """A stale start reaches RunRegistry.start within a request's routing
+    gate. Past the window, the only send at that number is one after a
+    truncation whose forget of this entry failed, which used to be refused
+    until the entry expired."""
+    window = turn_index.STALE_START_WINDOW_SECONDS
+    released = turn_index.TurnIndexEntry(
+        turn_id=3, run_id="run-a", correlation_id="corr-a", saved_question=True, released_at=1000.0,
+    )
+
+    assert released.makes_stale(turn_id=3, now=1000.0 + window - 1) is True
+    assert released.makes_stale(turn_id=3, now=1000.0 + window) is False
+    # A run that has not released its claim (or never did) keeps refusing.
+    assert released.model_copy(update={"released_at": None}).makes_stale(turn_id=3, now=1e12) is True

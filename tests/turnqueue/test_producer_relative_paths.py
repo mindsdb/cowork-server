@@ -40,9 +40,10 @@ def captured(monkeypatch):
     monkeypatch.setattr(prod, "get_redis", lambda: _FakeRedis(box))
 
     async def _fake_llm(**_kw):
-        return {"provider": "minds-cloud", "api_key": "k", "base_url": "u"}
+        return prod.TurnLlm(block={"provider": "minds-cloud", "api_key": "k", "base_url": "u"},
+                            turn_key_id=None, ttl_seconds=1200)
 
-    monkeypatch.setattr(prod, "_mint_llm_block", _fake_llm)
+    monkeypatch.setattr(prod, "mint_turn_llm", _fake_llm)
     return box
 
 
@@ -88,7 +89,9 @@ async def test_only_project_memory_is_shipped_in_anton_job_params(captured):
         },
     )
     params = captured["payload"]["params"]
-    assert "skills" not in params
+    # No skills were passed: the block is still there, empty, since the pod
+    # recalls only what it names.
+    assert params["skills"] == {}
     assert params["memory"] == {"project": project_memory}
 
 

@@ -16,13 +16,14 @@ sharedStorage:
 
 # Who may open a connection to the cowork-server pods. See
 # templates/network-policy.yaml for why this is the boundary the identity
-# headers depend on.
+# headers depend on, and README.md, "Who can reach the pod", for what it admits.
 #
-# Off by default so a bare install, a desktop chart or an environment nobody
-# has validated yet cannot lock itself out. Turn it on one environment at a
-# time and watch pod readiness while it rolls: rule (b) is what keeps the
-# kubelet's probes working, and a wrong CIDR there fails the readiness probe
-# rather than anything a user would notice first.
+# Off by default so a bare install or an environment nobody has validated yet
+# cannot lock itself out. dev, staging and prod turn it on in their values
+# files, and the PR-environment deploy turns it on for every PR environment.
+# Watch pod readiness while it rolls out to a new environment: the kubelet's
+# probes need no rule (see nodeCidrs below), but a policy that refused them
+# would fail readiness before anything a user would notice.
 #
 # Enforcement is not the same on both clusters. newdev runs the AWS VPC CNI's
 # policy controller AND Cilium; newprod runs Cilium alone, installed 2026-08-20.
@@ -35,12 +36,14 @@ sharedStorage:
 # THIS CHART. The first and third fail loudly. The second does not fail at all
 # until users notice.
 #
-#   1. The CI deploy identity can create the kind. `helm upgrade` runs
-#      in-cluster as `system:serviceaccount:infrastructure:<env>-gha-runner`,
-#      which holds `create networkpolicies` only in the namespaces listed under
-#      `runner_deploy_namespaces` in Kubernetes-Foundational-Services. staging
-#      and prod are in that set and a PR environment is not. Where it is
-#      missing, the release fails and `--atomic` rolls the whole deploy back.
+#   1. Whatever deploys the release can create the kind. dev, staging and prod
+#      deploy with `helm upgrade` in-cluster as
+#      `system:serviceaccount:infrastructure:<env>-gha-runner`, which holds
+#      `create networkpolicies` only in the namespaces its deploy role lists;
+#      dev, staging and prod are among them. PR environments deploy through
+#      Argo CD, whose PR-environment project allows the kind. Where the
+#      deployer lacks it, the release fails and `--atomic` rolls the whole
+#      deploy back.
 #        kubectl --context <ctx> -n <ns> auth can-i create networkpolicies \
 #          --as=system:serviceaccount:infrastructure:<env>-gha-runner
 #   2. That cluster's ingress controller actually matches the selectors below,
@@ -73,8 +76,8 @@ networkPolicy:
   port: ""            # defaults to deployment.service.targetPort
   podSelectorLabels: {}   # defaults to {app: deployment.name}
 
-  # The nginx ingress controller, which is the only thing that should ever
-  # reach these pods over the network. It runs in `infrastructure`, NOT in
+  # The nginx ingress controllers, the only pods that should ever reach these
+  # pods over the network. They run in `infrastructure`, NOT in
   # `ingress-nginx`. Kubernetes stamps kubernetes.io/metadata.name on every
   # namespace, so that label needs nothing added to the cluster. Confirm with:
   #   kubectl get ns -L kubernetes.io/metadata.name | grep -i infra
@@ -83,9 +86,11 @@ networkPolicy:
   # admits every pod in `infrastructure`, and that namespace also runs the
   # GitHub Actions runners and openvpn, which MASQUERADEs VPN client traffic to
   # its own pod IP. Either could then send forged identity headers, which is the
-  # exact caller this policy exists to refuse. The label below is stamped by
-  # Kubernetes-Foundational-Services (nginx-ingress values `controller.podLabels`)
-  # with no per-environment override, so nothing needs adding to the cluster:
+  # exact caller this policy exists to refuse. The label below comes from the
+  # shared nginx-ingress values (`controller.podLabels`) with no
+  # per-environment override, so nothing needs adding to the cluster. It is on
+  # both the public controller and the internal (VPN) one; only the public one
+  # routes to cowork-server today:
   #   kubectl -n infrastructure get pods -l nginx-ingress-controller=true
   ingressController:
     enabled: true
@@ -136,22 +141,109 @@ deployment:
   # environment, which renders this file alone, stays off.
   datasourceTurnsEnabled: "false"
   datasourceCapabilities: ""
+  # Names each datasource connection for the agent (COWORK_TURN_DATASOURCE_LABELS_ENABLED).
+  # On everywhere, but it acts only where datasourceTurnsEnabled is on. Its anton
+  # must be in the scratchpad image before an environment turns grants on; an
+  # environment opts out with "false" in its own values file.
+  datasourceLabelsEnabled: "true"
+  # Lets cloud turns build custom connector templates a member saves from a card
+  # (COWORK_TURN_CONNECTOR_DRAFTS_ENABLED). On everywhere; an environment opts
+  # out with "false" in its own values file.
+  connectorDraftsEnabled: "true"
+  # Gives a member's org-mode turns the custom API connections they connected
+  # (COWORK_TURN_CUSTOM_API_ENABLED). Off in the base; an environment turns it on
+  # in its own values file once auth, the inference gateway and the pod's anton
+  # there serve those connections. tests/test_chart_values.py pins which are on.
+  customApiTurnsEnabled: "false"
+
+  # The draft-preview host name and the one page allowed to frame a draft. The
+  # draft Ingress and the COWORK_DRAFT_* variables below are templated from
+  # these, so the host the links point at, the host the listener answers for
+  # and the host the Ingress routes cannot disagree. Empty in the base, so a PR
+  # environment, which renders this file alone, starts no draft listener and
+  # keeps previews on srcdoc. values-<env>.yaml sets both and switches
+  # ingress_secondary on.
+  draftHost: ""
+  webOrigin: ""
 
   image:
-    # The build-push-ecr action derives the ECR repo name from the GitHub repo
-    # slug, so this must track the GitHub repo name (cowork-server).
+    # The module-name the build-image step in build-deploy.yml pushes to.
     repository: 168681354662.dkr.ecr.us-east-1.amazonaws.com/mindsdb-cowork-server
-    command: ["python", "-m", "uvicorn", "cowork.server:app"]
-    # Async FastAPI: the event loop handles concurrency per worker. Scale via
-    # replicas (and HPA) rather than worker count. --forwarded-allow-ips '*'
-    # trusts the in-cluster ingress for X-Forwarded-* headers.
-    args: ["--host", "0.0.0.0", "--port", "9010", "--forwarded-allow-ips", "*"]
+    # No command or args here: the image's CMD (Dockerfile) owns the uvicorn
+    # command, one worker per pod, scaled with replicas. That includes
+    # --forwarded-allow-ips '*', which takes X-Forwarded-For and
+    # X-Forwarded-Proto from every peer that reaches the pod (networkPolicy
+    # above decides which peers those are), and --timeout-graceful-shutdown,
+    # the bound on the shutdown drain that terminationGracePeriodSeconds below
+    # counts.
+    # tests/test_chart_values.py fails if a values file sets either key again.
 
-  # Alembic locks via the alembic_version table, so concurrent replicas don't
-  # race; on already-migrated databases this is a no-op. The deployment
-  # subchart applies `tpl` to top-level string fields on each initContainer,
-  # so the image string can reference the same chart helpers as the main
-  # container — no need to duplicate the repository/tag here.
+  # A shutdown, counted from the pod's deletion (README.md, "What a shutdown
+  # does to answers in progress"):
+  #   0-15 s  the preStop sleep. ingress-nginx drops the pod's endpoint and
+  #           sends new requests to the other pods; open answers keep
+  #           streaming here.
+  #   up to 5 s  SIGTERM. Before uvicorn sees it, cowork.server ends each
+  #           remaining answer as interrupted on its open stream
+  #           (TURN_SHUTDOWN_GRACE_SECONDS).
+  #   2 s     uvicorn's own drain (--timeout-graceful-shutdown in the image).
+  #   about 22 s  the lifespan teardown's bounded waits: the draft listener's
+  #           own drain when COWORK_DRAFT_PORT is set (2 s,
+  #           cowork/draft_host/listener.py), another pass over turns (5 s),
+  #           the stop of the artifact backfills' one task (the location,
+  #           held-root and sort-time backfills; 2 s,
+  #           LOCATION_BACKFILL_SHUTDOWN_SECONDS in cowork/server.py),
+  #           channel tasks (3 s, then up to 5 s more while each one
+  #           cancelled writes its sandbox turn's cancel flag and records its
+  #           artifacts) and scratchpad closes (5 s).
+  #   up to 8 s  last, only while a turn's artifact diff or record is still
+  #           running, as during a file store stall: the wait for those
+  #           (TURN_END_RECORD_DRAIN_SECONDS, cowork/db/units.py).
+  # About 44 s in all, or about 52 s during a stall, so 62 s leaves room for
+  # the unbounded closes at the end of teardown before the kubelet's SIGKILL.
+  # A stall that clears within the last wait keeps the turn's artifact rows.
+  # A record still running after it is cut by the event loop's close, so that
+  # turn's artifact rows are lost, and the pod logs shutdown_turn_record_lost
+  # at ERROR with the conversation, the project, touched and count. touched
+  # holds the new artifacts' slugs its diff found, or, when the diff had not
+  # returned, the pod's artifacts_touched list (empty for a pod that sends no
+  # usable list): the first of them in sorted order, none longer than 255
+  # characters, at most 50 (TURN_END_RECORD_NAMES_LOGGED) and only as many as
+  # fit in 12 KiB as the line encodes them (TURN_END_RECORD_TOUCHED_BYTES),
+  # so the line stays under the 16 KiB a container runtime splits a line at;
+  # count says how many the record held. A web answer still streaming at
+  # SIGTERM is saved anyway, marked turn_lost; one whose pod had finished
+  # starts its save once its record ends, and a save that starts as the loop
+  # closes may not finish. A file store call already running on the stuck
+  # mount keeps the process alive until the SIGKILL.
+  terminationGracePeriodSeconds: 62
+
+  lifecycle:
+    preStop:
+      exec:
+        command: ["/bin/sh", "-c", "sleep 15"]
+
+  # Create every new pod at once, as many as the Deployment runs when the
+  # rollout starts (the autoscaler's count in staging and prod, 2 to 4), and
+  # stop no old pod until a new one is Ready. When the cluster has room for
+  # every new pod, the old pods then stop within seconds of each other instead
+  # of a rollout step apart, so the retry an interrupted answer asks for lands
+  # on a new pod rather than on an old one about to stop too. A new pod still
+  # waiting for a node keeps one old pod running until it turns Ready. An
+  # autoscaler scale-in stops a pod the same way a rollout does (README.md).
+  deploymentStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: "100%"
+      maxUnavailable: 0
+
+  # The new pods of a rollout start together, and each runs this. On
+  # PostgreSQL, cowork/db/alembic/env.py takes an advisory lock first
+  # (cowork.db.migrations.lock_migrations), so they migrate one at a time and
+  # the later ones find nothing to do; on an already-migrated database this is
+  # a no-op. The deployment subchart applies `tpl` to top-level string fields
+  # on each initContainer, so the image string can reference the same chart
+  # helpers as the main container, with no need to repeat the repository/tag.
   initContainers:
     - name: db-migrate
       image: '{{ template "get-repository" . }}:{{ template "get-release-tag" . }}'
@@ -167,9 +259,17 @@ deployment:
   # Liveness restarts the pod if it fails. Kept tolerant (failureThreshold * periodSeconds = 60s)
   # so a transient stall doesn't take the pod down. Points at the zero-I/O /live
   # route so a database outage can't be misread as "this process is dead".
+  # The delay covers the boot: the lifespan does file store and database work
+  # before uvicorn binds, and on 28 Oct staging pods booting under load served
+  # their first request about 120s after start, the moment the old 60s delay
+  # plus 60s of failures killed them. With 180s a boot of up to about 230s
+  # survives: the first probe lands in [180, 190)s and the sixth failure 50s
+  # later. startup_finished logs each boot's length from process start. The
+  # deployment subchart renders no startupProbe, so the delay is the one
+  # setting that holds a slow boot.
   livenessProbe:
     enabled: true
-    initialDelaySeconds: 60
+    initialDelaySeconds: 180
     periodSeconds: 10
     timeoutSeconds: 5
     failureThreshold: 6
@@ -177,13 +277,16 @@ deployment:
 
   # Readiness gates traffic. Polls quickly so the pod returns to service fast after a hiccup.
   # failureThreshold * periodSeconds = 15s before the pod is pulled from endpoints.
+  # Points at /ready, which reads no database, file store or settings: a full
+  # pool or a slow file store would otherwise fail readiness on every replica
+  # at once and leave nginx with no upstream.
   readinessProbe:
     enabled: true
     initialDelaySeconds: 15
     periodSeconds: 5
     timeoutSeconds: 4
     failureThreshold: 3
-    path: /api/v1/health/
+    path: /api/v1/health/ready
 
   # deployment container resource requests/limits
   # Limits are HARD limits; Requests are "soft" and drive HPA aggressiveness when enabled.
@@ -225,8 +328,54 @@ deployment:
         X-Organization-Id,X-User-Id,X-User-Email,X-User-Roles,X-Forwarded-User
       nginx.ingress.kubernetes.io/auth-request-headers: "Authorization,Cookie"
 
+  # Draft-preview host. A second Ingress with no auth-url: the signed link in
+  # the path is the credential, and the draft sub-app checks it. It sends /_t/
+  # to the draft port only, where the API app does not listen, and pins the
+  # upstream Host, which ingress-nginx would otherwise take from a client's
+  # X-Forwarded-Host (use-forwarded-headers). The draft sub-app reads no
+  # identity headers, so nothing strips them here; a configuration-snippet
+  # would make this release depend on the controller allowing snippets.
+  # An empty host would make this Ingress a catch-all for /_t/ on every host
+  # the controller serves, so switching it on without draftHost fails the render.
+  ingress_secondary:
+    enabled: false
+    # The default would repeat the primary Ingress's name.
+    name: cowork-server-draft
+    # The controller that serves the primary Ingress.
+    nginx_class: "infrastructure"
+    # Cookie affinity would add a "route" Set-Cookie; the draft host sets none.
+    nginx_affinity: false
+    annotations:
+      # Not `required` here: the subchart passes annotations through toYaml,
+      # which folds a long template onto two lines. The host below fails the
+      # render on its own.
+      nginx.ingress.kubernetes.io/upstream-vhost: '{{ $.Values.draftHost }}'
+      # The path carries the link token; keep it out of the access log.
+      nginx.ingress.kubernetes.io/enable-access-log: "false"
+    hosts:
+      - host: '{{ required "set deployment.draftHost to enable ingress_secondary" $.Values.draftHost }}'
+        enableMultiPath: true
+        paths:
+          - path: /_t/
+            serviceName: cowork-server
+            servicePort: 9011
+
+  # The draft listener (COWORK_DRAFT_PORT below): a second server in the same
+  # process that serves only the draft sub-app. Declared everywhere, but it
+  # listens only where draftHost is set. The Service exposes it under the same
+  # name; templates/network-policy.yaml admits it.
+  additionalPorts:
+    - name: draft
+      containerPort: 9011
+      protocol: TCP
+
   service:
     targetPort: 9010
+    additionalPorts:
+      - name: draft
+        port: 9011
+        targetPort: draft
+        protocol: TCP
 
   # Must match the access point's posixUser (uid/gid 1000), or every org tree
   # is unreadable. The image pins the same ids.
@@ -239,10 +388,25 @@ deployment:
     - name: cowork-shared
       persistentVolumeClaim:
         claimName: cowork-shared
+    # The browser router's scope key, from the router's own Secret in this
+    # namespace. A file rather than an environment variable: the kubelet fills
+    # it when the Secret first appears and rewrites it on rotation, so a pod
+    # that started first still scopes once it syncs. Optional, so a namespace
+    # with no router (and so no Secret) starts as usual and scopes no turn.
+    - name: browser-scope-key
+      secret:
+        secretName: browser-proxy
+        optional: true
+        items:
+          - key: scope_key
+            path: scope_key
 
   volumeMounts:
     - name: cowork-shared
       mountPath: /mnt/cowork-shared
+    - name: browser-scope-key
+      mountPath: /etc/cowork/browser-scope
+      readOnly: true
 
   globalEnvs:
 
@@ -284,6 +448,13 @@ deployment:
         secretKeyRef:
           name: cowork-db
           key: database_uri
+
+    # Log each PostgreSQL statement that takes a second or more (event
+    # db_statement_slow), so statement_timeout and
+    # idle_in_transaction_session_timeout can be set from what hosted
+    # statements take. Both timeouts stay off until then.
+    - name: SLOW_STATEMENT_LOG_MS
+      value: "1000"
 
     # Fernet master key for encrypting sensitive settings at rest. Without it
     # the server generates a key into an ephemeral per-pod file, so a restart
@@ -334,6 +505,12 @@ deployment:
     - name: COWORK_TURN_TURN_KEY_TTL_SECONDS
       value: "1200"
 
+    # The browser router's scope key, sent beside each web turn's key when the
+    # producer scopes it, so only this server can scope a turn key. The file
+    # is the browser-scope-key volume above, read on every scope.
+    - name: COWORK_BROWSER_SCOPE_KEY_FILE
+      value: /etc/cowork/browser-scope/scope_key
+
     # Cloud datasource grants for hosted turns. Off until the release gate; on,
     # the producer lists the user's verified connections and registers grants
     # under the producer role of the datasource-service-keys bundle, an identity
@@ -345,6 +522,12 @@ deployment:
     # per environment; tests/test_chart_values.py pins which environments are on.
     - name: COWORK_TURN_DATASOURCE_ENABLED
       value: '{{ $.Values.datasourceTurnsEnabled }}'
+    - name: COWORK_TURN_DATASOURCE_LABELS_ENABLED
+      value: '{{ $.Values.datasourceLabelsEnabled }}'
+    - name: COWORK_TURN_CONNECTOR_DRAFTS_ENABLED
+      value: '{{ $.Values.connectorDraftsEnabled }}'
+    - name: COWORK_TURN_CUSTOM_API_ENABLED
+      value: '{{ $.Values.customApiTurnsEnabled }}'
     - name: COWORK_TURN_DATASOURCE_PRODUCER_KEY_ID
       valueFrom:
         secretKeyRef:
@@ -386,6 +569,82 @@ deployment:
     # correct for dev, staging, prod and per-PR alike.
     # A hardcoded value here pinned a per-PR host and 404'd every env at once
     # when that PR was reaped.
+
+    # ====================================
+    # DRAFT-PREVIEW LINKS
+    # ====================================
+
+    # The draft listener's port, the draft host it answers for, the origin links
+    # point at, the only page allowed to frame a draft (CSP frame-ancestors) and
+    # the signing key ring. All but the key come from draftHost and webOrigin
+    # above. Where draftHost is empty they render empty, and an empty
+    # COWORK_DRAFT_PORT starts no listener. The key is optional so a missing
+    # secret leaves draft links off (srcdoc previews) instead of blocking the
+    # pod; cowork-server logs a warning at boot. README.md has its format.
+    - name: COWORK_DRAFT_PORT
+      value: '{{ if $.Values.draftHost }}9011{{ end }}'
+    - name: COWORK_DRAFT_HOSTS
+      value: '{{ $.Values.draftHost }}'
+    - name: COWORK_DRAFT_ORIGIN
+      value: '{{ with $.Values.draftHost }}https://{{ . }}{{ end }}'
+    - name: COWORK_WEB_ORIGIN
+      value: '{{ $.Values.webOrigin }}'
+    - name: COWORK_DRAFT_LINK_KID
+      value: "v1"
+    - name: COWORK_DRAFT_LINK_KEYS
+      valueFrom:
+        secretKeyRef:
+          name: mindsdb-secrets
+          key: COWORK_DRAFT_LINK_KEYS
+          optional: true
+
+    # ====================================
+    # MOBILE PUSH
+    # ====================================
+
+    # Push notifications to the MindsHub Cowork mobile app (cowork.services.push).
+    # All optional: a platform whose keys are missing from the cowork-push
+    # Secret sends nothing, and a namespace without the Secret still deploys.
+    # APNs: the .p8 auth key (PEM or base64 of it) from Apple Developer > Keys,
+    # its Key ID and the team ID. FCM: a Firebase service-account JSON (or
+    # base64 of it) allowed to send through FCM HTTP v1.
+    # COWORK_PUSH_ENABLED=false is the kill switch.
+    - name: COWORK_PUSH_ENABLED
+      valueFrom:
+        secretKeyRef:
+          name: cowork-push
+          key: COWORK_PUSH_ENABLED
+          optional: true
+    - name: COWORK_PUSH_APNS_TOPIC
+      valueFrom:
+        secretKeyRef:
+          name: cowork-push
+          key: COWORK_PUSH_APNS_TOPIC
+          optional: true
+    - name: COWORK_PUSH_APNS_KEY_P8
+      valueFrom:
+        secretKeyRef:
+          name: cowork-push
+          key: COWORK_PUSH_APNS_KEY_P8
+          optional: true
+    - name: COWORK_PUSH_APNS_KEY_ID
+      valueFrom:
+        secretKeyRef:
+          name: cowork-push
+          key: COWORK_PUSH_APNS_KEY_ID
+          optional: true
+    - name: COWORK_PUSH_APNS_TEAM_ID
+      valueFrom:
+        secretKeyRef:
+          name: cowork-push
+          key: COWORK_PUSH_APNS_TEAM_ID
+          optional: true
+    - name: COWORK_PUSH_FCM_SERVICE_ACCOUNT_JSON
+      valueFrom:
+        secretKeyRef:
+          name: cowork-push
+          key: COWORK_PUSH_FCM_SERVICE_ACCOUNT_JSON
+          optional: true
 
     # ====================================
     # PROVIDER API KEYS

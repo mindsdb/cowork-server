@@ -18,6 +18,7 @@ import cowork.handlers.responses as responses_mod
 from cowork.handlers.responses import (
     ResponsesHandler,
     cancelled_ask_user_retirements,
+    stopped_turn_events,
 )
 
 from _fakes import inline_run_db
@@ -64,6 +65,21 @@ def test_no_questions_no_events():
     assert cancelled_ask_user_retirements([{"type": "response.output_text.delta"}]) == []
 
 
+def test_a_stop_retires_open_questions_then_ends_the_turn_as_stopped(monkeypatch):
+    # ENG-4345: the saved log says the turn was stopped, and when, so a reload
+    # can show it as stopped and end its time there.
+    monkeypatch.setattr(responses_mod, "event_at_ms", lambda: 1234)
+    assert stopped_turn_events([_ask("ask:1")]) == [
+        _answered("ask:1", status="cancelled"),
+        {"type": "response.cancelled", "at_ms": 1234},
+    ]
+    assert stopped_turn_events([{"type": "response.output_text.delta"}]) == [
+        {"type": "response.cancelled", "at_ms": 1234},
+    ]
+    # A Stop before any output saves no answer row; the terminal must not make one.
+    assert stopped_turn_events([]) == []
+
+
 # ── the same guard, driven through the real producer ────────────────────
 
 
@@ -85,6 +101,7 @@ class _FakeBuffer:
 def _cancellable_handler(monkeypatch, saved, published: asyncio.Event):
     """A handler whose turn publishes one ask_user and then blocks forever."""
     handler = object.__new__(ResponsesHandler)
+    handler.schedule_id = None
     handler.principal = object()
 
     class FakeConversationService:
@@ -110,7 +127,7 @@ def _cancellable_handler(monkeypatch, saved, published: asyncio.Event):
         def close(self):
             pass
 
-    async def formatter(stream, model, event_sink):
+    async def formatter(stream, model, event_sink, **_kwargs):
         event_sink("response.ask_user", _ask("ask:1"))
         yield "event: response.ask_user\ndata: {}\n\n"
         published.set()
@@ -146,13 +163,16 @@ async def test_stopping_a_turn_persists_a_retirement_for_the_open_question(monke
     events = saved["events"]
     assert events[0]["type"] == "response.ask_user"
     # The persisted log is self-consistent: the question it published is retired.
-    assert events[-1] == {
+    assert events[-2] == {
         "type": "response.ask_user_answered",
         "question_id": "ask:1",
         "status": "cancelled",
         "values": [],
         "text": "",
     }
+    # And it ends on the Stop, so a reload shows the turn as stopped (ENG-4345).
+    assert events[-1]["type"] == "response.cancelled"
+    assert isinstance(events[-1]["at_ms"], int)
 
 
 async def test_a_stall_retires_the_open_question_before_its_failure(monkeypatch):

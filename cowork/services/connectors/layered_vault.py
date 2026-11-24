@@ -13,7 +13,7 @@ import logging
 from dataclasses import dataclass
 from typing import Any, NamedTuple
 
-from anton.core.datasources.data_vault import DataVault, _slug_env_prefix
+from anton.core.datasources.data_vault import DataVault, LocalDataVault, _slug_env_prefix
 
 from cowork.creators import Changer
 from cowork.managed import SharedConnection
@@ -144,6 +144,12 @@ class LayeredDataVault:
             or self._changer is None
             or self._changer.may_change(self._creator(found.record))
         )
+
+    def answers_from_own(self, engine: str, name: str) -> bool:
+        """Whether (engine, name) reads from the scope's own vault: false for
+        a managed or shared entry, and for one nobody holds."""
+        found = self._find(engine, name)
+        return found.vault is self._own and found.record is not None
 
     def can_change(self, engine: str, name: str) -> bool:
         """Whether a save or delete of (engine, name) goes through: false for a
@@ -358,12 +364,31 @@ class FilteredDataVault:
     asker can't change.
     """
 
-    def __init__(self, *, source: DataVault, hidden: frozenset[tuple[str, str]]) -> None:
+    def __init__(
+        self,
+        *,
+        source: DataVault,
+        hidden: frozenset[tuple[str, str]],
+        hidden_engines: frozenset[str] = frozenset(),
+    ) -> None:
+        """``hidden`` names single connections; ``hidden_engines`` hides every
+        connection of those engines, whatever its name."""
         self._source = source
         self._hidden = hidden
+        self._hidden_engines = hidden_engines
 
     def _hides(self, engine: str, name: str) -> bool:
-        return (engine, name) in self._hidden
+        return engine in self._hidden_engines or (engine, name) in self._hidden
+
+    def hides(self, engine: str, name: str) -> bool:
+        """Whether this vault, or a filtered vault it reads through, turned
+        the connection off. A source of any other kind than a filtered,
+        layered or plain vault counts as hiding it, since it cannot be asked."""
+        if self._hides(engine, name):
+            return True
+        if isinstance(self._source, FilteredDataVault):
+            return self._source.hides(engine, name)
+        return not isinstance(self._source, (LayeredDataVault, LocalDataVault))
 
     def save(
         self,
@@ -407,10 +432,16 @@ class FilteredDataVault:
         label alone (_ConnectingFilteredDataVault)."""
         source = (
             self._source.for_connecting()
-            if isinstance(self._source, LayeredDataVault)
+            if isinstance(self._source, (LayeredDataVault, FilteredDataVault))
             else self._source
         )
-        return _ConnectingFilteredDataVault(source=source, hidden=self._hidden)
+        return _ConnectingFilteredDataVault(source=source, hidden=self._hidden, hidden_engines=self._hidden_engines)
+
+    def can_change(self, engine: str, name: str) -> bool:
+        """The source's answer: hiding a connection from reads does not change
+        who may save or delete it."""
+        source_can_change = getattr(self._source, "can_change", None)
+        return True if source_can_change is None else source_can_change(engine, name)
 
 
 class _ConnectingFilteredDataVault(FilteredDataVault):

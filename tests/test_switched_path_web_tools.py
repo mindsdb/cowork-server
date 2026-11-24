@@ -85,7 +85,7 @@ async def _session_config(
         conversation = ConversationService(
             ScopedSession(db, LOCAL_SCOPE)
         ).create_conversation(topic="web tools")
-        config, _, _ = await harness.AntonHarness()._build_chat_session(conversation)
+        config = (await harness.AntonHarness()._build_chat_session(conversation)).session
     return config
 
 

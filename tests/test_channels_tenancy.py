@@ -19,6 +19,7 @@ from cowork.db.scoped import LOCAL_SCOPE, MissingTenantScopeError, ScopedSession
 from cowork.models.channel import ChannelEvent, ChannelInstallation
 from cowork.services.channel_events import ChannelEventService
 from cowork.services.channels import ChannelConfigService, resolve_installation_by_external_account
+from _fakes import units_on_engine
 
 ORG_A = "6ba7b810-9dad-11d1-80b4-00c04fd430c8"
 ORG_B = "0f7f0b6a-3f0f-4c58-9e0c-6dbb3ac0f0a1"
@@ -73,12 +74,13 @@ def _live_fake_registry() -> PluginRegistry:
 
 
 @pytest.fixture()
-def engine():
+def engine(monkeypatch):
     import cowork.models.project, cowork.models.conversation  # noqa: F401
     eng = create_engine(
         "sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool
     )
     SQLModel.metadata.create_all(eng)
+    units_on_engine(monkeypatch, eng)
     return eng
 
 
@@ -293,13 +295,13 @@ def test_resolve_installation_needs_no_scope_at_all(engine):
 
 # --- LiveAdapterRegistry: cached per (channel_type, org_id) ---
 
-async def test_refresh_caches_independently_per_org(engine):
+async def test_refresh_caches_independently_per_org(engine, org_deployment):
     registry = LiveAdapterRegistry(_live_fake_registry())
     _config_svc(engine, _org(ORG_A)).set_config("slack", {"signing_secret": "org-a-secret"})
     _config_svc(engine, _org(ORG_B)).set_config("slack", {"signing_secret": "org-b-secret"})
 
-    assert await registry.refresh("slack", ORG_A, session=_scoped(engine, _org(ORG_A)))
-    assert await registry.refresh("slack", ORG_B, session=_scoped(engine, _org(ORG_B)))
+    assert await registry.refresh("slack", ORG_A)
+    assert await registry.refresh("slack", ORG_B)
 
     a = registry.get("slack", ORG_A)
     b = registry.get("slack", ORG_B)
@@ -312,7 +314,7 @@ async def test_local_mode_registry_is_unaffected(engine):
     registry = LiveAdapterRegistry(_live_fake_registry())
     _config_svc(engine, LOCAL_SCOPE).set_config("slack", {"signing_secret": "desktop-secret"})
 
-    assert await registry.refresh("slack", session=_scoped(engine, LOCAL_SCOPE))
+    assert await registry.refresh("slack")
 
     adapter = registry.get("slack")
     assert adapter is not None
@@ -321,12 +323,12 @@ async def test_local_mode_registry_is_unaffected(engine):
     assert registry.get("slack", ORG_A) is None
 
 
-async def test_remove_only_drops_the_named_org(engine):
+async def test_remove_only_drops_the_named_org(engine, org_deployment):
     registry = LiveAdapterRegistry(_live_fake_registry())
     _config_svc(engine, _org(ORG_A)).set_config("slack", {"signing_secret": "org-a-secret"})
     _config_svc(engine, _org(ORG_B)).set_config("slack", {"signing_secret": "org-b-secret"})
-    await registry.refresh("slack", ORG_A, session=_scoped(engine, _org(ORG_A)))
-    await registry.refresh("slack", ORG_B, session=_scoped(engine, _org(ORG_B)))
+    await registry.refresh("slack", ORG_A)
+    await registry.refresh("slack", ORG_B)
 
     await registry.remove("slack", ORG_A)
 
@@ -334,23 +336,23 @@ async def test_remove_only_drops_the_named_org(engine):
     assert registry.get("slack", ORG_B) is not None
 
 
-async def test_get_or_refresh_returns_cached_without_touching_session(engine):
+async def test_get_or_refresh_returns_cached_without_touching_session(engine, org_deployment):
     registry = LiveAdapterRegistry(_live_fake_registry())
     _config_svc(engine, _org(ORG_A)).set_config("slack", {"signing_secret": "org-a-secret"})
-    await registry.refresh("slack", ORG_A, session=_scoped(engine, _org(ORG_A)))
+    await registry.refresh("slack", ORG_A)
     cached = registry.get("slack", ORG_A)
 
-    # session=None here would try get_open_session() if this weren't a cache hit.
-    adapter = await registry.get_or_refresh("slack", ORG_A, session=_scoped(engine, _org(ORG_A)))
+    # A miss here would read the credentials again; the hit reads nothing.
+    adapter = await registry.get_or_refresh("slack", ORG_A)
     assert adapter is cached
 
 
-async def test_get_or_refresh_builds_on_first_use(engine):
+async def test_get_or_refresh_builds_on_first_use(engine, org_deployment):
     registry = LiveAdapterRegistry(_live_fake_registry())
     _config_svc(engine, _org(ORG_A)).set_config("slack", {"signing_secret": "org-a-secret"})
     assert registry.get("slack", ORG_A) is None
 
-    adapter = await registry.get_or_refresh("slack", ORG_A, session=_scoped(engine, _org(ORG_A)))
+    adapter = await registry.get_or_refresh("slack", ORG_A)
 
     assert adapter is not None
     assert adapter.creds == {"signing_secret": "org-a-secret"}
@@ -361,7 +363,7 @@ async def test_get_or_refresh_returns_none_for_unregistered_channel_type(engine)
     # Real and fake plugin factories both build a bridge unconditionally —
     # incomplete credentials surface later at verify_signature, not here.
     registry = LiveAdapterRegistry(_live_fake_registry())
-    adapter = await registry.get_or_refresh("discord", ORG_B, session=_scoped(engine, _org(ORG_B)))
+    adapter = await registry.get_or_refresh("discord", ORG_B)
     assert adapter is None
 
 
@@ -372,7 +374,7 @@ async def test_resolve_org_bridge_finds_the_right_orgs_bridge(engine, org_deploy
     _config_svc(engine, _org(ORG_A)).set_config("slack", {"signing_secret": "org-a-secret"})
     _config_svc(engine, _org(ORG_A)).set_external_account_id("slack", "T-A")
 
-    resolved = await registry.resolve_org_bridge("slack", "T-A", session=Session(engine))
+    resolved = await registry.resolve_org_bridge("slack", "T-A")
 
     assert resolved is not None
     bridge, org_id = resolved
@@ -383,23 +385,26 @@ async def test_resolve_org_bridge_finds_the_right_orgs_bridge(engine, org_deploy
 
 async def test_resolve_org_bridge_returns_none_for_unknown_routing_key(engine):
     registry = LiveAdapterRegistry(_live_fake_registry())
-    resolved = await registry.resolve_org_bridge("slack", "T-nope", session=Session(engine))
+    resolved = await registry.resolve_org_bridge("slack", "T-nope")
     assert resolved is None
 
 
 async def _routing_scope(engine, monkeypatch, routing_key: str) -> TenantScope:
-    """The scope resolve_org_bridge loads an installation's credentials under."""
+    """The scope resolve_org_bridge loads an installation's credentials under:
+    its last unit's, after the lookup of which installation claims the key."""
+    import cowork.channels.runtime as runtime_mod
+
     registry = LiveAdapterRegistry(_live_fake_registry())
     seen: list[TenantScope] = []
-    original = registry.get_or_refresh
+    original = runtime_mod.run_db
 
-    async def spy(channel_type, org_id, *, session=None):
-        seen.append(session.scope)
-        return await original(channel_type, org_id, session=session)
+    async def spy(fn, *, scope):
+        seen.append(scope)
+        return await original(fn, scope=scope)
 
-    monkeypatch.setattr(registry, "get_or_refresh", spy)
-    assert await registry.resolve_org_bridge("slack", routing_key, session=Session(engine)) is not None
-    return seen[0]
+    monkeypatch.setattr(runtime_mod, "run_db", spy)
+    assert await registry.resolve_org_bridge("slack", routing_key) is not None
+    return seen[-1]
 
 
 async def test_an_org_id_alone_never_routes_a_desktop_webhook_into_org_mode(engine, monkeypatch):
@@ -439,7 +444,7 @@ async def test_resolve_org_bridge_resolves_the_local_installation_too(engine):
     _config_svc(engine, LOCAL_SCOPE).set_config("slack", {"signing_secret": "desktop-secret"})
     _config_svc(engine, LOCAL_SCOPE).set_external_account_id("slack", "T-local")
 
-    resolved = await registry.resolve_org_bridge("slack", "T-local", session=Session(engine))
+    resolved = await registry.resolve_org_bridge("slack", "T-local")
 
     assert resolved is not None
     bridge, org_id = resolved
@@ -486,7 +491,7 @@ async def test_lifecycle_setup_and_teardown_hit_the_callers_own_org_slot(engine)
     scoped = _scoped(engine, _org(ORG_A))
     ChannelConfigService(scoped, registry=plugins).set_config("slack", {"signing_secret": "org-a-secret"})
     adapters = LiveAdapterRegistry(plugins)
-    svc = ChannelLifecycleService(scoped, adapters, plugins)
+    svc = ChannelLifecycleService(_org(ORG_A), adapters, plugins)
 
     await svc.setup("slack")
     assert adapters.get("slack", ORG_A) is not None
@@ -496,6 +501,46 @@ async def test_lifecycle_setup_and_teardown_hit_the_callers_own_org_slot(engine)
     assert adapters.get("slack", ORG_A) is None
 
 
+async def test_lifecycle_setup_persists_minted_credentials_into_the_callers_org(engine, org_deployment):
+    """Telegram's setup mints a secret and persists it before it registers the
+    webhook. The write is a unit in the caller's org scope."""
+    from cowork.channels.lifecycle import ChannelLifecycle, LifecycleResult
+    from cowork.services.channel_lifecycle import ChannelLifecycleService
+
+    async def _factory(creds):
+        return _FakeAdapter(creds)
+
+    async def _setup(ctx):
+        await ctx.persist_credentials({"signing_secret": "minted"})
+        await ctx.refresh_adapter()
+        return LifecycleResult(active=True, detail="ok")
+
+    async def _teardown(ctx):
+        return LifecycleResult(active=False, detail="ok")
+
+    plugins = PluginRegistry()
+    plugins.register(
+        ChannelPlugin(
+            channel_type="slack",
+            display_name="Slack",
+            factory=_factory,
+            credentials=CredentialSchema(
+                fields=(CredentialField(name="signing_secret", label="Signing secret"),)
+            ),
+            lifecycle=ChannelLifecycle(setup=_setup, teardown=_teardown),
+        )
+    )
+    adapters = LiveAdapterRegistry(plugins)
+
+    await ChannelLifecycleService(_org(ORG_A), adapters, plugins).setup("slack")
+
+    assert ChannelConfigService(_scoped(engine, _org(ORG_A)), registry=plugins).load_credentials("slack") == {
+        "signing_secret": "minted"
+    }
+    assert ChannelConfigService(_scoped(engine, _org(ORG_B)), registry=plugins).load_credentials("slack") == {}
+    assert adapters.get("slack", ORG_A).creds == {"signing_secret": "minted"}
+
+
 # --- AntonChannelRuntime: the scope one inbound turn runs under ---
 
 class _ScopeSeen(Exception):
@@ -503,16 +548,16 @@ class _ScopeSeen(Exception):
 
 
 async def _turn_scope(monkeypatch, org_id: str | None) -> TenantScope:
-    """Stop _handle_locked at its first ScopedSession and return that scope."""
+    """Stop _handle_locked at its first unit and return that unit's scope."""
     import cowork.channels.runtime as runtime_mod
 
     seen: list[TenantScope] = []
 
-    def recording_session(session, scope):
+    async def recording_unit(fn, *, scope):
         seen.append(scope)
         raise _ScopeSeen
 
-    monkeypatch.setattr(runtime_mod, "ScopedSession", recording_session)
+    monkeypatch.setattr(runtime_mod, "run_db", recording_unit)
     runtime = runtime_mod.AntonChannelRuntime(LiveAdapterRegistry(_fake_registry()))
     with pytest.raises(_ScopeSeen):
         await runtime._handle_locked("slack", object(), org_id)

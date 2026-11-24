@@ -2,6 +2,7 @@
 artifact. Slugs are unique only within a project, so the slug alone does not
 say which project kept a stale owner row."""
 from __future__ import annotations
+from tests._logging_assertions import assert_log_fields
 
 import logging
 
@@ -35,7 +36,7 @@ async def test_a_failed_owner_drop_names_the_project_and_the_artifact(
     monkeypatch.setattr(ownership, "forget_artifact_owner", fail_the_drop)
     logged = owned_logger(artifacts_ep.logger.name, level=logging.WARNING)
     with scoped(org_id, creator) as session:
-        await artifacts_ep.delete_artifact_for_request(session, local_id, project_id=project.id)
+        await artifacts_ep.delete_artifact_for_request(session.scope, local_id, project_id=project.id)
 
     assert not folder.exists()
     [record] = [
@@ -45,5 +46,5 @@ async def test_a_failed_owner_drop_names_the_project_and_the_artifact(
     assert record.getMessage().startswith("Database operation failed: error_type=OperationalError ")
     assert (record.project_id, record.artifact_slug) == (str(project.id), "mine")
     output = logged.output()
-    assert f"[Project:{project.id}][Artifact:'mine']: Database operation failed" in output
+    assert_log_fields(output, project_id=str(project.id), artifact_slug="mine", error_type="OperationalError")
     assert DRIVER_TEXT not in output

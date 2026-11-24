@@ -1,0 +1,9 @@
+# Elements the output may never hold, whatever the source and the mode, as
+# either libxml2 or a browser's parser reads the output.
+never_kept:
+  [
+    noscript, iframe, frame, frameset, object, embed, applet, portal, base,
+    link, video, audio, source, track, xmp, noembed, noframes, plaintext,
+    template, textarea, select, form, input, button, foreignobject, animate,
+    animatemotion, animatetransform, set, discard,
+  ]

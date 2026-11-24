@@ -1,5 +1,6 @@
 """One-time owner backfill for project-root artifacts (ENG-2961, D5)."""
 from __future__ import annotations
+from tests._logging_assertions import assert_log_fields
 
 import json
 import logging
@@ -52,7 +53,7 @@ def _assert_safe_database_log(caplog, logged, error_type, level, *, project_id, 
         assert all(value not in repr(captured.__dict__)
                    for value in (PRIVATE_SQL, PRIVATE_BIND, PRIVATE_DETAIL))
     [line] = [line for line in logged.output().splitlines() if "Database operation failed" in line]
-    assert f"[Project:{project_id}][Artifact:{slug!r}]" in line
+    assert_log_fields(line, project_id=str(project_id), artifact_slug=slug, error_type=error_type)
     assert all(value not in logged.output() for value in (PRIVATE_SQL, PRIVATE_BIND, PRIVATE_DETAIL))
 
 

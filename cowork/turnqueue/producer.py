@@ -14,32 +14,79 @@ import logging
 import time
 import uuid
 from datetime import datetime
+from functools import partial
+from typing import TYPE_CHECKING, NamedTuple
 
-from pydantic import BaseModel, ConfigDict
+import httpx
+from pydantic import BaseModel, ConfigDict, ValidationError
+from redis.exceptions import RedisError
 
 from cowork.build_info import KEY_ANTON_VERSION, account_ids, build_trace_metadata, surface
 from cowork.handlers.turn_errors import (
+    BUDGET_EXCEEDED_CODE,
+    MODEL_NOT_IN_TIER_CODE,
     RESET_AT_CODES,
+    WINDOW_ALLOWANCE_EXHAUSTED_CODE,
+    clean_budget_model,
+    clean_budget_period,
+    clean_budget_scope,
+    clean_plan_window,
+    clean_required_tier,
     WORKER_UNRESPONSIVE_TYPE_NAME,
     remote_error_label,
     remote_turn_error,
 )
-from cowork.services.providers import minds_chat_base_url
-from cowork.db.scoped import scope_for_identity
-from cowork.services import product_permissions
+from cowork.coding.reasoning import advertised_levels
+from cowork.schemas.turn_skills import TurnSkillEntry, TurnSkills, turn_skills_wire
+from cowork.services.providers import cached_org_model_catalog, minds_chat_base_url
+from cowork.db.scoped import TenantScope, scope_for_identity
+from cowork.db.units import run_db
+from cowork.services import decisions_proxy, product_permissions
+from cowork.services.connectors.custom_connectors import MemberTurnTemplate, member_turn_templates
+from cowork.services.connectors.notion_pages import describe_project_pages
 from cowork.services.connectors.specs._registry import registry
 from cowork.services.product_permissions import require_product_permission
 from cowork.turnqueue.auth_keys import (
+    CUSTOM_GRANTS_ROUTE,
+    DATASOURCE_CONNECTIONS_ROUTE,
+    DATASOURCE_GRANTS_ROUTE,
     list_active_connections,
+    list_custom_api_connections,
     list_verified_datasource_connections,
     mint_turn_key,
     mint_turn_key_details,
+    register_custom_api_grants,
     register_datasource_grants,
+    revoke_turn_key,
 )
-from cowork.turnqueue.models import MAX_DATASOURCE_CONNECTIONS, TurnJob, TurnReply, TurnReplyHeader
-from cowork.streaming.turn_index import record_turn
-from cowork.turnqueue.redis_client import cancel_cause_key, cancel_flag_key, get_redis, reply_stream_key
+from cowork.turnqueue.models import (
+    CUSTOM_API_PROTOCOL_VERSION,
+    MAX_CUSTOM_API_CONNECTIONS,
+    MAX_DATASOURCE_CONNECTIONS,
+    TurnJob,
+    TurnJobHeader,
+    TurnReply,
+    TurnReplyHeader,
+    is_connection_engine,
+    is_connection_label,
+    is_custom_connector_id,
+)
+from cowork.streaming.cancellation import stop_controller_turn
+from cowork.streaming.liveness import WORKER_ALIVE_PHASE
+from cowork.streaming.turn_index import record_channel_turn
+from cowork.turnqueue.redis_client import (
+    REDIS_BLOCK_MS,
+    cancel_cause_key,
+    cancel_flag_key,
+    get_redis,
+    reply_stream_key,
+    send_once,
+    xread_blocking,
+)
 from cowork.common.settings.app_settings import TurnQueueSettings, default_turn_minds_api_host
+
+if TYPE_CHECKING:
+    from cowork.common.settings.user_settings import UserSettings
 
 logger = logging.getLogger(__name__)
 
@@ -62,6 +109,8 @@ class RemoteWorkspace(BaseModel):
 
     project_id: str
     workspace_rel_path: str
+    # Picked Notion pages are tagged with project names, as on desktop.
+    project_name: str | None = None
 
 
 def _trace_block(*, user_id: str | None = None, org_id: str | None = None) -> dict[str, str]:
@@ -98,15 +147,57 @@ def _trace_block(*, user_id: str | None = None, org_id: str | None = None) -> di
         return {}
 
 
+def _limits_block(settings: UserSettings) -> dict[str, int]:
+    """The per-task limits this tenant's turns run under, for the job's params:
+    the same values the desktop harness overlays for an in-process turn, the
+    deployment defaults while the tenant's limits switch is off and its own
+    values once it's on."""
+    from cowork.common.settings.user_settings import effective_turn_limits
+
+    return effective_turn_limits(settings)._asdict()
+
+
 def _request_wire_size(params: dict) -> int:
     """Bytes the controller's request line will occupy for these params."""
     return len(json.dumps(params, separators=(",", ":")).encode("utf-8"))
 
 
-def _fit_request(params: dict, conversation_id: str) -> dict:
-    """Drop project memory first, then warn if the request still will not fit.
+def _shed_skills(params: dict, *, size: int, budget: int, always_on: bool) -> int:
+    """Drop the skills block's on-demand skills (or, with ``always_on``, its
+    always-on ones) one at a time from the end of the block until the request
+    fits; the request's size after. The block holds the always-on skills
+    first, the ones shared with everyone before the team ones, then the
+    on-demand ones by slug (cowork.services.skills.build_turn_skills), so the
+    on-demand skills go in reverse slug order, and the always-on ones team
+    skills first. The block itself stays, empty at worst: it is the pod's
+    whole recallable set, so a turn that sheds skills has fewer, never a
+    fallback to a mounted skills tree."""
+    skills = params.get("skills")
+    if size <= budget or not isinstance(skills, dict):
+        return size
+    skills = params["skills"] = dict(skills)
+    ranked = [
+        slug for slug, entry in skills.items()
+        if TurnSkillEntry.model_validate(entry).always_on is always_on
+    ]
+    for slug in reversed(ranked):
+        if size <= budget:
+            break
+        # The entry's own bytes, ``"slug":{...}``, and the comma before or
+        # after it when another entry is left.
+        entry_bytes = _request_wire_size({slug: skills.pop(slug)}) - 2
+        size -= entry_bytes + (1 if skills else 0)
+    return size
 
-    Skills and personal/global memory live on read-only mounts. Project memory
+
+def _fit_request(params: dict, conversation_id: str) -> dict:
+    """Shed what is optional until the request fits, least needed first: the
+    skills recalled on demand, one at a time from the end of the block, which
+    orders them by slug; then project memory; then the always-on skills one
+    at a time, team ones before the ones shared with everyone (_shed_skills).
+    Then warn if the request still will not fit.
+
+    Personal/global memory lives on read-only mounts. Project memory
     does not: the worker mounts only this conversation's workspace, so its two
     shared slots ride the request again. They are the one optional block we can
     deterministically shed as a unit without changing the user's input or
@@ -117,16 +208,32 @@ def _fit_request(params: dict, conversation_id: str) -> dict:
     windowing remains the upstream fix for that required-payload case.
     """
     budget = _MAX_REQUEST_BYTES - _REQUEST_BYTES_MARGIN
-    size = _request_wire_size(params)
+    size = original = _request_wire_size(params)
+    skill_count = len(params["skills"]) if isinstance(params.get("skills"), dict) else 0
+    size = _shed_skills(params, size=size, budget=budget, always_on=False)
     if size > budget and params.pop("memory", None) is not None:
         logger.warning(
-            "[producer] dropped project memory from turn %s: request line was "
-            "%d bytes, over the %d-byte cap",
-            conversation_id,
-            size,
-            budget,
+            "[producer] dropped project memory from a turn's request: the request line was over its cap",
+            extra={
+                "event": "turn_memory_dropped",
+                "conversation_id": conversation_id,
+                "request_bytes": original,
+                "cap_bytes": budget,
+            },
         )
         size = _request_wire_size(params)
+    size = _shed_skills(params, size=size, budget=budget, always_on=True)
+    if isinstance(params.get("skills"), dict) and len(params["skills"]) < skill_count:
+        logger.warning(
+            "[producer] shed skills from a turn's request: the request line was over its cap",
+            extra={
+                "event": "turn_skills_shed",
+                "conversation_id": conversation_id,
+                "count": skill_count - len(params["skills"]),
+                "request_bytes": original,
+                "cap_bytes": budget,
+            },
+        )
     if size > budget:
         logger.warning(
             "[producer] turn %s request line is %d bytes, over the %d-byte cap; "
@@ -140,9 +247,9 @@ def _new_correlation_id() -> str:
     return str(uuid.uuid4())
 
 
-async def _mint_llm_block(*, org_id: str | None, user_id: str | None,
-                          correlation_id: str, settings: TurnQueueSettings,
-                          workspace_id: str | None = None) -> dict:
+async def mint_llm_block(*, org_id: str | None, user_id: str | None,
+                         correlation_id: str, settings: TurnQueueSettings,
+                         workspace_id: str | None = None, ttl_seconds: int | None = None) -> dict:
     """Mint a short-TTL MindsHub turn key and build the job's `llm` block.
 
     The mint call is authenticated with the internal shared secret
@@ -152,11 +259,13 @@ async def _mint_llm_block(*, org_id: str | None, user_id: str | None,
     per-user provider key is needed or read here. `workspace_id` is the
     caller's active MindsHub workspace (`UserSettings.hub_workspace_id`), if
     they have picked one; omitted otherwise, so the key binds to the
-    organization's Default the way it always has.
+    organization's Default the way it always has. `ttl_seconds` overrides
+    the turn's key lifetime for a key minted for something shorter than a
+    turn (the mid-task message check, ENG-4194).
     """
     api_key = await mint_turn_key(
         user_id=user_id, org_id=org_id, correlation_id=correlation_id,
-        ttl_seconds=settings.turn_key_ttl_seconds, settings=settings,
+        ttl_seconds=ttl_seconds or settings.turn_key_lifetime_seconds, settings=settings,
         workspace_id=workspace_id,
     )
     return _build_llm_block(api_key, settings)
@@ -174,20 +283,40 @@ def _build_llm_block(api_key: str, settings: TurnQueueSettings) -> dict:
     return block
 
 
-async def _mint_llm_block_with_turn_key_id(
+class TurnLlm(NamedTuple):
+    """A web or channel turn's llm block, with what the job needs to know about its key."""
+
+    block: dict
+    #: The key's public prefix, which auth binds datasource and custom API
+    #: grants to; None when neither setting is on.
+    turn_key_id: str | None
+    #: The lifetime auth minted the key for: the turn's, or the untimed one
+    #: when auth refused that (auth_keys._request_turn_key).
+    ttl_seconds: int
+
+
+async def mint_turn_llm(
     *, org_id: str | None, user_id: str | None, correlation_id: str, settings: TurnQueueSettings,
     workspace_id: str | None = None,
-) -> tuple[dict, str]:
-    """As _mint_llm_block, also returning the key's public prefix the datasource grants bind to."""
+) -> TurnLlm:
+    """Mint a turn's key for its lifetime and build the job's `llm` block.
+
+    The routing gate and stream_remote_replies both mint through here, so the
+    job always knows the lifetime auth gave the key.
+    """
     minted = await mint_turn_key_details(
         user_id=user_id,
         org_id=org_id,
         correlation_id=correlation_id,
-        ttl_seconds=settings.turn_key_ttl_seconds,
+        ttl_seconds=settings.turn_key_lifetime_seconds,
         settings=settings,
         workspace_id=workspace_id,
     )
-    return _build_llm_block(minted.key, settings), minted.prefix
+    return TurnLlm(
+        block=_build_llm_block(minted.key, settings),
+        turn_key_id=minted.prefix if settings.needs_turn_key_id else None,
+        ttl_seconds=minted.ttl_seconds,
+    )
 
 
 async def _mint_oauth_block(*, org_id: str | None, user_id: str | None,
@@ -195,7 +324,7 @@ async def _mint_oauth_block(*, org_id: str | None, user_id: str | None,
                             settings: TurnQueueSettings) -> dict | None:
     """Build everything the job's `oauth` block needs except the turn key —
     the list of connections anton is allowed to use this turn. Deliberately
-    doesn't take the turn key `_mint_llm_block` mints: this function's own
+    doesn't take the turn key `mint_turn_llm` mints: this function's own
     network call (listing active connections) never uses it, only the final
     block does, so the caller runs the two mints concurrently and folds the
     turn key in afterward instead of sequencing this behind the llm mint.
@@ -244,7 +373,85 @@ async def _mint_oauth_block(*, org_id: str | None, user_id: str | None,
     }
 
 
-def _connectors_block(oauth_connections: dict | None) -> dict | None:
+class _ConnectorKeyUnavailable(Exception):
+    """The connector key could not be minted for a reason other than an auth
+    service that doesn't know the purpose yet."""
+
+
+def _purpose_not_supported(exc: BaseException) -> bool:
+    """Whether the auth service refused the mint for its ``purpose``: a 400
+    whose JSON body names the field, as an auth without the connector_token
+    purpose answers. The mint raises ProductPermissionUnavailable from it."""
+    cause = exc.__cause__
+    if not isinstance(cause, httpx.HTTPStatusError) or cause.response.status_code != 400:
+        return False
+    try:
+        body = cause.response.json()
+    except ValueError:
+        return False
+    return isinstance(body, dict) and "purpose" in body
+
+
+async def _mint_connector_key(*, org_id: str, user_id: str, correlation_id: str,
+                              settings: TurnQueueSettings, workspace_id: str | None) -> str | None:
+    """A connector-token key for anton's own token fetches.
+
+    None falls back to the turn key, only when the auth service predates the
+    connector_token purpose: there the turn key still fetches MCP tokens. Any
+    other failure raises _ConnectorKeyUnavailable, and the turn runs without
+    its MCP connections rather than hand their tokens to the turn key.
+    """
+    try:
+        return await mint_turn_key(
+            user_id=user_id, org_id=org_id, correlation_id=correlation_id,
+            ttl_seconds=settings.turn_key_lifetime_seconds, settings=settings,
+            purpose="connector_token", workspace_id=workspace_id,
+        )
+    except Exception as exc:
+        if _purpose_not_supported(exc):
+            logger.info(
+                "[producer] auth has no connector_token purpose correlation_id=%s; using the turn key",
+                correlation_id,
+            )
+            return None
+        raise _ConnectorKeyUnavailable() from exc
+
+
+async def _oauth_block_and_connector_key(*, org_id: str | None, user_id: str | None,
+                                         disabled: list[dict] | None, correlation_id: str,
+                                         settings: TurnQueueSettings,
+                                         workspace_id: str | None) -> tuple[dict | None, str | None]:
+    """The oauth connections, then a connector key when one of them is MCP.
+
+    The auth service hands an MCP engine's token only to a connector-token
+    key, which anton alone holds; the scratchpad keeps the turn key, so cell
+    code can't fetch the token and skip the connection's access mode.
+
+    Chained so the key is minted only for turns that need it, while the pair
+    still runs alongside the turn-key mint."""
+    oauth_connections = await _mint_oauth_block(
+        org_id=org_id, user_id=user_id, disabled=disabled, settings=settings,
+    )
+    connections = (oauth_connections or {}).get("connections") or []
+    mcp_engines = registry.mcp_engines()
+    if not any(c.get("engine") in mcp_engines for c in connections):
+        return oauth_connections, None
+    try:
+        connector_key = await _mint_connector_key(
+            org_id=org_id, user_id=user_id, correlation_id=correlation_id,
+            settings=settings, workspace_id=workspace_id,
+        )
+    except _ConnectorKeyUnavailable:
+        logger.warning(
+            "[producer] connector key mint failed correlation_id=%s; MCP connections left out of this turn",
+            correlation_id, exc_info=True,
+        )
+        others = [c for c in connections if c.get("engine") not in mcp_engines]
+        return ({**oauth_connections, "connections": others} if others else None), None
+    return oauth_connections, connector_key
+
+
+def _connectors_block(oauth_connections: dict | None, project_name: str | None = None) -> dict | None:
     """The turn's `connectors` block: {engine: {"usage_notes": ...}} for the
     engines of this turn's connections whose spec declares usage notes. None
     when there is nothing to send; the key is then left out of params, like
@@ -253,21 +460,115 @@ def _connectors_block(oauth_connections: dict | None) -> dict | None:
     Built from the same, already disabled-filtered, connection list as the
     `oauth` block: anton renders notes only for engines its vault connects,
     and on web that vault is built from `oauth` alone.
+
+    Notion's notes also list the pages added to this turn's project, the
+    same text the desktop harness puts in its prompt.
     """
     connections = (oauth_connections or {}).get("connections") or []
     notes = registry.usage_notes_for(dict.fromkeys(c.get("engine") for c in connections))
+    pages = describe_project_pages(_project_notion_pages(connections, project_name))
+    if pages:
+        notes = {**notes, "notion": (notes.get("notion", "") + pages).strip()}
     return {engine: {"usage_notes": text} for engine, text in notes.items()} or None
 
 
-def _refuse_datasource_grants(reason: str) -> product_permissions.ProductPermissionUnavailable:
+def custom_usage_prefix(
+    connector_id: str,
+    connection_ids: list[int],
+    field_names: tuple[str, ...],
+    optional_names: frozenset[str] = frozenset(),
+) -> str:
+    """The fixed paragraph the producer puts before a custom connector's notes.
+
+    Input: the connector id, its connections' ids in this turn, and its
+    template's field names (empty when unknown) and which of them a member
+    may leave unset, listed as "<name> (optional; this connection may not hold it)". Output: how to call it with
+    ``call_minds_api``, that no credential value reaches the turn, and the
+    path rules. Built from ids and names only, never a value. No side effects.
+    """
+    ids = ", ".join(str(connection_id) for connection_id in connection_ids)
+    noun = "connection" if len(connection_ids) == 1 else "connections"
+    call_id = str(connection_ids[0]) if len(connection_ids) == 1 else "connection_id"
+    listed = [
+        f"{name} (optional; this connection may not hold it)" if name in optional_names else name
+        for name in field_names
+    ]
+    fields = f" Fields: {', '.join(listed)}." if listed else ""
+    return (
+        f"Custom {noun} {ids} ({connector_id}).{fields} No credential value reaches this turn: "
+        f"call it with call_minds_api({call_id}, path, query=None, headers=None) and the gateway "
+        "adds the credentials. Every path starts at the API's host and includes any version, "
+        "such as /v2/eod; a ?name=value part goes in query. The user typed only the host."
+    )
+
+
+async def _with_custom_usage_notes(connectors_block: dict | None, scope: TenantScope,
+                                   custom_api_block: dict) -> dict | None:
+    """The connectors block plus, per custom connector of this turn, the producer's prefix and the template's notes.
+
+    Field names and notes come from the member's own rows only
+    (member_turn_templates). Every custom connector gets the prefix; a
+    template gone, one that no longer parses, or a database that cannot
+    answer leaves out its field names and notes, never the prefix or the turn.
+    Built-in notes win a key clash, as before.
+    """
+    ids_by_connector: dict[str, list[int]] = {}
+    for connection in custom_api_block["connections"]:
+        ids_by_connector.setdefault(connection["connector_id"], []).append(connection["connection_id"])
+    templates: dict[str, MemberTurnTemplate] = {}
+    try:
+        templates = await run_db(partial(member_turn_templates, connector_ids=list(ids_by_connector)), scope=scope)
+    except Exception:
+        logger.warning("[producer] custom connector field names and notes left out: the database did not answer",
+                       exc_info=True)
+    merged: dict[str, dict] = {}
+    for connector_id, connection_ids in ids_by_connector.items():
+        template = templates.get(connector_id)
+        text = custom_usage_prefix(
+            connector_id, connection_ids,
+            template.field_names if template else (), template.optional_names if template else frozenset(),
+        )
+        if template is not None and template.notes:
+            text += "\n\n" + template.notes
+        merged[connector_id] = {"usage_notes": text}
+    merged.update(connectors_block or {})
+    return merged or None
+
+
+def _project_notion_pages(connections: list[dict], project_name: str | None) -> dict[str, list[dict]]:
+    """Notion pages tagged to `project_name`, keyed by connection name: the
+    same rule as ConnectionsService.picked_files_by_project on desktop."""
+    if not project_name:
+        return {}
+    by_connection: dict[str, list[dict]] = {}
+    for c in connections:
+        if c.get("engine") != "notion" or not isinstance(c.get("picked_files"), list):
+            continue
+        scoped = [
+            f for f in c["picked_files"]
+            if isinstance(f, dict) and project_name in (f.get("projects") or [])
+        ]
+        if scoped:
+            by_connection[str(c.get("name"))] = scoped
+    return by_connection
+
+
+def _oauth_connections_wire(connections: list[dict]) -> list[dict]:
+    # The pod's vault needs only engine and name; picked pages go in `connectors`.
+    return [{k: v for k, v in c.items() if k != "picked_files"} for c in connections]
+
+
+def _refuse_datasource_grants(reason: str, *, route: str) -> product_permissions.ProductPermissionUnavailable:
     """Name the failed check for the operator, who otherwise sees the same
     permission_unavailable for an outage, a malformed row and a bad binding.
-    The reason is a fixed phrase: never the key, the producer secret or a row."""
-    logger.warning("[producer] datasource grants refused: %s", reason)
-    return product_permissions.ProductPermissionUnavailable()
+    ``route`` is the auth call whose answer failed the check, or the one it
+    skipped. The reason is a fixed phrase: never the key, the producer secret or a row."""
+    return product_permissions.permission_unavailable(route=route, cause=reason)
 
 
-def _datasource_connection_refs(connections: list[dict], disabled: list[dict] | None) -> list[dict]:
+def _datasource_connection_refs(
+    connections: list[dict], disabled: list[dict] | None, *, with_labels: bool = False
+) -> list[dict]:
     """The grant set: every verified connection auth listed, minus the
     conversation's disabled ones. A disabled entry carries ``engine`` and
     ``name``; auth's ``connector_id`` is the same value, so the join is exact."""
@@ -278,7 +579,9 @@ def _datasource_connection_refs(connections: list[dict], disabled: list[dict] | 
     seen: set[int] = set()
     for connection in connections:
         if not isinstance(connection, dict):
-            raise _refuse_datasource_grants("listing carries a connection that is not an object")
+            raise _refuse_datasource_grants(
+                "listing carries a connection that is not an object", route=DATASOURCE_CONNECTIONS_ROUTE,
+            )
         connection_id = connection.get("id")
         credential_version = connection.get("credential_version")
         if (
@@ -288,7 +591,9 @@ def _datasource_connection_refs(connections: list[dict], disabled: list[dict] | 
             or not connection["name"]
             or connection.get("status") != "verified"
         ):
-            raise _refuse_datasource_grants("listing carries a connection without verified metadata")
+            raise _refuse_datasource_grants(
+                "listing carries a connection without verified metadata", route=DATASOURCE_CONNECTIONS_ROUTE,
+            )
         if (connection.get("connector_id"), connection.get("name")) in disabled_keys:
             continue
         if (
@@ -300,12 +605,19 @@ def _datasource_connection_refs(connections: list[dict], disabled: list[dict] | 
             or credential_version < 1
             or connection_id in seen
         ):
-            raise _refuse_datasource_grants("listing carries a malformed or repeated connection reference")
+            raise _refuse_datasource_grants(
+                "listing carries a malformed or repeated connection reference", route=DATASOURCE_CONNECTIONS_ROUTE,
+            )
         seen.add(connection_id)
-        refs.append({"connection_id": connection_id, "credential_version": credential_version})
+        ref = {"connection_id": connection_id, "credential_version": credential_version}
+        if with_labels:
+            ref.update(_connection_labels(connection))
+        refs.append(ref)
     # Auth caps what is registered, so the cap applies after the disabled ones are gone.
     if len(refs) > MAX_DATASOURCE_CONNECTIONS:
-        raise _refuse_datasource_grants("more enabled connections than a grant set may hold")
+        raise _refuse_datasource_grants(
+            "more enabled connections than a grant set may hold", route=DATASOURCE_CONNECTIONS_ROUTE,
+        )
     return refs
 
 
@@ -319,6 +631,16 @@ def _same_identifier(echoed: object, ours: str) -> bool:
         return echoed == ours
 
 
+def _connection_labels(connection: dict) -> dict[str, str]:
+    """The connection's ``label`` and ``engine``, each only when the queue check accepts it; anton cleans them for the prompt."""
+    labels: dict[str, str] = {}
+    if is_connection_label(connection["name"]):
+        labels["label"] = connection["name"]
+    if is_connection_engine(connection["connector_id"]):
+        labels["engine"] = connection["connector_id"]
+    return labels
+
+
 async def _mint_datasource_block(*, org_id: str | None, user_id: str | None,
                                  correlation_id: str, turn_key_id: str | None,
                                  disabled: list[dict] | None,
@@ -329,7 +651,9 @@ async def _mint_datasource_block(*, org_id: str | None, user_id: str | None,
     # A datasource-enabled dispatch without the key prefix is a producer
     # misconfiguration; it fails here rather than reaching auth without it.
     if not isinstance(turn_key_id, str) or not turn_key_id.strip():
-        raise _refuse_datasource_grants("dispatch carries no turn key prefix")
+        raise _refuse_datasource_grants(
+            "dispatch carries no turn key prefix", route=DATASOURCE_CONNECTIONS_ROUTE,
+        )
     try:
         connections = await list_verified_datasource_connections(
             org_id=org_id, user_id=user_id, turn_key_id=turn_key_id, settings=settings
@@ -345,7 +669,7 @@ async def _mint_datasource_block(*, org_id: str | None, user_id: str | None,
             org_id, exc_info=True,
         )
         return None
-    refs = _datasource_connection_refs(connections, disabled)
+    refs = _datasource_connection_refs(connections, disabled, with_labels=settings.datasource_labels_enabled)
     if not refs:
         return None
     response = await register_datasource_grants(
@@ -364,10 +688,12 @@ async def _mint_datasource_block(*, org_id: str | None, user_id: str | None,
         or response.get("audience") != "datasource-gateway"
         or response.get("purpose") != "execute"
     ):
-        raise _refuse_datasource_grants("grant response binding does not match this turn")
+        raise _refuse_datasource_grants(
+            "grant response binding does not match this turn", route=DATASOURCE_GRANTS_ROUTE,
+        )
     grants = response.get("grants")
     if not isinstance(grants, list):
-        raise _refuse_datasource_grants("grant response carries no grant list")
+        raise _refuse_datasource_grants("grant response carries no grant list", route=DATASOURCE_GRANTS_ROUTE)
     returned = {
         (grant.get("connection_id"), grant.get("credential_version"))
         for grant in grants
@@ -375,9 +701,134 @@ async def _mint_datasource_block(*, org_id: str | None, user_id: str | None,
     }
     expected = {(ref["connection_id"], ref["credential_version"]) for ref in refs}
     if returned != expected or len(grants) != len(expected):
-        raise _refuse_datasource_grants("grants differ from the requested connection references")
+        raise _refuse_datasource_grants(
+            "grants differ from the requested connection references", route=DATASOURCE_GRANTS_ROUTE,
+        )
     return {"protocol_version": 1, "connections": refs}
 
+
+
+def _custom_api_connection_refs(connections: list[dict], disabled: list[dict] | None) -> list[dict] | None:
+    """The custom API connections auth listed, minus the conversation's disabled ones.
+
+    None, logged, when the listing contradicts itself (not verified, malformed,
+    repeated, or a connector id or name the pod would refuse): the turn then
+    runs without custom connections, as it does when auth cannot list them.
+    Past MAX_CUSTOM_API_CONNECTIONS, the lowest ids are kept.
+    """
+    disabled_keys = {
+        (entry.get("engine"), entry.get("name")) for entry in (disabled or []) if isinstance(entry, dict)
+    }
+    refs: list[dict] = []
+    seen: set[int] = set()
+    for connection in connections:
+        if not isinstance(connection, dict):
+            logger.warning("[producer] custom API connections left out: the listing carries a non-object")
+            return None
+        connection_id = connection.get("id")
+        if (
+            not is_custom_connector_id(connection.get("connector_id"))
+            or not is_connection_label(connection.get("name"))
+            or connection.get("status") != "verified"
+            or isinstance(connection_id, bool)
+            or not isinstance(connection_id, int)
+            or connection_id < 1
+            or connection_id in seen
+        ):
+            logger.warning("[producer] custom API connections left out: the listing carries a malformed "
+                           "or repeated connection")
+            return None
+        seen.add(connection_id)
+        if (connection["connector_id"], connection["name"]) in disabled_keys:
+            continue
+        refs.append({"connection_id": connection_id, "connector_id": connection["connector_id"],
+                     "name": connection["name"]})
+    refs.sort(key=lambda ref: ref["connection_id"])
+    if len(refs) > MAX_CUSTOM_API_CONNECTIONS:
+        logger.warning("[producer] %d custom API connections listed; the first %d by id are kept",
+                       len(refs), MAX_CUSTOM_API_CONNECTIONS)
+        refs = refs[:MAX_CUSTOM_API_CONNECTIONS]
+    return refs
+
+
+def _refuse_custom_api(reason: str) -> product_permissions.ProductPermissionUnavailable:
+    """Name the failed check of auth's grant answer for the operator; a fixed
+    phrase, never a key or a row."""
+    return product_permissions.permission_unavailable(route=CUSTOM_GRANTS_ROUTE, cause=reason)
+
+
+async def _mint_custom_api_block(*, scope: TenantScope, correlation_id: str, turn_key_id: str | None,
+                                 disabled: list[dict] | None, settings: TurnQueueSettings) -> dict | None:
+    """The member's custom API connections for this turn, with grants bound to its turn key.
+
+    None, logged, when the turn cannot carry them: outside org mode, the
+    setting off, no turn key prefix (a channel turn), no producer key, a
+    listing that failed or contradicts itself, or a grant call auth refused.
+    The turn then runs without custom connections. Only a grant answer that
+    contradicts this turn fails it.
+
+    Returns:
+        ``{"connections": [{connection_id, connector_id, name, credential_version}]}``;
+        the caller adds ``protocol_version``. Versions are the grants', not the listing's.
+
+    Raises:
+        ProductPermissionUnavailable: the grant answer names another member,
+            organization, key, correlation, scope or connection set.
+    """
+    org_id, user_id = scope.org_id, scope.user_id
+    if not settings.custom_api_enabled or not scope.org_mode or not org_id or not user_id:
+        return None
+    if not isinstance(turn_key_id, str) or not turn_key_id.strip():
+        logger.info("[producer] custom API connections left out: the turn has no turn key prefix")
+        return None
+    if not settings.datasource_producer_key_id or not settings.datasource_producer_key:
+        logger.warning("[producer] custom API connections left out: the producer key is not configured")
+        return None
+    try:
+        connections = await list_custom_api_connections(
+            org_id=org_id, user_id=user_id, turn_key_id=turn_key_id, settings=settings
+        )
+    except product_permissions.ProductPermissionUnavailable:
+        logger.warning("[producer] custom API connections left out: auth could not list them", exc_info=True)
+        return None
+    refs = _custom_api_connection_refs(connections, disabled)
+    if not refs:
+        return None
+    requested = [ref["connection_id"] for ref in refs]
+    try:
+        response = await register_custom_api_grants(
+            user_id=user_id, org_id=org_id, correlation_id=correlation_id, turn_key_id=turn_key_id,
+            connection_ids=requested, settings=settings,
+        )
+    except product_permissions.ProductPermissionUnavailable:
+        logger.warning("[producer] custom API connections left out: auth refused their grants", exc_info=True)
+        return None
+    if (
+        not _same_identifier(response.get("user_id"), user_id)
+        or not _same_identifier(response.get("organization_id"), org_id)
+        or response.get("turn_key_id") != turn_key_id
+        or not _same_identifier(response.get("correlation_id"), correlation_id)
+        or response.get("audience") != "custom-api"
+        or response.get("purpose") != "fetch"
+    ):
+        raise _refuse_custom_api("grant response binding does not match this turn")
+    grants = response.get("grants")
+    if not isinstance(grants, list):
+        raise _refuse_custom_api("grant response carries no grant list")
+    versions: dict[int, int] = {}
+    for grant in grants:
+        connection_id = grant.get("connection_id") if isinstance(grant, dict) else None
+        version = grant.get("credential_version") if isinstance(grant, dict) else None
+        if (
+            isinstance(connection_id, bool) or not isinstance(connection_id, int)
+            or isinstance(version, bool) or not isinstance(version, int) or version < 1
+            or connection_id in versions
+        ):
+            raise _refuse_custom_api("grant response carries a malformed grant")
+        versions[connection_id] = version
+    if set(versions) != set(requested):
+        raise _refuse_custom_api("grants differ from the requested connections")
+    return {"connections": [{**ref, "credential_version": versions[ref["connection_id"]]} for ref in refs]}
 
 # What the reply loop reports when the worker stops answering. Shaped like the
 # pod's own scrubbed "ExceptionType: message" errors so remote_turn_error can
@@ -387,6 +838,62 @@ async def _mint_datasource_block(*, org_id: str | None, user_id: str | None,
 UNRESPONSIVE_WORKER_ERROR = (
     f"{WORKER_UNRESPONSIVE_TYPE_NAME}: the turn worker stopped responding"
 )
+# What the reply loop reports when a reply's number is below the last one it
+# applied: a second run of the same job is replying, and the two runs' answers
+# would mix. Shaped like the pod's errors, so remote_turn_error classifies it
+# as a failure with the generic message.
+SECOND_RUN_ERROR = "TurnRunRepeated: a second run of this turn's job sent replies"
+#: How many of the newest entries of a conversation's job stream the producer
+#: reads back after a job XADD whose reply it lost. A conversation's turns run
+#: one at a time, so a job that landed is among the last few.
+_JOB_READBACK_COUNT = 5
+
+# Replies a turn streams to the client before it ends; each needs the
+# workspace authorized first. `TurnReply.kind` lists the kinds it accepts.
+_STREAMED_REPLY_KINDS = (
+    "turn_delta", "turn_step", "turn_memory", "turn_skill", "turn_connector", "turn_history", "turn_compaction",
+)
+
+
+async def _job_queued(*, r, job_stream: str, correlation_id: str) -> bool:
+    """Whether the job for ``correlation_id`` is among the newest entries of
+    ``job_stream``. Raises when Redis cannot be read."""
+    for _entry_id, fields in await r.xrevrange(job_stream, count=_JOB_READBACK_COUNT):
+        try:
+            if TurnJobHeader.model_validate_json(fields["payload"]).correlation_id == correlation_id:
+                return True
+        except (KeyError, ValidationError):
+            continue
+    return False
+
+
+async def _queued_after_a_failed_send(
+    *, r, job_stream: str, conversation_id: str, turn_id: int, correlation_id: str,
+) -> bool:
+    """After a job XADD that failed without saying whether Redis applied it
+    (a lost reply, or one slower than the socket timeout), whether the job is
+    queued.
+
+    Reads the job stream back. When the job is not there, or the read fails
+    too, writes the turn's cancel flag before answering False, so a copy the
+    controller picks up later stops at its first check rather than run with
+    nobody reading its replies. A resend would not be safe: the controller
+    skips a repeated job only after its first run ended normally.
+    """
+    try:
+        queued = await _job_queued(r=r, job_stream=job_stream, correlation_id=correlation_id)
+    except RedisError:
+        queued = False
+    logger.warning(
+        "A remote turn's job XADD failed without saying whether Redis applied it; read the job stream back.",
+        extra={
+            "event": "remote_job_send_unconfirmed", "outcome": "queued" if queued else "canceled",
+            "conversation_id": conversation_id, "request_id": correlation_id,
+        },
+    )
+    if not queued:
+        await stop_controller_turn(correlation_id, turn_id=str(turn_id), reason="job_send_unconfirmed")
+    return queued
 
 
 def _remote_reset_at(*, code: str, value: object) -> str | None:
@@ -420,6 +927,7 @@ def step_stream_events(data: dict) -> list:
         LLMResponse,
         StreamAskUser,
         StreamAskUserAnswered,
+        StreamBrowserSession,
         StreamComplete,
         StreamContextCompacted,
         StreamTaskProgress,
@@ -462,6 +970,16 @@ def step_stream_events(data: dict) -> list:
         )]
     if step == "compacted":
         return [StreamContextCompacted(message=data.get("message") or "")]
+    if step == "browser":
+        # The agent opened the person's browser session. Its id only: any
+        # other field the line carries, a viewer link included, is dropped,
+        # so nothing that opens the browser is ever stored with the turn.
+        from cowork.services.browser_contract import SESSION_ID
+
+        session_id = data.get("session_id")
+        if not isinstance(session_id, str) or not SESSION_ID.fullmatch(session_id):
+            return []
+        return [StreamBrowserSession(session_id=session_id)]
     if step == "round_end":
         # Only stop_reason and tool_calls truthiness drive the formatter's
         # round-break decision; a placeholder call carries the truthiness.
@@ -504,9 +1022,136 @@ def step_stream_events(data: dict) -> list:
     if step == "turn_ended":
         ended_by = data.get("ended_by")
         return [StreamTurnEnded(ended_by=ended_by)] if isinstance(ended_by, str) and ended_by else []
+    # `addon` steps (ENG-4194) are relayed only after a check this sync
+    # mapping can't make: that the addon is one this server accepted for the
+    # turn (turnqueue.addons.relay_addon_step, which the web turn's relay
+    # calls). A channel turn takes no mid-task messages, so it renders none.
     # `ask_user_answer_rejected` is the pod's verdict on one answer; only
     # /answer reads it (turnqueue/answers.py), nothing renders it.
     return []
+
+
+def _offered_effort(model: str, effort: str | None, *, org_id: str | None,
+                    user_id: str | None) -> str | None:
+    """``effort`` when ``model`` advertises it, else None so the pod keeps its default.
+
+    Reads the org's cached model listing, the one the composer offered levels
+    from. Without a listing the effort is kept; the pod falls back to its
+    configured effort if the provider refuses it.
+    """
+    if not effort or not org_id or not user_id:
+        return effort or None
+    offered = advertised_levels(model, cached_org_model_catalog(org_id=org_id, user_id=user_id))
+    if offered is None or effort in offered:
+        return effort
+    logger.warning("dropping the selected reasoning effort: model %s does not offer it", model)
+    return None
+
+
+#: A scope that takes longer than this is logged: every web turn waits on it.
+_SLOW_SCOPE_MS = 1000
+
+
+async def _scoped_browser_block(
+    *, scope, conversation_id: str, turn_key: str, project_id: str | None,
+) -> dict | None:
+    """The job's browser block, or None when the turn gets no browser.
+
+    Wherever the web has a router, every turn's key is scoped with it before
+    the job is queued, since the router turns a key it hasn't scoped away and
+    takes only one scope per key. A turn with a browser is scoped to the
+    task's session and the project's saved tabs, which also starts the
+    person's browser, so it is likely up by the time the agent reaches for
+    it. A turn without one (the person switched the browser off, or no person
+    stands behind the turn) is scoped to no session, so code in the turn that
+    holds its key can't scope it to a session of its own. A refused or failed
+    scope leaves the turn without a browser rather than failing it, and logs
+    ``browser_scope_failed``, or ``browser_scope_not_entitled`` at info for a
+    person the browser isn't for. No alert reads either yet.
+    """
+    from cowork.common.settings.user_settings import get_user_settings
+    from cowork.db.units import run_on_unit_threads
+    from cowork.services import browser, browser_contract
+
+    router = browser.router_url()
+    if not router or not turn_key:
+        return None
+    config = browser.turn_block(
+        await run_on_unit_threads(partial(get_user_settings, scope)),
+        user_id=scope.user_id, conversation_id=conversation_id, project_id=project_id,
+    )
+    started = time.monotonic()
+    try:
+        await browser.scope_turn(turn_key=turn_key, router=router, config=config)
+    except browser.BrowserServiceError as exc:
+        elapsed_ms = round((time.monotonic() - started) * 1000)
+        if exc.detail.code == browser_contract.NOT_ENTITLED:
+            # The router reads the person's entitlement on every scope, so an
+            # organization that switched the browser off answers this on each
+            # of its members' turns: expected, not a failure.
+            logger.info(
+                "[producer] the person may not use the browser; the turn runs without one",
+                extra={"event": "browser_scope_not_entitled", "conversation_id": conversation_id,
+                       "elapsed_ms": elapsed_ms},
+            )
+        else:
+            logger.warning(
+                "[producer] the browser router did not scope the turn; it runs without a browser",
+                extra={"event": "browser_scope_failed", "conversation_id": conversation_id,
+                       "status_code": exc.status, "reason": exc.detail.code, "with_browser": config is not None,
+                       "elapsed_ms": elapsed_ms},
+            )
+        return None
+    except Exception as exc:
+        # A turn must not fail over the browser.
+        logger.warning(
+            "[producer] scoping the turn failed; it runs without a browser",
+            extra={"event": "browser_scope_failed", "conversation_id": conversation_id,
+                   "reason": type(exc).__name__, "with_browser": config is not None},
+        )
+        return None
+    elapsed_ms = round((time.monotonic() - started) * 1000)
+    if elapsed_ms > _SLOW_SCOPE_MS:
+        logger.info(
+            "[producer] the browser router took a while to scope the turn",
+            extra={"event": "browser_scope_slow", "conversation_id": conversation_id, "elapsed_ms": elapsed_ms},
+        )
+    return config.to_dict() if config is not None else None
+
+
+async def _admit_decisions_proxy(
+    r, browser_block: dict | None, *, turn_key: str, turn_key_ttl_seconds: int, org_id: str | None,
+    user_id: str | None, correlation_id: str,
+) -> dict | None:
+    """The browser block as the job carries it. One that names the decisions
+    proxy (the organization's own decision model, through this server) needs
+    the turn's key recorded first, which is how the proxy knows the key and
+    its organization (cowork.services.decisions_proxy). If that fails the
+    block goes without the proxy, and the pod's browser asks Jev on MindsHub
+    rather than a proxy that would refuse its key."""
+    if not browser_block or not browser_block.get("decisions_proxy"):
+        return browser_block
+    try:
+        if not turn_key or not org_id or not user_id:
+            raise ValueError("no turn key or identity to record")
+        await decisions_proxy.admit(
+            r, turn_key=turn_key, org_id=org_id, user_id=user_id, correlation_id=correlation_id,
+            ttl_seconds=turn_key_ttl_seconds,
+        )
+    except Exception as exc:
+        logger.warning(
+            "[producer] could not record the turn for the decisions proxy; its browser asks Jev on MindsHub",
+            extra={"event": "decisions_proxy_admit_failed", "correlation_id": correlation_id,
+                   "error_type": type(exc).__name__},
+        )
+        return {k: v for k, v in browser_block.items() if k != "decisions_proxy"}
+    return browser_block
+
+
+async def revoke_turn_key_quietly(correlation_id: str) -> None:
+    """Revoke the key the routing gate minted for a turn that never runs,
+    logging rather than raising: a failed revoke leaves it to its own expiry."""
+    await _revoke_turn_key_at_turn_end(correlation_id, TurnQueueSettings())
 
 
 async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
@@ -515,34 +1160,64 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
                                 turn_id: int = 0,
                                 history: list | None = None,
                                 memory: dict | None = None,
+                                skills: TurnSkills | None = None,
                                 workspace: RemoteWorkspace | None = None,
                                 correlation_id: str | None = None,
                                 run_id: str | None = None,
-                                llm: dict | None = None,
-                                turn_key_id: str | None = None,
+                                llm: TurnLlm | None = None,
                                 disabled: list[dict] | None = None,
                                 started_at: str | None = None,
                                 interactive: bool = False,
-                                tool_messages: bool = False):
+                                tool_messages: bool = False,
+                                connector_drafts: bool = False,
+                                preview_checks: bool = False,
+                                ui_locale: str | None = None,
+                                reasoning_effort: str | None = None):
     """Mint, enqueue, then yield this turn's replies as (kind, data) tuples.
 
     Yields turn_delta / turn_step / turn_memory in arrival order and ends with
-    exactly one terminal — turn_completed, or turn_failed (classified with the
+    exactly one terminal: turn_completed, or turn_failed (classified with the
     same (code, message) the caller streams and persists; synthesized locally
     when the worker goes quiet past the idle timeout).
-    `correlation_id`/`llm` reuse a turn key the routing gate already minted.
+    `correlation_id`/`llm` reuse a turn key the routing gate already minted
+    (mint_turn_llm), with its prefix and the lifetime auth minted it for.
     `interactive` tells the pod it may ask `ask_user` questions (web UI turns;
     channel turns never).
     `tool_messages` tells the pod the client renders a tool's message to the
     user (the cowork UI does; channel turns never).
+    `connector_drafts` asks for the pod's connector template tool. It reaches
+    the job only with the deployment setting on, in org mode, for a turn with
+    a user; the caller passes it only where a member sees and saves the card.
+    `preview_checks` lets the pod's artifact editor ask the app's open
+    preview whether an edit runs (ENG-4227, turnqueue/preview_checks.py).
+    Only with `interactive`: the answer reaches the pod on the stdin an
+    interactive turn keeps open. Channel turns never.
+    `ui_locale` is the app's language (cowork.common.ui_locale), which the
+    pod's anton replies in when the user's message does not say; None for a
+    turn with no request behind it.
     `workspace` is the project the turn runs in; None runs it in the org's
-    default project with no project on the job."""
+    default project with no project on the job.
+    `skills` is the caller's visible skills, each with `always_on` set on the
+    ones the pod puts in its prompt every turn
+    (cowork.services.skills.build_turn_skills). Always sent, None as an empty
+    block: the pod recalls only what the block names, and a request without
+    one would let it fall back to a mounted org skills tree
+    (cowork.handlers.responses.remote_turn_skills).
+    `reasoning_effort` is the composer's pick for this turn; None leaves the
+    pod's configured default."""
     settings = TurnQueueSettings()
     scope = scope_for_identity(org_id=org_id, user_id=user_id)
-    await require_product_permission(scope, "product.execute")
-    workspace_mode = (
-        "persistent" if await product_permissions.has_product_permission(scope, "artifact.manage") else "ephemeral"
-    )
+    try:
+        await require_product_permission(scope, "product.execute")
+        workspace_mode = (
+            "persistent" if await product_permissions.has_product_permission(scope, "artifact.manage")
+            else "ephemeral"
+        )
+    except product_permissions.ProductPermissionUnavailable as exc:
+        # Raised to every caller, a channel turn and a scheduled run among
+        # them, so it is logged here, before any of them answers it.
+        product_permissions.report_permission_unavailable(exc)
+        raise
     r = get_redis()
     corr = correlation_id or _new_correlation_id()
     # A flag left by an earlier turn would cancel this one on its first line,
@@ -558,7 +1233,10 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
     # a valid minds alias, independent of any harness's built-in default.
     if not model:
         from cowork.common.settings.user_settings import get_user_settings
-        model = get_user_settings(scope).resolved_planning_model
+        from cowork.db.units import run_on_unit_threads
+
+        model = (await run_on_unit_threads(partial(get_user_settings, scope))).resolved_planning_model
+    reasoning_effort = _offered_effort(model, reasoning_effort, org_id=org_id, user_id=user_id)
 
     # Independent network round trips (llm's turn-key mint, oauth's active-
     # connections list) — run concurrently rather than paying both latencies
@@ -568,40 +1246,57 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
     # An outage here happens before anything is queued. Reported as a
     # turn_failed so both callers stream permission_unavailable, not a generic error.
     try:
-        oauth_connections_coro = _mint_oauth_block(
-            org_id=org_id, user_id=user_id, disabled=disabled, settings=settings,
+        from cowork.common.settings.user_settings import get_user_settings
+        from cowork.db.units import run_on_unit_threads
+
+        user_settings = await run_on_unit_threads(partial(get_user_settings, scope))
+        workspace_id = getattr(user_settings, "hub_workspace_id", "") or None
+        oauth_connections_coro = _oauth_block_and_connector_key(
+            org_id=org_id, user_id=user_id, disabled=disabled, correlation_id=corr,
+            settings=settings, workspace_id=workspace_id,
         )
-        if llm:
-            llm_block = llm
-            oauth_connections = await oauth_connections_coro
+        if llm is not None:
+            llm_block, turn_key_id, key_ttl_seconds = llm
+            oauth_connections, connector_key = await oauth_connections_coro
         else:
-            from cowork.common.settings.user_settings import get_user_settings
-            workspace_id = getattr(get_user_settings(scope), "hub_workspace_id", "") or None
-            if settings.datasource_enabled:
-                (llm_block, turn_key_id), oauth_connections = await asyncio.gather(
-                    _mint_llm_block_with_turn_key_id(
-                        org_id=org_id, user_id=user_id, correlation_id=corr, settings=settings,
-                        workspace_id=workspace_id,
-                    ),
-                    oauth_connections_coro,
-                )
-            else:
-                llm_block, oauth_connections = await asyncio.gather(
-                    _mint_llm_block(
-                        org_id=org_id, user_id=user_id, correlation_id=corr, settings=settings,
-                        workspace_id=workspace_id,
-                    ),
-                    oauth_connections_coro,
-                )
-        datasource_block = await _mint_datasource_block(
-            org_id=org_id,
-            user_id=user_id,
-            correlation_id=corr,
-            turn_key_id=turn_key_id,
-            disabled=disabled,
-            settings=settings,
+            # Both run to the end, so a connector key minted beside a failed
+            # turn-key mint is known here and revoked rather than left live.
+            llm_result, oauth_result = await asyncio.gather(
+                mint_turn_llm(org_id=org_id, user_id=user_id, correlation_id=corr, settings=settings,
+                              workspace_id=workspace_id),
+                oauth_connections_coro,
+                return_exceptions=True,
+            )
+            if isinstance(oauth_result, BaseException):
+                raise oauth_result
+            oauth_connections, connector_key = oauth_result
+            if isinstance(llm_result, BaseException):
+                if connector_key:
+                    await _revoke_turn_key_at_turn_end(corr, settings)
+                raise llm_result
+            llm_block, turn_key_id, key_ttl_seconds = llm_result
+        # Independent auth round trips, run together so custom connections add
+        # no turn start time. Both run to the end; the datasource failure wins.
+        datasource_result, custom_api_result = await asyncio.gather(
+            _mint_datasource_block(
+                org_id=org_id,
+                user_id=user_id,
+                correlation_id=corr,
+                turn_key_id=turn_key_id,
+                disabled=disabled,
+                settings=settings,
+            ),
+            _mint_custom_api_block(
+                scope=scope, correlation_id=corr, turn_key_id=turn_key_id, disabled=disabled, settings=settings,
+            ),
+            return_exceptions=True,
         )
-    except product_permissions.ProductPermissionUnavailable:
+        for result in (datasource_result, custom_api_result):
+            if isinstance(result, BaseException):
+                raise result
+        datasource_block, custom_api_connections = datasource_result, custom_api_result
+    except product_permissions.ProductPermissionUnavailable as exc:
+        product_permissions.report_permission_unavailable(exc)
         logger.warning(
             "[producer] turn setup unavailable conversation=%s correlation_id=%s", conversation_id, corr,
             exc_info=True,
@@ -609,18 +1304,54 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
         yield "turn_failed", _setup_permission_failure()
         return
 
-    # Reuses the turn key already minted for llm_block — never mints a
-    # second one. Org/cloud mode only: local-mode turns build in-process
-    # and never reach this function at all.
-    oauth_block = {**oauth_connections, "turn_key": llm_block.get("api_key", "")} if oauth_connections else None
-    connectors_block = _connectors_block(oauth_connections)
+    # The user's image model, resolved against what the wallet can pay for, rides
+    # on whichever block reaches the pod: Anton reads `llm["image_model"]` and,
+    # without it, falls back to the catalog's default image model. None until the
+    # cached catalog lists an image model (image_model_for_agent), so a MindsHub
+    # that has not published its image models yet is not handed one it cannot
+    # serve.
+    image_model = getattr(user_settings, "image_model_for_agent", None)
+    if image_model and "image_model" not in llm_block:
+        llm_block = {**llm_block, "image_model": image_model}
+
+    # anton fetches connector tokens with the connector key when the turn has
+    # an MCP connection, else with the turn key llm_block already carries. The
+    # connector key goes only here, never into llm_block or the scratchpad.
+    # Org/cloud mode only: local-mode turns never reach this function.
+    oauth_block = (
+        {
+            **oauth_connections,
+            "connections": _oauth_connections_wire(oauth_connections.get("connections") or []),
+            "turn_key": connector_key or llm_block.get("api_key", ""),
+        }
+        if oauth_connections
+        else None
+    )
+    connectors_block = _connectors_block(
+        oauth_connections, workspace.project_name if workspace is not None else None,
+    )
+    custom_api_block = (
+        {"protocol_version": CUSTOM_API_PROTOCOL_VERSION, **custom_api_connections}
+        if custom_api_connections
+        else None
+    )
+    if custom_api_block:
+        connectors_block = await _with_custom_usage_notes(connectors_block, scope, custom_api_block)
+    browser_block = await _scoped_browser_block(
+        scope=scope, conversation_id=conversation_id, turn_key=llm_block.get("api_key", ""),
+        project_id=workspace.project_id if workspace is not None else None,
+    )
+    browser_block = await _admit_decisions_proxy(
+        r, browser_block, turn_key=llm_block.get("api_key", ""), turn_key_ttl_seconds=key_ttl_seconds,
+        org_id=org_id, user_id=user_id, correlation_id=corr,
+    )
 
     # Org-relative, never absolute. cowork-server sees the shared tree at
     # <root>/<org_id> while the pod mounts its own org's access point AT
     # <root>, so the two sit at different depths and an absolute path from
     # here is wrong inside the pod. Each side joins its own root.
     #
-    # Skills and personal/global memory are mounted read-only. Project memory is
+    # Personal/global memory is mounted read-only. Project memory is
     # outside the conversation-scoped workspace mount, so send only that tier on
     # the wire. Filtering here as well as in ResponsesHandler keeps a future
     # caller from accidentally serializing private global memory into the job.
@@ -631,6 +1362,23 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
         else None
     )
     workspace_rel_path = workspace.workspace_rel_path if workspace is not None else _DEFAULT_WORKSPACE_PATH
+    from cowork.common.settings.user_settings import get_user_settings
+    from cowork.db.units import run_on_unit_threads
+
+    # The organization's Jev opt-out and per-task limits, read here so every
+    # remote turn carries them: web UI, scheduled and channel turns alike. Off
+    # the loop: a turn with no settings snapshot, such as a channel turn, reads
+    # them through a session of its own.
+    turn_settings = await run_on_unit_threads(partial(get_user_settings, scope))
+    jev_decisions = getattr(turn_settings, "jev_decisions_enabled", True) is not False
+    jev_classify = getattr(turn_settings, "jev_classify_enabled", True) is not False
+    # A key shorter than the time-limited window comes from an auth that
+    # refused that window (auth_keys._request_turn_key), so the turn runs
+    # untimed: no "Keep going" ask the key couldn't outlive.
+    time_limit = settings.time_limit_seconds if key_ttl_seconds >= settings.turn_key_lifetime_seconds else 0
+    offer_connector_drafts = bool(
+        connector_drafts and settings.connector_drafts_enabled and scope.org_mode and user_id
+    )
     params = {"input": input_text, "workspace_path": workspace_rel_path.lstrip("/"),
               "workspace_mode": workspace_mode,
               "model": model, "history": history or [], "llm": llm_block,
@@ -640,7 +1388,28 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
               # The cowork UI renders a tool's message to the user as an
               # agent message; without this the pod hands it to the agent.
               "tool_messages": tool_messages,
+              **({"connector_drafts": True} if offer_connector_drafts else {}),
+              # The pod asks the app's preview to check its edits only when
+              # this is a real true, and only an interactive turn keeps the
+              # stdin its answer comes back on (scratchpad-controller#134
+              # relays it; an older controller drops it and the pod never asks).
+              **({"preview_checks": True} if preview_checks and interactive else {}),
+              # False when the organization opted out of Jev: the pod's
+              # completion check then never asks it. A controller that
+              # predates the field drops it, and the pod keeps Jev on.
+              "jev_decisions": jev_decisions,
+              # False when the organization turned off labelling texts with
+              # Jev: the pod's scratchpad then has no classify(). A controller
+              # that predates the field drops it, and the pod keeps it on.
+              "jev_classify": jev_classify,
+              # The app's language (ENG-4149), read by anton's TurnRequestV1.
+              # Absent without one. scratchpad-controller relays it to the pod
+              # (mindsdb/scratchpad-controller#124, which merges first).
+              **({"ui_locale": ui_locale} if ui_locale else {}),
               **({"memory": memory_block} if memory_block else {}),
+              # Only the skills the caller sees, and the pod's whole
+              # recallable set, so always present, even empty.
+              "skills": turn_skills_wire(skills or {}),
               # Absent entirely (not an empty dict) when there's nothing to
               # offer — see _mint_oauth_block's docstring for why.
               **({"oauth": oauth_block} if oauth_block else {}),
@@ -648,10 +1417,30 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
               # entirely when none has notes.
               **({"connectors": connectors_block} if connectors_block else {}),
               **({"datasource": datasource_block} if datasource_block else {}),
+              # The member's own verified custom API connections, by id, with
+              # grants bound to this turn's key; never a field value.
+              **({"custom_api": custom_api_block} if custom_api_block else {}),
               # Conversation creation time, ISO 8601. The pod is fresh every
               # turn and would otherwise stamp today's date into the system
               # prompt, changing the cached prefix at midnight.
               **({"started_at": started_at} if started_at else {}),
+              # Already dropped above when the model does not offer it; the pod
+              # applies the rest to the planning model only.
+              **({"reasoning_effort": reasoning_effort} if reasoning_effort else {}),
+              # The browser router, the task's session and the project's
+              # saved-tabs key, with no credential: the pod reaches the router
+              # with the `llm` turn key, which _scoped_browser_block scoped to
+              # this session and project. Absent when the turn has no browser.
+              **({"browser": browser_block} if browser_block else {}),
+              # The per-task limits (steps, auto-continues, tokens) this turn
+              # runs under, and its time limit when one is set: anton asks at it
+              # and ends with a summary, and the controller raises its backstop
+              # above it. Without them the pod runs on anton's built-in defaults,
+              # whatever the tenant set.
+              "limits": {
+                  **_limits_block(turn_settings),
+                  **({"max_turn_seconds": time_limit} if time_limit else {}),
+              },
               # Trace attribution for the pod (ENG-1459). The remote turn runs in
               # a scratchpad pod that has no cowork-server installed, so nothing
               # there can derive the surface, this server's version, or its
@@ -682,95 +1471,223 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
     last_id = tail[0][0] if tail else "0-0"
     # Registry first: a conversation whose stream exists but isn't registered would
     # be invisible to the controller. The reverse is harmless, it prunes empty queues.
-    await r.sadd(f"{settings.jobs_stream}:queues", conversation_id)
-    await r.xadd(f"{settings.jobs_stream}:{conversation_id}", {"payload": job.model_dump_json()})
+    registry_key = f"{settings.jobs_stream}:queues"
+    await r.sadd(registry_key, conversation_id)
+    job_stream = f"{settings.jobs_stream}:{conversation_id}"
+    try:
+        # Sent at most once: an XADD resent after its reply was lost would
+        # queue the turn twice, and the controller would run it twice.
+        with send_once():
+            await r.xadd(job_stream, {"payload": job.model_dump_json()})
+    except RedisError:
+        if not await _queued_after_a_failed_send(
+            r=r, job_stream=job_stream, conversation_id=conversation_id, turn_id=turn_id, correlation_id=corr,
+        ):
+            raise
+    # Registered again: the controller retires a drained queue by deleting its
+    # stream and its registry entry in one script. One that ran between the
+    # SADD and the XADD above left this job in a new stream nobody reads. The
+    # new stream has no consumer group, so the script never retires it, and
+    # the controller creates the group when it next reads.
+    await r.sadd(registry_key, conversation_id)
     # Any replica can now find this turn: its turn_id to open the buffer, its
     # correlation_id to cancel it, its org to authorize the caller. Recorded
     # here rather than after the first buffer record, because this generator
     # does not own the buffer; _shared_turn covers the gap between the two.
+    # A turn with a run id was recorded by RunRegistry.start, which holds the
+    # conversation's claim; one without is skipped while such a run holds it.
     if run_id is None:
-        await record_turn(
-            conversation_id, turn_id=turn_id, correlation_id=corr,
+        await record_channel_turn(
+            conversation_id=conversation_id, turn_id=turn_id, correlation_id=corr,
             org_id=org_id, user_id=user_id, client=r,
         )
 
     authorized_workspace_mode = None
     idle_timeout = settings.reply_idle_timeout_seconds
     last_reply_at = time.monotonic()
-    while True:
-        resp = await r.xread({reply_stream: last_id}, count=100, block=5000)
-        if not resp:
-            # Unbounded, this loop spun forever whenever the worker was down:
-            # only a terminal reply ends the turn, so the SSE response never
-            # ended. Bound the wait and fail the turn.
-            if idle_timeout > 0 and time.monotonic() - last_reply_at > idle_timeout:
-                code, message = remote_turn_error(UNRESPONSIVE_WORKER_ERROR)
-                logger.warning(
-                    "Remote turn abandoned: no reply for %.0fs conversation=%s correlation_id=%s",
-                    idle_timeout, conversation_id, corr,
-                )
-                yield "turn_failed", {"error": UNRESPONSIVE_WORKER_ERROR,
-                                      "code": code, "message": message}
-                return
-            continue
-        for _stream, entries in resp:
-            for entry_id, fields in entries:
-                last_id = entry_id
-                if TurnReplyHeader.model_validate_json(fields["payload"]).correlation_id != corr:
-                    # Skipped before its kind is validated: an earlier turn
-                    # still finishing after Stop or the idle timeout can write
-                    # a kind this build does not know, and that must not fail
-                    # this turn. Deliberately does NOT refresh the idle clock:
-                    # liveness means "this turn is progressing", and another
-                    # turn's replies say nothing about ours.
-                    continue
-                reply = TurnReply.model_validate_json(fields["payload"])
-                last_reply_at = time.monotonic()
-                kind = reply.kind
-                data = reply.data or {}
-                if kind == "progress" and data.get("phase") == "workspace_authorized":
-                    resolved_mode = data.get("workspace_mode")
-                    if (
-                        resolved_mode not in ("persistent", "ephemeral")
-                        or (workspace_mode == "ephemeral" and resolved_mode != "ephemeral")
-                        or (authorized_workspace_mode is not None and resolved_mode != authorized_workspace_mode)
-                    ):
-                        yield "turn_failed", _workspace_permission_failure()
-                        return
-                    authorized_workspace_mode = resolved_mode
-                    yield "progress", {"phase": "workspace_authorized", "workspace_mode": resolved_mode}
-                    continue
-                if kind == "error" or (
-                    kind in ("turn_delta", "turn_step", "turn_memory", "turn_skill", "turn_history",
-                             "turn_compaction", "turn_completed")
-                    and authorized_workspace_mode is None
-                ):
-                    # Unsupported v2 operations and missing mount-policy
-                    # acknowledgements are terminal, never a fallback turn.
-                    yield "turn_failed", _workspace_permission_failure()
-                    return
-                if kind == "turn_failed":
-                    if data.get("code") == "permission_unavailable":
-                        yield "turn_failed", _workspace_permission_failure()
-                        return
-                    # Classify once; the SSE frame and the persisted events
-                    # log must carry the same (code, message), and the same
-                    # reset_at. An older worker sends no reset_at, and its
-                    # frame stays as it was.
-                    code, message = remote_turn_error(data.get("error"))
-                    data = {**data, "code": code, "message": message}
-                    reset_at = _remote_reset_at(code=code, value=data.pop("reset_at", None))
-                    if reset_at is not None:
-                        data["reset_at"] = reset_at
+    # The counter of the last reply applied. The controller numbers each
+    # turn's replies, counting up by one, and a reply its retried XADD wrote
+    # twice repeats a number.
+    last_n: int | None = None
+    # Set once a reply ends the turn: finished, failed or abandoned. A Stop
+    # cancels this generator before any reply comes, and shows as the turn's
+    # cancel flag instead (_stopped). A generator closed before either (the
+    # client went away) leaves the turn running on the worker, and its key
+    # with it.
+    ended = False
+    try:
+        while True:
+            resp = await xread_blocking(
+                r=r, streams={reply_stream: last_id}, count=100, block_ms=REDIS_BLOCK_MS,
+            )
+            if not resp:
+                # Unbounded, this loop spun forever whenever the worker was down:
+                # only a terminal reply ends the turn, so the SSE response never
+                # ended. Bound the wait and fail the turn.
+                if idle_timeout > 0 and time.monotonic() - last_reply_at > idle_timeout:
+                    code, message = remote_turn_error(UNRESPONSIVE_WORKER_ERROR)
                     logger.warning(
-                        "Remote turn failed conversation=%s correlation_id=%s error_type=%s error_code=%s",
-                        conversation_id, corr, remote_error_label(error=data.get("error")), code,
+                        "Remote turn abandoned: no reply for %.0fs conversation=%s correlation_id=%s",
+                        idle_timeout, conversation_id, corr,
                     )
-                if kind in ("turn_delta", "turn_step", "turn_memory", "turn_skill",
-                            "turn_history", "turn_compaction", "turn_completed", "turn_failed"):
-                    yield kind, data
-                if kind in ("turn_completed", "turn_failed"):
+                    ended = True
+                    yield "turn_failed", {"error": UNRESPONSIVE_WORKER_ERROR,
+                                          "code": code, "message": message}
                     return
+                continue
+            for _stream, entries in resp:
+                for entry_id, fields in entries:
+                    last_id = entry_id
+                    if TurnReplyHeader.model_validate_json(fields["payload"]).correlation_id != corr:
+                        # Skipped before its kind is validated: an earlier turn
+                        # still finishing after Stop or the idle timeout can write
+                        # a kind this build does not know, and that must not fail
+                        # this turn. Deliberately does NOT refresh the idle clock:
+                        # liveness means "this turn is progressing", and another
+                        # turn's replies say nothing about ours.
+                        continue
+                    reply = TurnReply.model_validate_json(fields["payload"])
+                    if reply.n is not None and last_n is not None:
+                        numbers = {
+                            "conversation_id": conversation_id, "request_id": corr,
+                            "last_reply_n": last_n, "reply_n": reply.n,
+                        }
+                        if reply.n == last_n:
+                            logger.warning(
+                                "Dropped a repeated remote turn reply",
+                                extra={"event": "remote_reply_repeat_dropped", **numbers},
+                            )
+                            continue
+                        if reply.n < last_n:
+                            # One run's publishes are serialized, so its numbers
+                            # never go back: a second run of the job is replying.
+                            logger.warning(
+                                "A second run of a remote turn's job sent replies; the turn fails.",
+                                extra={"event": "remote_reply_second_run", **numbers},
+                            )
+                            code, message = remote_turn_error(SECOND_RUN_ERROR)
+                            ended = True
+                            yield "turn_failed", {"error": SECOND_RUN_ERROR, "code": code, "message": message}
+                            return
+                        if reply.n > last_n + 1:
+                            # Applied: the answer lacks only the reply that never
+                            # reached the stream (a failover or an eviction lost it).
+                            logger.warning(
+                                "A remote turn reply skipped a number; a reply went missing.",
+                                extra={"event": "remote_reply_gap", **numbers},
+                            )
+                    if reply.n is not None:
+                        last_n = reply.n
+                    last_reply_at = time.monotonic()
+                    kind = reply.kind
+                    data = reply.data or {}
+                    if kind == "progress" and data.get("phase") == "workspace_authorized":
+                        resolved_mode = data.get("workspace_mode")
+                        if (
+                            resolved_mode not in ("persistent", "ephemeral")
+                            or (workspace_mode == "ephemeral" and resolved_mode != "ephemeral")
+                            or (authorized_workspace_mode is not None and resolved_mode != authorized_workspace_mode)
+                        ):
+                            ended = True
+                            yield "turn_failed", _workspace_permission_failure()
+                            return
+                        authorized_workspace_mode = resolved_mode
+                        yield "progress", {"phase": "workspace_authorized", "workspace_mode": resolved_mode}
+                        continue
+                    if kind == "progress" and data.get("phase") == WORKER_ALIVE_PHASE:
+                        # The caller decides whether the turn has been quiet long
+                        # enough to show it; this loop only passes it on.
+                        yield "progress", {"phase": WORKER_ALIVE_PHASE}
+                        continue
+                    if kind == "error" or (
+                        (kind in _STREAMED_REPLY_KINDS or kind == "turn_completed")
+                        and authorized_workspace_mode is None
+                    ):
+                        # Unsupported v2 operations and missing mount-policy
+                        # acknowledgements are terminal, never a fallback turn.
+                        ended = True
+                        yield "turn_failed", _workspace_permission_failure()
+                        return
+                    if kind == "turn_failed":
+                        if data.get("code") == "permission_unavailable":
+                            ended = True
+                            yield "turn_failed", _workspace_permission_failure()
+                            return
+                        # Classify once; the SSE frame and the persisted events
+                        # log must carry the same (code, message), and the same
+                        # reset_at. An older worker sends no reset_at, and its
+                        # frame stays as it was.
+                        # A newer worker names a spent budget's scope and period; kept for that code only.
+                        budget_scope = clean_budget_scope(data.pop("budget_scope", None))
+                        budget_period = clean_budget_period(data.pop("budget_period", None))
+                        budget_model = clean_budget_model(data.pop("budget_model", None))
+                        # ENG-4186: which plan window is spent, and which tier
+                        # covers a model the plan does not. Each kept for its
+                        # own code only, like the budget fields.
+                        window = clean_plan_window(data.pop("window", None))
+                        required_tier = clean_required_tier(data.pop("required_tier", None))
+                        code, message = remote_turn_error(data.get("error"), budget_scope, budget_period, budget_model)
+                        data = {**data, "code": code, "message": message}
+                        reset_at = _remote_reset_at(code=code, value=data.pop("reset_at", None))
+                        if reset_at is not None:
+                            data["reset_at"] = reset_at
+                        if code == BUDGET_EXCEEDED_CODE and budget_scope is not None:
+                            data["budget_scope"] = budget_scope
+                        if code == BUDGET_EXCEEDED_CODE and budget_period is not None:
+                            data["budget_period"] = budget_period
+                        if code == BUDGET_EXCEEDED_CODE and budget_model is not None:
+                            data["budget_model"] = budget_model
+                        if code == WINDOW_ALLOWANCE_EXHAUSTED_CODE and window is not None:
+                            data["window"] = window
+                        if code == MODEL_NOT_IN_TIER_CODE and required_tier is not None:
+                            data["required_tier"] = required_tier
+                        logger.warning(
+                            "Remote turn failed conversation=%s correlation_id=%s error_type=%s error_code=%s",
+                            conversation_id, corr, remote_error_label(error=data.get("error")), code,
+                        )
+                    if kind in ("turn_completed", "turn_failed"):
+                        ended = True
+                    if kind in _STREAMED_REPLY_KINDS or kind in ("turn_completed", "turn_failed"):
+                        yield kind, data
+                    if kind in ("turn_completed", "turn_failed"):
+                        return
+    finally:
+        if llm_block.get("api_key") and (ended or await _stopped(r, corr)):
+            await _revoke_turn_key_at_turn_end(corr, settings)
+            if browser_block and browser_block.get("decisions_proxy"):
+                await decisions_proxy.forget(r, correlation_id=corr)
+
+
+async def _stopped(r, corr: str) -> bool:
+    """Whether the turn was stopped. The cancel route writes the turn's cancel
+    flag before it cancels this generator, and the worker stops the turn when
+    it reads the flag, so the turn is over though no reply said so. A failed
+    read leaves the key to its own expiry."""
+    try:
+        return bool(await r.exists(cancel_flag_key(corr)))
+    except Exception as exc:
+        logger.warning(
+            "[producer] could not read the turn's cancel flag; its key lives to its expiry",
+            extra={"event": "turn_key_revoke_failed", "correlation_id": corr, "error_type": type(exc).__name__},
+        )
+        return False
+
+
+async def _revoke_turn_key_at_turn_end(corr: str, settings: TurnQueueSettings) -> None:
+    """The turn key dies with its turn, so code that ran in the turn can't use
+    it afterwards, at the browser router or anywhere else. Best effort: a
+    failed revoke leaves the key to its own expiry, and the turn's answer is
+    already out. With no internal auth configured, no key was minted here
+    either (mint refuses without it), so there is nothing to revoke."""
+    if not settings.auth_internal_base_url or not settings.auth_internal_secret:
+        return
+    try:
+        await revoke_turn_key(instance_id=corr, settings=settings)
+    except Exception as exc:
+        logger.warning(
+            "[producer] could not revoke the turn key at turn end; it lives to its expiry",
+            extra={"event": "turn_key_revoke_failed", "correlation_id": corr, "error_type": type(exc).__name__},
+        )
 
 
 def _setup_permission_failure() -> dict:

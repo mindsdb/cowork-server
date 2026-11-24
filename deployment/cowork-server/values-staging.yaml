@@ -1,12 +1,7 @@
-# Staging enables the ingress restriction first, and it is the only place it can
-# be rehearsed: cowork-server has no deployment in the dev namespace and PR
-# environments take base values only.
-#
-# The prerequisite outside this repo is now in place. `newdev-gha-runner` gets
-# `create networkpolicies` in this namespace from the `<env>-gha-runner-deploy`
-# role in Kubernetes-Foundational-Services. Without it the release fails and
-# --atomic rolls the whole deploy back, so confirm the runner chart was rolled
-# before merging a change here:
+# Staging runs the ingress restriction, as dev, prod and every PR environment
+# do. `newdev-gha-runner` gets `create networkpolicies` in this namespace from
+# its `<env>-gha-runner-deploy` role. Without it the release fails and --atomic
+# rolls the whole deploy back, so confirm it before merging a change here:
 #   kubectl --context newdev -n staging auth can-i create networkpolicies \
 #     --as=system:serviceaccount:infrastructure:newdev-gha-runner
 #
@@ -18,6 +13,28 @@ networkPolicy:
   enabled: true
 
 deployment:
+  # One uvicorn process per pod can use about one core, so cowork-server scales
+  # by replicas, not workers (see the `image` comment in values.yaml). The HPA
+  # adds a pod when average CPU passes 70% of the 1-CPU request. The subchart's
+  # default 90% memory target applies too, as it does for auth.
+  #
+  # The ceiling stays at 4 because each replica widens a race. Every replica runs
+  # the scheduler, and `_due_schedules` in cowork/scheduler.py checks
+  # `has_active_run` and then fires with no cross-replica claim. Two replicas
+  # polling together can both fire one schedule.
+  autoscaling:
+    enabled: true
+    minReplicas: 2
+    maxReplicas: 4
+    targetCPUUtilizationPercentage: 70
+
+  # Cloud datasource turns and the methods offered, on for staging by the
+  # release gate. Rollback removes both lines; see the chart README.
+  datasourceTurnsEnabled: "true"
+  datasourceCapabilities: '{"manifest_version": 1, "enabled": ["mysql:host-password", "postgres:host-port"]}'
+  # Members' custom API connections on their turns. Rollback removes this line.
+  customApiTurnsEnabled: "true"
+
   ingress:
     enabled: true
     name: cowork-server
@@ -35,10 +52,22 @@ deployment:
             serviceName: cowork-server
             servicePort: 80
 
+  # Draft-preview host. values.yaml builds the draft Ingress and the
+  # COWORK_DRAFT_* variables from these two; ingress_secondary.enabled is not
+  # templated, so it is switched on here too. webOrigin is the primary host
+  # above, where the web app runs.
+  draftHost: draft-staging.mindshub.co
+  webOrigin: https://cowork.staging.mindshub.ai
+  ingress_secondary:
+    enabled: true
+
   extraEnvs:
 
     - name: ENV
       value: "staging"
+
+    - name: ACCESS_LOG_MODE
+      value: "all"
 
     - name: LOG_LEVEL
       value: "WARNING"
@@ -53,8 +82,31 @@ deployment:
     - name: COWORK_ORGANIZATION_SWITCH_ENABLED
       value: "true"
 
+    # Offers Slack's In-Browser Connect. Unset (prod), Slack shows only the
+    # bot-token method: the Slack app is internal to one workspace for now.
+    - name: SLACK_CONNECTOR_ENABLED
+      value: "true"
+
+    # The agent's browser on the web: the browser router, served on this host
+    # under /browser. Unset, the web app offers no browser; see README.md.
+    - name: COWORK_BROWSER_ROUTER_URL
+      value: "https://cowork.staging.mindshub.ai/browser"
+
     - name: COWORK_TURN_MINDS_BASE_URL
       value: "https://api.staging.mindshub.ai/v1"
+
+    # Per-task time limit for web turns, in seconds: at it anton asks
+    # "Keep going / Stop here" and ends with a summary. 0 or unset turns it
+    # off. A turn's key lives the limit plus
+    # COWORK_TURN_TIME_LIMIT_KEY_MARGIN_SECONDS (2400), so auth's turn-key cap
+    # (turn_key_max_ttl_seconds) must be at least the limit + 2400 + 300 s of
+    # clock skew: 6300 for 3600. Under a lower cap auth refuses that key, and
+    # each turn runs untimed on a 1200 s key instead. Above 3600 also needs
+    # auth's turn-key lifetime limit and the controller's time-limited ceiling
+    # raised first; see time_limit_seconds in
+    # cowork/common/settings/app_settings.py.
+    - name: COWORK_TURN_TIME_LIMIT_SECONDS
+      value: "3600"
 
     # Agent tool budgets — deployment-level DEFAULTS for users who never set
     # the per-user setting (hosted has no Settings UI; inference cost lands on
@@ -63,6 +115,8 @@ deployment:
     # conservatively. Changing these requires a pod restart (env is read once
     # per process).
     # - name: COWORK_DEFAULT_MAX_TOOL_ROUNDS
-    #   value: "50"
+    #   value: "250"
     # - name: COWORK_DEFAULT_MAX_CONTINUATIONS
-    #   value: "5"
+    #   value: "10"
+    # - name: COWORK_DEFAULT_MAX_TURN_TOKENS
+    #   value: "25000000"

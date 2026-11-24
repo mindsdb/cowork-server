@@ -79,7 +79,7 @@ class _SeqResp:
 
     def raise_for_status(self):
         if self.status_code >= 400:
-            raise httpx.HTTPStatusError("error", request=None, response=None)
+            raise httpx.HTTPStatusError("error", request=None, response=self)
 
 
 def _sequenced_client(monkeypatch, responses):
@@ -103,7 +103,7 @@ def _sequenced_client(monkeypatch, responses):
 def forgotten(monkeypatch):
     calls = []
     monkeypatch.setattr(
-        "cowork.turnqueue.auth_keys.forget_stale_hub_workspace",
+        "cowork.turnqueue.auth_keys.forget_stale_mindshub_workspace",
         lambda **kw: calls.append(kw),
     )
     return calls
@@ -240,7 +240,7 @@ async def test_a_mint_with_a_prefix_returns_both_halves(monkeypatch):
     minted = await mint_turn_key_details(
         user_id="u1", org_id="o1", correlation_id="corr-1", ttl_seconds=1200, settings=_Settings()
     )
-    assert minted == MintedTurnKey(key="mdb_prefix.secret", prefix="mdb_prefix")
+    assert minted == MintedTurnKey(key="mdb_prefix.secret", prefix="mdb_prefix", ttl_seconds=1200)
 
 
 @pytest.mark.asyncio
@@ -317,3 +317,97 @@ async def test_grant_registration_sends_the_exact_body_and_the_producer_identity
     }
     assert seen["headers"]["x-datasource-service-key-id"] == "producer-v1"
     assert "x-internal-auth" not in seen["headers"]
+
+
+@pytest.mark.asyncio
+async def test_the_custom_api_listing_sends_the_turn_key_prefix_and_the_producer_identity(monkeypatch):
+    from cowork.turnqueue.auth_keys import list_custom_api_connections
+
+    seen = {}
+
+    async def handler(request):
+        seen["url"] = request.url
+        seen["headers"] = request.headers
+        return httpx.Response(200, json={"items": [{"id": 7, "connector_id": "acme_crm", "name": "Prod",
+                                                    "status": "verified", "credential_version": 1}]})
+
+    _over_mock_transport(monkeypatch, handler)
+    items = await list_custom_api_connections(
+        org_id="o1", user_id="u1", turn_key_id="mdb_prefix", settings=_DatasourceSettings()
+    )
+
+    assert [item["id"] for item in items] == [7]
+    assert seen["url"].path == "/internal/custom-connections/"
+    assert dict(seen["url"].params) == {"organization_id": "o1", "user_id": "u1", "turn_key_id": "mdb_prefix"}
+    assert seen["headers"]["x-datasource-service-key-id"] == "producer-v1"
+    assert seen["headers"]["x-datasource-service-key"] == "producer-secret"
+    assert "authorization" not in seen["headers"]
+
+
+@pytest.mark.asyncio
+async def test_custom_api_grant_registration_sends_no_audience_and_the_producer_identity(monkeypatch):
+    import json as _json
+
+    from cowork.turnqueue.auth_keys import register_custom_api_grants
+
+    seen = {}
+
+    async def handler(request):
+        seen["url"] = request.url
+        seen["headers"] = request.headers
+        seen["json"] = _json.loads(request.content)
+        return httpx.Response(201, json={**seen["json"], "audience": "custom-api", "purpose": "fetch", "grants": []})
+
+    _over_mock_transport(monkeypatch, handler)
+    await register_custom_api_grants(
+        user_id="u1", org_id="o1", correlation_id="r", turn_key_id="mdb_prefix", connection_ids=[7],
+        settings=_DatasourceSettings(),
+    )
+
+    assert seen["url"].path == "/internal/custom-connections/turn-grants/"
+    assert seen["json"] == {
+        "user_id": "u1", "organization_id": "o1", "correlation_id": "r", "turn_key_id": "mdb_prefix",
+        "connection_ids": [7],
+    }
+    assert seen["headers"]["x-datasource-service-key-id"] == "producer-v1"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", [401, 404, 409, 429, 503])
+@pytest.mark.parametrize("call", ["list", "grant"])
+async def test_a_custom_api_refusal_is_a_permission_failure(monkeypatch, status, call):
+    from cowork.services.product_permissions import ProductPermissionUnavailable
+    from cowork.turnqueue.auth_keys import list_custom_api_connections, register_custom_api_grants
+
+    async def handler(request):
+        return httpx.Response(status, json={"code": "refused"})
+
+    _over_mock_transport(monkeypatch, handler)
+    with pytest.raises(ProductPermissionUnavailable):
+        if call == "list":
+            await list_custom_api_connections(
+                org_id="o1", user_id="u1", turn_key_id="mdb_prefix", settings=_DatasourceSettings())
+        else:
+            await register_custom_api_grants(
+                user_id="u1", org_id="o1", correlation_id="r", turn_key_id="mdb_prefix", connection_ids=[7],
+                settings=_DatasourceSettings())
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("call", ["list", "grant"])
+async def test_without_a_producer_key_auth_is_never_asked(monkeypatch, call):
+    from cowork.services.product_permissions import ProductPermissionUnavailable
+    from cowork.turnqueue.auth_keys import list_custom_api_connections, register_custom_api_grants
+
+    async def handler(request):
+        raise AssertionError("auth was asked")
+
+    _over_mock_transport(monkeypatch, handler)
+    settings = _DatasourceSettings()
+    settings.datasource_producer_key = ""
+    with pytest.raises(ProductPermissionUnavailable):
+        if call == "list":
+            await list_custom_api_connections(org_id="o1", user_id="u1", turn_key_id="p", settings=settings)
+        else:
+            await register_custom_api_grants(user_id="u1", org_id="o1", correlation_id="r", turn_key_id="p",
+                                             connection_ids=[7], settings=settings)

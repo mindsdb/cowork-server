@@ -46,7 +46,7 @@ class FakeHarness:
         if False:
             yield
 
-    async def formatter(self, stream, model, event_sink):
+    async def formatter(self, stream, model, event_sink, **_kwargs):
         async for _ in stream:
             pass
         event_sink("response.output_text.delta", {"delta": "pong from the org bot"})
@@ -157,7 +157,7 @@ def test_slack_message_in_org_mode_gets_a_reply(monkeypatch, org_mode):
     try:
         async def flow():
             transport = httpx.ASGITransport(app=app)
-            async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
                 assert await adapters.get_or_refresh("slack", ORG_A) is not None
                 body = _slack_event_body("T-ORG-A", "Ev-org-a-1")
                 r = await client.post(

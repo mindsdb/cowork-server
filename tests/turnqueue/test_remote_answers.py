@@ -199,3 +199,131 @@ async def test_redis_error_during_ack_wait_is_reported_accepted(r, monkeypatch):
     text = "\n".join(record.getMessage() for record in records)
     assert "Redis error" in text
     assert "pg" not in text  # answer content never logged
+
+
+async def test_an_unblocked_read_during_the_ack_wait_reads_again(r, monkeypatch):
+    """A primary demoted during the wait answers ``-UNBLOCKED``. Read as a Redis
+    error, it would report accepted and lose the pod's rejection."""
+    from redis.exceptions import ResponseError
+
+    real_xread = r.xread
+    reads = 0
+
+    async def xread(*args, **kwargs):
+        nonlocal reads
+        reads += 1
+        if reads == 1:
+            raise ResponseError(
+                "UNBLOCKED force unblock from blocking operation, instance state changed (master -> replica?)")
+        return await real_xread(*args, **kwargs)
+
+    monkeypatch.setattr(r, "xread", xread)
+    pod = asyncio.create_task(_pod_says(r, "ask_user_answer_rejected", reason="invalid_option"))
+    assert await _submit(r) is RemoteAnswerResult.INVALID_OPTION
+    await pod
+    assert reads >= 2
+
+
+async def test_an_answer_whose_reply_was_lost_is_sent_again_as_the_same_entry(r, monkeypatch):
+    """Redis applies the answer's transaction and the connection drops before
+    its reply. Sent at most once, that failed /answer with a 500 although the
+    pod got the answer, and the client then resent the typed text as a new
+    message. Sent again, the same entry, with the same answer_id, is queued a
+    second time, and /answer reports the pod's verdict."""
+    from redis.exceptions import ConnectionError as RedisConnectionError
+
+    from cowork.turnqueue.redis_client import build_async_redis
+
+    client = build_async_redis(url="redis://127.0.0.1:1/0", call_budget_s=2)
+    pool = client.connection_pool
+    connection = pool.make_connection()
+    sent: list[str] = []
+
+    async def get_connection(*_args, **_kwargs):
+        return connection
+
+    async def release(_connection):
+        return None
+
+    async def disconnect(*_args, **_kwargs):
+        return None
+
+    async def applied_then_lost_once(_connection, commands, _raise_on_error):
+        """Run the transaction on the fake Redis, and lose the reply to the first."""
+        (_rpush, key, entry), _options = commands[0]
+        sent.append(entry)
+        await r.rpush(key, entry)
+        await r.expire(key, 60)
+        if len(sent) == 1:
+            raise RedisConnectionError("Connection closed by server.")
+        return [len(sent), True]
+
+    def pipeline(*_args, **_kwargs):
+        pipe = client.pipeline(transaction=True)
+        monkeypatch.setattr(pipe, "_execute_transaction", applied_then_lost_once)
+        return pipe
+
+    monkeypatch.setattr(pool, "get_connection", get_connection)
+    monkeypatch.setattr(pool, "release", release)
+    monkeypatch.setattr(connection, "disconnect", disconnect)
+    monkeypatch.setattr(r, "pipeline", pipeline)
+    pod = asyncio.create_task(_pod_says(r, "ask_user_answered", status="answered"))
+
+    assert await _submit(r) is RemoteAnswerResult.ACCEPTED
+    await pod
+
+    assert len(sent) == 2 and sent[0] == sent[1]
+    assert await r.lrange(KEY, 0, -1) == sent
+
+
+async def test_the_ack_wait_blocks_for_no_longer_than_the_shared_block(r, monkeypatch):
+    """redis-py cuts a read at the socket timeout, so a longer BLOCK reads an
+    idle stream as a dead socket."""
+    from cowork.turnqueue.redis_client import REDIS_BLOCK_MS
+
+    real_xread = r.xread
+    blocks: list[int] = []
+
+    async def xread(*args, **kwargs):
+        blocks.append(kwargs["block"])
+        return await real_xread(*args, **kwargs)
+
+    monkeypatch.setattr(r, "xread", xread)
+    pod = asyncio.create_task(_pod_says(r, "ask_user_answered", status="answered"))
+    assert await _submit(r, timeout=4.0) is RemoteAnswerResult.ACCEPTED
+    await pod
+
+    assert blocks and max(blocks) <= REDIS_BLOCK_MS
+
+
+async def test_the_ack_wait_stops_retrying_a_read_when_the_wait_ends(r, monkeypatch):
+    """The client retries a read for its whole call budget, 30 s by default.
+    A Redis that drops every read near the end of the wait would hold /answer
+    that long past its wait without a deadline that ends with the wait."""
+    import time
+
+    from redis.exceptions import ConnectionError as RedisConnectionError
+
+    from cowork.turnqueue.redis_client import _AsyncDeadlineRetry
+
+    retry = _AsyncDeadlineRetry(budget_s=5)
+    reads_ended: list[float] = []
+
+    async def dropped():
+        raise RedisConnectionError("Connection closed by server.")
+
+    async def fail(_error):
+        return None
+
+    async def xread(*args, **kwargs):
+        try:
+            return await retry.call_with_retry(dropped, fail)
+        finally:
+            reads_ended.append(time.monotonic())
+
+    monkeypatch.setattr(r, "xread", xread)
+    started = time.monotonic()
+    assert await _submit(r, timeout=1.0) is RemoteAnswerResult.ACCEPTED
+
+    # One read, retried until the wait ends and no longer.
+    assert reads_ended == [pytest.approx(started + 1.0, abs=0.3)]

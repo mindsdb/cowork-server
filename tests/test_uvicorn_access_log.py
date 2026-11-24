@@ -1,6 +1,7 @@
 """Uvicorn's access line keeps each request's path and redacts its query."""
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
@@ -27,7 +28,10 @@ _APP = """
 def test_uvicorns_access_line_keeps_the_path_and_redacts_the_query(tmp_path: Path, launch: Launch) -> None:
     run = run_uvicorn_app(tmp_path=tmp_path, app_source=_APP, paths=(f"/ok?code={PRIVATE}", "/ok"), launch=launch)
     assert run.statuses == (200, 200)
-    assert '"GET /ok?[redacted] HTTP/1.1" 200' in run.stdout, run.stdout
-    assert '"GET /ok HTTP/1.1" 200' in run.stdout, run.stdout
-    assert "Finished server process" in run.stderr
+    events = [json.loads(line) for line in run.stderr.splitlines()]
+    access = [event for event in events if event.get("event") == "http_access"]
+    assert len(access) == 2
+    assert all(event["status_code"] == 200 and event["method"] == "GET" for event in access)
+    assert "/ok" not in run.stdout + run.stderr
+    assert "Finished server process" not in run.stderr
     assert PRIVATE not in run.stdout + run.stderr

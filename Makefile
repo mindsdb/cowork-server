@@ -1,11 +1,13 @@
 #!make
-.PHONY: help test test/unit test/integration test/integration-production-read-only test/unit/coverage coverage/html check/wheels
+.PHONY: help test test/unit test/integration test/integration-production-read-only test/services test/unit/coverage coverage/html check/wheels
 
 .DEFAULT_GOAL := help
 
-PYTEST := uv run python -m pytest
+PYTEST := uv run --locked python -m pytest
 TESTS := tests/ --ignore=tests/integration
 INTEGRATION_TESTS := tests/integration
+# One pytest-xdist worker per logical CPU; `make test/unit PYTEST_WORKERS=0` runs serially.
+PYTEST_WORKERS ?= logical
 
 help: ## Display this help message
 	@echo "Usage: make [target]"
@@ -15,26 +17,30 @@ help: ## Display this help message
 	@echo "  \033[36mtest\033[0m                   Run unit tests (alias)"
 	@echo "  \033[36mtest/integration\033[0m       Run integration + post-deploy tests"
 	@echo "  \033[36mtest/integration-production-read-only\033[0m  Run the production GET-only smoke"
+	@echo "  \033[36mtest/services\033[0m          Run the tests that need a local Redis or PostgreSQL"
 	@echo "  \033[36mtest/unit/coverage\033[0m     Run unit tests with coverage"
 	@echo "  \033[36mcoverage/html\033[0m          Generate HTML coverage report"
 	@echo "  \033[36mcheck/wheels\033[0m           Check every shipped platform resolves to versions with wheels"
 
 test/unit: ## Run unit tests
-	$(PYTEST) $(TESTS)
+	$(PYTEST) -n $(PYTEST_WORKERS) $(TESTS)
 
 test: test/unit ## Run unit tests (alias)
 
 test/integration: ## Run integration + post-deploy tests (skip themselves without a target)
-	$(PYTEST) -v $(INTEGRATION_TESTS) -m "not production_read_only"
+	$(PYTEST) -v $(INTEGRATION_TESTS) -m "not production_read_only and not redis_service"
 
 test/integration-production-read-only: ## Run only the production GET-only smoke
 	$(PYTEST) -v tests/integration/test_production_read_only.py
 
+test/services: ## Run the tests that need a local Redis or PostgreSQL (COWORK_TEST_REDIS_URL, COWORK_TEST_POSTGRES_URI)
+	$(PYTEST) -v -rs tests/ -m "redis_service or postgres_service"
+
 test/unit/coverage: ## Run unit tests with coverage
-	$(PYTEST) --cov=cowork $(TESTS)
+	$(PYTEST) -n $(PYTEST_WORKERS) --cov=cowork $(TESTS)
 
 coverage/html: ## Generate HTML coverage report
-	$(PYTEST) --cov=cowork $(TESTS) --cov-report=html
+	$(PYTEST) -n $(PYTEST_WORKERS) --cov=cowork $(TESTS) --cov-report=html
 
 check/wheels: ## Check every shipped platform resolves to versions with wheels
 	bash scripts/check_wheels_available.sh

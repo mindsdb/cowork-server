@@ -100,7 +100,7 @@ async def test_session_model_selection_reaches_provider_and_stays_per_turn(monke
         other = service.create_conversation(topic="MODEL-2 defaults")
         try:
             for conv, model in ((conversation, "pick-A"), (conversation, "pick-B"), (other, None)):
-                config, _, _ = await harness.AntonHarness()._build_chat_session(conv, model=model)
+                config = (await harness.AntonHarness()._build_chat_session(conv, model=model)).session
                 configs.append(config)
                 for role in ("planning", "coding", "router"):
                     assert getattr(config.settings, f"{role}_model") == (

@@ -57,7 +57,76 @@ def map_codex_notification(method: str, payload: object) -> CodingEvent | None:
         )
     if method == "turn/started":
         return CodingEvent(type=EventType.session, title="Agent started", phase="started", turn_id=turn_id)
+    if method == "item/autoApprovalReview/completed":
+        return auto_review_event(raw, turn_id)
     return None
+
+
+def auto_review_event(raw: dict[str, Any], turn_id: str | None) -> CodingEvent | None:
+    """Record what Codex's approval reviewer decided in an Approve for me task.
+
+    An approval is recorded like one the person granted, which the timeline
+    folds into the work it unblocked. Anything else blocked the action, so it
+    is a visible notice carrying the reviewer's reason.
+    """
+    review = raw.get("review") if isinstance(raw.get("review"), dict) else {}
+    status = string(review.get("status"))
+    if status not in _AUTO_REVIEW_BLOCKED and status != "approved":
+        return None
+    action = raw.get("action") if isinstance(raw.get("action"), dict) else {}
+    summary = redact_text(auto_review_action(action))
+    rationale = redact_text(string(review.get("rationale")))
+    data = {
+        "approvalId": string(raw.get("reviewId")),
+        "reviewer": "auto_review",
+        "status": status,
+        "riskLevel": string(review.get("riskLevel")),
+        "action": sanitize(action),
+    }
+    target = string(raw.get("targetItemId")) or None
+    if status == "approved":
+        return CodingEvent(
+            type=EventType.approval,
+            title="Approved by the reviewer",
+            text=summary,
+            phase="completed",
+            turn_id=turn_id,
+            data={**data, "decision": "approve_once", "rationale": rationale, "targetItemId": target},
+        )
+    return CodingEvent(
+        type=EventType.command_result,
+        title=f"{_AUTO_REVIEW_BLOCKED[status]}: {summary}"[:240],
+        text=rationale or "The agent was told to find a safer way or stop.",
+        phase="failed",
+        turn_id=turn_id,
+        data={**data, "targetItemId": target},
+    )
+
+
+_AUTO_REVIEW_BLOCKED = {
+    "denied": "The reviewer blocked this",
+    "timedOut": "The review timed out, so this was blocked",
+    "aborted": "The review was cancelled, so this was blocked",
+}
+
+
+def auto_review_action(action: dict[str, Any]) -> str:
+    kind = string(action.get("type"))
+    if kind == "command":
+        return string(action.get("command"))
+    if kind == "execve":
+        argv = action.get("argv") if isinstance(action.get("argv"), list) else []
+        return " ".join(string(part) for part in argv) or string(action.get("program"))
+    if kind == "applyPatch":
+        files = action.get("files") if isinstance(action.get("files"), list) else []
+        return "Edit " + ", ".join(string(path) for path in files[:5]) if files else "Edit files outside the workspace"
+    if kind == "networkAccess":
+        return f"Network access to {string(action.get('target')) or string(action.get('host'))}"
+    if kind == "mcpToolCall":
+        return f"{string(action.get('toolTitle')) or string(action.get('toolName'))} ({string(action.get('server'))})"
+    if kind == "requestPermissions":
+        return string(action.get("reason")) or "More permissions"
+    return "An action outside the sandbox"
 
 
 def payload_dict(payload: object) -> dict[str, Any]:

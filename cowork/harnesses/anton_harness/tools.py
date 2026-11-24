@@ -20,22 +20,41 @@ here as needed; same pattern.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import re
+from collections.abc import Callable, Iterable
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any, TypeVar
 import uuid
 
+from cowork.common.settings.app_settings import get_app_settings
 from cowork.common.settings.user_settings import current_settings_scope
-from cowork.db.scoped import MissingTenantScopeError
+from cowork.db.scoped import LOCAL_SCOPE, MissingTenantScopeError, tenant_scope_required
+from cowork.db.units import run_db
 from cowork.deployment_identity import identity_for_turn
 from cowork.schemas.connectors import InvalidConnectorIdError, validate_engine_id
+from cowork.services.connectors.catalog import ConnectorCatalog
 from cowork.services.connectors.connections import ConnectionsService
+from cowork.services.connectors.custom_connectors import (
+    NEEDS_REBUILD_FOR_AGENT,
+    UnstorableFormError,
+    check_handcrafted_form,
+    handcrafted_form_allowed,
+    has_test_requests,
+    scope_is_one_persons,
+)
 from cowork.services.connectors.persist import vault_for_scope
-from cowork.services.connectors.specs._registry import registry
+from cowork.services.connectors.sharepoint import ENGINE as SHAREPOINT
+from cowork.services.connectors.specs._registry import ConnectorSpecRegistry, registry
+
+
+if TYPE_CHECKING:
+    from cowork.schemas.artifact_access import ArtifactAccessRequest
 
 logger = logging.getLogger(__name__)
+T = TypeVar("T")
 
 
 def _published_state(raw_path: str) -> dict:
@@ -51,7 +70,7 @@ def _published_state(raw_path: str) -> dict:
     return published_state(raw_path, scope=current_settings_scope())
 
 
-def _publish_artifact(raw_path: str, access: dict | None = None) -> dict:
+def _publish_artifact(raw_path: str, access: ArtifactAccessRequest | None = None) -> dict:
     """Desktop publish for the agent's own `publish_or_preview` tool.
 
     Resolves the artifact, its root and the credential the same way the HTTP
@@ -79,12 +98,14 @@ def _published_owner_state(raw_path: str) -> dict:
     return published_owner_state(raw_path, scope=current_settings_scope())
 
 
-def _access_from_state(entry: dict) -> dict:
+def _access_from_state(entry: dict) -> ArtifactAccessRequest:
     """Rebuild input access from a stored .published.json entry.
 
     Single source of truth: anton.publish_access.access_from_owner_side."""
     from anton.publish_access import access_from_owner_side
-    return access_from_owner_side(entry)
+
+    from cowork.schemas.artifact_access import ArtifactAccessRequest
+    return ArtifactAccessRequest.of_publisher(access_from_owner_side(entry))
 
 
 # Cowork-flavoured description/prompt for the publish_or_preview tool.
@@ -150,8 +171,17 @@ COWORK_PUBLISH_PROMPT = _PUBLISH_PROMPT.format(
     heading="CONTENT SHARING POLICY (desktop chat):",
     from_chat="publishing works straight from chat when MindsHub is configured",
 )
-SELF_HOSTED_PUBLISH_DESCRIPTION = _PUBLISH_DESCRIPTION.format(
-    panel="The user can also publish from the Live Artifacts panel",
+# A self-hosted deployment publishes to its own publisher, which takes HTML
+# and Markdown only: `publish_artifact` refuses a full-stack artifact there
+# (`FULLSTACK_PUBLISH_UNSUPPORTED`). The agent hears it before it builds one.
+_SELF_HOSTED_FULLSTACK_EXCEPTION = (
+    "Full-stack apps (a backend with its frontend) can't be published from this "
+    "deployment: publish an HTML page or a Markdown document."
+)
+SELF_HOSTED_PUBLISH_DESCRIPTION = (
+    _PUBLISH_DESCRIPTION.format(panel="The user can also publish from the Live Artifacts panel")
+    + " "
+    + _SELF_HOSTED_FULLSTACK_EXCEPTION
 )
 SELF_HOSTED_PUBLISH_PROMPT = _PUBLISH_PROMPT.format(
     heading="CONTENT SHARING POLICY:",
@@ -258,6 +288,11 @@ async def _cowork_publish_or_preview(session: Any, tc_input: dict):
         return f"publish_or_preview: unknown action '{action}'"
 
     # Resolve the access spec: explicit tool fields > preserve previous > public.
+    from pydantic import ValidationError
+
+    from cowork.models.artifact_owner_choice import AccessMode
+    from cowork.schemas.artifact_access import ArtifactAccessRequest, access_refusal
+
     access_mode = tc_input.get("access_mode")
     if access_mode == "password":
         pw = (tc_input.get("password") or "").strip()
@@ -267,7 +302,7 @@ async def _cowork_publish_or_preview(session: Any, tc_input: dict):
                 "from the publish panel (Access → Password) — do NOT ask for the "
                 "password in chat and never invent one."
             )
-        access = {"mode": "password", "password": pw}
+        access = ArtifactAccessRequest(mode=AccessMode.PASSWORD, password=pw)
     elif access_mode == "restricted":
         from anton.publish_access import parse_emails
         valid, invalid = parse_emails(tc_input.get("emails") or [])
@@ -278,18 +313,33 @@ async def _cowork_publish_or_preview(session: Any, tc_input: dict):
                 "INVALID: these are not valid email addresses: "
                 f"{', '.join(invalid)}. Fix them or omit them, then call the tool again."
             )
-        access = {"mode": "restricted",
-                  "emails": valid,
-                  "org_allowed": bool(tc_input.get("org_allowed")),
-                  "owner_only": bool(tc_input.get("owner_only"))}
+        access = ArtifactAccessRequest(
+            mode=AccessMode.RESTRICTED,
+            allowed_emails=valid,
+            org_allowed=bool(tc_input.get("org_allowed")),
+            owner_only=bool(tc_input.get("owner_only")),
+        )
     elif access_mode == "public":
-        access = {"mode": "public"}
+        access = ArtifactAccessRequest(mode=AccessMode.PUBLIC)
     else:
         # No access fields: preserve the artifact's previous access on re-publish.
-        # NOTE: _published_owner_state (not _published_state) — the latter drops
+        # NOTE: _published_owner_state (not _published_state): the latter drops
         # mode/access_password, which would silently reset to public.
         prev = _published_owner_state(abs_path)
-        access = _access_from_state(prev) if prev.get("report_id") else {"mode": "public"}
+        try:
+            access = (
+                _access_from_state(prev) if prev.get("report_id") else ArtifactAccessRequest(mode=AccessMode.PUBLIC)
+            )
+        except ValidationError as exc:
+            # The entry is a file the agent can write, so its access fields can
+            # hold any type; publishing without them would change who sees it.
+            reason = access_refusal(exc.errors(include_url=False))
+            logger.info("Cowork publish refused: the kept access can't be read")
+            return (
+                f"PUBLISH FAILED: The access saved with this artifact can't be read: {reason} "
+                "Tell the user to choose its access from the publish panel, and don't pick "
+                "one for them."
+            )
 
     # action == 'publish' — delegate to the service (single source of truth for
     # target resolution, fullstack bundling, vault secrets, access, history,
@@ -316,10 +366,25 @@ async def _cowork_publish_or_preview(session: Any, tc_input: dict):
             return message
         return SideEffectResult.failed(message, reason=reason)
 
-    from cowork.services.publish import OWNED_BY_OTHER_USER_MESSAGE, PublishOwnedByOtherUser
+    from fastapi import HTTPException
+
+    from cowork.services.publish import (
+        ARTIFACT_TOO_LARGE_MESSAGE,
+        MARKDOWN_NOT_PUBLISHABLE_CODE,
+        OWNED_BY_OTHER_USER_MESSAGE,
+        MarkdownNotPublishable,
+        PublishOwnedByOtherUser,
+        PublishRejected,
+        PublishTooLarge,
+        ShareOrgRequired,
+    )
+    from cowork.services.sharing_contract import SHARE_ORG_REQUIRED_INSTRUCTION
 
     try:
-        result = _publish_artifact(abs_path, access=access)
+        # A thread of its own: a Markdown page renders in the conversion
+        # process, for up to its 30 s, and the upload blocks too. This handler
+        # runs on the server's event loop.
+        result = await asyncio.to_thread(_publish_artifact, abs_path, access=access)
     except PublishOwnedByOtherUser:
         # The model can edit files, so spell out that it must not work around
         # the refusal (e.g. by dropping the stored report_id). Not a ban for the
@@ -332,6 +397,40 @@ async def _cowork_publish_or_preview(session: Any, tc_input: dict):
             "ask after resolving it.",
             reason="owned_by_other_user",
         )
+    except PublishTooLarge:
+        # Retrying the same files cannot succeed; the model can shrink them. Kept
+        # before the generic HTTPException branch for this do-not-retry advice.
+        logger.info("Cowork publish refused: %s", ARTIFACT_TOO_LARGE_MESSAGE)
+        return _fail(
+            f"PUBLISH FAILED: {ARTIFACT_TOO_LARGE_MESSAGE} Do not retry with the same files. "
+            "Tell the user, or remove or shrink large files in the artifact "
+            "(PDFs, images) and publish again.",
+            reason="too_large",
+        )
+    except MarkdownNotPublishable as exc:
+        # The same file is refused on every try, and each try can hold the
+        # server's one conversion for 30 s; the model can shorten the file.
+        message = exc.detail["message"]
+        logger.info("Cowork publish refused: %s", message)
+        return _fail(
+            f"PUBLISH FAILED: {message} Do not retry with the same file. "
+            "Tell the user, or shorten or simplify the Markdown and publish again.",
+            reason=MARKDOWN_NOT_PUBLISHABLE_CODE,
+        )
+    except ShareOrgRequired as exc:
+        # The reason is MindsHub's, and classify_upload_error already logged
+        # the refusal. A PublishRejected, so kept before that branch, which
+        # would drop the code.
+        return _fail(f"PUBLISH FAILED: {exc} {SHARE_ORG_REQUIRED_INSTRUCTION}", reason=exc.code)
+    except HTTPException as exc:
+        # Typed refusals carry their text in `detail`; str(exc) would hand the
+        # model "503: {'code': ...}".
+        detail = exc.detail
+        info = detail if isinstance(detail, dict) else {}
+        message = info.get("message") or str(detail)
+        reason = info.get("code") or "http_error"
+        logger.info("Cowork publish refused: %s", message)
+        return _fail(f"PUBLISH FAILED: {message}", reason=reason)
     except ValueError as exc:
         # The service raises ValueError for several distinct reasons. Only the
         # missing-API-key case warrants the STOP/"go configure a key" directive;
@@ -348,6 +447,10 @@ async def _cowork_publish_or_preview(session: Any, tc_input: dict):
             )
         logger.info("Cowork publish rejected: %s", exc)
         return _fail(f"PUBLISH FAILED: {exc}", reason="ValueError")
+    except PublishRejected as exc:
+        # publish_artifact has already logged the traceback.
+        logger.warning("Cowork publish rejected: %s", exc)
+        return _fail(f"PUBLISH FAILED: {exc}", reason="PublishRejected")
     except Exception as exc:
         logger.exception("Cowork publish tool failed")
         return _fail(f"PUBLISH FAILED: {exc}", reason=type(exc).__name__)
@@ -440,21 +543,36 @@ def _lookup_score(query: str, c: dict) -> float:
     return score
 
 
+def _sharepoint_instruction() -> str:
+    """What the agent tells a person who wants SharePoint, instead of collecting its key.
+
+    SharePoint is saved only by its own form in Customize, which checks the
+    key with Microsoft first, and that form exists only outside org mode.
+    """
+    if get_app_settings().tenancy_mode == "org":
+        return (
+            "Don't ask for SharePoint's key in chat. Tell the person SharePoint is "
+            "available in the desktop app."
+        )
+    return (
+        "Don't ask for SharePoint's key in chat and don't call request_credentials for it. "
+        "Tell the person to set it up in Customize, under Connections, where Cowork checks "
+        "the key with Microsoft. Once it is connected, they bring files into a project with "
+        "\"Add files from SharePoint\"."
+    )
+
+
 async def _cowork_lookup_connector(session: Any, tc_input: dict) -> str:
     """Tool handler for `lookup_connector`.
 
-    Pulls a registry-backed connector spec by id (slug) or by
+    Pulls a connector spec, built-in or one of this scope's custom ones, by id (slug) or by
     natural-language query. The returned `form` blob is what the LLM
     should pass to `request_credentials` verbatim — methods, OAuth
     blocks, how_to markdown, and help_url all already filled in. We
     also stamp `_connector_id` onto the form so submissions land via
     the registry-aware save path (POST /v1/connectors/{id}/save).
     """
-    try:
-        from cowork.services.connectors.specs._registry import registry
-    except Exception as exc:
-        logger.exception("Cowork lookup_connector could not import registry")
-        return f"lookup_connector: registry unavailable ({exc})"
+    connectors = await _scope_connectors()
 
     cid = (tc_input.get("id") or "").strip()
     query = (tc_input.get("query") or "").strip()
@@ -463,6 +581,17 @@ async def _cowork_lookup_connector(session: Any, tc_input: dict) -> str:
         return "lookup_connector: provide either `id` (a connector slug) or `query` (a natural-language name)."
 
     def _present(connector: dict, confidence: float, stage: str) -> str:
+        if connector.get("id") == SHAREPOINT:
+            # No form: there is nothing for request_credentials to render.
+            return json.dumps({
+                "id": connector.get("id"),
+                "label": connector.get("label"),
+                "description": connector.get("description"),
+                "category": connector.get("category"),
+                "confidence": confidence,
+                "stage": stage,
+                "next_step": _sharepoint_instruction(),
+            })
         # Stamp `_connector_id` into the form blob so the LLM doesn't
         # have to remember to copy it across. The vault save endpoint
         # uses this to route through POST /v1/connectors/{id}/save
@@ -482,6 +611,9 @@ async def _cowork_lookup_connector(session: Any, tc_input: dict) -> str:
             "label": connector.get("label"),
             "description": connector.get("description"),
             "category": connector.get("category"),
+            # How to use the service once connected: base URL, auth header,
+            # endpoints. Saved with a custom connector when it was built.
+            "usage_notes": connector.get("usage_notes"),
             "confidence": confidence,
             "stage": stage,
             "form": form_blob,
@@ -495,28 +627,26 @@ async def _cowork_lookup_connector(session: Any, tc_input: dict) -> str:
 
     # Stage 0 — explicit id always wins.
     if cid:
-        c = registry.get_connector(cid)
+        c = connectors.get(cid)
         if c:
-            return _present(c.model_dump(), 1.0, "id")
+            return _present(c, 1.0, "id")
         # Fall through to query-style lookup if the id didn't match.
         if not query:
             return json.dumps({
                 "id": None,
                 "match": "none",
                 "message": (
-                    f"No connector with id `{cid}` in the registry. "
-                    f"Either retry with a `query` (natural-language) or "
-                    f"handcraft the form spec — see the request_credentials "
-                    f"schema for the OAuth/how_to/help_url fields."
+                    f"No connector with id `{cid}`. Retry with a `query` "
+                    f"(natural-language), or: {_no_match_hint()}"
                 ),
-                "available_ids": sorted(registry.get_connectors().keys()),
+                "available_ids": sorted(connectors),
             })
         # If both were given and id missed, treat the id as part of the query.
         query = f"{cid} {query}".strip()
 
     # Stage 1 — exact match (id or alias) on the query.
     nq = _lookup_normalize(query)
-    for c in registry.get_connectors().values():
+    for c in connectors.values():
         if _lookup_normalize(c.get("id", "")) == nq:
             return _present(c, 1.0, "exact-id")
         for alias in c.get("aliases", []):
@@ -525,7 +655,7 @@ async def _cowork_lookup_connector(session: Any, tc_input: dict) -> str:
 
     # Stage 2 — token-overlap. Return up to 3 candidates with confidence.
     scored: list[tuple[float, dict]] = []
-    for c in registry.get_connectors().values():
+    for c in connectors.values():
         s = _lookup_score(query, c)
         if s > 0:
             scored.append((s, c))
@@ -536,12 +666,10 @@ async def _cowork_lookup_connector(session: Any, tc_input: dict) -> str:
             "id": None,
             "match": "none",
             "message": (
-                "No connector matched the query. Either ask the user to "
-                "clarify, or handcraft the form spec — see the "
-                "request_credentials schema for the OAuth/how_to/help_url "
-                "fields you should fill in when you know the auth shape."
+                "No connector matched the query. If the user may have meant a "
+                f"listed one, ask them to clarify. Otherwise: {_no_match_hint()}"
             ),
-            "available_ids": sorted(registry.get_connectors().keys()),
+            "available_ids": sorted(connectors),
         })
 
     top_score, top_c = scored[0]
@@ -621,6 +749,76 @@ def build_cowork_lookup_connector_tool():
         # the system prompt on every turn once the tool sticks after unlock.
         unlock_skill="connect-datasource",
     )
+
+
+_DATA_REQUEST_NOTE = (
+    "When the API has no plain GET route that returns data, usage_notes must "
+    "say how to fetch a small sample of data (method, path, body shape, token "
+    "flow), because the connection test passes only once data comes back."
+)
+_TEST_REQUEST_NOTE = (
+    "Every handcrafted form needs a `test_request`: the request Cowork sends to "
+    "check that the API returns data, written as data with `{{field}}` "
+    "placeholders. Give it an optional `token` step (method, url, form or "
+    "json_body, basic_auth, token_field) and a `data` step that sends `{{token}}` "
+    "or a secret field and fetches a few rows. Placeholders go only in the path, "
+    "query, header values and bodies, never in the host, so when each customer "
+    "has their own host, ask the user for it first and write it into the url. "
+    "APIs that need signed requests or client certificates can't be tested this way."
+)
+_BUILD_CUSTOM_CONNECTOR = (
+    "No built-in or saved connector matches. Build a custom connector: ask the "
+    "user how the system is reached (a REST or GraphQL API, a database, or file "
+    "exports; reaching a website through the browser isn't available yet). Then "
+    "handcraft the form with `engine` set to the new connector's id and a "
+    "`connector` block (label, description, category, usage_notes), and pass it "
+    "to `request_credentials`. Credentials go only through that form, never chat. "
+    f"{_TEST_REQUEST_NOTE} {_DATA_REQUEST_NOTE} Once its connection test passes it is saved for reuse."
+)
+_NO_CUSTOM_CONNECTOR = (
+    "No built-in or saved connector matches, and custom connectors can't be "
+    "saved for reuse on this deployment. Tell the user so. A handcrafted form "
+    "passed to `request_credentials` still saves this connection once its test "
+    "passes, but it won't be listed with the connectors. Still give the form a "
+    f"`connector` block with usage_notes. {_TEST_REQUEST_NOTE} {_DATA_REQUEST_NOTE}"
+)
+
+
+def _no_match_hint() -> str:
+    """What lookup_connector tells the agent when nothing matches: build a
+    custom connector where one can be kept (scope_is_one_persons), else that
+    none can be."""
+    scope = current_settings_scope() or LOCAL_SCOPE
+    return _BUILD_CUSTOM_CONNECTOR if scope_is_one_persons(scope) else _NO_CUSTOM_CONNECTOR
+
+
+async def _read_scope_catalog(read: Callable[[ConnectorSpecRegistry], T]) -> T:
+    """Apply ``read`` to the connectors this turn's scope sees, off the event loop.
+
+    With no bound scope where one is required (org mode, or trusted identity
+    headers), ``read`` gets the built-ins only: LOCAL_SCOPE there is the
+    operator's view, not the caller's.
+    """
+    scope = current_settings_scope()
+    if scope is None:
+        if tenant_scope_required():
+            logger.warning("connectors: no tenant scope is bound; custom connectors skipped")
+            return read(registry)
+        scope = LOCAL_SCOPE
+    return await run_db(lambda session: read(ConnectorCatalog(session)), scope=scope)
+
+
+async def _scope_connectors() -> dict[str, dict]:
+    """Return built-in and custom connector specs visible to this turn's scope,
+    as raw specs keyed by connector id."""
+    return await _read_scope_catalog(lambda catalog: dict(catalog.get_connectors()))
+
+
+async def scope_usage_notes(engines: Iterable[str]) -> dict[str, str]:
+    """Return engine -> agent-facing usage notes for those of ``engines``
+    that declare some, custom connectors included, in this turn's scope."""
+    wanted = list(engines)
+    return await _read_scope_catalog(lambda catalog: catalog.usage_notes_for(wanted))
 
 
 # Request Credentials Tool
@@ -727,26 +925,35 @@ async def _cowork_request_credentials(session: Any, tc_input: dict) -> str:
         validate_engine_id(connector_id)
     except InvalidConnectorIdError as e:
         return f"request_credentials: {e}"
-    # For a registry id the server validates and saves against the registry
-    # spec, not this form, so a handcrafted form for one can't be honoured.
-    is_builtin = registry.get_connector(connector_id) is not None
-    if not spec.get("_connector_id") and is_builtin:
+    if connector_id == SHAREPOINT:
+        return f"request_credentials: {_sharepoint_instruction()}"
+    known = (await _scope_connectors()).get(connector_id)
+    extends_name = spec.get("extends_connection")
+    custom = bool(known and known.get("custom"))
+    stored_test_request = has_test_requests(known.get("form") or {}) if custom else None
+    handcrafted = handcrafted_form_allowed(
+        known=known is not None, custom=custom, extends=extends_name is not None,
+        stored_test_request=stored_test_request,
+    )
+    if spec.get("_connector_id") and stored_test_request is False and not tenant_scope_required():
+        return f"request_credentials: {NEEDS_REBUILD_FOR_AGENT.format(connector_id=connector_id)}"
+    if not spec.get("_connector_id") and not handcrafted:
         return (
-            f"request_credentials: {connector_id!r} is a built-in connector. Call "
+            f"request_credentials: {connector_id!r} is already a connector. Call "
             f"lookup_connector with id {connector_id!r} and pass its form, with "
             "`_connector_id`, instead of a handcrafted spec."
         )
 
     spec = dict(spec)
-    if spec.get("_connector_id") and not is_builtin:
-        # A stamped form saves an OAuth step through the registry-only direct
-        # save; a handcrafted one must route by `engine` through the submission.
+    if spec.get("_connector_id") and known is None:
+        # A stamped form saves an OAuth step through direct save, which only
+        # takes known connectors; an unknown id must route by `engine`.
         spec["engine"] = spec.pop("_connector_id")
-    extends_name = spec.pop("extends_connection", None)
+    spec.pop("extends_connection", None)
     if extends_name is not None:
         if not isinstance(extends_name, str) or not extends_name.strip():
             return "request_credentials: `extends_connection` must be the saved connection's name."
-        if is_builtin:
+        if known is not None and spec.get("_connector_id"):
             return (
                 "request_credentials: `extends_connection` applies only to handcrafted "
                 "forms; a built-in connector's form saves its connection in one step."
@@ -760,6 +967,13 @@ async def _cowork_request_credentials(session: Any, tc_input: dict) -> str:
         spec["_existing_name"] = extends_name.strip()
 
     spec = _scrub_secret_values(_ensure_form_id(spec))
+    if handcrafted:
+        # Checked before the form renders, so the user never fills in a form
+        # the server would refuse.
+        try:
+            check_handcrafted_form(spec)
+        except UnstorableFormError as e:
+            return f"request_credentials: {e}"
     block = "```data-vault-form\n" + json.dumps(spec, indent=2) + "\n```"
     return (
         "Form ready. Include the following markdown block VERBATIM in your "
@@ -770,13 +984,34 @@ async def _cowork_request_credentials(session: Any, tc_input: dict) -> str:
         "fence and AFTER the closing fence. Do not concatenate the fence "
         "onto the end of a sentence — markdown parsers won't recognise it "
         "as a code block if it isn't at the start of a line.\n\n"
-        "After the user submits, the server tests the connection and saves "
-        "the credentials automatically — your job is done. Do not call any "
+        "After the user submits, the server tests the connection, and the "
+        "credentials are saved once it passes (on a custom connector, once the "
+        "user confirms its result) — your job is done. Do not call any "
         "tool to retrieve the submitted values, and do not re-emit the form "
         "unless the user asks for a new one.\n\n"
         f"{block}"
     )
 
+
+_TEST_STEP_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "method": {"type": "string", "enum": ["GET", "POST"]},
+        "url": {"type": "string", "description": "https URL; {{field}} placeholders only in the path and query."},
+        "headers": {"type": "object", "description": "Header values may use {{field}} or {{token}}."},
+        "basic_auth": {"type": "array", "items": {"type": "string"}, "description": "Two placeholders: user, then password."},
+        "form": {"type": "object", "description": "Form-encoded body."},
+        "json_body": {"description": "JSON body; placeholders in its string values."},
+        "token_field": {"type": "string", "description": "Token step only: the JSON key that holds the token."},
+    },
+    "required": ["method", "url"],
+}
+_TEST_REQUEST_SCHEMA = {
+    "type": "object",
+    "description": "REQUIRED on a handcrafted form (on each method of a multi-method form). " + _TEST_REQUEST_NOTE,
+    "properties": {"token": _TEST_STEP_SCHEMA, "data": _TEST_STEP_SCHEMA},
+    "required": ["data"],
+}
 
 _REQUEST_CREDENTIALS_SCHEMA = {
     "type": "object",
@@ -793,6 +1028,17 @@ _REQUEST_CREDENTIALS_SCHEMA = {
             "type": "string",
             "description": "Name of a connection saved earlier in this flow (the slug from 'Saved as `...`'). Set it on a follow-up step of a multi-step connect, e.g. tokens after an OAuth grant, so the new fields are added to that connection instead of creating a second one.",
         },
+        "connector": {
+            "type": "object",
+            "description": "On every handcrafted form. Its usage_notes guide the connection test, and where lookup_connector says a custom connector can be saved, it is how the connector is listed for reuse once that test passes.",
+            "properties": {
+                "label": {"type": "string", "description": "Display name (e.g. 'Acme Planner')."},
+                "description": {"type": "string", "description": "One line on what it connects to."},
+                "category": {"type": "string", "description": "Picker category (e.g. 'database', 'crm', 'developer')."},
+                "usage_notes": {"type": "string", "description": f"Short notes for using it later: base URL, auth header, key endpoints, quirks. {_DATA_REQUEST_NOTE} Never credential values."},
+            },
+        },
+        "test_request": _TEST_REQUEST_SCHEMA,
         "_connector_id": {
             "type": "string",
             "description": "Slug of the canonical spec returned by `lookup_connector`. ALWAYS copy it over when the spec came from lookup (routes submissions to the registry-aware save endpoint); omit for handcrafted specs.",
@@ -824,6 +1070,10 @@ _REQUEST_CREDENTIALS_SCHEMA = {
                         "enum": ["text", "password", "url", "select", "textarea", "boolean"],
                     },
                     "required": {"type": "boolean"},
+                    "secret": {
+                        "type": "boolean",
+                        "description": "True for any credential (password, API key, token, secret). It is masked wherever the connection is shown.",
+                    },
                     "placeholder": {"type": "string"},
                     "default": {},
                     "value": {"description": "Pre-fill on re-render. NEVER for secrets — password values are scrubbed server-side."},
@@ -883,6 +1133,7 @@ _REQUEST_CREDENTIALS_SCHEMA = {
                         "items": {"type": "object"},
                     },
                     "actions": {"type": "array", "items": {"type": "object"}},
+                    "test_request": _TEST_REQUEST_SCHEMA,
                 },
                 "required": ["id", "label", "fields"],
             },

@@ -3,7 +3,7 @@ name = "cowork-server"
 dynamic = ["version"]
 description = "FastAPI backend for the MindsHub Cowork desktop app"
 readme = "README.md"
-license = "LicenseRef-Proprietary"
+license = "AGPL-3.0-only"
 requires-python = ">=3.12,<3.14"
 authors = [
     { name = "MindsDB Inc", email = "admin@mindsdb.com" },
@@ -37,7 +37,39 @@ dependencies = [
     # `api_key_provider` capability gate) or `handlers/turn_errors.py`
     # (`is_auth_error`'s untyped 401): what they stand in for predates the
     # `anton.core.artifacts.internal_files` constants it imports at startup.
-    "anton-agent>=2.26.10.19.1,<3",
+    # 2.26.10.21.1 is the first that exports `scratchpad_action`, which the
+    # connector probe imports, and the first that runs a scratchpad call left
+    # without `action` and names `exec` on its streamed result, which the cell
+    # replay reads.
+    # 2.26.10.22.1rc2 is the first with `anton.core.artifacts.live_app_slots`
+    # (mindsdb/anton#620), which live apps hand their launches to and the
+    # live-app tests import.
+    # 2.26.10.25.1rc1 is the first with `skills_artifact_roots`
+    # (mindsdb/anton#630), which every in-process turn sets.
+    # 2.26.10.26.1 is the first that keeps a compacted cell's error flag
+    # (mindsdb/anton#613), which the replayed write check reads.
+    # 2.26.10.29.1rc4 is the first whose `LiveAppHost` has `launch_lock`,
+    # `slots_full` and `slots_available` (mindsdb/anton#646), which shared
+    # live-app slots admit each person's launch through.
+    # 2.26.11.9.1 is the first final release that carries all of the above.
+    # 2.26.11.15.1 is the first final release with the asynchronous publish
+    # job (`PUBLISH_JOB_BUDGET_S`, `PublishJobFailed`, `PublishJobTimeout`,
+    # mindsdb/anton#481), which publishing imports unguarded. It also carries
+    # Notion's MCP server URL and `McpTokenRejected` (mindsdb/anton#549, first
+    # in 2.26.11.12.1rc4), which the Notion connector reads.
+    # 2.26.11.18.1rc1 is the first with custom MCP servers' URL check, guarded
+    # sessions and `list_custom_server_tools` (mindsdb/anton#814), which the
+    # custom MCP routes import.
+    # 2.26.11.19.1rc3 is the first with Slack's MCP server and tool access
+    # tiers (mindsdb/anton#820), which Slack's In-Browser Connect needs.
+    # 2.26.11.20.1rc3 tags the budget-refusal link with from=budget_denial
+    # (mindsdb/anton#819), so the console counts those visits.
+    # 2.26.11.22.1rc1 asks Jev on the MindsHub the person is signed in to, not
+    # only api.mindshub.ai (mindsdb/anton#837), so the artifact bar edits
+    # directly on staging too (quickEditDirect).
+    # Desktop installs the anton this lock names, so a production release
+    # names a final anton, never a release candidate.
+    "anton-agent>=2.26.11.23.1,<3",
     # Floor for GHSA-8bx3-mgpq-m8m9 (IDNA 2003 vs IDNA 2009 host-name encoding
     # mismatch in TLSStream/connect_tcp() lets a hijacked connection to an
     # internationalized domain present a certificate that validates against
@@ -103,7 +135,9 @@ dependencies = [
     "cryptography>=48.0.0,<51",
     "cryptography<49; sys_platform == 'darwin' and platform_machine == 'x86_64'",
     "fastapi>=0.136.1",
-    "httpx>=0.27",
+    # The http2 extra (h2) is for APNs, which only speaks HTTP/2
+    # (cowork/services/push/apns.py).
+    "httpx[http2]>=0.27",
     # Structured app-server integration with a pinned, bundled Codex runtime;
     # users do not need to install a separate CLI.
     "openai-codex==0.147.0",
@@ -125,7 +159,7 @@ dependencies = [
     # `postgresql://`. SQLAlchemy maps that scheme to the psycopg2 dialect, so
     # the driver has to be present or `db-migrate` dies on import.
     "psycopg2-binary>=2.9",
-    "redis>=5,<6",
+    "redis>=5.3.1,<6",
     # Org-controlled channel-binding trigger patterns (channel_bindings.py)
     # are matched against every inbound message at runtime (channels/runtime.py).
     # stdlib `re` has no backtracking bound, so a syntactically-valid but
@@ -138,18 +172,42 @@ dependencies = [
     "sqlmodel>=0.0.38",
     "tzlocal>=5.0",
     "uvicorn>=0.47.0",
-    # Document export (md/html → pdf/docx). All pure-Python, no native
-    # deps — keeps the desktop install clean across platforms.
-    "markdown>=3.7",
-    "xhtml2pdf>=0.2.16",
-    "python-docx>=1.1.2",
-    "htmldocx>=0.0.6",
-    # Floor for the Pillow security fixes; the document libraries above only
-    # pull it in transitively with no lower bound of their own.
-    "pillow>=12.3.0",
+    # Document libraries, for export and for agent code cells. Pins are exact
+    # so that a new upstream release can't change what export or an agent
+    # cell does without review. They match the reviewed runtime export,
+    # cowork/release-requirements.txt; to move one, change it here, relock and
+    # regenerate that file with scripts/release_contract.py.
+    #
+    # Export: Markdown rendering, the fetch-free HTML inliner (lxml parses,
+    # tinycss2 rewrites CSS) and the Word writer.
+    "markdown==3.11.2",
+    "python-docx==1.2.0",
+    "lxml==6.1.3",
+    "tinycss2==1.5.1",
+    # A release with the Pillow security fixes. reportlab, xhtml2pdf and
+    # svglib pull it in with floors that still allow older releases.
+    "pillow==13.0.0",
+    # Agent code cells use these: the built-in pdf skill
+    # (cowork/skills_builtin/pdf/SKILL.md) imports pypdf and reportlab, and
+    # anton's prompt names BeautifulSoup. The PDF export client also counts a
+    # render service's pages with pypdf. Declared directly so they stay
+    # installed whatever another package's dependencies become.
+    "pypdf==6.21.4",
+    "reportlab==5.0.1",
+    "beautifulsoup4==4.15.0",
+    # Kept for agent code cells that render PDFs with it. cowork/ never
+    # imports it, because it fetches what the HTML names, and
+    # tests/test_no_subprocess_static.py bans it there.
+    "xhtml2pdf==0.2.26",
     # Floor for the PyJWT security fixes; redis and mcp (via anton-agent) pull
     # it in transitively with lower bounds that still allow 2.13.
     "pyjwt>=2.15.0",
+    "structlog==26.1.0",
+    # Teams channel (cowork/channels/teams_client.py). Linux only: Teams runs
+    # only on a server Cowork, so desktop installs don't need them. A main
+    # dependency rather than an extra because the server image installs none.
+    "microsoft-teams-api>=2.1.1; sys_platform == 'linux'",
+    "msal>=1.37.0; sys_platform == 'linux'",
 ]
 
 [project.urls]
@@ -180,6 +238,13 @@ fallback-version = "0.0.0-dev"
 [tool.hatch.build.targets.wheel]
 packages = ["cowork"]
 
+[tool.cowork.release.allow-prerelease]
+# The exact pre-releases a production release may still name, in the lock and
+# in the bounds above. `scripts/release_contract.py --require-final` refuses
+# every other one, a newer candidate of the same project included. The anton
+# relock (`scripts/anton_final_lock_pr.py`) removes anton-agent's entry when it
+# locks anton's final.
+
 [dependency-groups]
 dev = [
     "alembic>=1.18.4",
@@ -187,6 +252,7 @@ dev = [
     "pytest>=9.0.3",
     "pytest-asyncio>=0.25.0",
     "pytest-cov>=7.1.0",
+    "pytest-xdist>=3.8.0",
 ]
 
 [tool.pytest.ini_options]
@@ -196,4 +262,6 @@ markers = [
     "integration: needs a real Redis; skips itself when none is reachable",
     "postdeploy: runs against a deployed cowork-server; skips unless COWORK_BASE_URL is set",
     "production_read_only: GET-only smoke selected by the production nightly",
+    "redis_service: needs a Redis at COWORK_TEST_REDIS_URL; runs in make test/services",
+    "postgres_service: needs a disposable PostgreSQL at COWORK_TEST_POSTGRES_URI; runs in make test/services",
 ]
