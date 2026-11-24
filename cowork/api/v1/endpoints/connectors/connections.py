@@ -35,7 +35,7 @@ from cowork.services.connectors.layered_vault import SHARED_CONNECTION_REFUSAL, 
 from cowork.services.connectors.oauth import auth_proxy
 from cowork.services.connectors.oauth.google import oauth_service
 from cowork.services.connectors.persist import own_vault_for_scope, own_vault_root, persist_connection, vault_for_scope
-from cowork.services.connectors.sealed_vault import RecordTooLargeError
+from cowork.services.connectors.sealed_vault import RecordTooLargeError, ReservedFieldError
 from cowork.services.connectors.sharepoint import ENGINE as SHAREPOINT, generic_setup_refusal
 
 _log = logging.getLogger("cowork.connectors.connections")
@@ -283,10 +283,11 @@ def _persist_direct_connection(
             vault=vault,
             scope=scope,
         )
-    except (SharedConnectionError, RecordTooLargeError):
+    except (SharedConnectionError, RecordTooLargeError, ReservedFieldError):
         # A derived name that lands on a connection the caller can't change,
-        # or a sealed record too large to read back: create_app's handlers
-        # answer them with 403 and 422, not the 500 below.
+        # a sealed record too large to read back, or a field named like the
+        # sealed mark: create_app's handlers answer them with 403 and 422,
+        # not the 500 below.
         raise
     except Exception:
         _log.exception("Failed to save connection %s", body.connector_id)

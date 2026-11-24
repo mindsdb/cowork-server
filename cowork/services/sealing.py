@@ -19,7 +19,6 @@ from __future__ import annotations
 import logging
 import os
 from pathlib import Path
-from typing import Any
 from uuid import UUID
 
 import sqlalchemy as sa
@@ -33,14 +32,12 @@ from cowork.common.settings.user_settings import UserSettings
 from cowork.db.session import get_engine
 from cowork.models.setting import Setting
 from cowork.services.connectors.sealed_vault import (
-    BOOKKEEPING_FIELDS,
-    SEALED_FIELD,
+    RecordSealing,
     SealedDataVault,
     SealedRecordError,
     errno_name,
-    is_fernet_token,
-    is_sealed_record,
     read_record_file,
+    record_sealing,
 )
 
 logger = logging.getLogger(__name__)
@@ -104,16 +101,6 @@ def sealing_marker_present() -> bool:
     return row is not None
 
 
-def _holds_sealed_values(*, fields: dict[str, Any]) -> bool:
-    """Whether a record reads as one SealedDataVault wrote, checked without a
-    key: the sealed mark, and each value outside the bookkeeping fields a
-    Fernet token. A plain record can carry a field named like the mark."""
-    return is_sealed_record(fields=fields) and all(
-        key in BOOKKEEPING_FIELDS or key == SEALED_FIELD or is_fernet_token(value=value)
-        for key, value in fields.items()
-    )
-
-
 def _warn_unreadable_vault(*, folder: Path | str | None, error: OSError) -> None:
     logger.warning(
         "A vault folder can't be read, so the no-key start check skips it",
@@ -154,7 +141,14 @@ def refuse_sealed_state_without_key_file() -> None:
                 record = read_record_file(path=path, connection=path.name)
             except SealedRecordError:
                 continue
-            if record is not None and _holds_sealed_values(fields=record["fields"]):
+            # A record counts when it reads as one SealedDataVault wrote: the integer mark, and each
+            # value outside the bookkeeping fields a Fernet token by its shape, as no key is here to
+            # open one. A plain record with a field named like the mark beside a plain value doesn't
+            # count. A record that is only the mark beside bookkeeping fields does: SealedDataVault
+            # writes that for a connection with no values, such as an empty custom MCP connection,
+            # and a deployment sealed from its first start has no marker row, so this scan is its
+            # only guard.
+            if record is not None and record_sealing(fields=record["fields"]) is RecordSealing.SEALED:
                 raise KeyFileError(
                     f"The saved connection file {path} is sealed, and COWORK_KEY_FILE isn't set. "
                     "Start the server with COWORK_KEY_FILE naming the key file it was sealed under."

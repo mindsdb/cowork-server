@@ -18,6 +18,7 @@ import errno
 import json
 import os
 import sys
+from collections.abc import Callable
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from uuid import uuid4
@@ -37,7 +38,7 @@ from cowork.models.setting import Setting
 from cowork.ops import reseal
 from cowork.services.connectors.connections import ConnectionsService
 from cowork.services.connectors.identity import VAULT_KEEP_SENTINEL
-from cowork.services.connectors.sealed_vault import SEALED_FIELD, SealedDataVault
+from cowork.services.connectors.sealed_vault import SEALED_FIELD, SealedDataVault, is_fernet_token
 from cowork.services.sealing import SEALING_MARKER_KEY
 
 PARTITION_A = "44e92829-e701-599b-88f9-69f5bf1165eb"
@@ -272,7 +273,7 @@ def test_a_setting_no_key_opens_stops_it_before_any_write(deployment, capsys):
     printed = _refused(deployment, capsys, names="setting anthropic_api_key (global)")
 
     assert f"setting anthropic_api_key (user {USER} in {ORG})" in printed
-    assert "A row no key you hold opens can be entered again, or deleted, with Cowork started as before; then run this again." in printed
+    assert UNOPENED_ROW_REMEDY in printed and UNOPENED_CONNECTION_REMEDY not in printed
 
 
 def test_without_a_key_file_it_changes_nothing(deployment, monkeypatch, capsys):
@@ -379,18 +380,302 @@ def test_a_record_too_large_to_read_back_once_sealed_stops_it_before_any_write(d
     assert "AAAA" not in printed
 
 
-def test_a_plain_record_with_a_field_named_like_the_mark_is_sealed_as_plain(deployment):
-    """Only the integer mark SealedDataVault.save writes makes a record sealed; a plain record's
-    string "1" there is a field like any other, and the save writes the mark in its place."""
+PARTLY_SEALED_HEADING = (
+    "These saved connections hold sealed values but don't read as sealed records, so the re-seal wrote nothing:"
+)
+PARTLY_SEALED_REASON = "some of its values are sealed, but it doesn't read as a sealed record"
+PARTLY_SEALED_REMEDY = "Remove each one and run this again; then connect it again once Cowork starts."
+RESERVED_HEADING = "These saved connections hold a field named _sealed and aren't sealed, so the re-seal wrote nothing:"
+RESERVED_REMEDY = (
+    "Save each one again without that field, with Cowork started as before, or remove it; then run this again. "
+    "A connection in the managed folder can't be saved from Cowork: edit its file to drop the field, or remove it."
+)
+
+
+def _partly_sealed(deployment, *, changed: dict[str, object]) -> Path:
+    """A sealed record, its host and password both tokens, with ``changed`` written over its
+    fields. Returns its file."""
+    keys = MultiFernet([file_fernet(deployment)])
+    SealedDataVault(deployment["vaults"]["a"], keys=keys).save("postgres", "mixed", {"host": "db.example", "password": SECRET_A})
+    record_file = deployment["vaults"]["a"] / "postgres-mixed"
+    record = json.loads(record_file.read_text())
+    record["fields"].update(changed)
+    record_file.write_text(json.dumps(record))
+    return record_file
+
+
+@pytest.mark.parametrize("mark", ["1", 1, True, 1.0], ids=["string", "int", "bool", "float"])
+def test_a_plain_record_with_a_field_named_like_the_mark_stops_it(deployment, capsys, mark):
+    """The field name _sealed is reserved for the sealed mark. A plain record that holds it,
+    whatever the field holds, the integer 1 too, is neither sealed nor plain: sealed as plain, it
+    would lose the field to the mark, and opened as sealed, no key would open its plain values."""
     plain_records(deployment)
-    LocalDataVault(deployment["vaults"]["base"]).save("http", "flagged", {"token": "flag-token", SEALED_FIELD: "1"})
+    record_file = deployment["vaults"]["base"] / "acme_api-acme"
+    LocalDataVault(deployment["vaults"]["base"]).save("acme_api", "acme", {"api_token": "flag-token", SEALED_FIELD: mark})
+
+    printed = _refused(deployment, capsys, names=f"{record_file}: the field name _sealed is reserved for the sealed mark")
+
+    assert RESERVED_HEADING in printed and RESERVED_REMEDY in printed
+    assert PARTLY_SEALED_HEADING not in printed
+    assert "flag-token" not in printed
+
+
+@pytest.mark.parametrize("plain_value", ["db.example", 5432], ids=["text", "number"])
+def test_a_record_with_the_mark_beside_values_that_arent_sealed_stops_it(deployment, capsys, plain_value):
+    """A sealed record with one value put back as plain text or a number. Its refusal says to
+    remove it, never to save it again. An edit from the form would keep the stored password, a
+    token, as plain text, and the next run would seal that text as the password. With a key file,
+    Cowork doesn't start beside it either."""
+    plain_records(deployment)
+    record_file = _partly_sealed(deployment, changed={"host": plain_value})
+
+    printed = _refused(deployment, capsys, names=f"{record_file}: {PARTLY_SEALED_REASON}")
+
+    assert PARTLY_SEALED_HEADING in printed and PARTLY_SEALED_REMEDY in printed
+    assert RESERVED_HEADING not in printed and "Save each one again" not in printed
+    assert SECRET_A not in printed and "db.example" not in printed
+
+
+def test_a_record_with_a_string_mark_beside_tokens_stops_it_with_the_remove_remedy(deployment, capsys):
+    """A sealed record whose mark was made the string "1": no plain value, and no mark the server
+    reads as sealed. Saved again from the form, as the reserved field's remedy says, the edit would
+    keep each token's text as a plain value, the next run would seal that text, and the password
+    would open as a token's text. So its refusal says to remove it."""
+    plain_records(deployment)
+    record_file = _partly_sealed(deployment, changed={SEALED_FIELD: "1"})
+
+    printed = _refused(deployment, capsys, names=f"{record_file}: {PARTLY_SEALED_REASON}")
+
+    assert PARTLY_SEALED_HEADING in printed and PARTLY_SEALED_REMEDY in printed
+    assert RESERVED_HEADING not in printed and "Save each one again" not in printed
+    assert SECRET_A not in printed and "db.example" not in printed
+
+
+def test_a_partly_sealed_record_and_a_plain_one_with_the_field_are_refused_under_their_own_headings(deployment, capsys):
+    """Each kind is refused as itself: the partly sealed record first, and once it is removed, as its
+    refusal says, the plain record with a field named like the mark under the reserved heading."""
+    plain_records(deployment)
+    partly_sealed = _partly_sealed(deployment, changed={"host": "db.example"})
+    reserved = deployment["vaults"]["base"] / "acme_api-acme"
+    LocalDataVault(deployment["vaults"]["base"]).save("acme_api", "acme", {"api_token": "flag-token", SEALED_FIELD: 1})
+
+    first = _refused(deployment, capsys, names=f"{partly_sealed}: {PARTLY_SEALED_REASON}")
+
+    assert PARTLY_SEALED_HEADING in first and str(reserved) not in first and RESERVED_HEADING not in first
+
+    partly_sealed.unlink()
+    second = _refused(deployment, capsys, names=f"{reserved}: the field name _sealed is reserved for the sealed mark")
+
+    assert RESERVED_HEADING in second and RESERVED_REMEDY in second
+    assert PARTLY_SEALED_HEADING not in second and str(partly_sealed) not in second
+
+
+def _with_a_skipped_character(token: str, character: str = ".") -> str:
+    """``token`` with ``character`` after its second character, inside the text every token starts
+    with. Fernet's base64 decoder skips the character, so the token opens all the same."""
+    return token[:2] + character + token[2:]
+
+
+# Tokens Fernet opens whose shape is no token's: with stray whitespace a hand edit can leave around
+# them, and with a character Fernet's decoder skips inside the text every token starts with. Only
+# opening the value reads the last two as sealed.
+OPENING_REWRITES = pytest.mark.parametrize(
+    "rewrite",
+    [
+        lambda token: token + "\n",
+        lambda token: " " + token,
+        _with_a_skipped_character,
+        lambda token: _with_a_skipped_character(token, '"'),
+    ],
+    ids=["trailing-newline", "leading-space", "dot-inside-the-prefix", "quote-inside-the-prefix"],
+)
+
+
+def _rewritten_password(
+    deployment,
+    *,
+    fields: dict[str, object],
+    rewrite: Callable[[str], str],
+    mark: object,
+    sealed_under: Fernet | None = None,
+) -> Path:
+    """A record SealedDataVault saved with ``fields`` under ``sealed_under``, the key file's key
+    when None, its password token written back as ``rewrite`` makes it and its mark as ``mark``.
+    Returns its file."""
+    keys = MultiFernet([sealed_under or file_fernet(deployment)])
+    SealedDataVault(deployment["vaults"]["a"], keys=keys).save("postgres", "padded", fields)
+    record_file = deployment["vaults"]["a"] / "postgres-padded"
+    record = json.loads(record_file.read_text())
+    record["fields"]["password"] = rewrite(record["fields"]["password"])
+    record["fields"][SEALED_FIELD] = mark
+    record_file.write_text(json.dumps(record))
+    return record_file
+
+
+@OPENING_REWRITES
+@pytest.mark.parametrize(
+    "fields",
+    [{"password": SECRET_A}, {"host": "db.example", "password": SECRET_A}],
+    ids=["alone", "beside-a-good-token"],
+)
+@pytest.mark.parametrize("sealed_under", [file_fernet, legacy_fernet], ids=["key-file", "legacy-key"])
+def test_a_token_that_opens_is_sealed_again_whatever_its_shape(deployment, rewrite, fields, sealed_under):
+    """The run counts a value its keys open as sealed, whatever its shape, so a sealed record with
+    one token a hand edit changed opens to its secret and is sealed again, rather than refused as a
+    record with a field named like the mark. It reads each record with every key it opens with, the
+    legacy key among them, not with the key file's keys alone, which it seals under: a token with a
+    skipped character inside its first six characters reads as sealed only because it opens."""
+    plain_records(deployment)
+    record_file = _rewritten_password(
+        deployment, fields=fields, rewrite=rewrite, mark=1, sealed_under=sealed_under(deployment)
+    )
 
     assert run(deployment) == 0
 
     keys = MultiFernet([file_fernet(deployment)])
-    assert SealedDataVault(deployment["vaults"]["base"], keys=keys).load("http", "flagged") == {"token": "flag-token"}
-    on_disk = json.loads((deployment["vaults"]["base"] / "http-flagged").read_text())
-    assert on_disk["fields"][SEALED_FIELD] == 1 and "flag-token" not in json.dumps(on_disk)
+    assert SealedDataVault(deployment["vaults"]["a"], keys=keys).load("postgres", "padded") == fields
+    on_disk = json.loads(record_file.read_text())["fields"]
+    assert is_fernet_token(value=on_disk["password"]) and SECRET_A not in json.dumps(on_disk)
+
+
+@OPENING_REWRITES
+def test_a_string_mark_beside_a_changed_token_that_opens_stops_it_with_the_remove_remedy(deployment, capsys, rewrite):
+    """The changed token opens with the run's keys, so the record holds a sealed value beside a mark
+    the server doesn't read as sealed. Saved again from the form, as the reserved field's remedy
+    says, the edit would keep the token's text as the password, so its refusal says to remove it."""
+    plain_records(deployment)
+    record_file = _rewritten_password(deployment, fields={"password": SECRET_A}, rewrite=rewrite, mark="1")
+
+    printed = _refused(deployment, capsys, names=f"{record_file}: {PARTLY_SEALED_REASON}")
+
+    assert PARTLY_SEALED_HEADING in printed and PARTLY_SEALED_REMEDY in printed
+    assert RESERVED_HEADING not in printed and "Save each one again" not in printed
+    assert SECRET_A not in printed
+
+
+UNOPENED_HEADING = "No key opens these, so the re-seal changed nothing:"
+UNOPENED_CONNECTION_REMEDY = (
+    "Remove each connection no key you hold opens and run this again; then connect it again once Cowork starts."
+)
+UNOPENED_ROW_REMEDY = (
+    "A row no key you hold opens can be entered again, or deleted, with Cowork started as before; then run this again."
+)
+
+
+def another_fernet(deployment) -> Fernet:
+    """A key the deployment doesn't hold."""
+    return Fernet(Fernet.generate_key())
+
+
+@pytest.mark.parametrize(
+    ("rewrite", "sealed_under"),
+    [
+        (lambda token, fernet: token[:-10], file_fernet),
+        (lambda token, fernet: token + "\n", another_fernet),
+        (lambda token, fernet: token[:3] + "\n " + token[3:], another_fernet),
+        (lambda token, fernet: '"' + token + '"', another_fernet),
+        (lambda token, fernet: " " + fernet.encrypt(b"not json").decode(), file_fernet),
+        (lambda token, fernet: _with_a_skipped_character(fernet.encrypt(b"not json").decode()), file_fernet),
+    ],
+    ids=[
+        "truncated", "another-key-with-a-trailing-newline", "another-key-with-whitespace-inside", "another-key-quoted",
+        "opens-to-text-that-isnt-json", "opens-to-text-that-isnt-json-with-a-skipped-character",
+    ],
+)
+def test_ciphertext_no_key_opens_under_the_mark_stops_it_as_unopened(deployment, capsys, rewrite, sealed_under):
+    """A token cut short, one sealed under a key the run doesn't hold with whitespace a hand edit left
+    after or inside it or quotes around it, and one Fernet opens to text that isn't the JSON a save
+    seals: none opens to a value, and none has a token's shape. The run reads each one as sealed, as
+    its text, with each character outside a token's alphabet removed, starts as a token's does, or as Fernet opens it, and refuses it as a value no key opens,
+    by name, whose remedy is to remove the connection and connect it again. Read as plain, it would
+    get the reserved field's remedy to save it again from the form, which keeps the ciphertext's text
+    as the password."""
+    plain_records(deployment)
+    fernet = sealed_under(deployment)
+    record_file = _rewritten_password(
+        deployment,
+        fields={"password": SECRET_A},
+        rewrite=lambda token: rewrite(token, fernet),
+        mark=1,
+        sealed_under=fernet,
+    )
+
+    printed = _refused(
+        deployment,
+        capsys,
+        names=f"connection postgres/padded in {record_file.parent}: its password field doesn't open with the server's key",
+    )
+
+    assert UNOPENED_HEADING in printed and UNOPENED_CONNECTION_REMEDY in printed
+    assert RESERVED_HEADING not in printed and PARTLY_SEALED_HEADING not in printed
+    assert "Save each one again" not in printed and "Traceback" not in printed
+    assert SECRET_A not in printed
+
+
+@pytest.mark.parametrize(
+    "rewrite",
+    [
+        lambda token: token[:-10],
+        lambda token: Fernet(Fernet.generate_key()).encrypt(b'"zx-other"').decode(),
+        lambda token: "gAAAAA-plain-token",
+    ],
+    ids=["truncated", "another-key", "plain-text-with-the-prefix"],
+)
+def test_a_connection_no_key_opens_beside_a_good_token_is_removed_and_connected_again(deployment, capsys, rewrite):
+    """A sealed record whose password no key opens, beside a host token that opens. Its refusal says
+    to remove the connection and connect it again, never to enter it again: the form shows the host
+    as its token's text and keeps that text, as it keeps each value the person doesn't type again
+    (cowork.services.connectors.identity.resolve_keep_sentinels), and the next run would seal the
+    token's text as the host. Followed, the remedy leaves each value opening to what was typed."""
+    plain_records(deployment)
+    fields = {"host": "db.example", "password": SECRET_A}
+    record_file = _rewritten_password(deployment, fields=fields, rewrite=rewrite, mark=1)
+
+    printed = _refused(
+        deployment,
+        capsys,
+        names=f"connection postgres/padded in {record_file.parent}: its password field doesn't open with the server's key",
+    )
+
+    assert UNOPENED_HEADING in printed and UNOPENED_CONNECTION_REMEDY in printed
+    assert "entered again" not in printed and UNOPENED_ROW_REMEDY not in printed
+
+    record_file.unlink()
+    assert run(deployment) == 0
+    vault = SealedDataVault(deployment["vaults"]["a"], keys=MultiFernet([file_fernet(deployment)]))
+    vault.save("postgres", "padded", fields)
+    opened = vault.load("postgres", "padded")
+    assert opened == fields and not any(str(value).startswith("gAAAAA") for value in opened.values())
+
+
+def test_a_connection_and_a_setting_no_key_opens_each_get_their_remedy(deployment, capsys):
+    plain_records(deployment)
+    record_file = _rewritten_password(deployment, fields={"password": SECRET_A}, rewrite=lambda token: token[:-10], mark=1)
+    store_setting(deployment, key="anthropic_api_key", value=Fernet(Fernet.generate_key()).encrypt(b"lost").decode())
+
+    printed = _refused(deployment, capsys, names=f"connection postgres/padded in {record_file.parent}")
+
+    assert "setting anthropic_api_key (global)" in printed
+    assert UNOPENED_CONNECTION_REMEDY in printed and UNOPENED_ROW_REMEDY in printed
+
+
+def test_a_plain_value_that_starts_as_a_token_does_beside_the_mark_stops_it_as_unopened(deployment, capsys):
+    """A plain record with the integer mark beside a value whose text merely starts as a token's
+    does reads as sealed, and is refused as a value no key opens, not as a field named like the
+    mark. That false reading is accepted: its remedy removes the connection and connects it again,
+    which costs a re-entry, and no real secret is sealed twice."""
+    plain_records(deployment)
+    base = deployment["vaults"]["base"]
+    LocalDataVault(base).save("acme_api", "acme", {"api_token": "gAAAAA-plain-token", SEALED_FIELD: 1})
+
+    printed = _refused(
+        deployment,
+        capsys,
+        names=f"connection acme_api/acme in {base}: its api_token field doesn't open with the server's key",
+    )
+
+    assert UNOPENED_HEADING in printed and UNOPENED_CONNECTION_REMEDY in printed and RESERVED_HEADING not in printed
+    assert "gAAAAA-plain-token" not in printed
 
 
 @pytest.mark.parametrize("secure_keys", [5, "password", ["password", 1]])

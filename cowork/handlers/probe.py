@@ -37,6 +37,7 @@ from cowork.services.connectors.identity import spec_secret_fields
 from cowork.services.connectors.pending_tests import PendingTest
 from cowork.services.connectors.persist import persist_connection, vault_for_scope
 from cowork.services.connectors.probe import CredentialProbe, ProbeOutcome
+from cowork.services.connectors.sealed_vault import RecordTooLargeError, ReservedFieldError
 from cowork.services.connectors.specs._registry import registry
 from cowork.services.connectors.submissions import store
 from cowork.db.scoped import (
@@ -383,6 +384,12 @@ class ProbeHandler:
                     )
                     saved_record = vault.read_record(connector_id, slug) or {}
                     saved_user_label = str(saved_record.get("fields", {}).get("_user_label", "")).strip() or None
+                except (RecordTooLargeError, ReservedFieldError) as exc:
+                    # The sealed vault refuses these values (SealedDataVault.save). Its reason is a
+                    # sentence that names the connection and never a value, so it is said as it is.
+                    yield _delta(str(exc))
+                    yield await _completed(db_conversation_id, {"status": "failed"})
+                    return
                 except Exception as exc:
                     yield _delta(f"Could not save: `{exc}`.")
                     yield await _completed(db_conversation_id, {"status": "failed"})
@@ -691,6 +698,12 @@ class ProbeHandler:
                     saved_slug = slug
                     saved_record = vault.read_record(connector_id, slug) or {}
                     saved_user_label = str(saved_record.get("fields", {}).get("_user_label", "")).strip() or None
+                except (RecordTooLargeError, ReservedFieldError) as exc:
+                    # The sealed vault refuses these values (SealedDataVault.save): a refusal of the
+                    # person's input, not a server error, so nothing is logged. Its reason names the
+                    # connection and never a value.
+                    final_outcome.status = "failure"
+                    final_outcome.error = str(exc)
                 except Exception as exc:
                     logger.exception("Vault save failed despite probe success")
                     final_outcome.status = "failure"

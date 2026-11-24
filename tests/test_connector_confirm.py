@@ -10,6 +10,7 @@ answer shapes the renderer's tests load
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 from pathlib import Path
@@ -23,13 +24,17 @@ from cowork.api.v1.endpoints.connectors import submissions as submissions_endpoi
 from cowork.api.v1.endpoints.connectors.submissions import allow_private_route, cancel_route, confirm_route
 from cowork.api.v1.permissions import SingleUserOnly
 from cowork.api.v1.route_walker import declared_permissions
+from cowork.common.record_files import MAX_RECORD_BYTES
 from cowork.db.scoped import LOCAL_SCOPE, TenantScope
+from cowork.handlers import probe as probe_handler
 from cowork.models.custom_connector import CustomConnector
 from cowork.schemas.connectors import ConnectorTestAnswer
 from cowork.server import create_app
-from cowork.services.connectors import connector_test_run, pending_tests as pending_module
+from cowork.services.connectors import connector_test_flow, connector_test_run, pending_tests as pending_module
 from cowork.services.connectors.connector_test_flow import CANCELLED, ENDED, NOT_ALLOWED
 from cowork.services.connectors.pending_tests import PendingTest, PendingTests
+from cowork.services.connectors.persist import own_vault_for_scope, vault_for_scope
+from cowork.services.connectors.sealed_vault import SEALED_FIELD, SealedDataVault
 # The mock API and the local vault, database and saved turn are the probe stream's own fixtures.
 from tests.test_probe_test_request import ISSUED, PLANNER_FORM, SECRET, VALUES, api, connect, of, saved
 
@@ -191,6 +196,52 @@ class TestTheMemberAnswers:
         with pytest.raises(HTTPException) as exc:
             await confirm_route(ConnectorTestAnswer(confirm_id="nope"), LOCAL_SCOPE)
         assert exc.value.status_code == 404
+
+
+FLAG = "flag-value-6150"
+_RESERVED = re.compile(
+    r"The saved connection planner/planner-[0-9a-f]{8} can't be saved: the field name _sealed is reserved for "
+    r"the sealed mark\. Rename the field and save again\."
+)
+_TOO_LARGE = re.compile(
+    r"The saved connection planner/planner-[0-9a-f]{8} is too large to save: sealed, its record file would be "
+    rf"\d+ bytes, and the limit is {MAX_RECORD_BYTES}\."
+)
+
+
+class TestAKeyedSaveTheVaultRefuses:
+    """With a key file, SealedDataVault.save refuses a field named like the sealed mark and a record
+    too large to read back once sealed. The member's form and the conversation give the vault's own
+    reason, which names the connection and never a value, not a generic failure that submitting the
+    form again can't get past."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("field", "value", "reason"),
+        [(SEALED_FIELD, FLAG, _RESERVED), ("notes", FLAG + "x" * MAX_RECORD_BYTES, _TOO_LARGE)],
+        ids=["field-named-like-the-mark", "too-large-once-sealed"],
+    )
+    async def test_the_form_and_the_conversation_say_why_and_nothing_is_saved(
+        self, api, saved, key_file, sharepoint_stores, monkeypatch, caplog, field, value, reason,
+    ):
+        for module in (probe_handler, connector_test_flow):
+            monkeypatch.setattr(module, "vault_for_scope", vault_for_scope)
+        form = {**PLANNER_FORM, "fields": [*PLANNER_FORM["fields"], {"name": field, "label": field, "type": "text"}]}
+        [preview] = of(await connect(form, {**VALUES, field: value}, saved), "connector.test_preview")
+
+        with caplog.at_level(logging.DEBUG):
+            answer = await confirm_route(ConnectorTestAnswer(confirm_id=preview["confirm_id"]), LOCAL_SCOPE)
+
+        assert set(answer) == {"patch"} and answer["patch"]["_is_success"] is False
+        assert reason.fullmatch(answer["patch"]["form_error"]), answer["patch"]["form_error"]
+        assert saved.turns[-1]["text"] == f"Not saved: {answer['patch']['form_error']}"
+        vault = own_vault_for_scope(LOCAL_SCOPE)
+        assert isinstance(vault, SealedDataVault) and vault.list_connections() == []
+        with Session(saved.engine) as session:
+            assert session.exec(select(CustomConnector)).all() == []
+        assert [r for r in caplog.records if r.name == submissions_endpoint.logger.name and r.levelno >= logging.ERROR] == []
+        shown = json.dumps(answer) + json.dumps(saved.turns[-1]["text"]) + caplog.text
+        assert FLAG not in shown and SECRET not in shown
 
 
 CANCEL_URL = "/api/v1/connectors/submissions/cancel"

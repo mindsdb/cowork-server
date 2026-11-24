@@ -20,9 +20,15 @@ it:
 3. opens every record, and every sealed setting, channel credential and live-app preview cookie,
    with the key file's keys and the legacy key: ``--old-key-file``, else ``COWORK_MASTER_KEY``,
    else the file at ``MASTER_KEY_PATH``. A record is sealed when it carries the mark
-   SealedDataVault.save writes (cowork.services.connectors.sealed_vault.is_sealed_record), and
-   plain otherwise. It stops, changing nothing, when a record, setting or credential opens with
-   none, naming every one; when a record, sealed, would make a file larger than the server reads
+   SealedDataVault.save writes and each value outside its bookkeeping fields is sealed, and plain
+   when it holds no field named ``_sealed``, a name reserved for the mark
+   (cowork.services.connectors.sealed_vault.record_sealing). A value counts as sealed when it has
+   a Fernet token's shape, opens with these keys, or starts as a token's text does, whitespace
+   aside: Fernet opens a token with stray whitespace around it, as a hand edit can leave, and the
+   shape test refuses that, and a token cut short or sealed under a key it doesn't hold is then
+   refused as one no key opens, never saved again as plain text. It stops, changing nothing, at a
+   record that is neither, and when a record, setting or credential opens with none, naming
+   every one; when a record, sealed, would make a file larger than the server reads
    (cowork.common.record_files.MAX_RECORD_BYTES); and when a setting outside those opens with the
    legacy key or an older key in the key file but not with its first key. A channel plugin that
    failed to import leaves its credentials out of cowork.services.sealing.sealed_setting_keys, and
@@ -74,11 +80,13 @@ from cowork.ops import OperatorCommandError, OperatorCommandStopped, run_operato
 from cowork.ops.connection_inventory import vault_filename
 from cowork.services.connectors.persist import own_vault_root
 from cowork.services.connectors.sealed_vault import (
+    SEALED_FIELD,
+    RecordSealing,
     SealedDataVault,
     SealedRecordError,
-    is_sealed_record,
     open_fields,
     record_file_bytes,
+    record_sealing,
     seal_fields,
 )
 from cowork.services.sealing import SEALING_MARKER_KEY, row_name, sealed_setting_keys
@@ -133,6 +141,8 @@ class RecordsCheck(NamedTuple):
     """What opening every record found."""
 
     records: list[StoredRecord]  # each record, opened, to write back sealed
+    partly_sealed: list[Problem]  # each record with a field named SEALED_FIELD and a sealed value, not read as sealed
+    reserved: list[Problem]  # each record that holds a field named SEALED_FIELD and no sealed value
     unopened: list[str]  # each record no key opens, by name
     too_large: list[Problem]  # each record whose sealed file would be larger than the server reads
 
@@ -270,17 +280,32 @@ def _unwritable_folders(*, found: dict[Path, VaultContents]) -> list[Problem]:
 
 
 def _open_records(*, found: dict[Path, VaultContents], opening: MultiFernet, sealing: MultiFernet) -> RecordsCheck:
-    """Every record, opened; each one no key opens; and each one that, sealed in memory and
-    measured as anton's save writes it over the record on disk, is larger than the server reads.
-    SealedDataVault.save refuses such a record, which would stop the writes part-way."""
-    check = RecordsCheck(records=[], unopened=[], too_large=[])
+    """Every record, opened; each one that holds a field named SEALED_FIELD and a sealed value
+    but isn't sealed, and each one that holds that field and no sealed value
+    (cowork.services.connectors.sealed_vault.record_sealing, given the opening keys, so a token a
+    hand edit left stray whitespace around counts as sealed, as it opens, and so does a value that
+    starts as a token's text does, which no key may open); each one no key opens;
+    and each one that, sealed in memory and measured as anton's save writes it over the record on
+    disk, is larger than the server reads. SealedDataVault.save refuses such a record, which would
+    stop the writes part-way."""
+    check = RecordsCheck(records=[], partly_sealed=[], reserved=[], unopened=[], too_large=[])
     for folder, contents in found.items():
         for record in contents.records:
             connection = f"{record.engine}/{record.name}"
+            path = folder / vault_filename(record.engine, record.name)
+            reads_as = record_sealing(fields=record.fields, keys=opening)
+            if reads_as is RecordSealing.PARTLY_SEALED:
+                check.partly_sealed.append(
+                    Problem(path, "some of its values are sealed, but it doesn't read as a sealed record")
+                )
+                continue
+            if reads_as is RecordSealing.RESERVED_FIELD:
+                check.reserved.append(Problem(path, f"the field name {SEALED_FIELD} is reserved for the sealed mark"))
+                continue
             try:
                 opened = (
                     open_fields(fields=record.fields, keys=opening, connection=connection)
-                    if is_sealed_record(fields=record.fields)
+                    if reads_as is RecordSealing.SEALED
                     else dict(record.fields)
                 )
             except SealedRecordError as error:
@@ -289,14 +314,14 @@ def _open_records(*, found: dict[Path, VaultContents], opening: MultiFernet, sea
             size = record_file_bytes(
                 engine=record.engine,
                 name=record.name,
-                fields=seal_fields(fields=opened, keys=sealing),
+                fields=seal_fields(fields=opened, keys=sealing, connection=connection),
                 secure_keys=record.secure_keys,
                 prior={"created_at": record.created_at},
             )
             if size > MAX_RECORD_BYTES:
                 check.too_large.append(
                     Problem(
-                        folder / vault_filename(record.engine, record.name),
+                        path,
                         f"sealed, its file would be {size} bytes, and the server reads at most {MAX_RECORD_BYTES}",
                     )
                 )
@@ -425,6 +450,26 @@ def reseal(*, managed_vault: Path | None, old_key_file: Path | None) -> str:
             + "\nRun it as the server's own user, with the server stopped."
         )
     record_check = _open_records(found=found, opening=opening, sealing=sealing)
+    # An edit from the form keeps each stored secret the person doesn't type again
+    # (cowork.services.connectors.identity.resolve_keep_sentinels), so saving one of these again
+    # would keep a token's text as a plain value, and with a key file Cowork doesn't start beside
+    # one (cowork.services.sealing.refuse_unopenable_sealed_data). Removing it is the remedy.
+    if record_check.partly_sealed:
+        raise OperatorCommandError(
+            "These saved connections hold sealed values but don't read as sealed records, so the re-seal "
+            "wrote nothing:"
+            + _listed([f"{problem.path}: {problem.reason}" for problem in record_check.partly_sealed])
+            + "\nRemove each one and run this again; then connect it again once Cowork starts."
+        )
+    if record_check.reserved:
+        raise OperatorCommandError(
+            f"These saved connections hold a field named {SEALED_FIELD} and aren't sealed, so the re-seal wrote "
+            "nothing:"
+            + _listed([f"{problem.path}: {problem.reason}" for problem in record_check.reserved])
+            + "\nSave each one again without that field, with Cowork started as before, or remove it; then run "
+            "this again. A connection in the managed folder can't be saved from Cowork: edit its file to drop "
+            "the field, or remove it."
+        )
     if record_check.too_large:
         raise OperatorCommandError(
             "These saved connections would be too large for the server to read once sealed, so the re-seal "
@@ -439,12 +484,27 @@ def reseal(*, managed_vault: Path | None, old_key_file: Path | None) -> str:
         settings = _check_settings(session=session, opening=opening, first_key=file_keys[0])
         unopened = record_check.unopened + settings.unopened
         if unopened:
+            # Started without a key file, Cowork shows a sealed connection's values in the form as their
+            # tokens' text, and an edit keeps each one the person doesn't type again
+            # (cowork.services.connectors.identity.resolve_keep_sentinels). Entering the connection
+            # again would keep a token's text as a value, and the next run would seal that text.
+            # Removing it is the remedy, as for a partly sealed record.
+            remedies: list[str] = []
+            if record_check.unopened:
+                remedies.append(
+                    "Remove each connection no key you hold opens and run this again; then connect it again once "
+                    "Cowork starts."
+                )
+            if settings.unopened:
+                remedies.append(
+                    "A row no key you hold opens can be entered again, or deleted, with Cowork started as before; "
+                    "then run this again."
+                )
             raise OperatorCommandError(
                 "No key opens these, so the re-seal changed nothing:"
                 + _listed(unopened)
                 + "\nCheck that the key file lists the key they were sealed under, or name the old key with --old-key-file. "
-                "A row no key you hold opens can be entered again, or deleted, with Cowork started as before; "
-                "then run this again."
+                + " ".join(remedies)
             )
         if settings.stranded:
             raise OperatorCommandError(

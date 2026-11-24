@@ -66,7 +66,7 @@ from cowork.services.live_apps import live_app_slot_paths
 from cowork.services.product_permissions import ProductPermissionUnavailable, report_permission_unavailable
 from cowork.schemas.refusals import TURN_IN_PROGRESS, Refusal
 from cowork.services.connectors.layered_vault import SharedConnectionError
-from cowork.services.connectors.sealed_vault import RecordTooLargeError, SealedRecordError
+from cowork.services.connectors.sealed_vault import RecordTooLargeError, ReservedFieldError, SealedRecordError
 from cowork.streaming import ServerShuttingDown, TurnInProgress, registry
 from cowork.streaming.registry import TURN_SHUTDOWN_GRACE_SECONDS
 from cowork.streaming.turn_claim import TurnClaimUnavailable
@@ -1087,6 +1087,13 @@ def create_app() -> FastAPI:
     # (SealedDataVault.save). Its message names the connection and the sizes.
     @app.exception_handler(RecordTooLargeError)
     async def _record_too_large(request, exc: RecordTooLargeError):
+        return JSONResponse({"detail": str(exc)}, status_code=422)
+
+    # A save with a key file whose values hold a field named like the sealed
+    # mark (SealedDataVault.save). Its message names the connection and the
+    # field, never a value.
+    @app.exception_handler(ReservedFieldError)
+    async def _reserved_field(request, exc: ReservedFieldError):
         return JSONResponse({"detail": str(exc)}, status_code=422)
 
     # Bearer-token auth. On by default in local mode (see AppSettings.
