@@ -31,8 +31,8 @@ from cowork.docs.store import doc_lock, doc_subfolder, read_metadata
 from cowork.docs.tools import TOO_BIG_TEXT, DocToolContext, remote_doc_tool_specs, run_doc_tool
 from cowork.services.artifact_identity import _write_metadata
 from cowork.services.artifact_ownership import artifact_root_for_base, record_artifact_owner
-from cowork.services.artifact_permissions import artifact_capabilities
 from cowork.schemas.turn_skills import TurnSkillEntry, TurnSkills
+from cowork.services.artifact_permissions import artifact_capabilities
 from cowork.turnqueue.host_tools import MAX_RESULT_BYTES, EmitStep, HostCall, HostToolOutcome, HostToolRunner
 
 if TYPE_CHECKING:

@@ -102,10 +102,8 @@ def _handler(ctx: DocToolContext, name: str):
 
 
 def build_doc_tools(ctx: DocToolContext) -> list[ToolDef]:
-    """``list_docs`` is always there and carries the short docs section of the
-    system prompt; the others wait until the agent recalls the ``doc-tools`` skill,
-    whose body is the writing guide. A tool unlocked that way stays for the
-    session, and anton re-unlocks it from the recall in a reloaded history."""
+    """``list_docs`` carries the docs prompt; the others wait for the
+    ``doc-tools`` skill (cowork.docs.prompt)."""
     return [
         ToolDef(name=name, description=description, input_schema=schema, handler=_handler(ctx, name),
                 **({"prompt": DOC_PROMPT} if name == "list_docs" else {"unlock_skill": DOC_SKILL_LABEL}))
