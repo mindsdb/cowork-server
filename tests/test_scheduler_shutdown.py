@@ -332,7 +332,9 @@ async def test_a_run_a_shutdown_cancels_mid_turn_is_saved_failed_and_its_slot_st
     from cowork.common.datetime_utils import ensure_utc
     from cowork.db.scoped import SYSTEM_SCOPE, ScopedSession
     from cowork.db.session import get_open_session
+    from cowork.models.notice import Notice
     from cowork.schemas.schedules import RunStatus
+    from sqlmodel import select
 
     streaming = asyncio.Event()
 
@@ -362,6 +364,8 @@ async def test_a_run_a_shutdown_cancels_mid_turn_is_saved_failed_and_its_slot_st
     poll = get_open_session()
     try:
         due = scheduler._due_schedules(ScopedSession(poll, SYSTEM_SCOPE), datetime.now(timezone.utc))
+        (notice,) = poll.exec(select(Notice).where(Notice.source_id == str(finished.id))).all()
+        assert notice.kind == "scheduled_run.failed"
     finally:
         poll.close()
     assert due_schedule.id in [schedule.id for schedule in due]

@@ -900,6 +900,7 @@ async def _execute_schedule(
     timed_out = False
     end: _AttemptEnd | None = None
     shutdown_interrupted = False
+    shutdown_failed = False
     scheduled: _ScheduledTurn | None = None
     # Set once the run's ending is recorded: True finished, False didn't, and
     # None sends no push (_push_run_ending).
@@ -975,6 +976,7 @@ async def _execute_schedule(
             outcome = AttemptOutcome.failed_before_execution
             if isinstance(refused, ServerShuttingDown):
                 error = _SHUTDOWN_RUN_ERROR
+                shutdown_failed = True
                 logger.info(
                     "Schedule run did not start; the server is shutting down",
                     extra=log_context(schedule_id=schedule_id, conversation_id=conversation_id),
@@ -1092,6 +1094,7 @@ async def _execute_schedule(
         # cron run still going. The finally saves it as failed.
         error = _INTERRUPTED_RUN_ERROR
         outcome = AttemptOutcome.interrupted if turn_started else AttemptOutcome.failed_before_execution
+        shutdown_failed = True
         raise
     except Exception as exc:
         # The ids travel as record attributes: a database error's sanitized
@@ -1194,9 +1197,11 @@ async def _execute_schedule(
         finally:
             with _active_run_lock:
                 _active_run_ids.discard(run_id)
-            if push_succeeded is not None and not lease_lost.is_set() and trigger != RunTrigger.trial:
-                _push_run_ending(scheduled, conversation_id=conversation_id, succeeded=push_succeeded)
-                await _post_run_notice(run_id)
+            if not lease_lost.is_set() and trigger != RunTrigger.trial:
+                if push_succeeded is not None:
+                    _push_run_ending(scheduled, conversation_id=conversation_id, succeeded=push_succeeded)
+                if push_succeeded is not None or shutdown_failed:
+                    await _post_run_notice(run_id)
 
 
 def _push_run_ending(

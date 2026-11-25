@@ -16,8 +16,8 @@ class Notice(BaseSQLModel, table=True):
     Features post notices; the inbox lists them. A notice stores what
     happened (``kind``), what it is about (``subject``, such as a task's
     name) and what opening it shows (``target``). The client turns the kind
-    and subject into text in the reader's language, so the server never
-    stores display copy.
+    and subject into text in the reader's language when it knows the kind.
+    The fallback carries a summary and destination for other clients.
 
     Owned like the schedules that post them: ``org_id`` is the organization
     in org mode or the person's partition on a trusted-identity deployment,
@@ -35,6 +35,7 @@ class Notice(BaseSQLModel, table=True):
         sa_type=sa.JSON,  # type: ignore
         description="What opening the notice shows; its keys depend on the kind",
     )
+    fallback: dict[str, Any] | None = Field(default=None, sa_type=sa.JSON)  # type: ignore
     source_id: str | None = Field(
         default=None, max_length=64,
         description="The record that posted it, such as a run id, so one event posts one notice",

@@ -21,6 +21,7 @@ from cowork.db.personal_resources import PersonalResource
 from cowork.db.scoped import SYSTEM_SCOPE, ScopedSession, TenantScope
 from cowork.db.session import get_open_session
 from cowork.models.notice import Notice
+from cowork.schemas.notices import NoticeFallback
 from cowork.services import notices
 from cowork.services.conversations import ConversationService
 from cowork.services.projects import GENERAL_PROJECT_ID
@@ -110,7 +111,8 @@ def _org_scoped(session, user_id: str) -> ScopedSession:
 
 def _post(session, *, user_id: str | None = ALICE, org_id: str | None = ORG, subject: str = "inbox test", **kwargs):
     return notices.post_notice(
-        session, org_id=org_id, user_id=user_id, kind="test.kind", subject=subject, target={"x": 1}, **kwargs,
+        session, org_id=org_id, user_id=user_id, kind="test.kind", subject=subject, target={"x": 1},
+        fallback=NoticeFallback(summary=subject), **kwargs,
     )
 
 
@@ -234,12 +236,14 @@ async def test_the_api_lists_counts_and_marks_notices_read():
         with get_open_session() as session:
             posted = notices.post_notice(
                 session, org_id=None, user_id=None, kind="test.kind", subject=subject, target={"runId": "r1"},
+                fallback=NoticeFallback(summary="You have a test update."),
             )
         async with _notices_client() as client:
             listed = (await client.get("/api/v1/notices/")).json()
             (shown,) = [n for n in listed["notices"] if n["subject"] == subject]
             assert shown["kind"] == "test.kind"
             assert shown["target"] == {"runId": "r1"}
+            assert shown["fallback"] == {"summary": "You have a test update.", "destination": None}
             assert shown["readAt"] is None
             unread = (await client.get("/api/v1/notices/unread-count")).json()["unreadCount"]
             assert unread == listed["unreadCount"] >= 1
@@ -268,6 +272,10 @@ async def test_a_failed_run_posts_one_notice_naming_the_task(schedule_id, turns,
     assert notice.target["scheduleId"] == str(schedule_id)
     assert notice.target["runId"] == notice.source_id
     assert notice.target["conversationId"] is not None
+    assert notice.fallback == {
+        "summary": f"Scheduled task failed: {notice.subject}",
+        "destination": {"kind": "conversation", "id": notice.target["conversationId"]},
+    }
     assert notice.read_at is None
 
 

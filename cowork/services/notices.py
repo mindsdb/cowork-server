@@ -25,6 +25,7 @@ from cowork.db.personal_resources import PersonalResource
 from cowork.db.scoped import ScopedSession, scope_for_identity, unsafe_unscoped_session
 from cowork.models.notice import Notice
 from cowork.models.schedule import Schedule, ScheduleRun
+from cowork.schemas.notices import NoticeDestination, NoticeFallback
 from cowork.schemas.schedules import AttemptOutcome, RunStatus
 
 logger = logging.getLogger(__name__)
@@ -36,6 +37,12 @@ SCHEDULED_RUN_FAILED = "scheduled_run.failed"
 SCHEDULED_RUN_STOPPED = "scheduled_run.stopped"
 SCHEDULED_RUN_SUCCEEDED = "scheduled_run.succeeded"
 _SCHEDULED_RUN_KINDS = (SCHEDULED_RUN_FAILED, SCHEDULED_RUN_STOPPED, SCHEDULED_RUN_SUCCEEDED)
+_RUN_FALLBACK = {
+    SCHEDULED_RUN_FAILED: "Scheduled task failed",
+    SCHEDULED_RUN_STOPPED: "Scheduled task stopped",
+    SCHEDULED_RUN_SUCCEEDED: "Scheduled task completed",
+}
+
 
 def _owner_clause(org_id: str | None, user_id: str | None) -> list[Any]:
     """Match one person's notices, NULL ids included (desktop rows)."""
@@ -46,7 +53,8 @@ def _owner_clause(org_id: str | None, user_id: str | None) -> list[Any]:
 
 def post_notice(
     session: Session, *, org_id: str | None, user_id: str | None, kind: str, subject: str,
-    target: dict[str, Any], source_id: str | None = None, now: datetime | None = None,
+    target: dict[str, Any], fallback: NoticeFallback, source_id: str | None = None,
+    now: datetime | None = None,
 ) -> Notice:
     """Add a notice to one person's inbox and prune it. Commits.
 
@@ -56,7 +64,7 @@ def post_notice(
     now = now or datetime.now(timezone.utc)
     notice = Notice(
         org_id=org_id, user_id=user_id, kind=kind, subject=(subject or "")[:255],
-        target=target, source_id=source_id, created_at=now,
+        target=target, fallback=fallback.model_dump(mode="json"), source_id=source_id, created_at=now,
     )
     session.add(notice)
     session.flush()
@@ -92,7 +100,7 @@ def _scheduled_run_kind(run: ScheduleRun) -> str | None:
     """What a finished run's notice says happened, or None for a run that
     posts nothing: a trial (its author is watching it), one still running,
     and one the user cancelled."""
-    if run.trial or run.status == RunStatus.running:
+    if run.trial or run.status in (RunStatus.running, RunStatus.cancelled):
         return None
     if run.outcome == AttemptOutcome.cancelled:
         return None
@@ -149,6 +157,13 @@ def post_scheduled_run_notice(scoped: ScopedSession, *, run_id: UUID) -> Notice 
                 "runId": str(run.id),
                 "conversationId": str(run.conversation_id) if run.conversation_id else None,
             },
+            fallback=NoticeFallback(
+                summary=f"{_RUN_FALLBACK[kind]}: {schedule.title}" if schedule.title else _RUN_FALLBACK[kind],
+                destination=NoticeDestination(
+                    kind="conversation" if run.conversation_id else "schedule",
+                    id=run.conversation_id or schedule.id,
+                ),
+            ),
             source_id=str(run.id),
         )
     except sa.exc.IntegrityError:
