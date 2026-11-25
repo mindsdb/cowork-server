@@ -62,6 +62,22 @@ def own_vault_root(scope: "TenantScope | None" = None) -> Path:
     return scoped_storage_root(Path(ConnectorSettings().vault_dir), scope, store="data-vault")
 
 
+def data_vault_at(root: Path) -> LocalDataVault:
+    """The vault in folder ``root``, the one way the server builds a vault.
+
+    With COWORK_KEY_FILE set it is a SealedDataVault, which seals every
+    non-bookkeeping value under the key file; otherwise anton's plain
+    LocalDataVault, as on every deployment that hasn't turned sealing on.
+    """
+    from anton.core.datasources.data_vault import LocalDataVault
+
+    from cowork.common.encryption import sealing_keys
+    from cowork.services.connectors.sealed_vault import SealedDataVault
+
+    keys = sealing_keys()
+    return LocalDataVault(root) if keys is None else SealedDataVault(root, keys=keys)
+
+
 def own_vault_for_scope(scope: "TenantScope | None" = None) -> LocalDataVault:
     """The vault ``scope`` saves into, without the operator's managed entries.
 
@@ -71,11 +87,9 @@ def own_vault_for_scope(scope: "TenantScope | None" = None) -> LocalDataVault:
     (refuse_planted_links) instead of the server following it. Someone else
     reading what they share goes on without it (_shared_sources).
     """
-    from anton.core.datasources.data_vault import LocalDataVault
-
     root = own_vault_root(scope)
     refuse_planted_links(root)
-    return LocalDataVault(root)
+    return data_vault_at(root)
 
 
 def _registry_for(scope: "TenantScope | None", managed: ManagedFolder | None) -> SharedConnections:
@@ -159,13 +173,11 @@ def _vault_changed_by(
     managed = managed_folder()
     if managed is None and not get_app_settings().trust_identity_headers:
         return own
-    from anton.core.datasources.data_vault import LocalDataVault
-
     registry = _registry_for(scope, managed).root
     own_partition = None if scope is None else scope.org_id
     return LayeredDataVault(
         own=own,
-        managed=None if managed is None else LocalDataVault(managed.vault_dir),
+        managed=None if managed is None else data_vault_at(managed.vault_dir),
         shared=_shared_sources(registry, own_partition=own_partition),
         shared_by_own=frozenset(
             (entry.engine, entry.name) for entry in registry if entry.partition_id == own_partition

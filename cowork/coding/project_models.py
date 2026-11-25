@@ -461,6 +461,7 @@ class DraftPullRequestSpec(BaseModel):
     # folder whose commit or destination has moved since, so a later commit or
     # a changed remote never rides an earlier confirmation.
     head_revision: str | None = Field(default=None, pattern=r"^[0-9a-f]{40}([0-9a-f]{24})?$")
+    base_branch: str | None = Field(default=None, max_length=512)
     task_branch: str | None = Field(default=None, max_length=512)
     remote_url: str | None = Field(default=None, max_length=8_192)
 

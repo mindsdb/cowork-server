@@ -82,6 +82,7 @@ def confirm(item, **changes) -> DraftPullRequestSpec:
         "title": "Delivery",
         "head_revision": item.head_revision,
         "task_branch": item.task_branch,
+        "base_branch": item.base_branch,
         "remote_url": item.remote_url,
     }
     values.update(changes)
@@ -133,21 +134,24 @@ def test_publishing_refuses_a_commit_made_after_confirmation(ready_task) -> None
     assert output(ready_task.remote, "for-each-ref") == ""
 
 
-def test_publishing_refuses_a_changed_destination(ready_task) -> None:
+@pytest.mark.parametrize("changed_branch", ["task_branch", "base_branch"])
+def test_publishing_refuses_a_changed_destination(ready_task, changed_branch: str) -> None:
     item = ready_task.service.delivery_plan(ready_task.task.id).items[0]
     integrations = Integrations()
     records = ready_task.service.create_draft_pull_requests(
         ready_task.task.id,
         DraftPullRequestRequest(
             title="Delivery",
-            drafts=[confirm(item, task_branch="someone-elses-branch")],
+            drafts=[confirm(item, **{changed_branch: "previously-reviewed-branch"})],
             confirmed=True,
         ),
         integrations,  # type: ignore[arg-type]
     )
 
     assert records[0].status == "failed"
+    assert "confirm again" in records[0].detail
     assert integrations.pushes == []
+    assert integrations.drafts == []
 
 
 def test_publishing_refuses_git_lfs_rather_than_pushing_pointer_files(ready_task) -> None:
