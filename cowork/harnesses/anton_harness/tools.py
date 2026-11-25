@@ -608,7 +608,10 @@ async def _cowork_publish_or_preview(session: Any, tc_input: dict):
         notes += (
             " Only the user can open the link; they can change who can open it in the Share dialog."
         )
-    if prev.get("mode") == AccessMode.WEBSITE and access is None:
+    # The service re-reads the entry under its lock, so the owner may have turned
+    # the site back on since `prev` was read: trust the result, not `prev`.
+    result_mode = result.get("accessMode") if isinstance(result, dict) else None
+    if prev.get("mode") == AccessMode.WEBSITE and access is None and result_mode != AccessMode.WEBSITE:
         notes += (
             " It is no longer a public website: it was published with the default access, "
             "and only its owner can make it a website again in the Share panel."

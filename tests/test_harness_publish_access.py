@@ -573,6 +573,21 @@ async def test_a_taken_down_website_is_republished_with_the_servers_default_acce
 
 
 @pytest.mark.asyncio
+async def test_a_republish_that_lands_on_a_website_does_not_say_it_stopped_being_one(tmp_path):
+    """The owner can turn the site back on between the tool's read and the publish."""
+    f = _artifact(tmp_path)
+    fake = mock.Mock(return_value={"url": "https://v/r/1", "accessMode": "website", "result": {"report_id": "r1"}})
+    entry = {"report_id": "r1", "url": "", "published": False, "mode": "website"}
+    with mock.patch.object(htools, "_publish_artifact", fake), \
+         mock.patch.object(htools, "_published_owner_state", return_value=entry):
+        out = await htools._cowork_publish_or_preview(
+            _session(tmp_path), {"file_path": str(f), "action": "publish"},
+        )
+    assert "Published successfully" in _text(out)
+    assert "no longer a public website" not in _text(out)
+
+
+@pytest.mark.asyncio
 async def test_a_request_for_a_website_on_a_live_website_says_it_is_one(tmp_path, websites_offered):
     websites_offered("org", "on")
     f = _artifact(tmp_path)
