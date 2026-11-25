@@ -511,12 +511,13 @@ def test_the_tool_tells_the_agent_each_run_starts_without_this_chat():
 
 def test_first_run_guidance_converts_utc_and_preserves_delayed_starts():
     manage = {tool.name: tool for tool in build_schedule_tools(project_id=GENERAL_PROJECT_ID)}[MANAGE_TOOL_NAME]
+    guidance = " ".join(manage.prompt.split())
 
-    assert "choose the next occurrence of the requested cadence" in manage.prompt
-    assert "hourly at 11:48 starts at 12:00 that day" in manage.prompt
-    assert "Convert the UTC message time to that timezone first" in manage.prompt
-    assert "For a daily or weekly request without a time of day, ask" in manage.prompt
-    assert "Preserve explicit delayed starts" in manage.prompt
+    assert "choose the next occurrence of the requested cadence" in guidance
+    assert "hourly at 11:48 starts at 12:00 that day" in guidance
+    assert "Convert the UTC message time to that timezone first" in guidance
+    assert "For a daily, weekly or monthly request without a time of day, ask for the missing time." in guidance
+    assert "Preserve explicit delayed starts" in guidance
 
 
 # --- end to end ---------------------------------------------------------------
