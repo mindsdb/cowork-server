@@ -1463,19 +1463,41 @@ async def _cowork_connect_datasource(session: Any, tc_input: dict) -> str:
     with connections turned off reads a FilteredDataVault over it, whose
     connecting view lists them by label alone, so a paste never matches or
     relabels one.
+
+    With a key file, a field named SEALED_FIELD is refused by name before
+    anton's handler runs, as the sealed vault refuses it, even for a value
+    anton would drop or an engine whose fields lack it, so the model hears one
+    rule. A save the sealed vault refuses as too large (RecordTooLargeError)
+    answers with its reason. anton has written an engine it doesn't know to
+    ~/.anton/datasources.md by then, with the same field names any connect
+    with them writes, and a retry with a smaller value keeps them, so anton
+    drops none.
     """
     from anton.tools import handle_connect_datasource
 
+    from cowork.common.encryption import sealing_keys
     from cowork.services.connectors.layered_vault import FilteredDataVault, LayeredDataVault
+    from cowork.services.connectors.sealed_vault import SEALED_FIELD, RecordTooLargeError, ReservedFieldError
+
+    known_variables = tc_input.get("known_variables")
+    if sealing_keys() is not None and isinstance(known_variables, dict) and SEALED_FIELD in known_variables:
+        # anton's handler writes an engine it doesn't know to ~/.anton/datasources.md, this field
+        # among its fields, before the sealed vault refuses the save. The model's retry with the
+        # field renamed would then find that engine, and anton would drop the renamed field without
+        # a word. anton names the connection only when it saves, so the refusal names the engine.
+        return str(ReservedFieldError(connection=str(tc_input.get("engine", ""))))
 
     vault = session._data_vault
-    if not isinstance(vault, (LayeredDataVault, FilteredDataVault)):
-        return await handle_connect_datasource(session, tc_input)
     # anton's handler reads the vault off the session, and a session runs its
     # tool calls one at a time, so the swap holds for this call alone.
-    session._data_vault = vault.for_connecting()
+    if isinstance(vault, (LayeredDataVault, FilteredDataVault)):
+        session._data_vault = vault.for_connecting()
     try:
         return await handle_connect_datasource(session, tc_input)
+    except RecordTooLargeError as exc:
+        # A refusal of the person's input, as the pre-check's is: the reason names the connection
+        # and the sizes, never a value, and nothing is logged.
+        return str(exc)
     finally:
         session._data_vault = vault
 

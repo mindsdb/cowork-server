@@ -163,8 +163,8 @@ class AppHeldVault(FilteredDataVault):
     The access mode is the held one, else "read", never the file's: agent code
     can write the file, or delete the connection and save it again, while only
     the secret-guarded routes may set a mode. A save of an MCP connection keeps
-    the token out of the file, holds it here, ignores any mode it carries and
-    holds "read" when no mode is held.
+    the token out of the file, ignores any mode it carries, and once the file
+    is written holds the token here and "read" when no mode is held.
 
     A custom MCP connection (``custom_mcp``) reads nothing from the file but
     its existence: its URL, label and allowed tools come from the held entry,
@@ -264,12 +264,17 @@ class AppHeldVault(FilteredDataVault):
         secure_keys: list[str] | None = None,
     ) -> object:
         refuse_generic_write(engine)
-        if active() and credentials.get("_method") == MCP_METHOD:
-            credentials = dict(credentials)
-            token = credentials.pop("access_token", None)
-            credentials.pop("_access_mode", None)
-            _hold_token_and_default_mode(self._root, engine, name, token, credentials.get("expires_at"))
-        return super().save(engine, name, credentials, secure_keys=secure_keys)
+        if not active() or credentials.get("_method") != MCP_METHOD:
+            return super().save(engine, name, credentials, secure_keys=secure_keys)
+        credentials = dict(credentials)
+        token = credentials.pop("access_token", None)
+        credentials.pop("_access_mode", None)
+        saved = super().save(engine, name, credentials, secure_keys=secure_keys)
+        # Held only once the record is written. A save the sealed vault refuses (ReservedFieldError,
+        # RecordTooLargeError) or that fails otherwise would leave the token in memory, and a later
+        # read at this name would lay it over whatever record is saved there next.
+        _hold_token_and_default_mode(self._root, engine, name, token, credentials.get("expires_at"))
+        return saved
 
 
 def turn_vault(data_vault: Any, *, source_vault: Any, root: Path) -> Any:
