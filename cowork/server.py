@@ -13,6 +13,7 @@ import signal
 import stat
 import threading
 import time
+from collections.abc import Callable
 from contextlib import asynccontextmanager
 from functools import partial
 from pathlib import Path
@@ -576,6 +577,28 @@ def _warm_agent_runtime() -> None:
             logger.debug("agent runtime warm-up skipped %s", name, exc_info=True)
 
 
+async def _run_sealing_start_check(*, check: Callable[[], None]) -> None:
+    """Run a sealing start check off the event loop, and log why it refused.
+
+    Starlette hands a failed start to Uvicorn as traceback text, and the log
+    formatter keeps only that text's frames and exception classes
+    (structured_logging._event_schema), so without this line the operator's
+    log wouldn't say why Cowork stopped. A KeyFileError or SealedDataError
+    message names only paths, settings' names and records, never a value.
+    """
+    from cowork.common.encryption import KeyFileError
+    from cowork.services.sealing import SealedDataError
+
+    try:
+        await asyncio.to_thread(check)
+    except (KeyFileError, SealedDataError) as refusal:
+        logger.error(
+            "A sealing start check refused, so Cowork won't start",
+            extra={"event": "sealing_start_refused", "reason": str(refusal)},
+        )
+        raise
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     clock = _StartupClock()
@@ -588,13 +611,13 @@ async def lifespan(app: FastAPI):
     # sealed under a key file doesn't start without one.
     from cowork.services.sealing import refuse_sealed_state_without_key_file, refuse_unopenable_sealed_data
 
-    await asyncio.to_thread(refuse_sealed_state_without_key_file)
+    await _run_sealing_start_check(check=refuse_sealed_state_without_key_file)
     clock.begin("dev_setup")
     run_dev_setup()
     clock.begin("sealed_data_check")
     # After migrations, before anything serves: every sealed setting and
     # connection opens with the key file, or the start stops naming each one.
-    await asyncio.to_thread(refuse_unopenable_sealed_data)
+    await _run_sealing_start_check(check=refuse_unopenable_sealed_data)
     clock.begin("credential_clear")
     # After migrations and the .env seed, before anything reads a credential.
     app_settings = get_app_settings()
