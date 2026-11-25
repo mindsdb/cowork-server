@@ -458,10 +458,11 @@ def classify_upload_error(exc: Exception) -> UploadError | None:
     UploadError; a failure that got no HTTP answer returns None.
 
     A failed asynchronous job (`PublishJobFailed`) carries the status /upload
-    would have answered. The server records the answer's code too, but anton
-    does not pass it on, so a job's refusal maps by status alone: its 503 is
-    the upload service itself, and a 403 share_org_required or permission_denied
-    comes back as an UploadError.
+    would have answered, and the answer's code when the job recorded one. A
+    400 with a website code is WebsiteRefused, as for a synchronous answer.
+    Any other refusal maps by status alone: its 503 is the upload service
+    itself, and a 403 share_org_required or permission_denied comes back as an
+    UploadError.
     """
     from cowork.services.product_permissions import ProductPermissionDenied, ProductPermissionUnavailable
 
@@ -478,6 +479,13 @@ def classify_upload_error(exc: Exception) -> UploadError | None:
     ):
         raise exc
     if isinstance(exc, PublishJobFailed):
+        job_code = getattr(exc, "code", None)
+        if exc.status_code == 400 and job_code in WEBSITE_REFUSALS:
+            logger.warning(
+                "Publish service answered HTTP %s code=%s body=%r", 400, job_code, str(exc)[:200],
+                extra={"status_code": 400, "reason": job_code},
+            )
+            raise WebsiteRefused(job_code) from exc
         if exc.status_code == 503:
             # Leaves publish_artifact before its failure log, like the typed
             # refusals below; str(exc) names the job to find in the worker's log.

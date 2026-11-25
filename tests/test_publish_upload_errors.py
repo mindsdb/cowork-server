@@ -250,3 +250,25 @@ def test_a_website_refusal_is_logged_with_its_code(caplog):
             classify_upload_error(_http_error(400, {"error": "x", "code": "website_requires_owner"}))
     [record] = [r for r in caplog.records if "Publish service answered HTTP 400" in r.getMessage()]
     assert record.reason == "website_requires_owner"
+
+
+@pytest.mark.parametrize(
+    "code",
+    ["website_requires_publish_key", "website_not_supported", "website_requires_owner", "website_not_enabled"],
+)
+def test_a_failed_job_with_a_website_code_is_the_same_refusal(code):
+    from anton.publisher import PublishJobFailed
+
+    exc = PublishJobFailed(400, "access/mode", job_id="a" * 32, report_id="r", code=code)
+    with pytest.raises(WebsiteRefused) as error:
+        classify_upload_error(exc)
+    assert (error.value.code, str(error.value)) == (code, WEBSITE_REFUSALS[code])
+
+
+def test_a_failed_job_without_a_website_code_stays_an_upload_error():
+    from anton.publisher import PublishJobFailed
+
+    plain = PublishJobFailed(400, "pip install failed", job_id="a" * 32, report_id="r")
+    other = PublishJobFailed(400, "pip install failed", job_id="a" * 32, report_id="r", code="invalid_request")
+    assert classify_upload_error(plain) == UploadError(400, None, "pip install failed")
+    assert classify_upload_error(other) == UploadError(400, None, "pip install failed")

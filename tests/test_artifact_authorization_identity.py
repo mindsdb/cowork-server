@@ -2597,12 +2597,17 @@ def test_a_republish_without_access_of_a_live_website_is_sent_without_the_confir
     assert uploads[-1]["access"] == {"mode": "website"}
 
 
-def _upload_refuses_website(monkeypatch, code, attempts):
+def _upload_refuses_website(monkeypatch, code, attempts, *, as_job=False):
     """anton's publisher reaches /upload, counted in ``attempts``, and the
-    upload service refuses the website with ``code``."""
+    upload service refuses the website with ``code``, in its answer or, with
+    ``as_job``, in the status of the asynchronous job."""
 
     def refused(_source, **kwargs):
         attempts.append(kwargs["access"])
+        if as_job:
+            from anton.publisher import PublishJobFailed
+
+            raise PublishJobFailed(400, "access/mode", job_id="a" * 32, report_id="r", code=code)
         body = io.BytesIO(json.dumps({"error": "access/mode", "code": code}).encode())
         raise urllib.error.HTTPError("https://view.test/upload", 400, "Bad Request", {}, body)
 
@@ -2630,6 +2635,22 @@ async def test_a_website_refused_as_ownerless_is_not_uploaded_again_by_autopubli
     assert await _autopublish_once(folder, scope, project) is False
     assert await _autopublish_once(folder, scope, project) is False
     assert await _live_sync(folder, scope, project, monkeypatch) is False
+
+    assert attempts == [{"mode": "website"}]
+
+
+@pytest.mark.asyncio
+async def test_an_ownerless_refusal_from_an_async_job_is_remembered_like_the_synchronous_one(
+    issuer, scope, local_id, owned_artifact, monkeypatch, websites_on, fresh_website_refusals,
+):
+    _session, project, _conversation, folder = owned_artifact
+    run, _uploads = _org_publisher(issuer, folder, scope, project, monkeypatch, view_url=SITE_URL)
+    run({"mode": "website"}, owner_save=True)
+    attempts = []
+    _upload_refuses_website(monkeypatch, "website_requires_owner", attempts, as_job=True)
+
+    assert await _autopublish_once(folder, scope, project) is False
+    assert await _autopublish_once(folder, scope, project) is False
 
     assert attempts == [{"mode": "website"}]
 

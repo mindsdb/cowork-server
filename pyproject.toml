@@ -268,4 +268,4 @@ markers = [
 
 [tool.uv.sources]
 # Development pin to anton's website mode; replaced by anton's release before merge.
-anton-agent = { git = "https://github.com/mindsdb/anton.git", rev = "af64d33d91c7c8d47093e4481bdb6f3544be68ae" }
+anton-agent = { git = "https://github.com/mindsdb/anton.git", rev = "56f30a7068817c38d2bbf09dfaddaa060721b33a" }
