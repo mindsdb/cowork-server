@@ -405,7 +405,7 @@ class El {
     this.classes = opts.classes || []; this.classes.forEach((c) => this.sel.push('.' + c));
     this.text = opts.text || ''; this.rect = opts.rect || null; this.visible = opts.visible !== false;
     this.children = []; this.parentElement = null; this.isConnected = true;
-    this.scrollTop = 0; this.scrollLeft = 0;
+    this.scrollTop = 0; this.scrollLeft = 0; this.dataset = {}; this.style = {};
     this.classList = { contains: (c) => this.classes.includes(c) };
   }
   add(child) { child.parentElement = this; this.children.push(child); return child; }
@@ -477,7 +477,10 @@ __SHIM__
 })(fakeWindow, fakeDocument, fakeSetTimeout, fakeClearTimeout, FakeMutationObserver);
 __SCENARIO__
 advance(20000);
-process.stdout.write(JSON.stringify({ posted, reloads: reloads.length }));
+process.stdout.write(JSON.stringify({
+  posted, reloads: reloads.length,
+  theme: { dataset: html.dataset.theme || null, colorScheme: html.style.colorScheme || null },
+}));
 """
 
 
@@ -756,3 +759,75 @@ def test_the_shim_reports_the_page_height_and_whether_it_scrolls():
     assert "var locked = hidesOverflow(root) || hidesOverflow(body);" in js
     assert "window.addEventListener('load', scheduleSize)" in js
     assert "window.addEventListener('resize', scheduleSize)" in js
+
+
+# The app's theme, for a page shown inside a chat reply (ENG-4684): the parent
+# posts `theme` on the restore's channel, as often as the app's theme changes.
+_THEME = """
+const theme = (mode, more = {}) => fire('message', Object.assign({
+  isTrusted: true, source: fakeWindow.parent,
+  data: { source: 'anton-preview-parent', type: 'theme', mode },
+}, more));
+"""
+
+
+def _run_theme(scenario: str) -> dict:
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("node is not installed")
+    script = _VIEW_HARNESS.replace("__SHIM__", SHIM_JS.replace("__LINE_OFFSET__", "0")).replace(
+        "__SCENARIO__", _THEME + scenario
+    )
+    done = subprocess.run([node, "-e", script], capture_output=True, text=True, timeout=30, check=True)
+    return json.loads(done.stdout)["theme"]
+
+
+def test_a_theme_sets_the_root_data_theme_and_color_scheme():
+    assert _run_theme("theme('dark');") == {"dataset": "dark", "colorScheme": "dark"}
+    assert _run_theme("theme('light');") == {"dataset": "light", "colorScheme": "light"}
+
+
+def test_a_theme_is_taken_every_time_it_changes():
+    assert _run_theme("theme('dark'); theme('light'); theme('dark');") == {
+        "dataset": "dark", "colorScheme": "dark",
+    }
+
+
+@pytest.mark.parametrize("mode", ["'Dark'", "' dark'", "'auto'", "'constructor'", "''", "1", "null", "{}"])
+def test_any_other_mode_is_ignored(mode):
+    assert _run_theme(f"theme({mode});") == {"dataset": None, "colorScheme": None}
+    # And it leaves a theme already set alone.
+    assert _run_theme(f"theme('dark'); theme({mode});") == {"dataset": "dark", "colorScheme": "dark"}
+
+
+def test_a_theme_is_taken_from_the_parent_only_with_its_tag():
+    out = _run_theme(
+        "theme('dark', { source: {} });\n"
+        "theme('dark', { isTrusted: false });\n"
+        "theme('dark', { data: { source: 'anton-preview', type: 'theme', mode: 'dark' } });\n"
+        "theme('dark', { data: { type: 'theme', mode: 'dark' } });\n"
+        "theme('dark', { data: 'dark' });"
+    )
+    assert out == {"dataset": None, "colorScheme": None}
+
+
+def test_a_theme_that_came_early_is_set_again_once_the_page_has_loaded():
+    # A theme before there is a root, and one the page's own script then
+    # overwrote: both hold once the document is parsed and loaded.
+    out = _run_theme(
+        "fakeDocument.documentElement = null; theme('dark'); fakeDocument.documentElement = html;\n"
+        "fire('doc:DOMContentLoaded', {});"
+    )
+    assert out == {"dataset": "dark", "colorScheme": "dark"}
+    out = _run_theme(
+        "theme('dark'); html.dataset.theme = 'light'; html.style.colorScheme = 'light';\n"
+        "fire('load', {});"
+    )
+    assert out == {"dataset": "dark", "colorScheme": "dark"}
+
+
+def test_a_theme_does_not_take_the_restore():
+    # The two share a channel: a theme is no restore, and a restore after it
+    # still replays.
+    out = _run_restore(_THEME + f"theme('dark'); restore({json.dumps({'inputs': [_KEY], 'heading': 'Two'})});")
+    assert out["restored"] == ["ok"]

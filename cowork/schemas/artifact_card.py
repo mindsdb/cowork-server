@@ -45,6 +45,9 @@ class ArtifactCard(BaseModel):
     folder: str
     path: str
     primary: str | None
+    # "inline" for an artifact the chat reply shows live (metadata.json
+    # `display`); set only then, so other cards carry no key.
+    display: str | None = None
     project_id: str | None
     project_name: str
     origin_conversation_id: str

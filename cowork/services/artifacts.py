@@ -1661,6 +1661,8 @@ def _prepare_artifact_card(
         folder=str(logical_folder),
         path=primary_path,
         primary=meta.primary or None,
+        # Only when metadata.json asks for it, so other cards keep their keys.
+        **({"display": meta.display} if meta.display else {}),
         project_id=project_id,
         # What the card shows. The serve URL below carries `project_name`
         # instead, because serve_artifact_file resolves that segment by name

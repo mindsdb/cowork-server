@@ -28,6 +28,8 @@
   // later and silently swallow every diagnostic this shim reports.
   var PARENT = window.parent, IS_TOP = window.parent === window;
   var TAG = 'anton-preview';
+  /* The tag on what the parent window sends in: a `restore` and a `theme`. */
+  var PARENT_TAG = 'anton-preview-parent';
   var LINE_OFFSET = __LINE_OFFSET__;
   var MAX_REPORTS = 20;
   /* What the new report types carry at most. The app and the server cut a
@@ -492,7 +494,6 @@
        so the next report (and the next save's restore) carries the whole way
        there. One that did not land reloads the document, which then stays
        at its start: somewhere random is worse than the beginning. */
-    var PARENT_TAG = 'anton-preview-parent';
     var KEY_CODES = {
       ArrowLeft: 37, ArrowUp: 38, ArrowRight: 39, ArrowDown: 40,
       PageUp: 33, PageDown: 34, End: 35, Home: 36, ' ': 32
@@ -763,6 +764,40 @@
       } catch (inner) { /* never break the page */ }
     });
   } catch (e) { /* no view reports: the page still runs */ }
+
+  /* The app's light or dark theme, for a page shown inside a chat reply
+     (ENG-4684): the parent sends `theme` with mode 'light' or 'dark', on load
+     and whenever the app's theme changes, so unlike `restore` it is taken
+     every time. It lands as <html data-theme> and the root's color-scheme,
+     which a page styles from. The last mode is kept and set again once the
+     document is parsed and loaded, so one that came before the page's own
+     script ran (or that script overwrote) still holds. Only the parent window
+     may send it, with its own tag, and any other mode is ignored. */
+  try {
+    var THEMES = { light: 1, dark: 1 };
+    var theme = '';
+    var applyTheme = function () {
+      var root = document.documentElement;
+      if (!theme || !root) return;
+      root.dataset.theme = theme;
+      root.style.colorScheme = theme;
+    };
+    window.addEventListener('message', function (ev) {
+      try {
+        var data = ev.data;
+        if (IS_TOP || !ev.isTrusted || ev.source !== PARENT || !data || typeof data !== 'object') return;
+        if (data.source !== PARENT_TAG || data.type !== 'theme') return;
+        if (typeof data.mode !== 'string' || THEMES[data.mode] !== 1) return;
+        theme = data.mode;
+        applyTheme();
+      } catch (inner) { /* never break the page */ }
+    });
+    var reapplyTheme = function () {
+      try { applyTheme(); } catch (inner) { /* never break the page */ }
+    };
+    document.addEventListener('DOMContentLoaded', reapplyTheme);
+    window.addEventListener('load', reapplyTheme);
+  } catch (e) { /* no theme: the page keeps its own */ }
 
   var nativeStorageWorks = true;
   try { void window.localStorage; } catch (e) { nativeStorageWorks = false; }

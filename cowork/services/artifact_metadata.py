@@ -52,6 +52,12 @@ def _port(value: Any) -> int | None:
     return value if 0 < value < 65536 else None
 
 
+def _display(value: Any) -> str | None:
+    # The one way to show an artifact other than as a card: "inline", live in
+    # the chat reply (ENG-4684). Anything else reads as missing.
+    return value if value == "inline" else None
+
+
 LenientStr = Annotated[str | None, BeforeValidator(lenient_text)]
 LenientPort = Annotated[int | None, BeforeValidator(_port)]
 
@@ -109,6 +115,7 @@ class ArtifactMetadata(BaseModel):
     description: LenientStr = None
     type: LenientStr = None
     primary: LenientStr = None
+    display: Annotated[str | None, BeforeValidator(_display)] = None
     port: LenientPort = None
     datasources: Annotated[list[DatasourceRef], BeforeValidator(_datasource_items)] = []
     provenance: Annotated[list[ProvenanceEntry | None], BeforeValidator(_provenance_items)] = []

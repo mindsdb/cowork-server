@@ -153,3 +153,40 @@ def test_a_desktop_status_answers_its_own_shape(session, tmp_path, monkeypatch, 
         "publishedUrl", "modified", "accessMode", "accessProtected", "accessEmails",
         "orgAllowed", "ownerOnly", "artifactKey", "reportId", "linkOwnerRecorded",
     ]
+
+
+def _with_display(folder, value) -> None:
+    meta = json.loads((folder / "metadata.json").read_text())
+    meta["display"] = value
+    (folder / "metadata.json").write_text(json.dumps(meta))
+
+
+_INLINE = _HEAD[: _HEAD.index("primary") + 1] + ["display"] + _HEAD[_HEAD.index("primary") + 1 :]
+
+
+async def test_display_inline_goes_out_on_the_list_the_inline_card_and_its_stream_event(session, tmp_path, local_mode):
+    """An artifact whose metadata.json says `display: "inline"` (ENG-4684)
+    carries it, right after `primary`, on every path that sends its card."""
+    row, folder = _project_with_artifact(session, tmp_path, name="mine", org_id=None, slug="chart")
+    _with_display(folder, "inline")
+
+    [listed] = await ep.list_artifacts(LOCAL_SCOPE, project_id=row.id, project_path=None)
+    [card] = cards_for_slugs(folder.parent, ["chart"], scope=LOCAL_SCOPE, project_id=str(row.id), project_name="mine")
+    streamed = await _stream_event(card)
+
+    for sent in (listed, _json(card), streamed):
+        assert sent["display"] == "inline"
+        assert list(sent)[: len(_INLINE)] == _INLINE
+
+
+@pytest.mark.parametrize("value", ["card", "Inline", "", 1, True, None, ["inline"], {"mode": "inline"}])
+async def test_any_other_display_sends_no_key(session, tmp_path, local_mode, value):
+    row, folder = _project_with_artifact(session, tmp_path, name="mine", org_id=None, slug="chart")
+    _with_display(folder, value)
+
+    [listed] = await ep.list_artifacts(LOCAL_SCOPE, project_id=row.id, project_path=None)
+    [card] = cards_for_slugs(folder.parent, ["chart"], scope=LOCAL_SCOPE, project_id=str(row.id), project_name="mine")
+
+    assert "display" not in listed
+    assert "display" not in _json(card)
+    assert "display" not in await _stream_event(card)
