@@ -1,8 +1,8 @@
 """What a push says, and how each platform's request carries it.
 
-The app reads three custom fields from every notification: ``kind`` (one of
+The app reads these custom fields: ``kind`` (one of
 the PushKind values), ``path`` (an in-app route, for a task) and ``url`` (the
-shared view of an artifact). Each field is left out when it has no value.
+shared view of an artifact), and ``artifact_ref`` (its project and artifact IDs). Each field is left out when it has no value.
 That contract is shared with the mobile app (mindsdb/cowork), so a change
 here is a change there.
 """
@@ -32,10 +32,13 @@ class PushPayload:
     body: str
     path: str | None = None
     url: str | None = None
+    artifact_ref: str | None = None
 
     def data(self) -> dict[str, str]:
         """The custom fields, every value a string, empty ones left out."""
         fields = {"kind": str(self.kind), "path": self.path or "", "url": self.url or ""}
+        if self.artifact_ref:
+            fields["artifact_ref"] = self.artifact_ref
         return {key: value for key, value in fields.items() if value}
 
     def apns_body(self) -> dict[str, Any]:
@@ -86,12 +89,13 @@ def scheduled_run_finished(*, conversation_id: str | None, schedule_name: str | 
     )
 
 
-def artifact_shared(*, sharer: str | None, artifact_title: str | None, url: str | None) -> PushPayload:
+def artifact_shared(*, sharer: str | None, artifact_title: str | None, url: str | None, artifact_ref: str | None = None) -> PushPayload:
     who = _clip(sharer or "", 60) or "Someone"
     what = _clip(artifact_title or "", 80)
     shared = f"“{what}”" if what else "an artifact"
     return PushPayload(
         kind=PushKind.ARTIFACT_SHARED,
+        artifact_ref=artifact_ref,
         title=_clip(f"{who} shared {shared} with you", _MAX_TITLE_CHARS),
         body="Tap to open.",
         url=url if url and url.startswith("https://") else None,

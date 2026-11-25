@@ -7,12 +7,11 @@ for development/test environments.
 
 from pathlib import Path
 
-from sqlalchemy.engine import make_url
 from sqlmodel import Session as SQLSession
 
 from cowork.common.settings.app_settings import get_app_settings
 from cowork.db.migrations import run_schema_migrations
-from cowork.db.session import get_engine
+from cowork.db.session import get_engine, sqlite_database_file
 from cowork.models.project import Project
 from cowork.services.projects import GENERAL_PROJECT, GENERAL_PROJECT_ID
 
@@ -60,13 +59,9 @@ def run_dev_setup() -> None:
     settings = get_app_settings()
     db_uri = settings.database.uri
 
-    parsed = make_url(db_uri)
-    if (
-        parsed.drivername.startswith("sqlite")
-        and parsed.database
-        and parsed.database != ":memory:"
-    ):
-        Path(parsed.database).parent.mkdir(parents=True, exist_ok=True)
+    database_file = sqlite_database_file(db_uri=db_uri)
+    if database_file is not None:
+        database_file.parent.mkdir(parents=True, exist_ok=True)
 
     engine = get_engine(db_uri)
     run_schema_migrations(engine, db_uri)

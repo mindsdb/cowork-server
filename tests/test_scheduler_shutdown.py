@@ -327,8 +327,7 @@ async def test_a_run_a_shutdown_cancels_mid_turn_is_saved_failed_and_its_slot_st
 ):
     """Uvicorn's request drain cancels a Run now request at its bound, and the
     event loop's close cancels a cron run still going. The run is saved as
-    failed, not success, so the next poll still runs the slot: the freshness
-    guard skips a slot only after a successful run."""
+    failed and leaves the slot available for the next poll."""
     import cowork.handlers.responses as responses_mod
     from cowork.common.datetime_utils import ensure_utc
     from cowork.db.scoped import SYSTEM_SCOPE, ScopedSession

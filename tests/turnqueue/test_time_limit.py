@@ -38,7 +38,7 @@ def remote_turn(monkeypatch):
 
     async def _mint(**kwargs):
         minted.append(kwargs)
-        return "mdb_turnkey"
+        return auth_keys.MintedTurnKey(key="mdb_turnkey", prefix="mdb_tk", ttl_seconds=kwargs["ttl_seconds"])
 
     async def _revoke(*, instance_id, settings):
         revoked.append(instance_id)
@@ -46,7 +46,7 @@ def remote_turn(monkeypatch):
     monkeypatch.setattr(prod, "get_redis", lambda: fake)
     monkeypatch.setattr(prod, "_new_correlation_id", lambda: "r")
     monkeypatch.setattr(prod, "_mint_oauth_block", AsyncMock(return_value=None))
-    monkeypatch.setattr(prod, "mint_turn_key", _mint)
+    monkeypatch.setattr(prod, "mint_turn_key_details", _mint)
     monkeypatch.setattr(prod, "revoke_turn_key", _revoke)
     return fake, minted, revoked
 
@@ -238,16 +238,16 @@ async def test_extend_without_auth_configured_does_nothing(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_the_datasource_mint_sizes_the_key_to_the_time_limit(time_limit, monkeypatch):
-    """The gate and producer mint through this path when datasources are on."""
+async def test_the_turn_mint_sizes_the_key_to_the_time_limit(time_limit, monkeypatch):
+    """The gate and the producer both mint a turn's key through this path."""
     seen = {}
 
     async def _details(**kwargs):
         seen.update(kwargs)
-        return auth_keys.MintedTurnKey(key="mdb_turnkey", prefix="mdb_tk")
+        return auth_keys.MintedTurnKey(key="mdb_turnkey", prefix="mdb_tk", ttl_seconds=kwargs["ttl_seconds"])
 
     monkeypatch.setattr(prod, "mint_turn_key_details", _details)
-    await prod._mint_llm_block_with_turn_key_id(
+    await prod.mint_turn_llm(
         org_id="o", user_id="u", correlation_id="c", settings=TurnQueueSettings(),
     )
     assert seen["ttl_seconds"] == 3600 + 2400

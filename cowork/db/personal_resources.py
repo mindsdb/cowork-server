@@ -90,6 +90,10 @@ MODEL_RESOURCE: dict[str, PersonalResource] = {
     # every resource is partitioned, so this entry decides nothing in
     # single-tenant mode.
     "artifact_owner_choices": PersonalResource.PROJECTS,
+    # Which connections a person approved for an artifact's full-stack
+    # publish. The approval releases the person's connection credentials, so
+    # it follows connections.
+    "artifact_datasource_approvals": PersonalResource.CONNECTIONS,
     # Written and read only in org mode, where every resource is partitioned,
     # so this entry decides nothing in a personal scope.
     "artifact_locations": PersonalResource.PROJECTS,

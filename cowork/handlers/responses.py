@@ -88,6 +88,7 @@ from cowork.turnqueue.host_tools import HOST_TOOL_CALL_STEP
 from cowork.turnqueue.preview_checks import ARTIFACT_CHECK_STEP, register_remote_check
 from cowork.turnqueue.producer import (
     RemoteWorkspace,
+    TurnLlm,
     revoke_turn_key_quietly,
     step_stream_events,
     stream_remote_replies,
@@ -910,6 +911,12 @@ async def _drop_gate_key(turn_llm: dict | None) -> None:
     """Revoke the turn key the routing gate minted, for a turn that won't run."""
     if turn_llm and turn_llm.get("correlation_id"):
         await revoke_turn_key_quietly(turn_llm["correlation_id"])
+
+
+def _gate_block(turn_llm: dict | None) -> dict:
+    """The llm block of the turn key the routing gate minted; empty when it minted none."""
+    gate: TurnLlm | None = (turn_llm or {}).get("llm")
+    return gate.block if gate is not None else {}
 
 
 class ResponsesHandler:
@@ -1827,7 +1834,7 @@ class ResponsesHandler:
             target = jev_route.own_decision_target(settings)
             model = settings.decision_model or queue_settings.jev_route_model
         else:
-            block = (turn_llm or {}).get("llm") or {}
+            block = _gate_block(turn_llm)
             if block.get("base_url") and block.get("api_key"):
                 target = jev_route.JevTarget.mindshub(block["base_url"], block["api_key"])
             else:
@@ -1864,7 +1871,7 @@ class ResponsesHandler:
         if not answer_model:
             return None
         provider_kind = settings.resolved_planning_provider
-        block = (turn_llm or {}).get("llm") or {}
+        block = _gate_block(turn_llm)
         try:
             if provider_kind is Provider.MINDS_CLOUD and block.get("base_url") and block.get("api_key"):
                 from anton.core.llm.openai import OpenAIProvider
@@ -1895,31 +1902,19 @@ class ResponsesHandler:
                 or provider_api_key(settings, Provider.MINDS_CLOUD) is not None):
             return None, None
         from anton.core.llm.openai import OpenAIProvider
-        from cowork.turnqueue.producer import _mint_llm_block_with_turn_key_id, mint_llm_block
+        from cowork.turnqueue.producer import mint_turn_llm
 
         corr = str(uuid4())
-        queue_settings = TurnQueueSettings()
-        turn_key_id = None
-        workspace_id = getattr(settings, "hub_workspace_id", "") or None
-        if queue_settings.needs_turn_key_id:
-            block, turn_key_id = await _mint_llm_block_with_turn_key_id(
-                org_id=self.scope.org_id,
-                user_id=self.scope.user_id,
-                correlation_id=corr,
-                settings=queue_settings,
-                workspace_id=workspace_id,
-            )
-        else:
-            block = await mint_llm_block(
-                org_id=self.scope.org_id,
-                user_id=self.scope.user_id,
-                correlation_id=corr,
-                settings=queue_settings,
-                workspace_id=workspace_id,
-            )
+        gate = await mint_turn_llm(
+            org_id=self.scope.org_id,
+            user_id=self.scope.user_id,
+            correlation_id=corr,
+            settings=TurnQueueSettings(),
+            workspace_id=getattr(settings, "hub_workspace_id", "") or None,
+        )
         provider = OpenAIProvider(
-            api_key=block["api_key"],
-            base_url=block["base_url"],
+            api_key=gate.block["api_key"],
+            base_url=gate.block["base_url"],
             flavor=OpenAIProvider.FLAVOR_MINDS_PASSTHROUGH,
         )
         # Built outside LLMClient, so nothing else names this call's role.
@@ -1929,10 +1924,8 @@ class ResponsesHandler:
             model=settings.resolved_gate_model or MINDS_FREE_MODEL,
             label=Provider.MINDS_CLOUD.value,
         )
-        turn_context = {"correlation_id": corr, "llm": block}
-        if turn_key_id is not None:
-            turn_context["turn_key_id"] = turn_key_id
-        return binding, turn_context
+        # The producer reuses this key, with its prefix and the lifetime auth gave it.
+        return binding, {"correlation_id": corr, "llm": gate}
 
     async def _handle_direct_response(
         self,
@@ -3516,7 +3509,6 @@ class ResponsesHandler:
                 correlation_id=corr,
                 run_id=lifecycle.identity.run_id,
                 llm=(turn_llm or {}).get("llm"),
-                turn_key_id=(turn_llm or {}).get("turn_key_id"),
                 disabled=disabled,
                 # Questions need someone to answer them: this path serves
                 # the web UI, which renders the card and posts /answer.
