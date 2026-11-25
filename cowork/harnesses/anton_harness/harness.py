@@ -440,27 +440,42 @@ settings = AntonHarnessSettings()
 
 
 def build_elicitor(conversation_id: str, *, interactive: bool = True):
-    """The question strategy for this conversation, or None when disabled or
-    when nobody watches the turn (``interactive`` False: a scheduled run).
-    Unattended, a question or a browser hand-over would only wait out its
-    timeout; without an elicitor the agent learns at once that nobody can
-    answer, as a pod turn without ``interactive`` does.
+    """The question strategy for this conversation's turn.
 
-    Returning None is the kill switch: anton only registers `ask_user` when
-    an elicitor supports "choice", so the model reverts to asking in plain
-    text with no silent-failure window. This holds only as long as the
-    ChatSessionConfig built from this value is not also given a `console`:
-    with elicitor=None and a console present, anton constructs its own
-    CLIElicitor (which does support "choice"), silently reopening the
-    switch. See tests/test_ask_user_flag.py for the guard.
+    With questions off (COWORK_ASK_USER_ENABLED=false) it is None, the kill
+    switch: anton registers `ask_user` only when an elicitor supports
+    "choice", so the model reverts to asking in plain text with no
+    silent-failure window. No write waits on a card there either, because
+    check_write_approval_startup refuses to start the server with
+    ANTON_WRITE_APPROVAL on and questions off.
+
+    An interactive turn gets an elicitor that takes "choice": the model's
+    questions, the browser hand-over and the confirmation cards reach the
+    person watching the turn.
+
+    A scheduled run (``interactive`` False) gets an elicitor that takes only
+    approval cards (APPROVAL_KIND). A person who opens the run can still
+    approve a held write. A question, a browser hand-over or a tool's own
+    confirmation card (confirm_card) still comes back at once, because the
+    elicitor doesn't take "choice": nobody waits to answer them, so they would
+    only wait out their timeout. An anton that predates APPROVAL_KIND takes no
+    card from this elicitor, so it refuses the held write at once as well.
+
+    The kill switch holds only as long as the ChatSessionConfig built from
+    this value is not also given a `console`: with elicitor=None and a
+    console present, anton constructs its own CLIElicitor (which does
+    support "choice"), silently reopening the switch. See
+    tests/test_ask_user_flag.py for the guard.
     """
-    if not interactive or not get_app_settings().ask_user_enabled:
+    if not get_app_settings().ask_user_enabled:
         return None
-    from cowork.harnesses.anton_harness.elicitor import CoworkElicitor
+    from cowork.harnesses.anton_harness.elicitor import APPROVAL_KIND, CoworkElicitor
     from cowork.streaming.answers import broker
 
     # timeout_s deliberately not passed: elicitor.DEFAULT_TIMEOUT_S is the one
     # place the number lives, so this call site does not restate it.
+    if not interactive:
+        return CoworkElicitor(conversation_id, broker, supported_kinds=(APPROVAL_KIND,))
     return CoworkElicitor(conversation_id, broker)
 
 
