@@ -7,12 +7,11 @@ for development/test environments.
 
 from pathlib import Path
 
-from sqlalchemy.engine import make_url
 from sqlmodel import Session as SQLSession
 
 from cowork.common.settings.app_settings import get_app_settings
 from cowork.db.migrations import run_schema_migrations
-from cowork.db.session import get_engine
+from cowork.db.session import get_engine, sqlite_database_file
 from cowork.models.project import Project
 from cowork.services.projects import GENERAL_PROJECT, GENERAL_PROJECT_ID
 
@@ -53,19 +52,6 @@ def _distribute_skill_links() -> None:
     from cowork.services.skills import SkillService
 
     reconcile_all(SkillService(LOCAL_SCOPE).list_skills())
-
-
-def sqlite_database_file(*, db_uri: str) -> Path | None:
-    """The file a SQLite ``db_uri`` names, or None for an in-memory SQLite
-    database or another kind of database."""
-    parsed = make_url(db_uri)
-    if (
-        parsed.drivername.startswith("sqlite")
-        and parsed.database
-        and parsed.database != ":memory:"
-    ):
-        return Path(parsed.database)
-    return None
 
 
 def run_dev_setup() -> None:

@@ -12,6 +12,8 @@ from __future__ import annotations
 import json
 import logging
 import os
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -311,6 +313,43 @@ def test_no_key_file_and_the_marker_refuses_the_start(legacy_key, base_vault, st
 
     with pytest.raises(KeyFileError, match="Sealing was turned on"):
         sealing.refuse_sealed_state_without_key_file()
+
+
+_ROOT = Path(__file__).resolve().parents[1]
+# What an operator's script runs in the server's container: it imports only what it names, so
+# no model a relationship names by string, such as a project's Schedule, is loaded.
+_LEGACY_KEY_IN_A_FRESH_INTERPRETER = "from cowork.common.encryption import get_fernet\nget_fernet()\n"
+
+
+def _in_a_fresh_interpreter(code: str) -> subprocess.CompletedProcess[str]:
+    return subprocess.run([sys.executable, "-c", code], cwd=_ROOT, env=dict(os.environ),
+                          capture_output=True, text=True, timeout=60)
+
+
+def test_no_key_file_and_a_fresh_interpreter_reaches_the_legacy_key_and_can_query_after_it(legacy_key, base_vault):
+    """The check loads no model of its own, so the script's own query configures only what it loaded."""
+    ran = _in_a_fresh_interpreter(
+        _LEGACY_KEY_IN_A_FRESH_INTERPRETER
+        + "from sqlmodel import Session, select\n"
+        "from cowork.common.settings.app_settings import get_app_settings\n"
+        "from cowork.db.session import get_engine\n"
+        "from cowork.models.setting import Setting\n"
+        "with Session(get_engine(get_app_settings().database.uri)) as session:\n"
+        "    session.exec(select(Setting)).all()\n"
+    )
+
+    assert ran.returncode == 0, ran.stderr
+    assert legacy_key.is_file()
+
+
+def test_no_key_file_and_the_marker_refuse_a_fresh_interpreter_with_the_reason(legacy_key, base_vault, stored_rows):
+    stored_rows(sealing.SEALING_MARKER_KEY, "1")
+
+    ran = _in_a_fresh_interpreter(_LEGACY_KEY_IN_A_FRESH_INTERPRETER)
+
+    assert ran.returncode != 0
+    assert "KeyFileError: Sealing was turned on" in ran.stderr, ran.stderr
+    assert not legacy_key.exists()
 
 
 def test_no_key_file_and_a_sealed_record_refuses_the_start(legacy_key, base_vault):

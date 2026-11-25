@@ -29,7 +29,7 @@ from sqlmodel import select
 from cowork.common.encryption import KeyFileError, sealing_keys
 from cowork.common.settings.app_settings import get_app_settings
 from cowork.common.settings.user_settings import UserSettings
-from cowork.db.session import get_engine
+from cowork.db.session import get_engine, sqlite_database_file
 from cowork.models.setting import Setting
 from cowork.services.connectors.sealed_vault import (
     RecordSealing,
@@ -85,18 +85,23 @@ def sealing_marker_present() -> bool:
     SQLite file that doesn't exist yet, or a database with no settings table,
     has never been sealed, and the query names the ``key`` column alone. Only
     the re-seal command writes the marker, as a global row, so no scope is
-    asked for."""
-    from cowork.dev_setup import sqlite_database_file
+    asked for.
 
+    It reads the table, not the model, and imports no other model. A fresh
+    interpreter that reaches the legacy key through ``get_fernet`` hasn't
+    imported the models a relationship names by string, such as a project's
+    ``Schedule``, and a query through a model would configure every mapper
+    loaded, that project's among them."""
     db_uri = get_app_settings().database.uri
     database_file = sqlite_database_file(db_uri=db_uri)
     if database_file is not None and not database_file.exists():
         return False
+    settings = Setting.__table__
     with get_engine(db_uri).connect() as connection:
-        if not sa.inspect(connection).has_table(Setting.__tablename__):
+        if not sa.inspect(connection).has_table(settings.name):
             return False
         row = connection.execute(
-            sa.select(Setting.key).where(Setting.key == SEALING_MARKER_KEY).limit(1)
+            sa.select(settings.c.key).where(settings.c.key == SEALING_MARKER_KEY).limit(1)
         ).first()
     return row is not None
 
