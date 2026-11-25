@@ -12,7 +12,7 @@ from typing import Any
 from anton.core.mcp.access import allowed_for_mode
 from anton.core.mcp.client import McpSession
 from anton.core.mcp.errors import McpPermanentError, classify_mcp_error
-from anton.core.mcp.names import namespaced_tool_name
+from anton.core.mcp.names import registrable_tool_name
 
 from cowork.coding.integrations import code_provider_mcp_url
 from cowork.coding.project_models import CodeProject, ProjectConnection
@@ -122,11 +122,13 @@ class ProviderTools:
             for tool in tools:
                 if not allowed_for_mode(connection.provider, tool.name, "read"):
                     continue
-                name = namespaced_tool_name(
+                name = registrable_tool_name(
                     connection.provider,
                     tool.name,
                     connection_name=connection.name if per_provider[connection.provider] > 1 else None,
                 )
+                if name is None:
+                    continue
                 self._routes[name] = (session, tool.name)
                 listed.append({**tool.model_dump(by_alias=True, exclude_none=True, mode="json"), "name": name})
                 exposed += 1

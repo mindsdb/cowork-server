@@ -66,13 +66,16 @@ def test_only_classified_read_tools_are_exposed_and_forwarded() -> None:
         tools.close()
 
 
-def test_two_connections_for_one_provider_are_named_by_connection() -> None:
+@pytest.mark.parametrize(("connection", "prefix"), [("work", "work"), ("Work Team", "9016fbe5")])
+def test_two_connections_for_one_provider_are_named_by_connection(connection: str, prefix: str) -> None:
     tools = providers(project(
-        ProjectConnection(provider="linear", name="work"),
+        ProjectConnection(provider="linear", name=connection),
         ProjectConnection(provider="linear", name="oss"),
     ))
     try:
-        assert {item["name"] for item in tools.tools()} == {"linear__work__list_issues", "linear__oss__list_issues"}
+        name = f"linear__{prefix}__list_issues"
+        assert {item["name"] for item in tools.tools()} == {name, "linear__oss__list_issues"}
+        assert tools.call(name, {"project": "Demo"})["isError"] is False
     finally:
         tools.close()
 
