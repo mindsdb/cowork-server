@@ -69,7 +69,7 @@ def _call(session, path, **extra):
 async def test_publish_on_the_card_publishes_once_with_the_listed_connections(tmp_path):
     calls = []
 
-    def fake(raw, access=None, approved_datasources=None):
+    def fake(raw, access=None, approved_datasources=None, adopted=()):
         calls.append(approved_datasources)
         if approved_datasources is None:
             raise DatasourceApprovalRequired(PENDING)

@@ -332,7 +332,7 @@ async def test_self_hosted_publish_tool_names_neither_the_desktop_app_nor_mindsh
     cowork_server.create_app()
     report = tmp_path / "report.html"
     report.write_text("<h1>report</h1>", encoding="utf-8")
-    monkeypatch.setattr(tools, "_published_state", lambda raw_path: {})
+    monkeypatch.setattr(tools, "_published_state", lambda raw_path, adopted=(): {})
     publish = tools.build_cowork_publish_tool()
 
     answer = await publish.handler(SimpleNamespace(), {"file_path": str(report), "action": "ask"})

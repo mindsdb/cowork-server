@@ -35,9 +35,8 @@ from cowork.services.artifact_metadata import ArtifactMetadata
 from cowork.services.artifact_roots import (
     ProjectRow,
     RootsPlan,
-    desktop_adopted_rows,
+    adopted_rows_for,
     discover_roots,
-    folders_can_be_adopted,
     plan_project_roots,
     plan_scope_roots,
     recorded_location,
@@ -52,17 +51,6 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 T = TypeVar("T")
-
-
-async def adopted_rows_for(scope: TenantScope) -> tuple[ProjectRow, ...]:
-    """The caller's projects in a folder the user chose, read in a database
-    unit, for the path-addressed artifact actions to hand to file store work.
-
-    No query where no folder can be adopted (`folders_can_be_adopted`).
-    """
-    if not folders_can_be_adopted(scope):
-        return ()
-    return await run_db(desktop_adopted_rows, scope=scope)
 
 
 async def _adopted_rows(scope: TenantScope = Depends(get_tenant_scope)) -> tuple[ProjectRow, ...]:

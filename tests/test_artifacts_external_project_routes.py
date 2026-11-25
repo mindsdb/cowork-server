@@ -11,10 +11,12 @@ project's row.
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import shutil
 from contextlib import nullcontext
 from pathlib import Path
+from types import SimpleNamespace
 
 import anton.core.artifacts.backend_launcher as backend_launcher
 import anton.publisher as anton_publisher
@@ -29,6 +31,7 @@ from cowork.api.v1.endpoints import publish as publish_ep
 from cowork.common.settings.app_settings import get_app_settings
 from cowork.db.scoped import LOCAL_SCOPE, ScopedSession
 from cowork.db.session import get_open_session
+from cowork.harnesses.anton_harness import tools as agent_tools
 from cowork.models.project import Project
 from cowork.server import create_app
 from cowork.services import artifact_revisions, artifact_stats
@@ -36,6 +39,7 @@ from cowork.services import artifacts as artifacts_service
 from cowork.services import published_page_ownership
 from cowork.services import publish as publish_service
 from cowork.services import scratchpad_runtime
+import cowork.services.artifact_roots as artifact_roots
 from cowork.services.artifact_roots import desktop_adopted_rows
 
 ARTIFACT_ID = "cccccccc-cccc-4ccc-8ccc-cccccccccc01"
@@ -611,3 +615,55 @@ def test_comments_on_a_restricted_publication_in_a_chosen_folder_go_to_the_cloud
 
     assert res.status_code == 200, res.text
     assert forwarded == [("b9996ebec", "c675003f", "threads")]
+
+
+# -- the agent's own publish tool ---------------------------------------------
+
+
+class _ToolSession:
+    """What the publish tool reads from the agent's session: its workspace."""
+
+    def __init__(self, base: Path) -> None:
+        self._workspace = SimpleNamespace(base=str(base), artifacts_dir=base / ".anton" / "artifacts")
+
+
+def test_the_agent_publish_tool_publishes_from_a_chosen_folder(projects_root, tmp_path, monkeypatch):
+    """Not a route, but the same refusal: the agent could not publish the
+    artifact it had just written into the user's own folder."""
+    seen = {}
+
+    def _fake_publish(artifact, *, artifacts_base, api_key, publish_url, **kwargs):
+        seen["artifact"] = Path(artifact)
+        seen["base"] = Path(artifacts_base)
+        return {"url": "https://4nton.ai/a/uuid-tool", "result": {"report_id": "uuid-tool"}}
+
+    monkeypatch.setattr(publish_service, "publish_artifact", _fake_publish)
+    monkeypatch.setattr(publish_service, "desktop_publish_credential", lambda: ("key", "https://4nton.ai"))
+    client = _client()
+    _project, folder, artifact = _adopted(client, tmp_path, "routes-agent-tool")
+    primary = artifact / "index.html"
+
+    out = asyncio.run(
+        agent_tools._cowork_publish_or_preview(
+            _ToolSession(folder),
+            {"file_path": str(primary), "action": "publish", "title": "Dash", "access_mode": "public"},
+        )
+    )
+
+    assert "https://4nton.ai/a/uuid-tool" in getattr(out, "content", str(out))
+    assert seen == {"artifact": primary.resolve(), "base": (folder / ".anton" / "artifacts").resolve()}
+
+
+def test_an_unbound_turn_reads_no_operator_rows_where_identity_headers_are_trusted(
+    projects_root, monkeypatch
+):
+    """There LOCAL_SCOPE is the operator view of every person's rows, so a
+    turn with no bound scope must not read through it."""
+    async def no_database(fn, *, scope):
+        raise AssertionError("an unbound turn read rows under the operator view")
+
+    monkeypatch.setattr(artifact_roots, "run_db", no_database)
+    monkeypatch.setenv("COWORK_TRUST_IDENTITY_HEADERS", "true")
+    get_app_settings.cache_clear()
+
+    assert asyncio.run(agent_tools._turn_adopted_rows()) == ()

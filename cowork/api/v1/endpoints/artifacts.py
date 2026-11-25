@@ -43,7 +43,7 @@ from cowork.api.v1.artifact_preview import (
     wants_html_preview,
 )
 from cowork.api.v1.artifact_scope import (
-    AdoptedRowsDep, adopted_rows_for, review_artifact_and_read, scoped_project_id_for_request,
+    AdoptedRowsDep, review_artifact_and_read, scoped_project_id_for_request,
 )
 from cowork.db.units import FilesystemBusy, run_db, run_efs, run_on_unit_threads
 from cowork.common.logger import log_context
@@ -65,6 +65,7 @@ from cowork.services.artifact_roots import (
     ProjectRow,
     RootsPlan,
     adopted_artifacts_sources,
+    adopted_rows_for,
     artifacts_sources_for_scan,
     held_root_of,
     plan_project_roots,

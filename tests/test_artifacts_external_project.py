@@ -15,12 +15,11 @@ from pydantic import BaseModel
 from sqlalchemy.pool import StaticPool
 from sqlmodel import Session, SQLModel, create_engine
 
-import cowork.api.v1.artifact_scope as artifact_scope
-from cowork.api.v1.artifact_scope import adopted_rows_for
 from cowork.db.personal_resources import PersonalResource
 from cowork.db.scoped import LOCAL_SCOPE, ScopedSession, TenantScope
 from cowork.models.project import Project
-from cowork.services.artifact_roots import ProjectRow, desktop_adopted_rows
+import cowork.services.artifact_roots as artifact_roots
+from cowork.services.artifact_roots import ProjectRow, adopted_rows_for, desktop_adopted_rows
 from cowork.services.artifacts import _resolve_project_root, resolve_artifact_path
 from cowork.services.projects import (
     GENERAL_PROJECT,
@@ -209,7 +208,7 @@ def test_no_rows_are_read_where_no_folder_can_be_adopted(scope, monkeypatch):
     async def no_database(fn, *, scope):
         raise AssertionError("adopted rows were read from the database")
 
-    monkeypatch.setattr(artifact_scope, "run_db", no_database)
+    monkeypatch.setattr(artifact_roots, "run_db", no_database)
     assert asyncio.run(adopted_rows_for(scope)) == ()
 
 
@@ -220,7 +219,7 @@ def test_the_desktop_reads_its_adopted_rows_in_a_database_unit(monkeypatch):
         units.append((fn, scope))
         return ()
 
-    monkeypatch.setattr(artifact_scope, "run_db", database_unit)
+    monkeypatch.setattr(artifact_roots, "run_db", database_unit)
     asyncio.run(adopted_rows_for(LOCAL_SCOPE))
     assert units == [(desktop_adopted_rows, LOCAL_SCOPE)]
 
