@@ -23,7 +23,7 @@ import subprocess
 import sys
 import time
 import uuid
-from collections.abc import Iterable
+from collections.abc import Collection, Iterable
 from contextlib import ExitStack
 from dataclasses import dataclass, field
 from functools import partial
@@ -61,6 +61,7 @@ from anton.core.artifacts.store import iter_content_files
 
 if TYPE_CHECKING:
     from cowork.db.scoped import ScopedSession, TenantScope
+    from cowork.services.artifact_roots import ProjectRow
 
 logger = logging.getLogger(__name__)
 
@@ -319,6 +320,20 @@ def _scan_artifact_dirs(*, scope: TenantScope | None) -> list[Path]:
         candidate = _real_artifacts_dir(project_dir)
         if candidate is not None:
             dirs[str(candidate.resolve())] = candidate
+    return list(dirs.values())
+
+
+def _artifact_dirs_for(*, scope: TenantScope | None, adopted: Collection[ProjectRow] = ()) -> list[Path]:
+    """The scan's `.anton/artifacts` dirs plus those of `adopted`, the
+    caller's projects in a folder the user chose, which the scan cannot see.
+    With no rows this is the scan."""
+    # Imported here because `artifact_roots` imports this module at module level.
+    from cowork.services.artifact_roots import adopted_artifacts_sources
+
+    dirs = {str(d.resolve()): d for d in _scan_artifact_dirs(scope=scope)}
+    for source in adopted_artifacts_sources(adopted):
+        base = Path(source.base)
+        dirs.setdefault(str(base.resolve()), base)
     return list(dirs.values())
 
 
@@ -950,7 +965,11 @@ def _candidate_relative_artifacts(raw_path: str, artifact_dirs: list[Path]) -> l
 
 
 def resolve_artifact_path(
-    raw_path: str, *, scope: TenantScope | None, allow_dir: bool = False
+    raw_path: str,
+    *,
+    scope: TenantScope | None,
+    allow_dir: bool = False,
+    adopted: Collection[ProjectRow] = (),
 ) -> Path | None:
     """Turn an artifact request path into an absolute path on disk.
 
@@ -966,6 +985,9 @@ def resolve_artifact_path(
     by publish/unpublish so a folder-based artifact can be addressed by its
     folder. The relative-path branch stays file-only (the client always
     sends absolute folder paths).
+
+    `adopted` adds the caller's projects in a folder the user chose
+    (`_artifact_dirs_for`).
     """
     if "\x00" in raw_path:
         raise ValueError("Invalid artifact path")
@@ -976,9 +998,10 @@ def resolve_artifact_path(
     if not str(target).strip():
         raise ValueError("Invalid artifact path")
 
+    artifact_dirs = _artifact_dirs_for(scope=scope, adopted=adopted)
     if target.is_absolute():
         resolved = target.resolve()
-        for art_root in _scan_artifact_dirs(scope=scope):
+        for art_root in artifact_dirs:
             try:
                 resolved.relative_to(art_root.resolve())
             except ValueError:
@@ -989,7 +1012,7 @@ def resolve_artifact_path(
                 return resolved
         raise FileNotFoundError("Artifact is not in a known artifacts directory")
 
-    matches = _candidate_relative_artifacts(raw_path, _scan_artifact_dirs(scope=scope))
+    matches = _candidate_relative_artifacts(raw_path, artifact_dirs)
     if len(matches) == 1:
         return matches[0]
     if len(matches) > 1:
@@ -997,7 +1020,9 @@ def resolve_artifact_path(
     raise FileNotFoundError("Artifact is not in a known artifacts directory")
 
 
-def _artifact_root_for(path: Path, *, scope: TenantScope | None) -> Path:
+def _artifact_root_for(
+    path: Path, *, scope: TenantScope | None, adopted: Collection[ProjectRow] = ()
+) -> Path:
     """Climb from an artifact file to the folder that holds its
     `metadata.json` — the artifact root.
 
@@ -1011,7 +1036,7 @@ def _artifact_root_for(path: Path, *, scope: TenantScope | None) -> Path:
     (`<base>/.anton/artifacts/`) so a metadata-less tree can't send us
     climbing into the rest of the disk. Falls back to `path.parent`.
     """
-    containers = {str(d.resolve()) for d in _scan_artifact_dirs(scope=scope)}
+    containers = {str(d.resolve()) for d in _artifact_dirs_for(scope=scope, adopted=adopted)}
     current = path.parent.resolve()
     while True:
         if (current / "metadata.json").is_file():
@@ -2501,20 +2526,32 @@ def _backends_cross_people() -> bool:
     )
 
 
-def _resolve_project_root(artifact_dir: Path, *, scope: TenantScope | None) -> Path | None:
+def _resolve_project_root(
+    artifact_dir: Path, *, scope: TenantScope | None, adopted: Collection[ProjectRow] = ()
+) -> Path | None:
     """The registered project root of ``scope`` that owns this artifact dir.
 
     `artifact_dir` is the parent of the primary file (e.g.
     `<project>/.anton/artifacts/<slug>/`). We walk back to the registered
     project root by checking ancestors against `_registered_project_dirs`.
     Returns None when the dir isn't under any of the scope's projects — in
-    which case auto-launch is a non-starter anyway.
+    which case auto-launch is a non-starter anyway. `adopted` adds the
+    caller's projects in a folder the user chose.
     """
+    from cowork.services.artifact_roots import adopted_artifacts_sources
+
     try:
         artifact_resolved = artifact_dir.resolve()
     except OSError:
         return None
     registered = _registered_project_dirs(scope=scope)
+    # Resolved like the scan's entries, or a /var temp folder on macOS never
+    # matches its /private/var ancestor.
+    registered += [
+        Path(source.trusted_anchor).resolve()
+        for source in adopted_artifacts_sources(adopted)
+        if source.trusted_anchor is not None
+    ]
     for parent in (artifact_resolved, *artifact_resolved.parents):
         if parent in registered:
             # The registered entry, equal to the ancestor: the caller hands it

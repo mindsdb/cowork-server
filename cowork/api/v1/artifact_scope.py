@@ -9,12 +9,13 @@ from collections import OrderedDict
 from collections.abc import Callable
 from functools import partial
 from pathlib import Path
-from typing import TYPE_CHECKING, Generic, NamedTuple, TypeVar
+from typing import TYPE_CHECKING, Annotated, Generic, NamedTuple, TypeVar
 from uuid import UUID
 
-from fastapi import HTTPException, status
+from fastapi import Depends, HTTPException, status
 
-from cowork.db.scoped import ScopedSession, TenantScope, tenant_scope_required
+from cowork.db.personal_resources import PersonalResource
+from cowork.db.scoped import ScopedSession, TenantScope, get_tenant_scope, tenant_scope_required
 from cowork.db.units import run_db, run_efs
 from cowork.services.artifact_identity import (
     FolderCheck,
@@ -33,7 +34,9 @@ from cowork.services.artifact_locations import (
 )
 from cowork.services.artifact_metadata import ArtifactMetadata
 from cowork.services.artifact_roots import (
+    ProjectRow,
     RootsPlan,
+    desktop_adopted_rows,
     discover_roots,
     plan_project_roots,
     plan_scope_roots,
@@ -49,6 +52,27 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 T = TypeVar("T")
+
+
+async def adopted_rows_for(scope: TenantScope) -> tuple[ProjectRow, ...]:
+    """The caller's projects in a folder the user chose, read in a database
+    unit, for the path-addressed artifact actions to hand to file store work.
+
+    No query where no folder can be adopted (`directory_is_external`): org
+    mode and a scope partitioned for projects get no rows.
+    """
+    if _org_mode() or scope.partitioned_for(PersonalResource.PROJECTS):
+        return ()
+    return await run_db(desktop_adopted_rows, scope=scope)
+
+
+async def _adopted_rows(scope: TenantScope = Depends(get_tenant_scope)) -> tuple[ProjectRow, ...]:
+    """FastAPI dependency for `adopted_rows_for`. Takes the tenant scope, never
+    the request's session, so it reads nothing on the event loop."""
+    return await adopted_rows_for(scope)
+
+
+AdoptedRowsDep = Annotated[tuple[ProjectRow, ...], Depends(_adopted_rows)]
 
 
 def scoped_project_id_for_request(session: ScopedSession, project_ref: str) -> UUID:

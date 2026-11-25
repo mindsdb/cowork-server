@@ -382,15 +382,7 @@ def plan_scope_roots(session: ScopedSession) -> RootsPlan:
         # Desktop projects pointed at a folder the user chose. The scan only
         # sees direct children of the projects root, so an adopted folder is
         # invisible to it and has to come from its row.
-        return RootsPlan(
-            scan=True,
-            scan_scope=session.scope,
-            adopted=tuple(
-                _project_row(service, project)
-                for project in service.list_projects()
-                if service.directory_is_external(project)
-            ),
-        )
+        return RootsPlan(scan=True, scan_scope=session.scope, adopted=desktop_adopted_rows(session))
     partition = partition_of(session.scope)
     return RootsPlan(
         projects=_rows_in_partition(service=service, projects=service.list_projects(), partition=partition),
@@ -398,6 +390,30 @@ def plan_scope_roots(session: ScopedSession) -> RootsPlan:
         owner_filter=session.scope.org_mode,
         owned=owned_conversation_ids(session) if session.scope.org_mode else frozenset(),
     )
+
+
+def desktop_adopted_rows(session: ScopedSession) -> tuple[ProjectRow, ...]:
+    """The caller's desktop projects in a folder the user chose, as plain data.
+
+    A database step: the path-addressed artifact actions read these in a
+    database unit and hand them to file store work, which holds no session.
+    Empty wherever `directory_is_external` is never true (org mode, a scope
+    partitioned for projects), though callers skip the query there.
+    """
+    from cowork.services.projects import ProjectService
+
+    service = ProjectService(session)
+    return tuple(
+        _project_row(service, project)
+        for project in service.list_projects()
+        if service.directory_is_external(project)
+    )
+
+
+def adopted_artifacts_sources(adopted: Collection[ProjectRow]) -> list[ProjectArtifacts]:
+    """The artifacts root of each project in `adopted` that `_adopted_root`
+    accepts. File store work only: it stats, and opens no database session."""
+    return [found.source for project in adopted if (found := _adopted_root(project)) is not None]
 
 
 def with_held_roots(session: ScopedSession, plan: RootsPlan) -> RootsPlan:
