@@ -1181,6 +1181,7 @@ class AntonHarness:
         ui_locale: str | None = None,
         # The scheduler's own turn (see HarnessProvider).
         schedule_id: str | None = None,
+        docs: bool = False,
     ) -> AsyncIterator[str]:
         if get_app_settings().tenancy_mode == "org":
             # Org-mode turns must run on the remote worker, never in this
@@ -1348,6 +1349,7 @@ class AntonHarness:
                 tool_messages=tool_messages,
                 interactive=interactive,
                 ui_locale=ui_locale,
+                docs=docs,
             )
             session, turn_scratch_dir, seed_info = built.session, built.turn_scratch_dir, built.seed_info
             if model_wait is not None:
@@ -1690,10 +1692,17 @@ class AntonHarness:
         tool_messages: bool = False,
         interactive: bool = True,
         ui_locale: str | None = None,
+        docs: bool = False,
     ) -> BuiltChatSession:
         """Build the same core runtime the Anton CLI uses, scoped to one project
         (_build_turn_session). The live-app stops its prompt tells ride on the
-        result; a build that fails hands them back (release_stop_notices)."""
+        result; a build that fails hands them back (release_stop_notices).
+
+        ``docs``: the client shows docs, so the doc tools are registered, with
+        the short docs section of the prompt (DOC_PROMPT, on ``list_docs``) and
+        the ``doc-tools`` skill that unlocks the rest. Without it the agent never
+        hears of docs and writes none the client can't show.
+        """
         notices: list[UUID] = []
         try:
             built = await self._build_turn_session(
@@ -1706,6 +1715,7 @@ class AntonHarness:
                 interactive=interactive,
                 ui_locale=ui_locale,
                 live_app_notices=notices,
+                docs=docs,
             )
         except BaseException:
             if notices:
@@ -1735,6 +1745,7 @@ class AntonHarness:
         interactive: bool,
         live_app_notices: list[UUID],
         ui_locale: str | None = None,
+        docs: bool,
     ) -> BuiltChatSession:
         """_build_chat_session's work. ``live_app_notices`` gets the launch
         records whose stop the turn's prompt tells, which the turn claimed
@@ -1766,6 +1777,15 @@ class AntonHarness:
         REQUEST_CREDENTIALS_TOOL = build_cowork_request_credentials_tool()
         LABEL_CONNECTION_TOOL = build_cowork_label_connection_tool()
         CREATE_SKILL_DRAFT_TOOL = build_cowork_create_skill_draft_tool()
+        from .doc_tools import DocToolContext, build_doc_tools
+        doc_tool_ctx = DocToolContext(
+            artifacts_base=Path(conversation.project.path) / ".anton" / "artifacts",
+            conversation_id=str(conversation.id),
+            project_id=str(conversation.project_id) if conversation.project_id else None,
+            project_name=conversation.project.name,
+            project_label=display_label(conversation.project),
+        ) if docs else None
+        DOC_TOOLS = build_doc_tools(doc_tool_ctx) if doc_tool_ctx is not None else []
 
         try:
             from anton.core.datasources.data_vault import LocalDataVault
@@ -1806,6 +1826,12 @@ class AntonHarness:
         # skills others share with them after those (both linked into the
         # turn's scratch folder below).
         anton_settings.skills_extra_roots = [HOST_SKILLS_DIR]
+        if docs:
+            # The `doc-tools` skill unlocks the doc tools and holds the writing guide;
+            # a client without docs never hears of it.
+            from cowork.docs.prompt import DOC_SKILLS_ROOT
+
+            anton_settings.skills_extra_roots.append(DOC_SKILLS_ROOT)
 
         user = await run_on_unit_threads(get_user_settings)
         _overlay_user_settings(anton_settings, user)
@@ -1895,6 +1921,9 @@ class AntonHarness:
         # Read once: the prompt lists them, and the code sandbox grants their
         # folders read-only.
         attachment_rows = await _read_attachments(conversation, scope=current_settings_scope())
+        if doc_tool_ctx is not None:
+            # An attached image may go in a doc (copied beside it).
+            doc_tool_ctx.attached_files = frozenset(Path(a.path) for a in attachment_rows or [] if a.path)
         attachment_context = _attachment_context_for(attachment_rows, conversation=conversation)
         # Canonical order (ConversationService._MESSAGE_ORDER: seq, role, id);
         # the bare `conversation.messages` relationship is unordered and would
@@ -2031,6 +2060,29 @@ class AntonHarness:
             data_vault = app_held.turn_vault(
                 data_vault, source_vault=source_vault, root=own_vault_root(current_settings_scope())
             )
+            # anton builds the cell's DS_* environment one connection at a
+            # time and leaves out one that fails, so a sealed connection that
+            # won't open stops the turn here, naming it, instead.
+            from cowork.common.encryption import sealing_keys
+
+            if sealing_keys() is not None:
+                from cowork.services.connectors.sealed_vault import (
+                    SealedRecordError,
+                    refuse_unopenable_connections,
+                )
+
+                try:
+                    refuse_unopenable_connections(vault=data_vault)
+                except SealedRecordError as error:
+                    logger.error(
+                        "A saved connection can't be opened, so the turn stops",
+                        extra={
+                            "event": "sealed_connection_unopenable",
+                            "connection": error.connection,
+                            "reason": error.cause,
+                        },
+                    )
+                    raise
             # Registers this turn's DS_* names and values for scrubbing, and
             # touches no process state, so a concurrent turn's are left alone.
             from anton.utils.datasources import restore_namespaced_env
@@ -2346,6 +2398,7 @@ class AntonHarness:
                     REQUEST_CREDENTIALS_TOOL,
                     LABEL_CONNECTION_TOOL,
                     CREATE_SKILL_DRAFT_TOOL,
+                    *DOC_TOOLS,
                     # FETCH_SUBMISSION_TOOL,
                     # UPDATE_FORM_TOOL,
                     *([RECALL_HISTORY_TOOL] if RECALL_HISTORY_TOOL else []),

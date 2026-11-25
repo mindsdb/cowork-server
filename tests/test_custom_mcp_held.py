@@ -287,6 +287,18 @@ class TestTurnsReadOnlyHeldSettings:
         assert not {"_server_url", "_allowed_tools", "access_token"} & set(connecting)
 
 
+class TestConnectionList:
+    def test_a_custom_connection_lists_no_access_mode(self, protected):
+        # Its allowed tools, not an access mode, decide what the agent runs,
+        # so the tile must not claim "Read" for it.
+        _write_file(AGENT_WRITTEN)
+        _hold()
+        rows = _client().get(f"{BASE}/").json()
+        row = next(r for r in rows if r["engine"] == CUSTOM_MCP_ENGINE and r["name"] == CONN)
+        assert row["method"] == "mcp"
+        assert row["access_mode"] is None
+
+
 class TestHoldCustom:
     def test_a_new_server_url_drops_the_held_token(self, protected):
         _hold()

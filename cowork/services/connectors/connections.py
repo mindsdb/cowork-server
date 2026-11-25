@@ -106,6 +106,12 @@ class ConnectionsService:
             if is_custom_mcp(engine):
                 fields = self._held_custom_fields(name)
             user_label = str(fields.get("_user_label", "")).strip() or str(fields.get("_label", "")).strip() or None
+            method = fields.get("_method")
+            access_mode = None
+            # A custom MCP connection runs the tools the user picked, so no
+            # access mode describes it.
+            if method == app_held.MCP_METHOD and not is_custom_mcp(engine):
+                access_mode = app_held.effective_access_mode(own_vault_root(self.scope), engine, name, fields)
             result.append(ConnectionSummaryResponse(
                 engine=engine,
                 name=name,
@@ -119,6 +125,8 @@ class ConnectionsService:
                 custom=bool(spec.get("custom")),
                 managed=not self._can_change_in(vault, engine, name),
                 shared=self._is_shared_in(vault, engine, name),
+                method=method,
+                access_mode=access_mode,
             ))
         return result
 

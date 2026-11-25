@@ -321,6 +321,7 @@ def confirmation_mismatch(item: DeliveryPlanItem, confirmed: DraftPullRequestSpe
         return None
     pinned = (
         (confirmed.head_revision, item.head_revision),
+        (confirmed.base_branch, item.base_branch),
         (confirmed.task_branch, item.task_branch),
         (confirmed.remote_url, item.remote_url),
     )
