@@ -8,7 +8,8 @@ Memory left shared is one deployment store: the base global tier and the
 current project's tier under it, never another project's. A turn with no
 person, and every turn while memory is off, reads none of it and writes
 nothing: two empty tiers in its scratch folder, memory off, no background
-passes, and the managed rules alone. The desktop is unchanged.
+passes, and the managed rules alone. The desktop's own MEMORY_ENABLED now
+gates reads the same way.
 """
 from __future__ import annotations
 
@@ -343,23 +344,22 @@ async def test_the_desktop_keeps_the_base_tiers(monkeypatch, dirs):
         assert PLANTED_GLOBAL_RULE in context
 
 
-async def test_the_desktop_with_memory_disabled_still_reads_the_base_tiers(monkeypatch, dirs):
-    """The desktop keeps its own disabled-memory behavior: memory mode off over
-    the base tiers, which the turn still reads."""
+async def test_the_desktop_with_memory_disabled_reads_nothing(monkeypatch, dirs):
+    """MEMORY_ENABLED false now gates reads too: the turn gets two empty
+    tiers in its scratch folder, like the trusted-identity "memory off" case,
+    instead of the base tiers read-only."""
     monkeypatch.setenv("MEMORY_ENABLED", "false")
     async with _built(monkeypatch=monkeypatch, tmp_path=dirs, scope=None) as turn:
-        config, scratch, project = turn.config, turn.scratch, turn.project
+        config, scratch = turn.config, turn.scratch
         global_dir, project_dir = _tiers(config)
-        assert global_dir == dirs / "base-memory"
-        assert project_dir == Path(project.path) / ".anton" / "memory"
+        assert scratch is not None
+        assert global_dir.parent.parent == scratch and project_dir.parent.parent == scratch
         assert config.cortex.mode == "off"
-        assert config.background_memory is True
-        # It reads the base tiers, so its memory record keeps anton's `learned`.
-        assert turn.learns is True
-        assert scratch is None
+        assert config.background_memory is False
+        assert turn.learns is False
         context = await config.cortex.build_memory_context("how many?")
-        assert PLANTED_PROJECT_RULE in context
-        assert PLANTED_GLOBAL_RULE in context
+        assert PLANTED_PROJECT_RULE not in context
+        assert PLANTED_GLOBAL_RULE not in context
 
 
 def test_person_turn_memory_needs_a_person_only_when_identity_is_trusted(trusted, tmp_path):

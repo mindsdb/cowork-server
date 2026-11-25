@@ -1,4 +1,5 @@
-"""Deployment explanations follow access policy, not the encoding switch."""
+"""A turn whose settings say memory reads are off gets no stored memory,
+whatever the deployment's access policy would otherwise resolve."""
 from __future__ import annotations
 
 import json
@@ -22,7 +23,7 @@ from _self_hosted import enable_self_hosted
     (True, True, True, "off"),
     (False, False, False, "autopilot"),
 ])
-async def test_encoding_off_keeps_existing_saved_memory_readable(
+async def test_memory_reads_off_keeps_existing_saved_memory_unread(
     monkeypatch, tmp_path, personal_deployment, trusted, shared, enabled, mode,
 ):
     resources = ALL_PERSONAL_RESOURCES - {PersonalResource.MEMORY} if shared else ALL_PERSONAL_RESOURCES
@@ -54,11 +55,10 @@ async def test_encoding_off_keeps_existing_saved_memory_readable(
         session = ChatSession(turn.config)
         try:
             prompt = await session._build_system_prompt("What do you remember?")
-            assert "Prefers calendar quarters" in prompt
-            assert "Stored memories are not read" not in prompt
-            assert "No personal memories are saved" not in prompt
-            assert turn.config.learned_memory_scope == ("shared" if shared else "personal")
-            assert "Use scratchpad for tables" in turn.config.cortex.get_scratchpad_context(
+            assert "Prefers calendar quarters" not in prompt
+            assert "Stored memories are not read" in prompt
+            assert turn.config.learned_memory_scope == "off"
+            assert "Use scratchpad for tables" not in turn.config.cortex.get_scratchpad_context(
                 learned_memory_scope=turn.config.learned_memory_scope,
             )
             assert {path: path.read_bytes() for path in before} == before
