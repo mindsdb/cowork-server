@@ -314,7 +314,10 @@ def default_minds_auth_host() -> str:
 
     This is the PUBLIC host. It is not ``TurnQueueSettings.auth_internal_base_url``,
     which is a ClusterIP address for the secret-authenticated mint routes and is
-    unreachable from a desktop install.
+    unreachable from a desktop install. A desktop install, and any deployment
+    that sets no internal auth base, reads MindsHub here. A hosted deployment reads it at ``OAuthSettings.auth_service_base_url``
+    (cowork.services.mindshub_client.mindshub_v1) and keeps this host only for
+    the URLs a browser loads, such as brand images (org_branding.absolute_auth_url).
     """
     return re.sub(r"^(https?://)api([.-])", r"\1auth\2", default_turn_minds_api_host())
 
@@ -674,7 +677,9 @@ class OAuthSettings(Settings):
         description=(
             "Base URL of the auth service's public API, used in org/cloud mode to proxy the "
             "OAuth Connector Lifecycle (start/status/catalogue), the Google Drive Picker token "
-            "mint, and the turn-key oauth-token base URL anton calls directly. This is the same "
+            "mint, the turn-key oauth-token base URL anton calls directly, and every MindsHub "
+            "read made for a caller (mindshub_client.mindshub_v1, which falls back to the "
+            "public default_minds_auth_host when this is unset). This is the same "
             "auth service TurnQueueSettings.auth_internal_base_url reaches (just different, "
             "public /v1/... routes instead of /internal/...) — accepts that env var as a "
             "fallback so a single k8s config value covers both."
