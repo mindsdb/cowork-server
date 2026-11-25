@@ -19,10 +19,11 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from starlette.concurrency import run_in_threadpool
 
+from cowork.api.v1.artifact_scope import AdoptedRowsDep
 from cowork.api.v1.permissions import AuthenticatedInOrgMode, require
 from cowork.db.scoped import TenantScope, get_tenant_scope
 from cowork.services.artifact_identity import resolve_artifact_folder
-from cowork.services.artifact_roots import artifacts_sources_for_scan
+from cowork.services.artifact_roots import ProjectRow, adopted_artifacts_sources, artifacts_sources_for_scan
 from cowork.services.comments_proxy import forward_comments_rest, forward_comments_stream
 from cowork.services.comments_scope import published_comments_route
 from cowork.services.local_artifact_comments import handle_local_comments, local_comments_stream
@@ -43,7 +44,11 @@ def _org_mode() -> bool:
 
 
 def resolve_comments_route(
-    user_dir: str, report_id: str, *, tenant_scope: TenantScope | None = None
+    user_dir: str,
+    report_id: str,
+    *,
+    tenant_scope: TenantScope | None = None,
+    adopted: tuple[ProjectRow, ...] = (),
 ) -> tuple[str, str] | None:
     """Upstream scope for this artifact, or None to use the local journal.
 
@@ -92,7 +97,7 @@ def resolve_comments_route(
     # unresolvable here and falls back to the local journal's 404.
     try:
         _source, folder, _metadata = resolve_artifact_folder(
-            artifacts_sources_for_scan(scope=tenant_scope), artifact_id
+            artifacts_sources_for_scan(scope=tenant_scope) + adopted_artifacts_sources(adopted), artifact_id
         )
     except Exception:
         return None
@@ -120,15 +125,19 @@ def _local_report_id_for_request(user_dir: str, report_id: str) -> str | None:
 
 
 @router.get("/{user_dir}/{report_id}/stream")
-async def comments_stream(user_dir: str, report_id: str, request: Request, scope: ScopeDep):
+async def comments_stream(
+    user_dir: str, report_id: str, request: Request, scope: ScopeDep, adopted: AdoptedRowsDep
+):
     # SSE — registered before the catch-all so it isn't swallowed by {subpath:path}.
     local_report_id = _local_report_id_for_request(user_dir, report_id)
-    route = await run_in_threadpool(resolve_comments_route, user_dir, report_id, tenant_scope=scope)
+    route = await run_in_threadpool(
+        resolve_comments_route, user_dir, report_id, tenant_scope=scope, adopted=adopted
+    )
     if route is None:
         # ``route is None`` is possible only in desktop's canonical namespace,
         # where the boundary helper always returns a UUID.
         assert local_report_id is not None
-        return await local_comments_stream(local_report_id, scope=scope)
+        return await local_comments_stream(local_report_id, scope=scope, adopted=adopted)
     return await forward_comments_stream(request, route[0], route[1])
 
 
@@ -136,13 +145,17 @@ async def comments_stream(user_dir: str, report_id: str, request: Request, scope
     "/{user_dir}/{report_id}/{subpath:path}",
     methods=["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
 )
-async def comments_rest(user_dir: str, report_id: str, subpath: str, request: Request, scope: ScopeDep):
+async def comments_rest(
+    user_dir: str, report_id: str, subpath: str, request: Request, scope: ScopeDep, adopted: AdoptedRowsDep
+):
     # threads (list/create/edit/delete), replies (add/edit/delete), status.
     local_report_id = _local_report_id_for_request(user_dir, report_id)
-    route = await run_in_threadpool(resolve_comments_route, user_dir, report_id, tenant_scope=scope)
+    route = await run_in_threadpool(
+        resolve_comments_route, user_dir, report_id, tenant_scope=scope, adopted=adopted
+    )
     if route is None:
         assert local_report_id is not None
         return await handle_local_comments(
-            request, local_report_id, subpath, scope=scope
+            request, local_report_id, subpath, scope=scope, adopted=adopted
         )
     return await forward_comments_rest(request, route[0], route[1], subpath)

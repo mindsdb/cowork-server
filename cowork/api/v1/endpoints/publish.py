@@ -107,8 +107,8 @@ class _StatsTrackingBody(BaseModel):
 
 
 @router.get("/")
-async def list_publishable_endpoint(scope: ScopeDep):
-    return list_publishable(scope=scope)
+async def list_publishable_endpoint(scope: ScopeDep, adopted: AdoptedRowsDep):
+    return list_publishable(scope=scope, adopted=adopted)
 
 
 # Plain `def`: it reads the approval table and the vault.

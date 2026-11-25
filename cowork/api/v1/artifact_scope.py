@@ -14,7 +14,6 @@ from uuid import UUID
 
 from fastapi import Depends, HTTPException, status
 
-from cowork.db.personal_resources import PersonalResource
 from cowork.db.scoped import ScopedSession, TenantScope, get_tenant_scope, tenant_scope_required
 from cowork.db.units import run_db, run_efs
 from cowork.services.artifact_identity import (
@@ -38,6 +37,7 @@ from cowork.services.artifact_roots import (
     RootsPlan,
     desktop_adopted_rows,
     discover_roots,
+    folders_can_be_adopted,
     plan_project_roots,
     plan_scope_roots,
     recorded_location,
@@ -58,10 +58,9 @@ async def adopted_rows_for(scope: TenantScope) -> tuple[ProjectRow, ...]:
     """The caller's projects in a folder the user chose, read in a database
     unit, for the path-addressed artifact actions to hand to file store work.
 
-    No query where no folder can be adopted (`directory_is_external`): org
-    mode and a scope partitioned for projects get no rows.
+    No query where no folder can be adopted (`folders_can_be_adopted`).
     """
-    if _org_mode() or scope.partitioned_for(PersonalResource.PROJECTS):
+    if not folders_can_be_adopted(scope):
         return ()
     return await run_db(desktop_adopted_rows, scope=scope)
 

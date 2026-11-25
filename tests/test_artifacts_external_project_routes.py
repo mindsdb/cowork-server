@@ -19,10 +19,12 @@ from pathlib import Path
 import anton.core.artifacts.backend_launcher as backend_launcher
 import anton.publisher as anton_publisher
 import pytest
+from fastapi.responses import JSONResponse
 from fastapi.testclient import TestClient
 from sqlmodel import select
 
 from cowork.api.v1.endpoints import artifacts as artifacts_ep
+from cowork.api.v1.endpoints import comments as comments_ep
 from cowork.api.v1.endpoints import publish as publish_ep
 from cowork.common.settings.app_settings import get_app_settings
 from cowork.db.scoped import LOCAL_SCOPE, ScopedSession
@@ -108,11 +110,17 @@ def _adopt(client: TestClient, folder: Path, name: str) -> dict:
 
 
 def _adopted(
-    client: TestClient, tmp_path: Path, name: str, *, slug: str = "dash", extra: dict | None = None
+    client: TestClient,
+    tmp_path: Path,
+    name: str,
+    *,
+    slug: str = "dash",
+    artifact_id: str = ARTIFACT_ID,
+    extra: dict | None = None,
 ) -> tuple[dict, Path, Path]:
     folder = tmp_path / "Documents" / name
     folder.mkdir(parents=True)
-    artifact = _artifact_in(folder, slug, extra=extra)
+    artifact = _artifact_in(folder, slug, artifact_id=artifact_id, extra=extra)
     project = _adopt(client, folder, name)
     return project, folder, artifact
 
@@ -489,3 +497,117 @@ def test_the_datasource_check_answers_for_an_artifact_in_a_chosen_folder(project
 
     assert res.status_code == 200, res.text
     assert res.json() == {"pending": []}
+
+
+# -- the publishable list, the project_path list, search, comments ------------
+
+
+def test_the_publishable_list_includes_a_chosen_folder(projects_root, tmp_path):
+    """The publish picker built its list from the scan, so a project in a
+    chosen folder had nothing to offer."""
+    client = _client()
+    _project, _folder, artifact = _adopted(client, tmp_path, "routes-publishable")
+
+    res = client.get("/api/v1/publish/")
+
+    assert res.status_code == 200, res.text
+    listed = [Path(a["path"]).resolve() for a in res.json()["artifacts"]]
+    assert (artifact / "index.html").resolve() in listed
+
+
+def test_the_project_path_list_is_not_empty_for_a_chosen_folder(projects_root, tmp_path):
+    """Older desktop builds address the list by path. It answered 200 with an
+    empty body, so the project read as having produced nothing."""
+    client = _client()
+    project, folder, _artifact = _adopted(client, tmp_path, "routes-bypath")
+
+    res = client.get("/api/v1/artifacts/", params={"project_path": str(folder)})
+
+    assert res.status_code == 200, res.text
+    cards = res.json()
+    assert [c["title"] for c in cards] == ["Adopted dashboard"]
+    assert cards[0]["serveUrl"] == f"/api/v1/artifacts/serve/{project['name']}/dash/index.html"
+
+
+def test_the_project_path_list_carries_the_row_name_not_the_basename(projects_root, tmp_path):
+    """Adopting a folder whose basename is taken gives a row name that differs
+    from it; the serve URL follows the row, while the request still matches
+    the folder by its basename."""
+    client = _client()
+    taken = client.post("/api/v1/projects/", json={"name": "routes-clash"})
+    assert taken.status_code == 201, taken.text
+    folder = tmp_path / "elsewhere" / "routes-clash"
+    folder.mkdir(parents=True)
+    _artifact_in(folder)
+    project = _adopt(client, folder, "routes-clash-2")
+    assert project["name"] != folder.name
+
+    res = client.get("/api/v1/artifacts/", params={"project_path": str(folder)})
+
+    assert res.status_code == 200, res.text
+    cards = res.json()
+    assert len(cards) == 1
+    assert cards[0]["serveUrl"] == f"/api/v1/artifacts/serve/{project['name']}/dash/index.html"
+
+
+def test_search_finds_an_artifact_in_a_chosen_folder(projects_root, tmp_path):
+    client = _client()
+    _adopted(client, tmp_path, "routes-search")
+
+    res = client.get("/api/v1/search", params={"q": "Adopted dashboard"})
+
+    assert res.status_code == 200, res.text
+    titles = [hit["title"] for hit in res.json()["results"] if hit["type"] == "artifact"]
+    assert titles == ["Adopted dashboard"]
+
+
+def test_comments_resolve_an_artifact_in_a_chosen_folder(projects_root, tmp_path):
+    """The local journal finds the artifact folder to keep its threads, and
+    refused a chosen folder with a 404 that read as a missing artifact."""
+    client = _client()
+    comment_artifact_id = "cccccccc-cccc-4ccc-8ccc-cccccccccc02"
+    _project, _folder, _artifact = _adopted(
+        client, tmp_path, "routes-comments", slug="notes", artifact_id=comment_artifact_id
+    )
+
+    # "artifact" is the canonical desktop namespace; anything else proxies out.
+    res = client.get(f"/api/v1/artifact-comments/artifact/{comment_artifact_id}/threads")
+
+    assert res.status_code == 200, res.text
+
+
+def test_comments_on_a_restricted_publication_in_a_chosen_folder_go_to_the_cloud(
+    projects_root, tmp_path, monkeypatch
+):
+    """The publication record decides the route. Unread, a chosen folder's
+    threads silently land in the local journal instead of the cloud thread
+    the published page shows."""
+    client = _client()
+    comment_artifact_id = "cccccccc-cccc-4ccc-8ccc-cccccccccc04"
+    _project, _folder, artifact = _adopted(
+        client, tmp_path, "routes-comments-cloud", slug="notes", artifact_id=comment_artifact_id
+    )
+    (artifact / ".published.json").write_text(
+        json.dumps(
+            {
+                "index.html": {
+                    "report_id": "c675003f",
+                    "url": "https://view.dev.mindshub.ai/view/b9996ebec/c675003f",
+                    "published": True,
+                    "mode": "restricted",
+                }
+            }
+        )
+    )
+    forwarded: list[tuple[str, str, str]] = []
+
+    async def _forward(request, user_dir, report_id, subpath):
+        forwarded.append((user_dir, report_id, subpath))
+        return JSONResponse([])
+
+    monkeypatch.setattr(comments_ep, "forward_comments_rest", _forward)
+
+    res = client.get(f"/api/v1/artifact-comments/artifact/{comment_artifact_id}/threads")
+
+    assert res.status_code == 200, res.text
+    assert forwarded == [("b9996ebec", "c675003f", "threads")]

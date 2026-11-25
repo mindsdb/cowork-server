@@ -820,12 +820,12 @@ def _resolve_publish_endpoint(settings) -> tuple[str, str]:
     return publish_url, api_key
 
 
-def list_publishable(*, scope: TenantScope | None) -> dict:
+def list_publishable(*, scope: TenantScope | None, adopted: Collection[ProjectRow] = ()) -> dict:
     settings = get_user_settings()
     state = _load_state(scope=scope)
     publish_url, api_key = _resolve_publish_endpoint(settings)
     return {
-        "artifacts": html_artifacts(scope=scope),
+        "artifacts": html_artifacts(scope=scope, adopted=adopted),
         "publishReady": bool(api_key),
         "publishUrl": publish_url,
         "history": state.get("publish_history", [])[:40],

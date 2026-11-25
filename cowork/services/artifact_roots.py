@@ -392,13 +392,20 @@ def plan_scope_roots(session: ScopedSession) -> RootsPlan:
     )
 
 
+def folders_can_be_adopted(scope: TenantScope) -> bool:
+    """Whether ``scope`` can hold a project in a folder the user chose: never
+    in org mode or where projects are partitioned (`directory_is_external`),
+    so callers skip the rows query there."""
+    return not (_org_mode() or scope.partitioned_for(PersonalResource.PROJECTS))
+
+
 def desktop_adopted_rows(session: ScopedSession) -> tuple[ProjectRow, ...]:
     """The caller's desktop projects in a folder the user chose, as plain data.
 
     A database step: the path-addressed artifact actions read these in a
     database unit and hand them to file store work, which holds no session.
-    Empty wherever `directory_is_external` is never true (org mode, a scope
-    partitioned for projects), though callers skip the query there.
+    Empty wherever `folders_can_be_adopted` is false, though callers skip the
+    query there.
     """
     from cowork.services.projects import ProjectService
 

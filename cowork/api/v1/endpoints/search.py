@@ -9,6 +9,12 @@ from pydantic import BaseModel
 from cowork.api.v1.permissions import AuthenticatedInOrgMode, require
 from cowork.db.scoped import ScopedSession, TenantScope, get_tenant_scope
 from cowork.db.units import run_db, run_efs
+from cowork.services.artifact_roots import (
+    ProjectRow,
+    adopted_artifacts_sources,
+    desktop_adopted_rows,
+    folders_can_be_adopted,
+)
 from cowork.services.artifact_roots import artifacts_sources_for_scan as _sources_for_scan
 from cowork.services.artifacts import list_artifacts as _list_artifacts
 from cowork.services.conversations import ConversationService
@@ -62,6 +68,8 @@ class _RowMatches(NamedTuple):
 
     before_artifacts: list[SearchHit]
     after_artifacts: list[SearchHit]
+    # The caller's projects in a folder they chose, for the artifact search.
+    adopted: tuple[ProjectRow, ...] = ()
 
 
 def _search_rows(session: ScopedSession, query: str) -> _RowMatches:
@@ -128,7 +136,8 @@ def _search_rows(session: ScopedSession, query: str) -> _RowMatches:
                 route=pin.item_type or "task",
                 score=score + max(0, 5 - idx),
             ))
-    return _RowMatches(before_artifacts=before_artifacts, after_artifacts=results)
+    adopted = desktop_adopted_rows(session) if folders_can_be_adopted(session.scope) else ()
+    return _RowMatches(before_artifacts=before_artifacts, after_artifacts=results, adopted=adopted)
 
 
 def _artifact_rows(artifacts: list[ArtifactCard], query: str) -> list[SearchHit]:
@@ -169,7 +178,7 @@ async def search_cowork(
         artifacts = await run_efs(
             lambda: _list_artifacts([
                 source
-                for source in _sources_for_scan(scope=scope)
+                for source in _sources_for_scan(scope=scope) + adopted_artifacts_sources(matches.adopted)
                 if not is_comparison_sandbox(source.project_name)
             ]),
             scope=scope,

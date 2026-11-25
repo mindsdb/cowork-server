@@ -589,17 +589,19 @@ class _DesktopSourceCatalogEntry:
 
 
 def _desktop_registered_path_catalog(
-    *, scope: TenantScope | None
+    *, scope: TenantScope | None, adopted: tuple[ProjectRow, ...] = ()
 ) -> tuple[_DesktopSourceCatalogEntry, ...]:
-    """Build the complete legacy source catalog of ``scope``'s projects
-    without an HTTP selector."""
+    """Build the complete legacy source catalog of ``scope``'s projects, and
+    of `adopted`, its projects in a folder the user chose, without an HTTP
+    selector. `project_name` stays the folder's basename: it is the key the
+    request's own basename is compared with, not the name cards show."""
     return tuple(
         _DesktopSourceCatalogEntry(
             path_key=path_key,
             project_name=os.path.basename(str(Path(source.base).parent.parent)),
             source=source,
         )
-        for source in artifacts_sources_for_scan(scope=scope)
+        for source in artifacts_sources_for_scan(scope=scope) + adopted_artifacts_sources(adopted)
         for path_key in sorted(_desktop_source_path_keys(source))
     )
 
@@ -932,8 +934,9 @@ async def list_artifacts(
         # Local requests that carry both parameters have always preferred the
         # UUID. Do not let the ignored compatibility field enter resolution.
         if project_id is None:
+            adopted = await adopted_rows_for(scope)
             catalog = await run_efs(
-                partial(_desktop_registered_path_catalog, scope=scope), scope=scope
+                partial(_desktop_registered_path_catalog, scope=scope, adopted=adopted), scope=scope
             )
             if not project_path or "\x00" in project_path:
                 return []

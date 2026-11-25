@@ -24,7 +24,7 @@ from cowork.services.artifact_journal import (
     write_journal_file,
 )
 from cowork.services.artifact_lock import artifact_lock
-from cowork.services.artifact_roots import artifacts_sources_for_scan
+from cowork.services.artifact_roots import ProjectRow, adopted_artifacts_sources, artifacts_sources_for_scan
 
 _VIEWER = {"user_id": "desktop-owner", "email": "You", "role": "owner"}
 _CAPABILITIES = {
@@ -41,14 +41,17 @@ def _now() -> str:
 class LocalArtifactComments:
     """Small atomic journal with the same response shape as inference comments.
 
-    The artifact is found only among ``scope``'s artifacts roots, so another
-    person's artifact id answers 404.
+    The artifact is found only among ``scope``'s artifacts roots and those of
+    `adopted`, its projects in a folder the user chose, so another person's
+    artifact id answers 404.
     """
 
-    def __init__(self, artifact_id: str, *, scope: TenantScope | None) -> None:
+    def __init__(
+        self, artifact_id: str, *, scope: TenantScope | None, adopted: tuple[ProjectRow, ...] = ()
+    ) -> None:
         try:
             _, folder, _ = resolve_artifact_folder(
-                artifacts_sources_for_scan(scope=scope), artifact_id
+                artifacts_sources_for_scan(scope=scope) + adopted_artifacts_sources(adopted), artifact_id
             )
         except ArtifactIdentityConflict as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
@@ -225,12 +228,17 @@ class LocalArtifactComments:
 
 
 async def handle_local_comments(
-    request: Request, artifact_id: str, subpath: str, *, scope: TenantScope | None
+    request: Request,
+    artifact_id: str,
+    subpath: str,
+    *,
+    scope: TenantScope | None,
+    adopted: tuple[ProjectRow, ...] = (),
 ):
     # The service scans the artifacts roots and reads and writes the journal
     # under the artifact's lock, which can wait seconds, so it runs off the
     # event loop every request on the server shares.
-    service = await run_in_threadpool(LocalArtifactComments, artifact_id, scope=scope)
+    service = await run_in_threadpool(LocalArtifactComments, artifact_id, scope=scope, adopted=adopted)
     parts = [part for part in subpath.split("/") if part]
     method = request.method.upper()
     try:
@@ -279,9 +287,11 @@ def _dispatch(
     raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Unknown comment operation")
 
 
-async def local_comments_stream(artifact_id: str, *, scope: TenantScope | None) -> StreamingResponse:
+async def local_comments_stream(
+    artifact_id: str, *, scope: TenantScope | None, adopted: tuple[ProjectRow, ...] = ()
+) -> StreamingResponse:
     # As in handle_local_comments, every journal read runs off the event loop.
-    service = await run_in_threadpool(LocalArtifactComments, artifact_id, scope=scope)
+    service = await run_in_threadpool(LocalArtifactComments, artifact_id, scope=scope, adopted=adopted)
 
     async def threads() -> dict[str, dict]:
         payload = await run_in_threadpool(service.list_payload, "all")

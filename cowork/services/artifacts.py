@@ -2406,7 +2406,7 @@ def _publishable_in_folder(
     return [_PublishableCandidate(mtime_ns, entry_path, st.st_size, folder, title)]
 
 
-def html_artifacts(*, scope: TenantScope | None) -> list[dict]:
+def html_artifacts(*, scope: TenantScope | None, adopted: Collection[ProjectRow] = ()) -> list[dict]:
     """List the most recently changed publishable files (HTML + Markdown)
     across the artifacts tree of every project of ``scope``.
 
@@ -2418,7 +2418,7 @@ def html_artifacts(*, scope: TenantScope | None) -> list[dict]:
     """
     fullstack_types = _fullstack_types()
     candidates: list[_PublishableCandidate] = []
-    for container in _scan_artifact_dirs(scope=scope):
+    for container in _artifact_dirs_for(scope=scope, adopted=adopted):
         try:
             with os.scandir(container) as it:
                 entries = list(it)
