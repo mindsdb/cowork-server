@@ -12,6 +12,16 @@ cowork #537); COWORK_ASK_USER_ENABLED=false remains as the way back off.
 
 from __future__ import annotations
 
+import pytest
+
+
+def _questions(monkeypatch, *, enabled: bool) -> None:
+    """Set COWORK_ASK_USER_ENABLED as the harness reads it."""
+    monkeypatch.setattr(
+        "cowork.harnesses.anton_harness.harness.get_app_settings",
+        lambda: type("S", (), {"ask_user_enabled": enabled})(),
+    )
+
 
 def test_flag_defaults_to_on(monkeypatch):
     monkeypatch.delenv("COWORK_ASK_USER_ENABLED", raising=False)
@@ -33,39 +43,79 @@ def test_flag_reads_the_env_var(monkeypatch):
     assert AppSettings().ask_user_enabled is False
 
 
-def test_harness_injects_no_elicitor_when_the_flag_is_off(monkeypatch):
+@pytest.mark.parametrize("interactive", [True, False], ids=["interactive", "scheduled"])
+def test_harness_injects_no_elicitor_when_the_flag_is_off(monkeypatch, interactive):
+    """Questions off is the kill switch for every turn, a scheduled run's
+    approval cards included: the server refuses to start with
+    ANTON_WRITE_APPROVAL on and questions off, so no write waits on one."""
     from cowork.harnesses.anton_harness.harness import build_elicitor
 
-    monkeypatch.setattr(
-        "cowork.harnesses.anton_harness.harness.get_app_settings",
-        lambda: type("S", (), {"ask_user_enabled": False})(),
-    )
-    assert build_elicitor("conv-1") is None
+    _questions(monkeypatch, enabled=False)
+    assert build_elicitor("conv-1", interactive=interactive) is None
 
 
 def test_harness_injects_a_choice_elicitor_when_the_flag_is_on(monkeypatch):
     from cowork.harnesses.anton_harness.harness import build_elicitor
 
-    monkeypatch.setattr(
-        "cowork.harnesses.anton_harness.harness.get_app_settings",
-        lambda: type("S", (), {"ask_user_enabled": True})(),
-    )
+    _questions(monkeypatch, enabled=True)
     elicitor = build_elicitor("conv-1")
     assert elicitor is not None
     assert elicitor.supported_kinds == ("choice",)
     assert elicitor.timeout_s == 300
 
 
-def test_an_unattended_turn_gets_no_elicitor(monkeypatch):
-    """A scheduled run has nobody to answer: a question or a browser hand-over
-    would only wait out its timeout before the agent moved on (ENG-4340)."""
+def test_a_scheduled_run_gets_an_elicitor_that_takes_only_approval_cards(monkeypatch):
+    """A scheduled run keeps the write-approval card, which a person who opens
+    the run can answer. It takes no "choice", so a question or a browser
+    hand-over has nobody waiting to answer it and comes back at once instead
+    of waiting out its timeout before the agent moves on."""
     from cowork.harnesses.anton_harness.harness import build_elicitor
 
-    monkeypatch.setattr(
-        "cowork.harnesses.anton_harness.harness.get_app_settings",
-        lambda: type("S", (), {"ask_user_enabled": True})(),
+    _questions(monkeypatch, enabled=True)
+    elicitor = build_elicitor("conv-1", interactive=False)
+    assert elicitor is not None
+    assert elicitor.supported_kinds == ("approval",)
+    assert "choice" not in elicitor.supported_kinds
+    assert elicitor.timeout_s == 300
+
+
+def test_the_approval_kind_is_antons():
+    """The literal stands in for anton's constant, which the pinned anton may
+    predate. Where the installed anton has the constant, the two match."""
+    from anton.core.interaction import elicit
+
+    from cowork.harnesses.anton_harness.elicitor import APPROVAL_KIND
+
+    assert APPROVAL_KIND == getattr(elicit, "APPROVAL_KIND", "approval")
+
+
+async def test_a_scheduled_run_refuses_a_tools_confirmation_card(monkeypatch):
+    """A tool's own confirmation card (publishing credentials, changing a
+    scheduled task) is a question, not an approval card, so a scheduled run
+    refuses it at once and publishes no card."""
+    from cowork.harnesses.anton_harness.confirm_card import confirm_card
+    from cowork.harnesses.anton_harness.harness import build_elicitor
+
+    _questions(monkeypatch, enabled=True)
+    published = []
+
+    class _Session:
+        elicitor = build_elicitor("conv-1", interactive=False)
+        emitter = object()
+        question_count = 0
+
+        async def emit(self, event):
+            published.append(event)
+
+    decision = await confirm_card(
+        _Session(),
+        key="publish",
+        prompt="Publish this app?",
+        confirm=("publish", "Publish", "Publish the app"),
+        cancel_detail="Publish nothing",
     )
-    assert build_elicitor("conv-1", interactive=False) is None
+    assert decision == "unavailable"
+    assert published == []
 
 
 def test_the_harness_builds_its_elicitor_for_the_turn_it_serves():
@@ -121,6 +171,23 @@ def test_a_session_with_a_choice_elicitor_has_the_ask_user_tool():
     session._build_tools()
     names = {t["name"] for t in session.tool_registry.dump()}
     assert "ask_user" in names
+    assert "select_path" in names
+
+
+def test_a_scheduled_runs_session_has_no_ask_user_tool(monkeypatch):
+    """The end-to-end consequence for a scheduled run: the session built from
+    the harness's elicitor for an unattended turn offers the model no
+    question, as a session with no elicitor doesn't."""
+    from anton.core.session import ChatSession, ChatSessionConfig
+    from cowork.harnesses.anton_harness.harness import build_elicitor
+
+    _questions(monkeypatch, enabled=True)
+    elicitor = build_elicitor("conv-1", interactive=False)
+    session = ChatSession(ChatSessionConfig(llm_client=_mock_llm(), elicitor=elicitor))
+    session._build_tools()
+    names = {t["name"] for t in session.tool_registry.dump()}
+    assert session.elicitor is elicitor
+    assert "ask_user" not in names
     assert "select_path" in names
 
 
