@@ -12,20 +12,27 @@ project's row.
 from __future__ import annotations
 
 import json
+import shutil
+from contextlib import nullcontext
 from pathlib import Path
 
 import anton.core.artifacts.backend_launcher as backend_launcher
+import anton.publisher as anton_publisher
 import pytest
 from fastapi.testclient import TestClient
 from sqlmodel import select
 
 from cowork.api.v1.endpoints import artifacts as artifacts_ep
+from cowork.api.v1.endpoints import publish as publish_ep
 from cowork.common.settings.app_settings import get_app_settings
 from cowork.db.scoped import LOCAL_SCOPE, ScopedSession
 from cowork.db.session import get_open_session
 from cowork.models.project import Project
 from cowork.server import create_app
+from cowork.services import artifact_revisions
 from cowork.services import artifacts as artifacts_service
+from cowork.services import published_page_ownership
+from cowork.services import publish as publish_service
 from cowork.services import scratchpad_runtime
 from cowork.services.artifact_roots import desktop_adopted_rows
 
@@ -279,3 +286,159 @@ def test_export_writes_beside_an_artifact_in_a_chosen_folder(projects_root, tmp_
 
     assert res.status_code == 200, res.text
     assert (artifact / res.json()["filename"]).is_file()
+
+
+# -- publish, update, versions, activate, unpublish, delete --------------------
+
+
+def _with_credential(monkeypatch) -> None:
+    """A configured publish credential: without one these routes answer 400
+    for every folder, chosen or allocated, before resolving the path."""
+    monkeypatch.setattr(publish_service, "desktop_publish_credential", lambda: ("key", "https://4nton.ai"))
+    monkeypatch.setattr(
+        publish_service, "_resolve_publish_endpoint", lambda settings: ("https://4nton.ai", "key")
+    )
+
+
+def test_publish_resolves_an_artifact_in_a_chosen_folder(projects_root, tmp_path, monkeypatch):
+    """The upload is stubbed; under test is that the artifact and its
+    artifacts base resolve, which is where publish refused before."""
+    seen = {}
+
+    def _fake_publish(artifact, *, artifacts_base, api_key, publish_url, **kwargs):
+        seen["artifact"] = Path(artifact)
+        seen["base"] = Path(artifacts_base)
+        return {"url": "https://4nton.ai/a/uuid-pub", "md5": "abc"}
+
+    monkeypatch.setattr(publish_ep, "_publish", _fake_publish)
+    _with_credential(monkeypatch)
+    client = _client()
+    _project, folder, artifact = _adopted(client, tmp_path, "routes-publish")
+    primary = artifact / "index.html"
+
+    res = client.post("/api/v1/publish/", json={"path": str(primary)})
+
+    assert res.status_code == 200, res.text
+    assert res.json()["url"] == "https://4nton.ai/a/uuid-pub"
+    assert seen == {"artifact": primary.resolve(), "base": (folder / ".anton" / "artifacts").resolve()}
+
+
+def test_update_republishes_an_artifact_in_a_chosen_folder(projects_root, tmp_path, monkeypatch):
+    seen = {}
+
+    def _fake_publish(artifact, *, artifacts_base, api_key, publish_url, access, **kwargs):
+        seen["artifact"] = Path(artifact)
+        return {"url": "https://4nton.ai/a/uuid-pub", "md5": "new"}
+
+    monkeypatch.setattr(publish_service, "publish_artifact", _fake_publish)
+    _with_credential(monkeypatch)
+    client = _client()
+    _project, _folder, artifact = _adopted(client, tmp_path, "routes-update")
+    _published_record(artifact)
+    primary = artifact / "index.html"
+
+    res = client.post("/api/v1/publish/update", json={"path": str(primary)})
+
+    assert res.status_code == 200, res.text
+    assert seen == {"artifact": primary.resolve()}
+
+
+def test_versions_lists_the_history_of_an_artifact_in_a_chosen_folder(
+    projects_root, tmp_path, monkeypatch
+):
+    asked = []
+
+    def _fake_list_versions(report_id, **kwargs):
+        asked.append(report_id)
+        return {"report_id": report_id, "current_md5": "v2", "versions": [{"md5": "v1"}, {"md5": "v2"}]}
+
+    monkeypatch.setattr(anton_publisher, "list_versions", _fake_list_versions)
+    _with_credential(monkeypatch)
+    client = _client()
+    _project, _folder, artifact = _adopted(client, tmp_path, "routes-versions")
+    _published_record(artifact, "uuid-versions")
+
+    res = client.get("/api/v1/publish/versions", params={"path": str(artifact / "index.html")})
+
+    assert res.status_code == 200, res.text
+    assert asked == ["uuid-versions"]
+    assert [v["md5"] for v in res.json()["versions"]] == ["v2", "v1"]
+
+
+def test_activate_rolls_back_an_artifact_in_a_chosen_folder(projects_root, tmp_path, monkeypatch):
+    def _fake_activate(report_id, md5, **kwargs):
+        return {"current_md5": md5, "view_url": f"https://4nton.ai/a/{report_id}"}
+
+    monkeypatch.setattr(anton_publisher, "activate_version", _fake_activate)
+    monkeypatch.setattr(published_page_ownership, "publication_owner", lambda *a, **kw: nullcontext())
+    _with_credential(monkeypatch)
+    client = _client()
+    _project, _folder, artifact = _adopted(client, tmp_path, "routes-activate")
+    _published_record(artifact, "uuid-activate")
+
+    res = client.post(
+        "/api/v1/publish/activate", json={"path": str(artifact / "index.html"), "md5": "v1"}
+    )
+
+    assert res.status_code == 200, res.text
+    assert res.json()["url"] == "https://4nton.ai/a/uuid-activate"
+    record = json.loads((artifact / ".published.json").read_text())
+    assert record["index.html"]["last_md5"] == "v1"
+
+
+def test_unpublish_resolves_an_artifact_in_a_chosen_folder(projects_root, tmp_path, monkeypatch):
+    seen = {}
+
+    def _fake_unpublish(artifact, *, artifacts_base, api_key, publish_url, **kwargs):
+        seen["artifact"] = Path(artifact)
+        return {"status": "ok"}
+
+    monkeypatch.setattr(publish_ep, "_unpublish", _fake_unpublish)
+    _with_credential(monkeypatch)
+    client = _client()
+    _project, _folder, artifact = _adopted(client, tmp_path, "routes-unpublish")
+    _published_record(artifact)
+    primary = artifact / "index.html"
+
+    res = client.request("DELETE", "/api/v1/publish/", params={"path": str(primary)})
+
+    assert res.status_code == 200, res.text
+    assert seen == {"artifact": primary.resolve()}
+
+
+def test_delete_by_path_removes_an_artifact_in_a_chosen_folder(projects_root, tmp_path, monkeypatch):
+    monkeypatch.setattr(artifacts_ep, "_delete_artifact", lambda artifact, **kw: shutil.rmtree(artifact))
+    _with_credential(monkeypatch)
+    client = _client()
+    _project, _folder, artifact = _adopted(client, tmp_path, "routes-delete")
+
+    res = client.request("DELETE", "/api/v1/artifacts/", params={"path": str(artifact)})
+
+    assert res.status_code == 204, res.text
+    assert not artifact.exists()
+
+
+def test_a_refresh_keeps_revisions_whose_comments_live_in_the_cloud_in_a_chosen_folder(
+    projects_root, tmp_path
+):
+    """A scheduled refresh may replace an artifact's head revision only while
+    its comments live in the local journal. Shared with restricted access, a
+    chosen folder's comments live in the cloud, and the check that says so
+    used to re-resolve the folder by scan and read it as never published."""
+    client = _client()
+    _project, _folder, artifact = _adopted(client, tmp_path, "routes-refresh")
+    (artifact / ".published.json").write_text(
+        json.dumps(
+            {
+                "index.html": {
+                    "report_id": "uuid-restricted",
+                    "url": "https://4nton.ai/a/uuid-restricted",
+                    "published": True,
+                    "mode": "restricted",
+                    "lambda_artifact_key": f"artifact/{ARTIFACT_ID}",
+                }
+            }
+        )
+    )
+
+    assert artifact_revisions._comments_live_in_the_cloud(artifact, LOCAL_SCOPE) is True

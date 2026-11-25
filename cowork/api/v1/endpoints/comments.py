@@ -96,7 +96,7 @@ def resolve_comments_route(
         )
     except Exception:
         return None
-    return published_comments_route(str(folder), scope=tenant_scope)
+    return published_comments_route(folder)
 
 
 def _local_report_id_for_request(user_dir: str, report_id: str) -> str | None:

@@ -1488,14 +1488,14 @@ async def proxy(token: str, rel_path: str, request: Request, scope: ScopeDep):
 
 
 @router.delete("/", status_code=status.HTTP_204_NO_CONTENT, dependencies=[Depends(require(DesktopOnly))])
-def delete_artifact_endpoint(scope: ScopeDep, path: str = Query(...)):
+def delete_artifact_endpoint(scope: ScopeDep, adopted: AdoptedRowsDep, path: str = Query(...)):
     try:
         from cowork.services.publish import (
             desktop_artifact_and_base,
             desktop_publish_credential,
         )
 
-        found = desktop_artifact_and_base(path, scope=scope)
+        found = desktop_artifact_and_base(path, scope=scope, adopted=adopted)
         # Credential resolved after the path so an unresolvable artifact still
         # reports 404 rather than "configure your API key". Only needed at all
         # because delete unpublishes first.

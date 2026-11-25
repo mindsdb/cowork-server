@@ -10,6 +10,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel, StrictBool, model_validator
 
+from cowork.api.v1.artifact_scope import AdoptedRowsDep
 from cowork.api.v1.endpoints.connectors.connections import require_app_secret
 from cowork.api.v1.permissions import DesktopOnly, require
 from cowork.db.scoped import TenantScope, get_tenant_scope
@@ -129,10 +130,12 @@ def pending_datasources_endpoint(scope: ScopeDep, path: str = Query(...)):
 # off the event loop. A typed refusal (an HTTPException) answers with its own
 # status: 413, 429 or 500 for a Markdown page, 413 for a bundle too large.
 @router.post("/")
-def publish_artifact(req: _PublishBody, request: Request, scope: ScopeDep):
+def publish_artifact(req: _PublishBody, request: Request, scope: ScopeDep, adopted: AdoptedRowsDep):
     try:
         approved = _approved(req.approved_datasources, request)
-        artifact, artifacts_base, api_key, publish_url = _desktop_context(req.path, scope=scope)
+        artifact, artifacts_base, api_key, publish_url = _desktop_context(
+            req.path, scope=scope, adopted=adopted
+        )
         # The publisher resolves datasource secrets from the connector vault,
         # which is keyed by the scope wherever connections are partitioned;
         # without it the publisher would look in the shared root. This router
@@ -162,11 +165,12 @@ def publish_artifact(req: _PublishBody, request: Request, scope: ScopeDep):
 
 
 @router.post("/update")
-def update_artifact(req: _UpdateBody, request: Request, scope: ScopeDep):
+def update_artifact(req: _UpdateBody, request: Request, scope: ScopeDep, adopted: AdoptedRowsDep):
     try:
         return _update(
             req.path, scope=scope,
             approved_datasources=_approved(req.approved_datasources, request),
+            adopted=adopted,
         )
     except FileNotFoundError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
@@ -186,10 +190,13 @@ def update_artifact(req: _UpdateBody, request: Request, scope: ScopeDep):
 @router.delete("/")
 def unpublish_artifact(
     scope: ScopeDep,
+    adopted: AdoptedRowsDep,
     path: str = Query(..., description="Absolute path to the published HTML artifact"),
 ):
     try:
-        artifact, artifacts_base, api_key, publish_url = _desktop_context(path, scope=scope)
+        artifact, artifacts_base, api_key, publish_url = _desktop_context(
+            path, scope=scope, adopted=adopted
+        )
         return _unpublish(
             artifact, artifacts_base=artifacts_base,
             api_key=api_key, publish_url=publish_url, scope=scope,
@@ -207,10 +214,11 @@ def unpublish_artifact(
 @router.get("/versions")
 async def list_versions_endpoint(
     scope: ScopeDep,
+    adopted: AdoptedRowsDep,
     path: str = Query(..., description="Absolute path to the published artifact"),
 ):
     try:
-        return _list_versions(path, scope=scope)
+        return _list_versions(path, scope=scope, adopted=adopted)
     except FileNotFoundError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
     except ValueError as e:
@@ -224,9 +232,9 @@ async def list_versions_endpoint(
 # A plain `def`: the rollback waits for its folder's publish lock and calls
 # the publishing service, both off the event loop.
 @router.post("/activate")
-def activate_version_endpoint(req: _ActivateBody, scope: ScopeDep):
+def activate_version_endpoint(req: _ActivateBody, scope: ScopeDep, adopted: AdoptedRowsDep):
     try:
-        return _activate_version(req.path, req.md5, scope=scope)
+        return _activate_version(req.path, req.md5, scope=scope, adopted=adopted)
     except FileNotFoundError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
     except ValueError as e:

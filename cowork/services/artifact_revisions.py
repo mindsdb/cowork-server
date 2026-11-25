@@ -564,7 +564,7 @@ def _comments_live_in_the_cloud(folder: Path, scope: TenantScope | None) -> bool
     if get_app_settings().tenancy_mode == "org" or (scope is not None and scope.org_mode):
         return True
     try:
-        return published_comments_route(str(folder), scope=scope) is not None
+        return published_comments_route(folder) is not None
     except Exception:
         logger.warning(
             "Could not read an artifact's publication record; its refresh keeps the last revision",

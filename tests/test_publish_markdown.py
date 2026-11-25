@@ -414,7 +414,7 @@ def test_a_markdown_refusal_answers_with_its_status_and_code(refusal, status, co
         patch.setattr(
             publish_ep,
             "_desktop_context",
-            lambda raw, *, scope: (Path(raw), Path(raw).parent, "key", "https://4nton.ai"),
+            lambda raw, *, scope, adopted=(): (Path(raw), Path(raw).parent, "key", "https://4nton.ai"),
         )
 
         def refuse(*_args, **_kwargs):
@@ -438,7 +438,7 @@ async def test_the_server_keeps_answering_while_a_hostile_markdown_page_publishe
     md.write_text(HOSTILE)
     _wire_publish(monkeypatch, tmp_path, md, "report.md")
     monkeypatch.setattr(
-        publish_ep, "_desktop_context", lambda raw, *, scope: (md, tmp_path, "key", "https://4nton.ai")
+        publish_ep, "_desktop_context", lambda raw, *, scope, adopted=(): (md, tmp_path, "key", "https://4nton.ai")
     )
     app = FastAPI()
     app.include_router(publish_ep.router, prefix="/api/v1/publish")
@@ -488,7 +488,7 @@ def _wire_publish(monkeypatch, tmp_path, target: Path, key: str, *, is_fullstack
         ),
     )
     monkeypatch.setattr(
-        publish, "resolve_artifact_path", lambda raw, *, scope, allow_dir=True: target
+        publish, "resolve_artifact_path", lambda raw, *, scope, allow_dir=True, adopted=(): target
     )
     monkeypatch.setattr(
         publish, "_resolve_publish_target",
