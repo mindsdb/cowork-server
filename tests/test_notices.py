@@ -17,6 +17,7 @@ import pytest
 from sqlmodel import select
 
 from cowork import scheduler
+from cowork.db.personal_resources import PersonalResource
 from cowork.db.scoped import SYSTEM_SCOPE, ScopedSession, TenantScope
 from cowork.db.session import get_open_session
 from cowork.models.notice import Notice
@@ -113,22 +114,57 @@ def _post(session, *, user_id: str | None = ALICE, org_id: str | None = ORG, sub
     )
 
 
-def test_a_person_sees_only_their_own_notices():
+def test_a_person_sees_and_updates_only_their_own_notices(monkeypatch):
     subject = f"own {uuid4()}"
+    other_org = str(uuid4())
+    now = datetime.now(timezone.utc)
+    stale = now - timedelta(days=31)
+    monkeypatch.setattr(notices, "KEEP_PER_PERSON", 1)
     try:
         with get_open_session() as session:
-            mine = _post(session, user_id=ALICE, subject=subject)
-            _post(session, user_id=BOB, subject=subject)
-            _post(session, user_id=ALICE, org_id=str(uuid4()), subject=subject)
+            mine = _post(session, user_id=ALICE, subject=subject, now=now)
+            other = _post(session, user_id=BOB, org_id=other_org, subject=subject, now=stale)
+            old = _post(session, user_id=BOB, subject=subject, now=stale)
+            bobs = _post(session, user_id=BOB, subject=subject, now=now + timedelta(seconds=1))
         with get_open_session() as session:
             alice = notices.NoticeService(_org_scoped(session, ALICE))
             listed = [n for n in alice.list_notices() if n.subject == subject]
             assert [n.id for n in listed] == [mine.id]
         with get_open_session() as session:
             bob = notices.NoticeService(_org_scoped(session, BOB))
-            assert [n.user_id for n in bob.list_notices() if n.subject == subject] == [BOB]
-            # Alice's notice can't be marked read by anyone else.
+            assert [n.id for n in bob.list_notices() if n.subject == subject] == [bobs.id]
+            assert bob.unread_count() == 1
             assert bob.mark_read(mine.id) is False
+            assert bob.mark_all_read() == 1
+        with get_open_session() as session:
+            assert session.get(Notice, old.id) is None
+            assert session.get(Notice, bobs.id).read_at is not None
+            assert session.get(Notice, mine.id).read_at is None
+            assert session.get(Notice, other.id).read_at is None
+    finally:
+        _delete_notices(subject=subject)
+
+
+def test_shared_schedule_notices_are_visible_without_exposing_personal_notices():
+    subject = f"shared {uuid4()}"
+    try:
+        with get_open_session() as session:
+            shared = _post(session, user_id=None, org_id=None, subject=subject)
+            private = _post(session, user_id=ALICE, org_id=ORG, subject=subject)
+        for user in (ALICE, BOB):
+            with get_open_session() as session:
+                scope = TenantScope(personal=True, org_id=ORG, user_id=user)
+                inbox = notices.NoticeService(ScopedSession(session, scope))
+                assert [n.id for n in inbox.list_notices()] == [shared.id]
+                assert inbox.unread_count() == 1
+                assert inbox.mark_read(private.id) is False
+        with get_open_session() as session:
+            scope = TenantScope(
+                personal=True, org_id=ORG, user_id=ALICE,
+                personal_resources=frozenset({PersonalResource.SCHEDULES}),
+            )
+            inbox = notices.NoticeService(ScopedSession(session, scope))
+            assert [n.id for n in inbox.list_notices()] == [private.id]
     finally:
         _delete_notices(subject=subject)
 

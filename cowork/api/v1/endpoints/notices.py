@@ -20,23 +20,25 @@ router = APIRouter(dependencies=[Depends(require(AuthenticatedInOrgMode))])
 
 
 @router.get("/")
-def list_notices(scoped: ScopedSessionDep, limit: int = Query(default=50, ge=1, le=KEEP_PER_PERSON)):
+def list_notices(
+    scoped: ScopedSessionDep, limit: int = Query(default=50, ge=1, le=KEEP_PER_PERSON),
+) -> NoticeListResponse:
     """The caller's notices, newest first, with their unread count."""
     service = NoticeService(scoped)
     return NoticeListResponse(
         notices=[NoticeResponse.model_validate(n, from_attributes=True) for n in service.list_notices(limit)],
         unread_count=service.unread_count(),
-    ).model_dump(by_alias=True, mode="json")
+    )
 
 
 @router.get("/unread-count")
-def unread_count(scoped: ScopedSessionDep):
+def unread_count(scoped: ScopedSessionDep) -> UnreadCountResponse:
     """How many of the caller's notices are unread. Cheap enough to poll."""
-    return UnreadCountResponse(unread_count=NoticeService(scoped).unread_count()).model_dump(by_alias=True)
+    return UnreadCountResponse(unread_count=NoticeService(scoped).unread_count())
 
 
 @router.post("/read-all")
-def mark_all_read(scoped: ScopedSessionDep):
+def mark_all_read(scoped: ScopedSessionDep) -> dict[str, int]:
     """Mark every one of the caller's notices read."""
     return {"updated": NoticeService(scoped).mark_all_read()}
 

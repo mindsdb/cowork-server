@@ -21,6 +21,7 @@ from uuid import UUID
 import sqlalchemy as sa
 from sqlmodel import Session, select
 
+from cowork.db.personal_resources import PersonalResource
 from cowork.db.scoped import ScopedSession, scope_for_identity, unsafe_unscoped_session
 from cowork.models.notice import Notice
 from cowork.models.schedule import Schedule, ScheduleRun
@@ -35,11 +36,6 @@ SCHEDULED_RUN_FAILED = "scheduled_run.failed"
 SCHEDULED_RUN_STOPPED = "scheduled_run.stopped"
 SCHEDULED_RUN_SUCCEEDED = "scheduled_run.succeeded"
 _SCHEDULED_RUN_KINDS = (SCHEDULED_RUN_FAILED, SCHEDULED_RUN_STOPPED, SCHEDULED_RUN_SUCCEEDED)
-
-# The outcome a run that ended at a step or token limit records. Read as a
-# string so the inbox doesn't depend on when that outcome is added.
-_STOPPED_AT_LIMIT = "stopped_at_limit"
-
 
 def _owner_clause(org_id: str | None, user_id: str | None) -> list[Any]:
     """Match one person's notices, NULL ids included (desktop rows)."""
@@ -100,7 +96,7 @@ def _scheduled_run_kind(run: ScheduleRun) -> str | None:
         return None
     if run.outcome == AttemptOutcome.cancelled:
         return None
-    if run.outcome == _STOPPED_AT_LIMIT:
+    if run.outcome == AttemptOutcome.stopped_at_limit:
         return SCHEDULED_RUN_STOPPED
     if run.status == RunStatus.success:
         return SCHEDULED_RUN_SUCCEEDED
@@ -169,18 +165,18 @@ def post_scheduled_run_notice(scoped: ScopedSession, *, run_id: UUID) -> Notice 
 
 
 class NoticeService:
-    """The caller's own inbox. The scoped session bounds it to their
-    organization or partition; the user filter is applied here, as user_id
-    has no automatic scoping."""
+    """The caller's inbox, using the deployment's schedule partitioning."""
 
     def __init__(self, session: ScopedSession) -> None:
         self.session = session
 
     def _own(self, stmt):
-        user_id = self.session.scope.user_id
-        if user_id is not None:
-            stmt = stmt.where(Notice.user_id == user_id)
-        return stmt
+        scope = self.session.scope
+        if scope.partitioned_for(PersonalResource.SCHEDULES):
+            return stmt.where(Notice.user_id == scope.user_id)
+        # Shared schedules post without an owner. Keep any notices from a
+        # previously enabled personal partition out of the shared inbox.
+        return stmt.where(*_owner_clause(None, None))
 
     def list_notices(self, limit: int = 50) -> list[Notice]:
         stmt = self._own(self.session.select(Notice)).order_by(
@@ -191,8 +187,8 @@ class NoticeService:
     def unread_count(self) -> int:
         stmt = self._own(
             self.session.select(Notice).where(Notice.read_at.is_(None))  # type: ignore[union-attr]
-        )
-        return len(self.session.exec(stmt).all())
+        ).with_only_columns(sa.func.count(), maintain_column_froms=True)
+        return self.session.exec(stmt).one()
 
     def mark_read(self, notice_id: UUID) -> bool:
         notice = self.session.exec(self._own(self.session.select(Notice).where(Notice.id == notice_id))).first()
