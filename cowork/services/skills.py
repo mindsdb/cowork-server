@@ -490,8 +490,9 @@ def shared_turn_skills(
 
 def agent_skill_names() -> frozenset[str]:
     """The skills every person's agent already has from a read-only root
-    beside the managed folder: the harness's own (HOST_SKILLS_DIR) and
-    anton's packaged ones (anton's SkillStore.builtin_root).
+    beside the managed folder: the harness's own (HOST_SKILLS_DIR and the
+    doc skill's root, DOC_SKILLS_ROOT) and anton's packaged ones (anton's
+    SkillStore.builtin_root).
 
     anton reads the harness's root ahead of the shared skills and its
     packaged ones after them, so a shared skill by one of these names would
@@ -500,10 +501,13 @@ def agent_skill_names() -> frozenset[str]:
     """
     from anton.core.memory.skills import SkillStore
 
+    from cowork.docs.prompt import DOC_SKILLS_ROOT
     from cowork.harnesses.anton_harness.harness import HOST_SKILLS_DIR
 
     return frozenset(
-        {*readonly_skill_dirs(HOST_SKILLS_DIR).reserved, *readonly_skill_dirs(SkillStore().builtin_root).reserved}
+        name
+        for root in (HOST_SKILLS_DIR, DOC_SKILLS_ROOT, SkillStore().builtin_root)
+        for name in readonly_skill_dirs(root).reserved
     )
 
 

@@ -376,7 +376,7 @@ async def test_a_turn_with_a_key_but_no_prefix_logs_it_at_info(auth):
     """A channel turn hands the producer a minted key and no prefix: every such turn has it, so not a warning."""
     block = {"provider": "minds-cloud", "api_key": "mdb_x.secret", "base_url": "https://minds.internal/v1"}
 
-    params, _ = await _run(auth, llm=block)
+    params, _ = await _run(auth, llm=prod.TurnLlm(block=block, turn_key_id=None, ttl_seconds=1200))
 
     assert "custom_mcp" not in params
     assert auth["calls"] == []

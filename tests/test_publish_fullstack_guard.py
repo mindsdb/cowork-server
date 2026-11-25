@@ -11,7 +11,6 @@ agent's publish tool.
 """
 from __future__ import annotations
 
-import json
 from pathlib import Path
 from unittest import mock
 
@@ -21,10 +20,26 @@ from fastapi.testclient import TestClient
 
 from cowork.api.v1.endpoints import publish as publish_ep
 from cowork.harnesses.anton_harness import tools as htools
+from cowork.db.scoped import LOCAL_SCOPE
+from cowork.db.units import unit_session
+from cowork.models.artifact_datasource_approval import ArtifactDatasourceApproval
 from cowork.services import publish
+from cowork.services.datasource_approval import DatasourceKey
 from cowork.services.providers import is_mindshub_publish_url
+from tests._artifact_metadata import write_artifact_metadata
 
 SELF_HOSTED_PUBLISH_URL = "http://publisher-api:8081"
+
+
+@pytest.fixture(autouse=True)
+def _no_approvals():
+    def clear():
+        with unit_session(scope=LOCAL_SCOPE) as session:
+            for row in session.exec(session.select(ArtifactDatasourceApproval)):
+                session.delete(row)
+    clear()
+    yield
+    clear()
 
 
 def _artifact(base: Path, slug: str, *, artifact_type: str, files: dict[str, str]) -> Path:
@@ -33,13 +48,9 @@ def _artifact(base: Path, slug: str, *, artifact_type: str, files: dict[str, str
         path = folder / rel
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(body)
-    (folder / "metadata.json").write_text(
-        json.dumps({
-            "slug": slug,
-            "name": slug,
-            "type": artifact_type,
-            "datasources": [{"engine": "postgres", "name": "scm"}],
-        })
+    write_artifact_metadata(
+        folder, slug=slug, artifact_type=artifact_type,
+        datasources=[{"engine": "postgres", "name": "scm"}],
     )
     return folder
 
@@ -147,7 +158,8 @@ def test_fullstack_to_a_self_hosted_publisher_is_refused_before_upload(
 @pytest.mark.parametrize("url", ["https://4nton.ai", "https://api.staging.mindshub.ai"])
 def test_fullstack_to_mindshub_still_publishes(fullstack, artifacts_base, publisher, url):
     out = publish.publish_artifact(
-        fullstack, artifacts_base=artifacts_base, api_key="k", publish_url=url
+        fullstack, artifacts_base=artifacts_base, api_key="k", publish_url=url,
+        approved_datasources=frozenset({DatasourceKey("postgres", "scm")}),
     )
 
     assert out["url"] == "https://view.example/r/1"

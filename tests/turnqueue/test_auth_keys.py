@@ -79,7 +79,7 @@ class _SeqResp:
 
     def raise_for_status(self):
         if self.status_code >= 400:
-            raise httpx.HTTPStatusError("error", request=None, response=None)
+            raise httpx.HTTPStatusError("error", request=None, response=self)
 
 
 def _sequenced_client(monkeypatch, responses):
@@ -240,7 +240,7 @@ async def test_a_mint_with_a_prefix_returns_both_halves(monkeypatch):
     minted = await mint_turn_key_details(
         user_id="u1", org_id="o1", correlation_id="corr-1", ttl_seconds=1200, settings=_Settings()
     )
-    assert minted == MintedTurnKey(key="mdb_prefix.secret", prefix="mdb_prefix")
+    assert minted == MintedTurnKey(key="mdb_prefix.secret", prefix="mdb_prefix", ttl_seconds=1200)
 
 
 @pytest.mark.asyncio

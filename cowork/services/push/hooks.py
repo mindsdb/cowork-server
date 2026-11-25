@@ -118,13 +118,13 @@ def scheduled_run_ended(
 
 def artifact_shared(
     *, org_id: str | None, sharer_id: str | None, sharer_name: str | None,
-    recipient_ids: Iterable[str], artifact_title: str | None, url: str | None,
+    recipient_ids: Iterable[str], artifact_title: str | None, url: str | None, artifact_ref: str | None = None,
 ) -> None:
     """Push a share to each person the sharer asked to notify, never to the
     sharer themself."""
     recipients = [user_id for user_id in dict.fromkeys(recipient_ids) if user_id and user_id != sharer_id]
     if not org_id or not recipients or not push_enabled():
         return
-    payload = payloads.artifact_shared(sharer=sharer_name, artifact_title=artifact_title, url=url)
+    payload = payloads.artifact_shared(sharer=sharer_name, artifact_title=artifact_title, url=url, artifact_ref=artifact_ref)
     for user_id in recipients:
         spawn(notify_user(org_id, user_id, payload))
