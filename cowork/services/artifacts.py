@@ -2283,6 +2283,9 @@ def preview_mount_for(token: str, *, scope: TenantScope | None) -> Path | None:
 # `.html` is served as-is; `.md` is rendered to a styled HTML page first
 # (see `publish._render_markdown_to_html`). Fullstack artifacts bypass this —
 # they publish their directory regardless of the primary file's suffix.
+# Files that aren't web pages (PDF, Word, ...) publish too, as a page of their
+# own (`file_page.PUBLISHABLE_FILE_SUFFIXES`, ENG-4687), but aren't listed by
+# `html_artifacts`: in a page's folder they are its supporting files.
 PUBLISHABLE_STATIC_SUFFIXES = (".html", ".md")
 _PUBLISHABLE_LIST_LIMIT = 40
 

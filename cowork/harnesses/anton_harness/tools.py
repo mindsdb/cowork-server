@@ -432,11 +432,10 @@ async def _cowork_publish_or_preview(session: Any, tc_input: dict):
     from cowork.services.datasource_approval import DatasourceKey
     from cowork.services.publish import (
         ARTIFACT_TOO_LARGE_MESSAGE,
-        MARKDOWN_NOT_PUBLISHABLE_CODE,
         OWNED_BY_OTHER_USER_MESSAGE,
         AccessChoiceRequired,
         DatasourceApprovalRequired,
-        MarkdownNotPublishable,
+        PageNotPublishable,
         PublishOwnedByOtherUser,
         PublishRejected,
         PublishTooLarge,
@@ -496,15 +495,17 @@ async def _cowork_publish_or_preview(session: Any, tc_input: dict):
             "(PDFs, images) and publish again.",
             reason="too_large",
         )
-    except MarkdownNotPublishable as exc:
+    except PageNotPublishable as exc:
         # The same file is refused on every try, and each try can hold the
         # server's one conversion for 30 s; the model can shorten the file.
+        # Markdown, or a file shared as a page of its own (ENG-4687).
         message = exc.detail["message"]
         logger.info("Cowork publish refused: %s", message)
+        what = "the Markdown" if exc.detail["code"] == "markdown_not_publishable" else "the file"
         return _fail(
             f"PUBLISH FAILED: {message} Do not retry with the same file. "
-            "Tell the user, or shorten or simplify the Markdown and publish again.",
-            reason=MARKDOWN_NOT_PUBLISHABLE_CODE,
+            f"Tell the user, or shorten or simplify {what} and publish again.",
+            reason=exc.detail["code"],
         )
     except ShareOrgRequired as exc:
         # The reason is MindsHub's, and classify_upload_error already logged
