@@ -14,7 +14,7 @@ class NoticeFallback(CamelResponse):
     """A summary and an in-app destination understood independently of the notice kind."""
 
     summary: str
-    destination: NoticeDestination | None = None
+    destination: NoticeDestination
 
 
 class NoticeResponse(CamelResponse):
