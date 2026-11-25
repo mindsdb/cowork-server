@@ -7,6 +7,7 @@ about 10x more on the larger input, and a quadratic one about 100x.
 """
 from __future__ import annotations
 
+import gc
 import time
 from collections.abc import Callable
 from typing import Generic, NamedTuple, TypeVar
@@ -30,13 +31,21 @@ class Growth(NamedTuple, Generic[Result]):
 def cpu_seconds_per_call(call: Callable[[], object]) -> float:
     """This thread's CPU time per call, repeating the call until the calls add
     up to _MIN_TIMED_SECONDS so a fast call still measures. CPU, not wall
-    time: a busy machine delays the calls without adding work."""
-    calls, started = 0, time.thread_time()
-    while True:
-        call()
-        calls += 1
-        if (elapsed := time.thread_time() - started) >= _MIN_TIMED_SECONDS:
-            return elapsed / calls
+    time: a busy machine delays the calls without adding work. The cycle
+    collector is off meanwhile: a full pass costs with the whole test
+    session's heap, and a large input sets one off where a small one does not."""
+    was_enabled = gc.isenabled()
+    gc.disable()
+    try:
+        calls, started = 0, time.thread_time()
+        while True:
+            call()
+            calls += 1
+            if (elapsed := time.thread_time() - started) >= _MIN_TIMED_SECONDS:
+                return elapsed / calls
+    finally:
+        if was_enabled:
+            gc.enable()
 
 
 def growth(run: Callable[[Input], Result], *, small: Input, large: Input) -> Growth[Result]:

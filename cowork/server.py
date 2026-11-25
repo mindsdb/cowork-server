@@ -714,7 +714,21 @@ async def lifespan(app: FastAPI):
     clock.begin("scheduler_and_channels")
     start_scheduler()
     await _start_channels(app)
+    # Shared docs catch up on what was still waiting when the app quit (see
+    # cowork.docs.sync; on a background thread, so boot never waits).
+    from cowork.docs import sync as shared_docs
+
+    shared_docs.start()
+    from cowork.docs.relay import start_doc_relay, stop_doc_relay
+    from cowork.docs.publish_queue import (
+        pause_doc_publish_worker,
+        start_doc_publish_worker,
+        stop_doc_publish_worker,
+    )
+
     clock.begin("draft_listener")
+    app.state.doc_relay = None
+    app.state.doc_publish_worker = None
     app.state.channel_ingress_reconciler = None
     app.state.artifact_owner_backfill = None
     app.state.artifact_location_backfill = None
@@ -751,6 +765,10 @@ async def lifespan(app: FastAPI):
         _end_remote_turns_on_sigterm()
     watchdog = None
     try:
+        # Doc events reach the other replicas' editors; only where replicas share Redis.
+        app.state.doc_relay = start_doc_relay()
+        # Shared doc pages follow their edits; only on an org deployment with Redis.
+        app.state.doc_publish_worker = start_doc_publish_worker()
         draft_listener = await start_draft_listener()
         clock.finished()
         # Last, once nothing left in startup blocks the loop on purpose.
@@ -758,9 +776,12 @@ async def lifespan(app: FastAPI):
         watchdog.start()
         yield
     finally:
+        # Turns still draining queue their pages for the other replicas; this
+        # replica stops taking new uploads it would have to abandon.
+        await pause_doc_publish_worker(getattr(app.state, "doc_publish_worker", None))
         if watchdog is not None:
             watchdog.stop()
-        # First, so no draft request is still reading files or the database
+        # Early, so no draft request is still reading files or the database
         # while the steps below close them.
         await stop_draft_listener(draft_listener)
         from cowork.channels.webhooks import drain_background_tasks
@@ -796,10 +817,23 @@ async def lifespan(app: FastAPI):
         # After the turn drains above, whose endings may each have started a
         # push, and the scheduled runs, which push when they finish.
         await drain_push_notifications()
+        shared_docs.stop()
+        await stop_doc_relay(getattr(app.state, "doc_relay", None))
         # After both turn drains above: each turn they unwound has queued the
-        # close of its scratchpad processes, and those must finish before the
-        # event loop stops.
-        await drain_scratchpad_closes()
+        # close of its scratchpad processes, and its last doc writes their
+        # pages. The worker's stop runs inside the closes' wait: the pod's
+        # grace period has no room for a wait of its own.
+        closes, worker_stop = await asyncio.gather(
+            drain_scratchpad_closes(),
+            stop_doc_publish_worker(getattr(app.state, "doc_publish_worker", None)),
+            return_exceptions=True,
+        )
+        if isinstance(worker_stop, BaseException):
+            logger.warning("doc_publish", exc_info=worker_stop, extra={
+                "event": "doc_publish", "outcome": "stop_failed", "error_type": type(worker_stop).__name__})
+        if isinstance(closes, BaseException):
+            # As before the gather: a failed wait for the closes ends the teardown.
+            raise closes
         await app.state.channel_adapters.shutdown()
         get_coding_service().close_all()
         shutdown_launched_backends()
