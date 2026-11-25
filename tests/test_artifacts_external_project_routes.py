@@ -159,9 +159,6 @@ def _published_record(artifact: Path, report_id: str = "uuid-pub", mode: str = "
     )
 
 
-# -- viewing, opening, revealing, status -------------------------------------
-
-
 def test_preview_reads_an_artifact_in_a_chosen_folder(projects_root, tmp_path):
     client = _client()
     _project, _folder, artifact = _adopted(client, tmp_path, "routes-preview")
@@ -309,8 +306,6 @@ def test_preview_assets_of_a_chosen_folder_serve_where_identity_headers_are_trus
     assert res.status_code == 200, res.text
     assert "hi" in res.text
 
-# -- export, which moved to an id-addressed route -----------------------------
-
 
 def test_export_writes_beside_an_artifact_in_a_chosen_folder(projects_root, tmp_path):
     """Coverage, not a regression test: the id-addressed export resolves
@@ -327,9 +322,6 @@ def test_export_writes_beside_an_artifact_in_a_chosen_folder(projects_root, tmp_
 
     assert res.status_code == 200, res.text
     assert (artifact / res.json()["filename"]).is_file()
-
-
-# -- publish, update, versions, activate, unpublish, delete --------------------
 
 
 def _with_credential(monkeypatch) -> None:
@@ -485,9 +477,6 @@ def test_a_refresh_keeps_revisions_whose_comments_live_in_the_cloud_in_a_chosen_
     assert artifact_revisions._comments_live_in_the_cloud(artifact, LOCAL_SCOPE) is True
 
 
-# -- viewer stats and the datasource check -----------------------------------
-
-
 @pytest.mark.parametrize(
     ("method", "url", "service_call", "body"),
     [
@@ -530,9 +519,6 @@ def test_the_datasource_check_answers_for_an_artifact_in_a_chosen_folder(project
 
     assert res.status_code == 200, res.text
     assert res.json() == {"pending": []}
-
-
-# -- the publishable list, the project_path list, search, comments ------------
 
 
 def test_the_publishable_list_includes_a_chosen_folder(projects_root, tmp_path):
@@ -649,9 +635,6 @@ def test_comments_on_a_restricted_publication_in_a_chosen_folder_go_to_the_cloud
 
     assert res.status_code == 200, res.text
     assert forwarded == [("b9996ebec", "c675003f", "threads")]
-
-
-# -- the agent's own publish tool ---------------------------------------------
 
 
 class _ToolSession:

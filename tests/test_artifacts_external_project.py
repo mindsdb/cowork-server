@@ -139,9 +139,6 @@ def test_an_in_root_project_is_still_found_by_the_scan(engine):
     assert base.resolve() in bases
 
 
-# -- resolving by path -------------------------------------------------------
-
-
 def _adopted_page(engine, folder: Path, name: str) -> tuple[tuple[ProjectRow, ...], Path]:
     """Adopt `folder` as project `name` with one artifact page in it, and
     return the caller's adopted rows and that page."""
