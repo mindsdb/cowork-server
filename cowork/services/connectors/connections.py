@@ -108,7 +108,9 @@ class ConnectionsService:
             user_label = str(fields.get("_user_label", "")).strip() or str(fields.get("_label", "")).strip() or None
             method = fields.get("_method")
             access_mode = None
-            if method == app_held.MCP_METHOD:
+            # A custom MCP connection runs the tools the user picked, so no
+            # access mode describes it.
+            if method == app_held.MCP_METHOD and not is_custom_mcp(engine):
                 access_mode = app_held.effective_access_mode(own_vault_root(self.scope), engine, name, fields)
             result.append(ConnectionSummaryResponse(
                 engine=engine,
