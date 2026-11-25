@@ -18,21 +18,13 @@ from cowork.streaming.answers import AnswerBroker
 
 logger = logging.getLogger(__name__)
 
-__all__ = ["APPROVAL_KIND", "DEFAULT_TIMEOUT_S", "CoworkElicitor"]
+__all__ = ["DEFAULT_TIMEOUT_S", "CoworkElicitor"]
 
 # Long enough for a real decision, short enough that a forgotten card returns
 # the model to work. There is no other bound: dispatch_tool is not wrapped in
 # wait_for and there is no turn idle timeout. Named so the harness's call site
 # does not have to restate it — one number, one place.
 DEFAULT_TIMEOUT_S = 300
-
-# The capability of an elicitor that takes approval cards (anton's
-# ApprovalRequest) and no question the model asks. anton owns it, as
-# anton.core.interaction.elicit.APPROVAL_KIND. It is written out here rather
-# than imported because the pinned anton may predate it, and the import would
-# then fail at startup. An anton without that capability takes no card from an
-# elicitor that lists only it.
-APPROVAL_KIND = "approval"
 
 
 class CoworkElicitor:

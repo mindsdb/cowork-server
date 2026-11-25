@@ -23,11 +23,12 @@ def _questions(monkeypatch, *, enabled: bool) -> None:
     )
 
 
-def _write_approval(monkeypatch, *, on: bool) -> None:
-    """Set ANTON_WRITE_APPROVAL as the harness's settings read it."""
-    from cowork.harnesses.anton_harness import harness
+def _anton_approval_kind(monkeypatch) -> None:
+    """Give the installed anton the approval capability, whether or not it
+    has it. On an anton without it, a scheduled run gets no elicitor."""
+    from anton.core.interaction import elicit
 
-    monkeypatch.setattr(harness.settings, "write_approval", on)
+    monkeypatch.setattr(elicit, "APPROVAL_KIND", "approval", raising=False)
 
 
 def test_flag_defaults_to_on(monkeypatch):
@@ -58,8 +59,8 @@ def test_harness_injects_no_elicitor_when_the_flag_is_off(monkeypatch, interacti
     from cowork.harnesses.anton_harness.harness import build_elicitor
 
     _questions(monkeypatch, enabled=False)
-    _write_approval(monkeypatch, on=True)
-    assert build_elicitor("conv-1", interactive=interactive) is None
+    _anton_approval_kind(monkeypatch)
+    assert build_elicitor("conv-1", interactive=interactive, write_approval=True) is None
 
 
 def test_harness_injects_a_choice_elicitor_when_the_flag_is_on(monkeypatch):
@@ -80,8 +81,8 @@ def test_a_scheduled_run_gets_an_elicitor_that_takes_only_approval_cards(monkeyp
     from cowork.harnesses.anton_harness.harness import build_elicitor
 
     _questions(monkeypatch, enabled=True)
-    _write_approval(monkeypatch, on=True)
-    elicitor = build_elicitor("conv-1", interactive=False)
+    _anton_approval_kind(monkeypatch)
+    elicitor = build_elicitor("conv-1", interactive=False, write_approval=True)
     assert elicitor is not None
     assert elicitor.supported_kinds == ("approval",)
     assert "choice" not in elicitor.supported_kinds
@@ -89,27 +90,52 @@ def test_a_scheduled_run_gets_an_elicitor_that_takes_only_approval_cards(monkeyp
 
 
 def test_a_scheduled_run_without_write_approval_gets_no_elicitor(monkeypatch):
-    """With ANTON_WRITE_APPROVAL off there is no write gate to remember an
+    """With write approval off there is no write gate to remember an
     unanswered card, so an approval card a scheduled run raises, such as a
-    live app's launch or a browser step, would wait out its timeout with
-    nobody watching. The run gets no elicitor, and every card comes back at
-    once."""
+    browser step, would wait out its timeout with nobody watching. The run
+    gets no elicitor, and every card comes back at once. The turn's own
+    write_approval decides: this server's import-time settings reading it as
+    on doesn't give the run an elicitor."""
+    from cowork.harnesses.anton_harness import harness
     from cowork.harnesses.anton_harness.harness import build_elicitor
 
     _questions(monkeypatch, enabled=True)
-    _write_approval(monkeypatch, on=False)
-    assert build_elicitor("conv-1", interactive=False) is None
+    _anton_approval_kind(monkeypatch)
+    monkeypatch.setattr(harness.settings, "write_approval", True)
+    assert build_elicitor("conv-1", interactive=False, write_approval=False) is None
     assert build_elicitor("conv-1").supported_kinds == ("choice",)
 
 
-def test_the_approval_kind_is_antons():
-    """The literal stands in for anton's constant, which the pinned anton may
-    predate. Where the installed anton has the constant, the two match."""
+def test_a_scheduled_run_takes_the_approval_kind_anton_names(monkeypatch):
+    """The scheduled elicitor lists anton's own approval capability, read by
+    name from anton's elicit module: a value anton names differently is the
+    value the elicitor lists."""
     from anton.core.interaction import elicit
 
-    from cowork.harnesses.anton_harness.elicitor import APPROVAL_KIND
+    from cowork.harnesses.anton_harness.harness import build_elicitor
 
-    assert APPROVAL_KIND == getattr(elicit, "APPROVAL_KIND", "approval")
+    _questions(monkeypatch, enabled=True)
+    monkeypatch.setattr(elicit, "APPROVAL_KIND", "approval-sentinel", raising=False)
+    elicitor = build_elicitor("conv-1", interactive=False, write_approval=True)
+    assert elicitor is not None
+    assert elicitor.supported_kinds == ("approval-sentinel",)
+
+
+def test_a_scheduled_run_on_an_anton_without_the_approval_kind_gets_no_elicitor(monkeypatch):
+    """An anton that predates the approval capability reads any elicitor as
+    a channel: its artifact brief takes an approvals-only elicitor as someone
+    who can confirm the brief, so a changed repeat brief would stop at its
+    confirmation instead of being written. A scheduled run there gets no
+    elicitor even with write approval on, and an interactive turn keeps its
+    "choice" elicitor."""
+    from anton.core.interaction import elicit
+
+    from cowork.harnesses.anton_harness.harness import build_elicitor
+
+    _questions(monkeypatch, enabled=True)
+    monkeypatch.delattr(elicit, "APPROVAL_KIND", raising=False)
+    assert build_elicitor("conv-1", interactive=False, write_approval=True) is None
+    assert build_elicitor("conv-1", write_approval=True).supported_kinds == ("choice",)
 
 
 async def test_a_scheduled_run_refuses_a_tools_confirmation_card(monkeypatch):
@@ -122,11 +148,13 @@ async def test_a_scheduled_run_refuses_a_tools_confirmation_card(monkeypatch):
     from cowork.harnesses.anton_harness.harness import build_elicitor
 
     _questions(monkeypatch, enabled=True)
-    _write_approval(monkeypatch, on=True)
+    _anton_approval_kind(monkeypatch)
     published = []
+    scheduled = build_elicitor("conv-1", interactive=False, write_approval=True)
+    assert scheduled is not None
 
     class _Session:
-        elicitor = build_elicitor("conv-1", interactive=False)
+        elicitor = scheduled
         emitter = object()
         question_count = 0
 
@@ -147,12 +175,17 @@ async def test_a_scheduled_run_refuses_a_tools_confirmation_card(monkeypatch):
 
 
 def test_the_harness_builds_its_elicitor_for_the_turn_it_serves():
+    """The elicitor follows the turn's own interactive flag and the
+    write_approval of the AntonSettings the turn's write gate reads."""
     import inspect
 
     from cowork.harnesses.anton_harness.harness import AntonHarness
 
-    source = inspect.getsource(AntonHarness._build_turn_session)
-    assert "build_elicitor(str(conversation.id), interactive=interactive)" in source
+    source = " ".join(inspect.getsource(AntonHarness._build_turn_session).split())
+    assert (
+        "build_elicitor( str(conversation.id), interactive=interactive, "
+        "write_approval=anton_settings.write_approval is True, )"
+    ) in source
 
 
 def _mock_llm():
@@ -210,8 +243,9 @@ def test_a_scheduled_runs_session_has_no_ask_user_tool(monkeypatch):
     from cowork.harnesses.anton_harness.harness import build_elicitor
 
     _questions(monkeypatch, enabled=True)
-    _write_approval(monkeypatch, on=True)
-    elicitor = build_elicitor("conv-1", interactive=False)
+    _anton_approval_kind(monkeypatch)
+    elicitor = build_elicitor("conv-1", interactive=False, write_approval=True)
+    assert elicitor is not None
     session = ChatSession(ChatSessionConfig(llm_client=_mock_llm(), elicitor=elicitor))
     session._build_tools()
     names = {t["name"] for t in session.tool_registry.dump()}
