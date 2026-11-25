@@ -330,10 +330,16 @@ def _over_backstop() -> dict:
         _second_server(tools=["LONE"]))).replace("LONE", "\\ud800").encode())], None,
      "listing_malformed", 1),
     ("listing nested 100,000 deep", [httpx.Response(200, content=_deep(100_000))], None, "listing_failed", 1),
+    ("listing answers a list", [httpx.Response(200, json=[])], None, "listing_failed", 1),
+    ("a 503 from a proxy is retried", [httpx.Response(503, text="<html>"), httpx.Response(503, text="<html>")], None,
+     "listing_failed", 2),
+    ("auth's other 503 is retried", [httpx.Response(503, json={"code": "storage_unavailable"})] * 2, None,
+     "listing_failed", 2),
     ("over the backstop", [httpx.Response(200, json=_over_backstop())], None, "over_backstop", 1),
     ("grant answers 429", None, [httpx.Response(429, json={"code": "quota_exceeded"})], "grant_quota", 1),
     ("grant answers 409", None, [httpx.Response(409, json={"code": "conflict"})], "grant_conflict", 1),
     ("grant answers 404", None, [httpx.Response(404, json={"code": "capability_denied"})], "grant_refused", 1),
+    ("grant answers a list", None, [httpx.Response(200, json=[])], "grant_refused", 1),
 ])
 async def test_a_turn_runs_without_the_block_and_logs_why(auth, case, listing, grant, reason, listing_calls):
     if listing is not None:
@@ -349,6 +355,31 @@ async def test_a_turn_runs_without_the_block_and_logs_why(auth, case, listing, g
     assert _paths(auth).count(_LISTING_PATH) == listing_calls
     if grant is None:
         assert _GRANT_PATH not in _paths(auth)
+
+
+@pytest.mark.parametrize("call", ["listing", "grant"])
+async def test_auths_switch_off_leaves_the_block_out_at_info_without_a_retry(auth, call):
+    auth[call] = [httpx.Response(503, json={"code": "disabled", "detail": "off", "request_id": "r"})]
+
+    params, _ = await _run(auth)
+
+    assert "custom_mcp" not in params
+    assert _paths(auth).count(_LISTING_PATH if call == "listing" else _GRANT_PATH) == 1
+    assert [e["reason"] for e in _events(auth, level="info")] == ["auth_disabled"]
+    assert _events(auth) == []
+
+
+async def test_with_custom_mcp_off_and_custom_api_on_nothing_asks_auth_about_custom_mcp(auth, monkeypatch):
+    monkeypatch.setenv("COWORK_TURN_CUSTOM_MCP_ENABLED", "false")
+    monkeypatch.setenv("COWORK_TURN_CUSTOM_API_ENABLED", "true")
+    get_app_settings.cache_clear()
+
+    params, _ = await _run(auth)
+
+    assert TurnQueueSettings().needs_turn_key_id is True
+    assert "custom_mcp" not in params
+    assert _LISTING_PATH not in _paths(auth) and _GRANT_PATH not in _paths(auth)
+    assert _events(auth) == [] and _events(auth, level="info") == []
 
 
 async def test_a_listing_that_fails_fast_once_is_tried_again_and_the_block_is_sent(auth):

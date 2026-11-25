@@ -342,18 +342,33 @@ async def register_custom_api_grants(
 _FAST_FAILURE_STATUSES = frozenset({502, 503, 504})
 
 
+def auth_switched_off(response: httpx.Response) -> bool:
+    """Whether ``response`` is auth's 503 ``disabled``: its custom MCP switch is off, a settled answer.
+
+    Any other 503, a proxy's included, is not: its body is not auth's error object.
+    """
+    if response.status_code != 503:
+        return False
+    try:
+        body = response.json()
+    except (ValueError, RecursionError):
+        return False
+    return isinstance(body, dict) and body.get("code") == "disabled"
+
+
 async def _send_retrying_once(client: httpx.AsyncClient, method: str, url: str, **kwargs) -> httpx.Response:
     """Send one request, and once more only when the first failed fast.
 
     A fast failure is no connection at all, or a 502, 503 or 504 answer. A
     timeout already spent the budget and a refusal would answer the same, so
-    neither is retried. Returns the last response; raises what httpx raises.
+    neither is retried; nor is auth's switched-off answer, which would too.
+    Returns the last response; raises what httpx raises.
     """
     try:
         resp = await client.request(method, url, **kwargs)
     except httpx.ConnectError:
         return await client.request(method, url, **kwargs)
-    if resp.status_code in _FAST_FAILURE_STATUSES:
+    if resp.status_code in _FAST_FAILURE_STATUSES and not auth_switched_off(resp):
         return await client.request(method, url, **kwargs)
     return resp
 

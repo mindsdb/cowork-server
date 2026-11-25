@@ -50,6 +50,7 @@ from cowork.turnqueue.auth_keys import (
     CUSTOM_GRANTS_ROUTE,
     DATASOURCE_CONNECTIONS_ROUTE,
     DATASOURCE_GRANTS_ROUTE,
+    auth_switched_off,
     list_active_connections,
     list_custom_api_connections,
     list_custom_mcp_connections,
@@ -913,6 +914,12 @@ def _custom_mcp_block_bytes(connections: list[dict]) -> int:
     return sum(len(text.encode("utf-8")) for connection in connections for text in connection["tools"])
 
 
+def _auth_custom_mcp_off(exc: product_permissions.ProductPermissionUnavailable) -> bool:
+    """Whether a failed custom MCP call failed on auth's switched-off answer, an expected leave-out."""
+    cause = exc.__cause__
+    return isinstance(cause, httpx.HTTPStatusError) and auth_switched_off(cause.response)
+
+
 def _custom_mcp_grant_reason(exc: product_permissions.ProductPermissionUnavailable) -> str:
     """The leave-out reason of a failed grant call, read from the status of auth's answer."""
     cause = exc.__cause__
@@ -937,9 +944,10 @@ async def _mint_custom_mcp_block(*, scope: TenantScope, conversation_id: str, co
 
     None when the turn cannot carry them: the setting off or outside a member's
     org turn (no event), or, with one ``turn_custom_mcp_left_out`` line naming
-    the reason, no turn key prefix, no producer key, a listing that failed or
-    breaks the contract, a block over the backstop, or a grant call auth
-    refused. A member with no server, or every server disabled, gets None and
+    the reason, no turn key prefix, no producer key, auth's custom MCP switch
+    off, a listing that failed or breaks the contract, a block over the
+    backstop, or a grant call auth refused. Only the switch being off and the
+    missing prefix log at info: every turn has them. A member with no server, or every server disabled, gets None and
     no event. The turn then runs without custom MCP tools.
 
     Returns:
@@ -962,8 +970,11 @@ async def _mint_custom_mcp_block(*, scope: TenantScope, conversation_id: str, co
         answer = await list_custom_mcp_connections(
             org_id=org_id, user_id=user_id, turn_key_id=turn_key_id, settings=settings
         )
-    except product_permissions.ProductPermissionUnavailable:
-        _leave_out_custom_mcp(conversation_id, "listing_failed", exc_info=True)
+    except product_permissions.ProductPermissionUnavailable as exc:
+        if _auth_custom_mcp_off(exc):
+            _leave_out_custom_mcp(conversation_id, "auth_disabled", expected=True)
+        else:
+            _leave_out_custom_mcp(conversation_id, "listing_failed", exc_info=True)
         return None
     connections = _custom_mcp_connections(answer, disabled)
     if connections is None:
@@ -988,7 +999,10 @@ async def _mint_custom_mcp_block(*, scope: TenantScope, conversation_id: str, co
             connection_ids=requested, settings=settings,
         )
     except product_permissions.ProductPermissionUnavailable as exc:
-        _leave_out_custom_mcp(conversation_id, _custom_mcp_grant_reason(exc), exc_info=True)
+        if _auth_custom_mcp_off(exc):
+            _leave_out_custom_mcp(conversation_id, "auth_disabled", expected=True)
+        else:
+            _leave_out_custom_mcp(conversation_id, _custom_mcp_grant_reason(exc), exc_info=True)
         return None
     if (
         not _same_identifier(response.get("user_id"), user_id)
