@@ -34,6 +34,7 @@ from urllib.parse import quote
 
 from cowork.code_sandbox import backends_off_message, build_cell_sandbox, code_sandbox_on
 from cowork.common.minds_tls import minds_ssl_verify
+from cowork.docs.store import DOC_HTML, is_doc_primary
 from cowork.common.paths import (
     O_NOFOLLOW,
     PinnedDir,
@@ -45,6 +46,7 @@ from cowork.common.paths import (
     dir_unlink,
 )
 from cowork.common.settings.app_settings import get_app_settings
+from cowork.services.connectors.sealed_vault import SealedRecordError
 from cowork.db.personal_resources import PersonalResource
 from cowork.models.artifact_owner_choice import AccessMode
 from cowork.schemas.artifact_access import ArtifactAccessView, ArtifactStatusView
@@ -583,9 +585,11 @@ def _modified_state(
     # `folder.parent` IS the artifacts root: artifacts always live at
     # `<base>/<slug>/`. Passing it explicitly is what makes the badge work in org
     # mode, where the module-level FS scan finds no roots at all.
+    # A doc publishes its rendered page, so that page is what changed or not.
+    target = primary if primary.name == DOC_HTML else folder
     try:
         current_md5 = compute_publish_md5(
-            folder, artifacts_base=artifacts_base or folder.parent
+            target, artifacts_base=artifacts_base or folder.parent
         )
     except MarkdownRenderBusy:
         return False, False  # another conversion runs: can't tell yet
@@ -1611,6 +1615,11 @@ def _prepare_artifact_card(
     primary_ext = logical_primary.suffix.lower() if logical_primary is not None else ""
     artifact_type = meta.type or "mixed"
     kind = KIND_BY_TYPE.get(artifact_type) or KIND_BY_EXT.get(primary_ext, "File")
+    # A doc (cowork.docs) is a document artifact whose primary is the doc file;
+    # the renderer opens it in the doc editor rather than as a JSON file.
+    is_doc = is_doc_primary(logical_primary.name if logical_primary is not None else meta.primary)
+    if is_doc:
+        kind = "Doc"
     is_live = False
     if primary is not None:
         # `primary_hint` can point at a file `_user_files` skipped (e.g. a
@@ -1626,7 +1635,12 @@ def _prepare_artifact_card(
 
     from cowork.services.artifact_identity import artifact_key
 
-    access = published_access_view(io_folder, primary, published_map=published_map)
+    # A doc is shared as its rendered page (doc.html, rewritten on every
+    # write), so its publish state, access and "modified" badge are the page's,
+    # not the JSON's.
+    doc_html = io_folder / DOC_HTML if is_doc else None
+    shared_page = doc_html if doc_html is not None else primary
+    access = published_access_view(io_folder, shared_page, published_map=published_map)
     # Left out here, at the one card builder, so inline chat cards are covered
     # too. In org mode the owner reads the password and the emails from GET
     # .../access, which can tell owner from co-member. `accessMode` stays:
@@ -1673,7 +1687,7 @@ def _prepare_artifact_card(
         # still reachable is the client's call: it already knows its own
         # conversations and can fetch the rest.
         origin_conversation_id=origin_conversation_id(meta),
-        published_url=_published_url_for(io_folder, primary, published_map=published_map),
+        published_url=_published_url_for(io_folder, shared_page, published_map=published_map),
         # Set explicitly so `to_json()` (exclude_unset) keeps the key for a caller
         # that doesn't assign it.
         modified=False,
@@ -1685,6 +1699,11 @@ def _prepare_artifact_card(
             project_name=project_name,
         ),
     )
+    if doc_html is not None:
+        card.format = "doc"
+        card.html_path = str(logical_folder / DOC_HTML)
+        if doc_html.is_file():
+            primary = doc_html
     if primary is not None:
         # macOS commonly exposes the same temporary directory through both
         # ``/var`` and ``/private/var``. Canonicalize both sides before deriving
@@ -2618,6 +2637,14 @@ async def _launch_backend_locked(
                     )
                     continue
                 extra_env.update(env)
+    except SealedRecordError as error:
+        # A sealed connection that won't open keeps the backend down, naming
+        # it, rather than starting it without that connection.
+        logger.error(
+            "A saved connection can't be opened, so the app backend doesn't start",
+            extra={"event": "sealed_connection_unopenable", "connection": error.connection, "reason": error.cause},
+        )
+        return BackendStatus(running=False, detail=str(error), port=0)
     except Exception:
         logger.warning(
             "Could not build datasource env for backend launch of %s", slug, exc_info=True

@@ -73,6 +73,13 @@ EVENT_FIELDS = frozenset(
         "slot",
         "model_alias",
         "managed_connection_file",
+        # A saved connection that won't open with the key file, named as
+        # engine/name or its record's file name
+        # (cowork.services.connectors.sealed_vault.SealedRecordError).
+        "connection",
+        # A vault folder the no-key start check can't search
+        # (cowork.services.sealing.refuse_sealed_state_without_key_file).
+        "vault_folder",
         "retryable",
         "statement_fingerprint",
         # cowork.common.loop_watchdog and the lifespan's step timings.
