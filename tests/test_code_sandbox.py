@@ -1710,7 +1710,7 @@ async def test_a_sandboxed_backend_preview_mints_no_token(landlock_alone, monkey
     from cowork.services import artifacts
 
     folder = _backend_artifact(tmp_path, port=26866)
-    monkeypatch.setattr(artifacts, "_artifact_root_for", lambda path, *, scope: folder)
+    monkeypatch.setattr(artifacts, "_artifact_root_for", lambda path, *, scope, adopted=(): folder)
     monkeypatch.setattr(artifacts, "_PREVIEW_MOUNTS", {})
     monkeypatch.setattr(artifacts, "_ensure_backend_running", _never)
 
@@ -1731,7 +1731,7 @@ async def test_a_sandboxed_preview_proxy_forwards_nothing(landlock_alone, monkey
     from cowork.services import preview_proxy
 
     folder = _backend_artifact(tmp_path, port=26866)
-    monkeypatch.setattr(preview_proxy, "preview_mount_for", lambda token, *, scope: folder)
+    monkeypatch.setattr(preview_proxy, "preview_mount_for", lambda token, *, scope, adopted=(): folder)
     monkeypatch.setattr(preview_proxy, "get_proxy_client", _never)
 
     async def receive():

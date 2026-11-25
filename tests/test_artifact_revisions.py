@@ -1646,7 +1646,7 @@ def test_a_comment_on_the_head_makes_the_next_refresh_append(artifact):
 def _published(monkeypatch, entry):
     from cowork.services import publish
 
-    monkeypatch.setattr(publish, "published_owner_state", lambda _path, *, scope: entry)
+    monkeypatch.setattr(publish, "published_owner_state_of_folder", lambda _folder: entry)
 
 
 RESTRICTED = {
@@ -1690,11 +1690,11 @@ def test_a_publication_with_local_comments_still_lets_a_refresh_replace(
 def test_a_failed_publication_check_keeps_the_head(artifact, monkeypatch):
     from cowork.services import publish
 
-    def boom(_path, *, scope):
+    def boom(_folder):
         raise RuntimeError("publication record unreadable")
 
     folder, _metadata, _artifact_id = artifact
-    monkeypatch.setattr(publish, "published_owner_state", boom)
+    monkeypatch.setattr(publish, "published_owner_state_of_folder", boom)
     first = _refresh(folder, "# Data 1\n")
     second = _refresh(folder, "# Data 2\n")
 

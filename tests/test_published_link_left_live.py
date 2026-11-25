@@ -131,9 +131,9 @@ def test_the_status_route_carries_the_owner_record_only_for_a_live_link(monkeypa
     request.addfinalizer(get_app_settings.cache_clear)
     monkeypatch.setattr(
         artifact_routes, "_desktop_artifact_status_for_path",
-        lambda path, *, scope: ArtifactStatusView(published_url=case["published_url"]),
+        lambda path, *, scope, adopted=(): ArtifactStatusView(published_url=case["published_url"]),
     )
-    monkeypatch.setattr(publish, "published_link_owner_recorded", lambda path, *, scope: case["recorded"])
+    monkeypatch.setattr(publish, "published_link_owner_recorded", lambda path, *, scope, adopted=(): case["recorded"])
     res = TestClient(cowork_server.create_app()).get("/api/v1/artifacts/status", params={"path": "/p/artifact/index.html"})
     assert res.status_code == 200, res.text
     assert res.json()["linkOwnerRecorded"] is case["link_owner_recorded"]
