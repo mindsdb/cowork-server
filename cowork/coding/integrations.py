@@ -8,6 +8,7 @@ from typing import Any, Callable
 from urllib.parse import parse_qs, urlparse
 
 import httpx
+from anton.core.mcp.servers import mcp_server_url
 
 from cowork.coding.contracts import SourceAttachment, SourceComment
 from cowork.coding.github_pull_requests import GitHubPullRequests
@@ -38,6 +39,10 @@ from cowork.services.connectors.developer_validation import (
     PinnedHostTransport,
     require_public_host,
 )
+
+
+def code_provider_mcp_url(provider: str) -> str | None:
+    return mcp_server_url(provider) if provider in {"github", "linear"} else None
 
 
 @dataclass(frozen=True)
@@ -114,6 +119,17 @@ class DeveloperIntegrationService:
         if request.provider == "linear":
             return self._read_linear(request, connection, fields)
         return self._read_slack(request, connection, fields)
+
+    def hosted_mcp_token(self, project: CodeProject, connection: ProjectConnection) -> str | None:
+        """The credential for the provider's own hosted MCP server, or None when it cannot reach one."""
+        _, fields = self._connection(project, connection.provider, connection.name)
+        if connection.provider == "linear":
+            return self._secret(fields, "access_token", "api_key", "token")
+        if connection.provider == "github":
+            _, token, host = self._github_credentials(fields)
+            # GitHub hosts its server for github.com only, not Enterprise Server.
+            return token if host == "github.com" else None
+        return None
 
     def search(self, project: CodeProject | None, request: WorkItemSearchRequest) -> WorkItemPage:
         # Discovery is account-scoped: opening the picker must not silently
