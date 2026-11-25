@@ -28,7 +28,6 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 
-
 def cloud_key_from_url(url: str) -> str:
     """``{user_dir}/{report_id}`` from a static viewer URL, else "".
 

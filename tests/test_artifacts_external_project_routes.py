@@ -29,7 +29,7 @@ from cowork.api.v1.endpoints import artifacts as artifacts_ep
 from cowork.api.v1.endpoints import comments as comments_ep
 from cowork.api.v1.endpoints import publish as publish_ep
 from cowork.common.settings.app_settings import get_app_settings
-from cowork.db.scoped import LOCAL_SCOPE, ScopedSession
+from cowork.db.scoped import LOCAL_SCOPE
 from cowork.db.session import get_open_session
 from cowork.harnesses.anton_harness import tools as agent_tools
 from cowork.models.project import Project
@@ -40,7 +40,6 @@ from cowork.services import published_page_ownership
 from cowork.services import publish as publish_service
 from cowork.services import scratchpad_runtime
 import cowork.services.artifact_roots as artifact_roots
-from cowork.services.artifact_roots import desktop_adopted_rows
 
 ARTIFACT_ID = "cccccccc-cccc-4ccc-8ccc-cccccccccc01"
 
@@ -127,6 +126,20 @@ def _adopted(
     artifact = _artifact_in(folder, slug, artifact_id=artifact_id, extra=extra)
     project = _adopt(client, folder, name)
     return project, folder, artifact
+
+
+def _trust_identity_headers(monkeypatch) -> dict[str, str]:
+    """Turn on trusted identity headers after a desktop has adopted a folder,
+    and return the bearer header a request then needs. Requests carry no
+    identity pair, which `audit` reads as LOCAL_SCOPE. Needs the
+    `landlock_kernel` fixture: identity headers require the code sandbox."""
+    monkeypatch.setenv("COWORK_TRUST_IDENTITY_HEADERS", "true")
+    monkeypatch.setenv("COWORK_REQUIRE_AUTH", "true")
+    monkeypatch.setenv("COWORK_AUTH_TOKEN", "routes-trusted-token")
+    monkeypatch.setenv("COWORK_CODE_SANDBOX", "landlock")
+    monkeypatch.setenv("COWORK_IDENTITY_ENFORCE", "audit")
+    get_app_settings.cache_clear()
+    return {"Authorization": "Bearer routes-trusted-token"}
 
 
 def _published_record(artifact: Path, report_id: str = "uuid-pub", mode: str = "public") -> None:
@@ -218,6 +231,27 @@ def test_status_keeps_the_published_pill_for_a_chosen_folder(projects_root, tmp_
     assert res.json()["modified"] is True
 
 
+def test_status_reads_the_owner_record_of_a_live_link_in_a_chosen_folder(
+    projects_root, tmp_path, monkeypatch, landlock_kernel
+):
+    """On a publisher Cowork protects, status says whether an owner record
+    ties the live page to this artifact; with none, Stop sharing would leave
+    it live. Unresolved, the folder read as unpublished and the answer was a
+    silent True."""
+    monkeypatch.setattr(publish_service, "_resolve_publish_endpoint", lambda settings: ("https://publish.test", "key"))
+    client = _client()
+    _project, _folder, artifact = _adopted(client, tmp_path, "routes-status-owner")
+    _published_record(artifact, "uuid-owner")
+    headers = _trust_identity_headers(monkeypatch)
+
+    res = _client().get(
+        "/api/v1/artifacts/status", params={"path": str(artifact / "index.html")}, headers=headers
+    )
+
+    assert res.status_code == 200, res.text
+    assert res.json()["linkOwnerRecorded"] is False
+
+
 def test_a_fullstack_backend_launches_from_a_chosen_folder(projects_root, tmp_path, monkeypatch):
     """Auto-launch answers 200 with a launchError rather than an error status,
     so the failure showed as a preview that never came up. The spawn is
@@ -257,28 +291,23 @@ def test_a_fullstack_backend_launches_from_a_chosen_folder(projects_root, tmp_pa
 
 
 def test_preview_assets_of_a_chosen_folder_serve_where_identity_headers_are_trusted(
-    projects_root, tmp_path, monkeypatch
+    projects_root, tmp_path, monkeypatch, landlock_kernel
 ):
     """Where identity headers are trusted, each preview asset is checked
     against the caller's artifacts roots. A folder adopted before that was
-    turned on keeps its row, so its mount still has to count as the caller's.
-    Checked at the service: a trusted-headers request carries a person's
-    scope, where no folder can be adopted to set this up over the route."""
+    turned on keeps its row, so its mount still has to count as the caller's."""
     client = _client()
     _project, _folder, artifact = _adopted(client, tmp_path, "routes-assets")
-    res = client.post("/api/v1/artifacts/preview-mount", json={"path": str(artifact / "index.html")})
+    mounted = client.post("/api/v1/artifacts/preview-mount", json={"path": str(artifact / "index.html")})
+    assert mounted.status_code == 200, mounted.text
+    token = mounted.json()["token"]
+
+    headers = _trust_identity_headers(monkeypatch)
+
+    res = _client().get(f"/api/v1/artifacts/preview-asset/{token}/index.html", headers=headers)
+
     assert res.status_code == 200, res.text
-    token = res.json()["token"]
-    with get_open_session(get_app_settings().database.uri) as s:
-        rows = desktop_adopted_rows(ScopedSession(s, LOCAL_SCOPE))
-
-    monkeypatch.setenv("COWORK_TRUST_IDENTITY_HEADERS", "true")
-    get_app_settings.cache_clear()
-    assert get_app_settings().trust_identity_headers
-
-    assert artifacts_service.preview_mount_for(token, scope=LOCAL_SCOPE) is None
-    assert artifacts_service.preview_mount_for(token, scope=LOCAL_SCOPE, adopted=rows) == artifact.resolve()
-
+    assert "hi" in res.text
 
 # -- export, which moved to an id-addressed route -----------------------------
 
@@ -570,14 +599,19 @@ def test_comments_resolve_an_artifact_in_a_chosen_folder(projects_root, tmp_path
     refused a chosen folder with a 404 that read as a missing artifact."""
     client = _client()
     comment_artifact_id = "cccccccc-cccc-4ccc-8ccc-cccccccccc02"
-    _project, _folder, _artifact = _adopted(
+    _project, _folder, artifact = _adopted(
         client, tmp_path, "routes-comments", slug="notes", artifact_id=comment_artifact_id
     )
 
     # "artifact" is the canonical desktop namespace; anything else proxies out.
-    res = client.get(f"/api/v1/artifact-comments/artifact/{comment_artifact_id}/threads")
+    url = f"/api/v1/artifact-comments/artifact/{comment_artifact_id}/threads"
+    created = client.post(url, json={"text": "Check the totals"})
+    listed = client.get(url)
 
-    assert res.status_code == 200, res.text
+    assert created.status_code == 200, created.text
+    assert listed.status_code == 200, listed.text
+    journal = json.loads((artifact / ".revisions" / "comments.json").read_text())
+    assert [thread["payload"]["text"] for thread in journal] == ["Check the totals"]
 
 
 def test_comments_on_a_restricted_publication_in_a_chosen_folder_go_to_the_cloud(
@@ -652,6 +686,54 @@ def test_the_agent_publish_tool_publishes_from_a_chosen_folder(projects_root, tm
 
     assert "https://4nton.ai/a/uuid-tool" in getattr(out, "content", str(out))
     assert seen == {"artifact": primary.resolve(), "base": (folder / ".anton" / "artifacts").resolve()}
+
+
+def test_the_agent_publish_tool_reads_the_publication_of_a_chosen_folder(
+    projects_root, tmp_path, monkeypatch
+):
+    """Asked, it reports the live link; re-publishing with no access fields
+    keeps the password the page has. Unresolved, it reported the page as
+    never published and re-published it without its password."""
+    seen = {}
+
+    def _fake_publish(artifact, *, artifacts_base, api_key, publish_url, access=None, **kwargs):
+        seen["access"] = access
+        return {"url": "https://4nton.ai/a/uuid-pw", "result": {"report_id": "uuid-pw"}}
+
+    monkeypatch.setattr(publish_service, "publish_artifact", _fake_publish)
+    monkeypatch.setattr(publish_service, "desktop_publish_credential", lambda: ("key", "https://4nton.ai"))
+    client = _client()
+    _project, folder, artifact = _adopted(client, tmp_path, "routes-agent-password")
+    (artifact / ".published.json").write_text(
+        json.dumps(
+            {
+                "index.html": {
+                    "report_id": "uuid-pw",
+                    "url": "https://4nton.ai/a/uuid-pw",
+                    "published": True,
+                    "mode": "password",
+                    "access_password": "synthetic-pw",
+                    "last_md5": "x",
+                    "published_mtime": 1,
+                }
+            }
+        )
+    )
+    primary = str(artifact / "index.html")
+
+    asked = asyncio.run(
+        agent_tools._cowork_publish_or_preview(
+            _ToolSession(folder), {"file_path": primary, "action": "ask", "title": "Dash"}
+        )
+    )
+    asyncio.run(
+        agent_tools._cowork_publish_or_preview(
+            _ToolSession(folder), {"file_path": primary, "action": "publish", "title": "Dash"}
+        )
+    )
+
+    assert "already published at https://4nton.ai/a/uuid-pw" in getattr(asked, "content", str(asked))
+    assert seen["access"].mode == "password"
 
 
 def test_an_unbound_turn_reads_no_operator_rows_where_identity_headers_are_trusted(

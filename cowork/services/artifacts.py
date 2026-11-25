@@ -340,6 +340,7 @@ def _artifact_dirs_for(*, scope: TenantScope | None, adopted: Collection[Project
 def _adopted_source_holding(path: Path, adopted: Collection[ProjectRow]) -> ProjectArtifacts | None:
     """The source in `adopted` whose artifacts root holds `path`, for a serve
     URL: its segment is the row's name, which the scan cannot rediscover."""
+    # Imported here because `artifact_roots` imports this module at module level.
     from cowork.services.artifact_roots import adopted_artifacts_sources
 
     resolved = path.resolve()
@@ -2561,6 +2562,7 @@ def _resolve_project_root(
     which case auto-launch is a non-starter anyway. `adopted` adds the
     caller's projects in a folder the user chose.
     """
+    # Imported here because `artifact_roots` imports this module at module level.
     from cowork.services.artifact_roots import adopted_artifacts_sources
 
     try:
