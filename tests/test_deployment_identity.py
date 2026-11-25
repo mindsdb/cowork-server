@@ -19,6 +19,7 @@ from cowork.db.personal_resources import ALL_PERSONAL_RESOURCES, PersonalResourc
 from cowork.db.scoped import LOCAL_SCOPE, TenantScope
 from cowork.deployment_identity import identity_for_turn
 from tests._turns import built_turn
+from _self_hosted import enable_self_hosted
 
 PRODUCT = "Example Workbench"
 SUB = "9a8b7c6d-5e4f-4a3b-8c2d-1e0f9a8b7c6d"
@@ -37,7 +38,7 @@ def isolated_identity(monkeypatch, tmp_path):
 
 
 def _enable(monkeypatch, path: Path | None) -> None:
-    monkeypatch.setenv("COWORK_DEPLOYMENT_KIND", "self-hosted")
+    enable_self_hosted(monkeypatch)
     if path is not None:
         monkeypatch.setenv("COWORK_DEPLOYMENT_BRAND_FILE", str(path))
     get_app_settings.cache_clear()

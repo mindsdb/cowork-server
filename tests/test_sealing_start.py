@@ -9,8 +9,11 @@ deployment that never turned sealing on starts as it always has.
 """
 from __future__ import annotations
 
+import json
 import logging
 import os
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -312,6 +315,43 @@ def test_no_key_file_and_the_marker_refuses_the_start(legacy_key, base_vault, st
         sealing.refuse_sealed_state_without_key_file()
 
 
+_ROOT = Path(__file__).resolve().parents[1]
+# What an operator's script runs in the server's container: it imports only what it names, so
+# no model a relationship names by string, such as a project's Schedule, is loaded.
+_LEGACY_KEY_IN_A_FRESH_INTERPRETER = "from cowork.common.encryption import get_fernet\nget_fernet()\n"
+
+
+def _in_a_fresh_interpreter(code: str) -> subprocess.CompletedProcess[str]:
+    return subprocess.run([sys.executable, "-c", code], cwd=_ROOT, env=dict(os.environ),
+                          capture_output=True, text=True, timeout=60)
+
+
+def test_no_key_file_and_a_fresh_interpreter_reaches_the_legacy_key_and_can_query_after_it(legacy_key, base_vault):
+    """The check loads no model of its own, so the script's own query configures only what it loaded."""
+    ran = _in_a_fresh_interpreter(
+        _LEGACY_KEY_IN_A_FRESH_INTERPRETER
+        + "from sqlmodel import Session, select\n"
+        "from cowork.common.settings.app_settings import get_app_settings\n"
+        "from cowork.db.session import get_engine\n"
+        "from cowork.models.setting import Setting\n"
+        "with Session(get_engine(get_app_settings().database.uri)) as session:\n"
+        "    session.exec(select(Setting)).all()\n"
+    )
+
+    assert ran.returncode == 0, ran.stderr
+    assert legacy_key.is_file()
+
+
+def test_no_key_file_and_the_marker_refuse_a_fresh_interpreter_with_the_reason(legacy_key, base_vault, stored_rows):
+    stored_rows(sealing.SEALING_MARKER_KEY, "1")
+
+    ran = _in_a_fresh_interpreter(_LEGACY_KEY_IN_A_FRESH_INTERPRETER)
+
+    assert ran.returncode != 0
+    assert "KeyFileError: Sealing was turned on" in ran.stderr, ran.stderr
+    assert not legacy_key.exists()
+
+
 def test_no_key_file_and_a_sealed_record_refuses_the_start(legacy_key, base_vault):
     SealedDataVault(base_vault, keys=MultiFernet([Fernet(Fernet.generate_key())])).save("postgres", "sales", {"password": CANARY})
 
@@ -337,6 +377,67 @@ def test_no_key_file_and_a_plain_record_with_a_field_named_like_the_mark_start_a
     encrypt(CANARY)
 
     assert legacy_key.exists()
+
+
+@pytest.mark.parametrize(
+    "changed",
+    [{"host": "db.example"}, {"host": 5432}, {"_sealed": "1"}, {"_sealed": True}],
+    ids=["mark-beside-text", "mark-beside-number", "string-mark-beside-tokens", "bool-mark-beside-tokens"],
+)
+def test_no_key_file_and_a_record_with_tokens_that_isnt_wholly_sealed_start_as_today(legacy_key, base_vault, changed):
+    """Only the integer mark beside values that are all tokens reads as sealed. A sealed record
+    with its host put back as plain text or a number, or with its mark made a string or a bool,
+    still holds a token, and it starts as a plain record does: the start goes ahead and the first
+    legacy key is made."""
+    keys = MultiFernet([Fernet(Fernet.generate_key())])
+    SealedDataVault(base_vault, keys=keys).save("postgres", "mixed", {"host": "db.example", "password": CANARY})
+    record_file = base_vault / "postgres-mixed"
+    record = json.loads(record_file.read_text())
+    record["fields"].update(changed)
+    record_file.write_text(json.dumps(record))
+
+    sealing.refuse_sealed_state_without_key_file()
+    encrypt(CANARY)
+
+    assert legacy_key.exists()
+
+
+@pytest.mark.parametrize(
+    "rewrite",
+    [lambda token: token + "\n", lambda token: token[:-10]],
+    ids=["trailing-newline", "truncated"],
+)
+def test_no_key_file_and_a_token_a_hand_edit_changed_start_as_today(legacy_key, base_vault, rewrite):
+    """With no key file the check has no key to open a value with, so it reads a token's shape
+    alone, and a token a hand edit left a newline after, or cut short, isn't one: the start goes
+    ahead and the first legacy key is made. The re-seal reads such a value as sealed, by the text a
+    token starts with, only given its keys, so a plain value that starts that way never stops a
+    start."""
+    keys = MultiFernet([Fernet(Fernet.generate_key())])
+    SealedDataVault(base_vault, keys=keys).save("postgres", "padded", {"password": CANARY})
+    record_file = base_vault / "postgres-padded"
+    record = json.loads(record_file.read_text())
+    record["fields"]["password"] = rewrite(record["fields"]["password"])
+    record_file.write_text(json.dumps(record))
+
+    sealing.refuse_sealed_state_without_key_file()
+    encrypt(CANARY)
+
+    assert legacy_key.exists()
+
+
+def test_no_key_file_and_a_sealed_record_with_no_values_refuses_the_start(legacy_key, base_vault):
+    """SealedDataVault writes only the mark beside the bookkeeping fields for a connection with no
+    values, such as an empty custom MCP connection. A deployment sealed from its first start has no
+    marker row, so the vault scan is its only guard, and such a record counts as sealed."""
+    SealedDataVault(base_vault, keys=MultiFernet([Fernet(Fernet.generate_key())])).save(
+        "custom_mcp", "empty", {"_label": "Empty"}
+    )
+
+    with pytest.raises(KeyFileError, match="custom_mcp-empty"):
+        sealing.refuse_sealed_state_without_key_file()
+
+    assert not legacy_key.exists()
 
 
 @pytest.mark.skipif(os.geteuid() == 0, reason="root searches any folder")

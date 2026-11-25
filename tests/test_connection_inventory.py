@@ -8,11 +8,11 @@ from pathlib import Path
 import pytest
 from anton.core.datasources.data_vault import LocalDataVault
 
+from cowork.common.record_files import MAX_RECORD_BYTES
 from cowork.common.settings.app_settings import get_app_settings
 from cowork.db.scoped import LOCAL_SCOPE
 from cowork.ops import Person
 from cowork.ops import connections as connections_ops
-from cowork.ops.connection_inventory import MAX_RECORD_BYTES
 from cowork.services.connectors.persist import data_vault_at, own_vault_for_scope, vault_for_scope
 from tests.test_ops_commands import ALICE, BOB, SUB_A, SUB_B, _arguments, _run, _tree, personal_scope, stack  # noqa: F401
 
@@ -99,13 +99,13 @@ def test_inventory_marks_managed_prefix_override_and_same_vault_collision(stack,
 
 
 def test_inventory_reads_pinned_vault_after_directory_replacement(stack, tmp_path, monkeypatch, capsys):
-    from cowork.ops import connection_inventory as inventory
+    from cowork.common import record_files
 
     _save(ALICE)
     vault = tmp_path / "shared" / ALICE.partition_id / "data-vault"
     replacement = tmp_path / "replacement"
     LocalDataVault(replacement).save("postgres", "foreign", {"password": SECRET})
-    real_open = inventory.dir_open
+    real_open = record_files.dir_open
     replaced = False
 
     def replace_before_open(d, name, flags):
@@ -116,7 +116,7 @@ def test_inventory_reads_pinned_vault_after_directory_replacement(stack, tmp_pat
             replaced = True
         return real_open(d, name, flags)
 
-    monkeypatch.setattr(inventory, "dir_open", replace_before_open)
+    monkeypatch.setattr(record_files, "dir_open", replace_before_open)
     rows = _list(capsys)["connections"]
     assert replaced
     assert [(row["name"], row["user_id"]) for row in rows] == [("warehouse", SUB_A)]

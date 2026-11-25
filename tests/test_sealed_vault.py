@@ -7,7 +7,8 @@ and each other value opens with the type and text it was saved with. A record
 that exists but won't open names the connection, and never lets a same-named
 connection from another layer answer in its place, in a turn, an app backend
 or a request, which answers 409. A save whose sealed record would be too
-large to read back is refused before anything is written, and answers 422.
+large to read back, or that holds a field named like the sealed mark, is
+refused before anything is written, and answers 422.
 """
 from __future__ import annotations
 
@@ -16,6 +17,7 @@ import base64
 import json
 import logging
 import os
+import re
 from collections.abc import Iterator
 from pathlib import Path
 
@@ -26,6 +28,7 @@ from fastapi.testclient import TestClient
 
 import cowork.server as cowork_server
 from cowork.common.encryption import sealing_keys
+from cowork.common.record_files import MAX_RECORD_BYTES
 from cowork.common.settings.app_settings import get_app_settings
 from cowork.db.scoped import LOCAL_SCOPE
 from cowork.handlers.turn_errors import GENERIC_TURN_ERROR_CODE, friendly_turn_error
@@ -34,11 +37,14 @@ from cowork.services.connectors.layered_vault import LayeredDataVault
 from cowork.services.connectors.persist import data_vault_at, own_vault_for_scope, own_vault_root
 from cowork.services.connectors.sealed_vault import (
     SEALED_FIELD,
+    RecordSealing,
     RecordTooLargeError,
+    ReservedFieldError,
     SealedDataVault,
     SealedRecordError,
     is_fernet_token,
     record_file_bytes,
+    record_sealing,
     refuse_unopenable_connections,
 )
 from tests._logging_assertions import assert_log_fields
@@ -182,6 +188,22 @@ def test_only_the_integer_mark_reads_as_sealed(tmp_path, mark):
         vault.load("postgres", "sales")
 
 
+def test_a_plain_value_beside_the_mark_is_named_as_not_sealed(tmp_path):
+    """A value with nothing of a token about it was never sealed, so the message names it that way
+    and doesn't send the operator to check the key."""
+    vault = SealedDataVault(tmp_path, keys=_keys(Fernet.generate_key()))
+    vault.save("postgres", "sales", {"host": "db.example", "password": CANARY})
+    path = _record_file(vault, "postgres", "sales")
+    stored = json.loads(path.read_text())
+    stored["fields"]["host"] = "db.example"
+    path.write_text(json.dumps(stored))
+
+    with pytest.raises(SealedRecordError) as raised:
+        vault.load("postgres", "sales")
+
+    assert str(raised.value) == "The saved connection postgres/sales can't be opened: its host field isn't sealed."
+
+
 def test_a_fernet_token_is_told_from_other_text_by_its_shape():
     token = Fernet(Fernet.generate_key()).encrypt(b'"value"').decode()
 
@@ -294,6 +316,50 @@ def test_a_turn_error_names_the_connection():
     )
 
 
+# ── reading a record file ───────────────────────────────────────────────────
+
+
+@pytest.mark.parametrize(
+    ("kind", "cause"),
+    [
+        ("link", "its record file is a link"),
+        ("second-name", "its record file isn't a regular file with one name"),
+        ("fifo", "its record file isn't a regular file with one name"),
+        ("too-large", "its record file is too large"),
+        pytest.param(
+            "unreadable",
+            "its record file can't be read (EACCES)",
+            marks=pytest.mark.skipif(os.geteuid() == 0, reason="root reads any file"),
+        ),
+    ],
+)
+def test_the_record_reader_names_why_it_refuses_a_file(tmp_path, kind, cause):
+    path = tmp_path / "postgres-sales"
+    target = tmp_path / "elsewhere"
+    target.write_text(json.dumps({"engine": "postgres", "name": "sales", "fields": {"password": CANARY}}))
+    if kind == "link":
+        path.symlink_to(target)
+    elif kind == "second-name":
+        os.link(target, path)
+    elif kind == "fifo":
+        os.mkfifo(path)
+    elif kind == "too-large":
+        path.write_bytes(b" " * (MAX_RECORD_BYTES + 1))
+    else:
+        path.write_text(target.read_text())
+        path.chmod(0)
+
+    with pytest.raises(SealedRecordError) as raised:
+        sealed_vault.read_record_file(path=path, connection="postgres/sales")
+
+    assert raised.value.cause == cause and CANARY not in str(raised.value)
+
+
+def test_the_record_reader_answers_none_where_no_file_is(tmp_path):
+    assert sealed_vault.read_record_file(path=tmp_path / "postgres-sales", connection="postgres/sales") is None
+    assert sealed_vault.read_record_file(path=tmp_path / "gone" / "postgres-sales", connection="postgres/sales") is None
+
+
 # ── a record too large to read back ─────────────────────────────────────────
 
 
@@ -359,6 +425,287 @@ def test_the_save_route_answers_422_for_a_record_too_large_to_read_back(key_file
     assert own_vault_for_scope(LOCAL_SCOPE).list_connections() == []
 
 
+# ── a field named like the sealed mark ──────────────────────────────────────
+
+
+_TOKEN_KEYS = _keys(Fernet.generate_key())
+_TOKEN = _TOKEN_KEYS.encrypt(b'"value"').decode()
+_OTHER_TOKEN = Fernet(Fernet.generate_key()).encrypt(b'"value"').decode()
+_NOT_JSON_TOKEN = _TOKEN_KEYS.encrypt(b"not json").decode()
+
+
+@pytest.mark.parametrize(
+    ("fields", "sealing"),
+    [
+        ({SEALED_FIELD: 1, "password": _TOKEN, "_label": "Sales"}, RecordSealing.SEALED),
+        ({SEALED_FIELD: 1, "_label": "Sales"}, RecordSealing.SEALED),
+        ({SEALED_FIELD: 1, "password": _TOKEN, "host": "db.example"}, RecordSealing.PARTLY_SEALED),
+        ({SEALED_FIELD: 1, "password": _TOKEN, "port": 5432}, RecordSealing.PARTLY_SEALED),
+        ({SEALED_FIELD: "1", "password": _TOKEN}, RecordSealing.PARTLY_SEALED),
+        ({SEALED_FIELD: True, "password": _TOKEN}, RecordSealing.PARTLY_SEALED),
+        ({SEALED_FIELD: 1, "api_token": CANARY}, RecordSealing.RESERVED_FIELD),
+        ({SEALED_FIELD: True, "api_token": CANARY}, RecordSealing.RESERVED_FIELD),
+        # A bookkeeping field is never sealed, so a token there is no sealed value.
+        ({SEALED_FIELD: 1, "_label": _TOKEN, "host": "db.example"}, RecordSealing.RESERVED_FIELD),
+        ({SEALED_FIELD: None}, RecordSealing.RESERVED_FIELD),
+        ({"password": _TOKEN, "_label": "Sales"}, RecordSealing.PLAIN),
+        ({}, RecordSealing.PLAIN),
+    ],
+)
+def test_a_record_reads_as_sealed_partly_sealed_reserved_or_plain(fields, sealing):
+    assert record_sealing(fields=fields) is sealing
+
+
+@pytest.mark.parametrize(
+    ("fields", "without_keys", "with_keys"),
+    [
+        ({SEALED_FIELD: 1, "password": _TOKEN + "\n"}, RecordSealing.RESERVED_FIELD, RecordSealing.SEALED),
+        ({SEALED_FIELD: 1, "password": " " + _TOKEN}, RecordSealing.RESERVED_FIELD, RecordSealing.SEALED),
+        ({SEALED_FIELD: 1, "password": _TOKEN + "\n", "host": _TOKEN}, RecordSealing.PARTLY_SEALED, RecordSealing.SEALED),
+        ({SEALED_FIELD: "1", "password": _TOKEN + "\n"}, RecordSealing.RESERVED_FIELD, RecordSealing.PARTLY_SEALED),
+        # Fernet's decoder skips a character that isn't base64, so these open, and their text doesn't
+        # start as a token's does: only opening them reads them as sealed. The second opens to text
+        # that isn't the JSON a save seals, so open_fields refuses it, and the re-seal names it as a
+        # value no key opens.
+        ({SEALED_FIELD: 1, "password": _TOKEN[:2] + "." + _TOKEN[2:]}, RecordSealing.RESERVED_FIELD, RecordSealing.SEALED),
+        (
+            {SEALED_FIELD: 1, "password": _NOT_JSON_TOKEN[:2] + "." + _NOT_JSON_TOKEN[2:]},
+            RecordSealing.RESERVED_FIELD,
+            RecordSealing.SEALED,
+        ),
+        # Text that can't be encoded to bytes, as a lone surrogate a JSON file can hold, opens with no key.
+        ({SEALED_FIELD: 1, "api_token": "\ud800"}, RecordSealing.RESERVED_FIELD, RecordSealing.RESERVED_FIELD),
+        # The rows below open with no key and have no token's shape; their text starts as a token's
+        # does, whitespace aside, so given keys they read as sealed, and the re-seal refuses them as
+        # values no key opens.
+        ({SEALED_FIELD: 1, "password": _OTHER_TOKEN + "\n"}, RecordSealing.RESERVED_FIELD, RecordSealing.SEALED),
+        (
+            {SEALED_FIELD: 1, "password": _OTHER_TOKEN[:3] + "\n " + _OTHER_TOKEN[3:]},
+            RecordSealing.RESERVED_FIELD,
+            RecordSealing.SEALED,
+        ),
+        ({SEALED_FIELD: 1, "password": _TOKEN[:-10]}, RecordSealing.RESERVED_FIELD, RecordSealing.SEALED),
+        # Fernet opens it, but not to the JSON text seal_fields seals, so open_fields refuses it.
+        (
+            {SEALED_FIELD: 1, "password": " " + _NOT_JSON_TOKEN},
+            RecordSealing.RESERVED_FIELD,
+            RecordSealing.SEALED,
+        ),
+        ({SEALED_FIELD: 1, "password": '"' + _OTHER_TOKEN + '"'}, RecordSealing.RESERVED_FIELD, RecordSealing.SEALED),
+        ({SEALED_FIELD: 1, "api_token": "gAAAAA" + CANARY}, RecordSealing.RESERVED_FIELD, RecordSealing.SEALED),
+        ({SEALED_FIELD: 1, "api_token": "gAAAA-" + CANARY}, RecordSealing.RESERVED_FIELD, RecordSealing.RESERVED_FIELD),
+        ({SEALED_FIELD: 1, "api_token": CANARY + " gAAAAA"}, RecordSealing.RESERVED_FIELD, RecordSealing.RESERVED_FIELD),
+        ({SEALED_FIELD: 1, "api_token": CANARY}, RecordSealing.RESERVED_FIELD, RecordSealing.RESERVED_FIELD),
+    ],
+    ids=[
+        "trailing-newline", "leading-space", "padded-beside-a-token", "string-mark-beside-padded",
+        "skipped-character", "skipped-character-opens-to-text-that-isnt-json", "text-that-cant-be-encoded",
+        "padded-under-another-key", "whitespace-inside-the-prefix-under-another-key", "truncated",
+        "opens-to-text-that-isnt-json", "quoted-under-another-key", "plain-text-with-the-prefix",
+        "plain-text-with-five-of-the-prefix", "plain-text-with-the-prefix-later", "plain",
+    ],
+)
+def test_given_keys_a_value_they_open_reads_as_sealed_whatever_its_shape(fields, without_keys, with_keys):
+    """Fernet opens a token with stray whitespace around it, as a hand edit can leave, and the shape
+    test refuses that. Given keys, as the re-seal passes its opening keys, a value Fernet opens with
+    them counts as sealed, whether or not it opens to JSON, and so does one whose text, with each
+    character outside a token's alphabet removed, starts as a token's does. Without them, as at a start with no key file, the
+    shape alone decides."""
+    assert record_sealing(fields=fields) is without_keys
+    assert record_sealing(fields=fields, keys=_TOKEN_KEYS) is with_keys
+
+
+@pytest.mark.parametrize("mark", ["1", 1, True, None], ids=["string", "int", "bool", "null"])
+def test_a_keyed_save_with_a_field_named_like_the_mark_is_refused_and_writes_nothing(tmp_path, mark):
+    """The mark would replace the field, so the person's value would be gone."""
+    vault = SealedDataVault(tmp_path, keys=_keys(Fernet.generate_key()))
+    vault.save("acme_api", "acme", {"api_token": "first"})
+    path = _record_file(vault, "acme_api", "acme")
+    before = path.read_bytes()
+
+    with pytest.raises(ReservedFieldError) as raised:
+        vault.save("acme_api", "acme", {"api_token": CANARY, SEALED_FIELD: mark})
+
+    assert str(raised.value) == (
+        "The saved connection acme_api/acme can't be saved: the field name _sealed is reserved for the sealed mark. "
+        "Rename the field and save again."
+    )
+    assert raised.value.connection == "acme_api/acme"
+    assert isinstance(raised.value, ValueError)
+    assert path.read_bytes() == before
+    assert [entry.name for entry in tmp_path.iterdir()] == ["acme_api-acme"]
+
+
+def test_without_a_key_file_a_save_keeps_a_field_named_like_the_mark(monkeypatch, sharepoint_stores):
+    """No key file, no sealed mark: the form's save writes the field through anton's vault as it
+    always has."""
+    from cowork.services.connectors.persist import persist_connection
+
+    monkeypatch.delenv("COWORK_KEY_FILE", raising=False)
+    sealing_keys.cache_clear()
+
+    persist_connection("acme_api", None, "acme", {"api_token": CANARY, SEALED_FIELD: "1"}, scope=LOCAL_SCOPE)
+
+    vault = own_vault_for_scope(LOCAL_SCOPE)
+    assert type(vault) is LocalDataVault
+    fields = json.loads(_record_file(vault, "acme_api", "acme").read_text())["fields"]
+    assert fields[SEALED_FIELD] == "1" and fields["api_token"] == CANARY
+
+
+def test_the_save_route_answers_422_for_a_field_named_like_the_mark(key_file, sharepoint_stores):
+    response = _loopback_client().post(
+        "/api/v1/connectors/connections/save",
+        json={"connector_id": "postgres", "name": "acme", "values": {"host": "db.example", SEALED_FIELD: "1"}},
+    )
+
+    assert response.status_code == 422, response.text
+    assert response.json() == {
+        "detail": "The saved connection postgres/acme can't be saved: the field name _sealed is reserved for the "
+        "sealed mark. Rename the field and save again."
+    }
+    assert own_vault_for_scope(LOCAL_SCOPE).list_connections() == []
+
+
+def test_the_validate_and_save_route_answers_422_for_a_field_named_like_the_mark(
+    monkeypatch, key_file, sharepoint_stores
+):
+    """Code's personal-token setup saves through the same direct save as /save once the provider
+    accepts the token, so a field named like the mark answers 422 there too."""
+    from cowork.api.v1.endpoints.connectors import connections as connections_endpoint
+    from cowork.services.connectors.developer_validation import ValidatedDeveloperIdentity
+
+    monkeypatch.setattr(
+        connections_endpoint,
+        "validate_developer_connection",
+        lambda connector_id, method, values: ValidatedDeveloperIdentity(account_email="dev@example.com"),
+    )
+
+    response = _loopback_client().post(
+        "/api/v1/connectors/connections/validate-and-save",
+        json={
+            "connector_id": "github",
+            "method": "fine-grained-pat",
+            "name": "acme",
+            "values": {"access_token": CANARY, SEALED_FIELD: "1"},
+        },
+    )
+
+    assert response.status_code == 422, response.text
+    assert response.json() == {
+        "detail": "The saved connection github/acme can't be saved: the field name _sealed is reserved for the "
+        "sealed mark. Rename the field and save again."
+    }
+    assert CANARY not in response.text
+    assert own_vault_for_scope(LOCAL_SCOPE).list_connections() == []
+
+
+@pytest.mark.parametrize("value", ["1", "", None], ids=["one", "empty", "null"])
+@pytest.mark.parametrize(
+    ("engine", "fields"),
+    [
+        ("acme_api", {"api_token": CANARY}),
+        ("postgres", {"host": "db.example", "port": "5432", "database": "sales", "user": "reader", "password": CANARY}),
+    ],
+    ids=["unknown-engine", "postgres"],
+)
+async def test_the_chat_connect_tool_refuses_a_field_named_like_the_mark_before_anton_writes_anything(
+    monkeypatch, key_file, sharepoint_stores, tmp_path, engine, fields, value
+):
+    """anton's connect tool writes an engine it doesn't know to ~/.anton/datasources.md before it
+    saves. Were the save refused there, the field would stay among that engine's fields, and the
+    model's retry with the field renamed would save without the renamed field, and say nothing. So
+    the tool refuses first: no engine is written and nothing is saved. It refuses by name, as the
+    vault does, where anton would drop the field and save without a word too: an empty value, no
+    value, and a field postgres's engine doesn't list."""
+    from anton.core.datasources.datasource_registry import DatasourceRegistry
+
+    from tests._turns import built_turn, connect_in_chat
+
+    home = tmp_path / "anton-home"
+    engines = home / ".anton" / "datasources.md"
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setattr(DatasourceRegistry, "_USER_PATH", engines)
+    async with built_turn(monkeypatch=monkeypatch, tmp_path=tmp_path, scope=None) as turn:
+        connected = await connect_in_chat(
+            turn, monkeypatch, engine=engine, known_variables={**fields, SEALED_FIELD: value}
+        )
+
+    assert connected.answer == (
+        f"The saved connection {engine} can't be saved: the field name _sealed is reserved for the sealed mark. "
+        "Rename the field and save again."
+    )
+    assert own_vault_for_scope(LOCAL_SCOPE).list_connections() == []
+    assert not engines.exists()
+
+
+async def test_the_chat_connect_tool_answers_with_the_vaults_reason_for_a_record_too_large_to_read_back(
+    monkeypatch, caplog, key_file, sharepoint_stores, tmp_path
+):
+    """The tool answers as it does for a field named like the mark: with the vault's reason, which
+    names the connection and never a value. Nothing is saved, and nothing is logged as an error.
+    anton has already written the engine it doesn't know to ~/.anton/datasources.md with these
+    field names, the entry any connect with them writes. A retry with a smaller value keeps the
+    names, so anton drops none of its fields."""
+    from anton.core.datasources.datasource_registry import DatasourceRegistry
+
+    from tests._turns import built_turn, connect_in_chat
+
+    home = tmp_path / "anton-home"
+    engines = home / ".anton" / "datasources.md"
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setattr(DatasourceRegistry, "_USER_PATH", engines)
+    async with built_turn(monkeypatch=monkeypatch, tmp_path=tmp_path, scope=None) as turn:
+        with caplog.at_level(logging.ERROR):
+            # About 790 KB in plain text seals to over 1 MiB.
+            connected = await connect_in_chat(
+                turn, monkeypatch, engine="acme_api", known_variables={"api_token": CANARY + "A" * 790_000}
+            )
+
+    assert re.fullmatch(
+        r"The saved connection acme_api/[0-9a-f]{8} is too large to save: sealed, its record file would be "
+        rf"\d+ bytes, and the limit is {MAX_RECORD_BYTES}\.",
+        connected.answer,
+    ), connected.answer
+    assert own_vault_for_scope(LOCAL_SCOPE).list_connections() == []
+    assert [record.getMessage() for record in caplog.records if record.levelno >= logging.ERROR] == []
+    engine = DatasourceRegistry().find_by_name("acme_api")
+    assert engine is not None and [field.name for field in engine.fields] == ["api_token"]
+
+
+async def test_without_a_key_file_the_chat_connect_tool_saves_a_field_named_like_the_mark(
+    monkeypatch, sharepoint_stores, tmp_path
+):
+    """No key file, no sealed mark: the tool answers as anton's save does, the record keeps the
+    field, and anton writes the engine it doesn't know to ~/.anton/datasources.md, this field among
+    its fields, as it always has."""
+    from anton.core.datasources.datasource_registry import DatasourceRegistry
+
+    from tests._turns import built_turn, connect_in_chat
+
+    monkeypatch.delenv("COWORK_KEY_FILE", raising=False)
+    sealing_keys.cache_clear()
+    home = tmp_path / "anton-home"
+    engines = home / ".anton" / "datasources.md"
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setattr(DatasourceRegistry, "_USER_PATH", engines)
+    async with built_turn(monkeypatch=monkeypatch, tmp_path=tmp_path, scope=None) as turn:
+        connected = await connect_in_chat(
+            turn, monkeypatch, engine="acme_api", known_variables={"api_token": CANARY, SEALED_FIELD: "1"}
+        )
+
+    vault = own_vault_for_scope(LOCAL_SCOPE)
+    [saved] = vault.list_connections()
+    assert connected.answer.startswith(
+        f"Saved connection `{saved['engine']}-{saved['name']}` (label \"acme_api\") to vault with fields: "
+        "_sealed, _user_label, api_token."
+    ), connected.answer
+    assert type(vault) is LocalDataVault
+    fields = vault.load("acme_api", saved["name"])
+    assert fields[SEALED_FIELD] == "1" and fields["api_token"] == CANARY
+    engine = DatasourceRegistry().find_by_name("acme_api")
+    assert engine is not None and {field.name for field in engine.fields} == {"api_token", SEALED_FIELD}
+
+
 # ── the one builder ─────────────────────────────────────────────────────────
 
 
@@ -389,7 +736,7 @@ def test_with_a_key_file_the_server_builds_sealed_vaults(key_file, tmp_path):
 _ALLOWED_VAULT_CALLS = {
     ("cowork/services/connectors/persist.py", "data_vault_at"),
     ("cowork/services/connectors/probe.py", "run"),
-    ("cowork/ops/connection_inventory.py", "_vault_filename"),
+    ("cowork/ops/connection_inventory.py", "vault_filename"),
 }
 
 

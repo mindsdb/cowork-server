@@ -66,7 +66,7 @@ from cowork.services.live_apps import live_app_slot_paths
 from cowork.services.product_permissions import ProductPermissionUnavailable, report_permission_unavailable
 from cowork.schemas.refusals import TURN_IN_PROGRESS, Refusal
 from cowork.services.connectors.layered_vault import SharedConnectionError
-from cowork.services.connectors.sealed_vault import RecordTooLargeError, SealedRecordError
+from cowork.services.connectors.sealed_vault import RecordTooLargeError, ReservedFieldError, SealedRecordError
 from cowork.streaming import ServerShuttingDown, TurnInProgress, registry
 from cowork.streaming.registry import TURN_SHUTDOWN_GRACE_SECONDS
 from cowork.streaming.turn_claim import TurnClaimUnavailable
@@ -79,6 +79,7 @@ from cowork.common.settings.app_settings import (
     get_app_settings,
     get_export_pdf_settings,
 )
+from cowork.common.settings.secret_files import file_variable, process_secret
 from cowork.dev_setup import run_dev_setup
 from cowork.scheduler import start_scheduler, stop_scheduler, wait_for_scheduled_runs
 from cowork.services.artifact_autopublish import cancel_self_heals
@@ -1088,6 +1089,13 @@ def create_app() -> FastAPI:
     async def _record_too_large(request, exc: RecordTooLargeError):
         return JSONResponse({"detail": str(exc)}, status_code=422)
 
+    # A save with a key file whose values hold a field named like the sealed
+    # mark (SealedDataVault.save). Its message names the connection and the
+    # field, never a value.
+    @app.exception_handler(ReservedFieldError)
+    async def _reserved_field(request, exc: ReservedFieldError):
+        return JSONResponse({"detail": str(exc)}, status_code=422)
+
     # Bearer-token auth. On by default in local mode (see AppSettings.
     # require_auth). Token is auto-generated on first startup when
     # COWORK_AUTH_TOKEN is not set, then persisted to <cowork_home>/.env so
@@ -1270,19 +1278,21 @@ def create_app() -> FastAPI:
                 "Org deployments authenticate at the ingress instead."
             )
         env_path = cowork_home() / ".env"
-        if settings.trust_identity_headers:
+        if settings.trust_identity_headers or os.environ.get(file_variable(name="COWORK_AUTH_TOKEN")):
             # With identity headers on, the token acts as any person, and the
             # desktop app, which reads the copy in cowork-home's .env, never
-            # runs here. The token comes from the process environment alone,
-            # never settings.auth_token, which cowork-home's .env also fills,
-            # and a copy an earlier start wrote there is removed.
-            token = os.environ.get("COWORK_AUTH_TOKEN", "")
+            # runs here. A token in the file COWORK_AUTH_TOKEN_FILE names is
+            # kept off the disk the same way, with identity headers on or off.
+            # The token comes from the process environment alone, or that
+            # file, never settings.auth_token, which cowork-home's .env also
+            # fills, and a copy an earlier start wrote there is removed.
+            token = process_secret(name="COWORK_AUTH_TOKEN")
             if not token:
                 raise RuntimeError(
-                    "COWORK_TRUST_IDENTITY_HEADERS needs COWORK_AUTH_TOKEN in the server's "
-                    "environment: with identity headers on, the token acts as any person, "
-                    "so Cowork neither generates it nor keeps a copy in cowork-home's .env. "
-                    "Set COWORK_AUTH_TOKEN where the server starts."
+                    "COWORK_TRUST_IDENTITY_HEADERS needs COWORK_AUTH_TOKEN or COWORK_AUTH_TOKEN_FILE "
+                    "in the server's environment: with identity headers on, the token acts as any "
+                    "person, so Cowork neither generates it nor keeps a copy in cowork-home's .env. "
+                    "Set one of them where the server starts."
                 )
             remove_auth_token(env_path)
         else:

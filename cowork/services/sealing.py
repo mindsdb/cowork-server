@@ -19,7 +19,6 @@ from __future__ import annotations
 import logging
 import os
 from pathlib import Path
-from typing import Any
 from uuid import UUID
 
 import sqlalchemy as sa
@@ -30,17 +29,15 @@ from sqlmodel import select
 from cowork.common.encryption import KeyFileError, sealing_keys
 from cowork.common.settings.app_settings import get_app_settings
 from cowork.common.settings.user_settings import UserSettings
-from cowork.db.session import get_engine
+from cowork.db.session import get_engine, sqlite_database_file
 from cowork.models.setting import Setting
 from cowork.services.connectors.sealed_vault import (
-    BOOKKEEPING_FIELDS,
-    SEALED_FIELD,
+    RecordSealing,
     SealedDataVault,
     SealedRecordError,
     errno_name,
-    is_fernet_token,
-    is_sealed_record,
     read_record_file,
+    record_sealing,
 )
 
 logger = logging.getLogger(__name__)
@@ -88,30 +85,25 @@ def sealing_marker_present() -> bool:
     SQLite file that doesn't exist yet, or a database with no settings table,
     has never been sealed, and the query names the ``key`` column alone. Only
     the re-seal command writes the marker, as a global row, so no scope is
-    asked for."""
-    from cowork.dev_setup import sqlite_database_file
+    asked for.
 
+    It reads the table, not the model, and imports no other model. A fresh
+    interpreter that reaches the legacy key through ``get_fernet`` hasn't
+    imported the models a relationship names by string, such as a project's
+    ``Schedule``, and a query through a model would configure every mapper
+    loaded, that project's among them."""
     db_uri = get_app_settings().database.uri
     database_file = sqlite_database_file(db_uri=db_uri)
     if database_file is not None and not database_file.exists():
         return False
+    settings = Setting.__table__
     with get_engine(db_uri).connect() as connection:
-        if not sa.inspect(connection).has_table(Setting.__tablename__):
+        if not sa.inspect(connection).has_table(settings.name):
             return False
         row = connection.execute(
-            sa.select(Setting.key).where(Setting.key == SEALING_MARKER_KEY).limit(1)
+            sa.select(settings.c.key).where(settings.c.key == SEALING_MARKER_KEY).limit(1)
         ).first()
     return row is not None
-
-
-def _holds_sealed_values(*, fields: dict[str, Any]) -> bool:
-    """Whether a record reads as one SealedDataVault wrote, checked without a
-    key: the sealed mark, and each value outside the bookkeeping fields a
-    Fernet token. A plain record can carry a field named like the mark."""
-    return is_sealed_record(fields=fields) and all(
-        key in BOOKKEEPING_FIELDS or key == SEALED_FIELD or is_fernet_token(value=value)
-        for key, value in fields.items()
-    )
 
 
 def _warn_unreadable_vault(*, folder: Path | str | None, error: OSError) -> None:
@@ -154,21 +146,39 @@ def refuse_sealed_state_without_key_file() -> None:
                 record = read_record_file(path=path, connection=path.name)
             except SealedRecordError:
                 continue
-            if record is not None and _holds_sealed_values(fields=record["fields"]):
+            # A record counts when it reads as one SealedDataVault wrote: the integer mark, and each
+            # value outside the bookkeeping fields a Fernet token by its shape, as no key is here to
+            # open one. A plain record with a field named like the mark beside a plain value doesn't
+            # count. A record that is only the mark beside bookkeeping fields does: SealedDataVault
+            # writes that for a connection with no values, such as an empty custom MCP connection,
+            # and a deployment sealed from its first start has no marker row, so this scan is its
+            # only guard.
+            if record is not None and record_sealing(fields=record["fields"]) is RecordSealing.SEALED:
                 raise KeyFileError(
                     f"The saved connection file {path} is sealed, and COWORK_KEY_FILE isn't set. "
                     "Start the server with COWORK_KEY_FILE naming the key file it was sealed under."
                 )
 
 
-def _sealed_setting_keys() -> frozenset[str]:
+def sealed_setting_keys() -> frozenset[str]:
+    """The settings keys whose rows the server stores sealed: each sensitive setting and each
+    first-party channel's secret credential.
+
+    It loads the channel plugins into a registry of its own, so the re-seal command, which never
+    builds the app, reads the same set as the server's start check. The process-wide registry
+    fills only in create_app (cowork.server._install_channels), and stays as it is."""
+    from cowork.channels.registry import PluginRegistry, load_first_party_plugins
     from cowork.services.channels import secret_credential_keys
 
+    registry = PluginRegistry()
+    load_first_party_plugins(registry)
     sensitive = frozenset(key for key in UserSettings.model_fields if UserSettings.field_is_sensitive(key))
-    return sensitive | secret_credential_keys()
+    return sensitive | secret_credential_keys(registry=registry)
 
 
-def _row_name(row: Setting) -> str:
+def row_name(row: Setting) -> str:
+    """A settings row by its key and whose it is: global, an organization's,
+    or a person's in an organization."""
     if row.scope is None:
         return f"setting {row.key} (global)"
     if row.scope == "org":
@@ -184,7 +194,7 @@ def refuse_unopenable_sealed_data() -> None:
     if keys is None:
         return
     failures: list[str] = []
-    sealed_keys = _sealed_setting_keys()
+    sealed_keys = sealed_setting_keys()
     engine = get_engine(get_app_settings().database.uri)
     with SQLSession(engine) as session:
         rows = session.exec(select(Setting).where(Setting.key.in_(sealed_keys))).all()
@@ -192,7 +202,7 @@ def refuse_unopenable_sealed_data() -> None:
         try:
             keys.decrypt(row.value.encode())
         except InvalidToken:
-            failures.append(_row_name(row))
+            failures.append(row_name(row))
     if get_app_settings().tenancy_mode != "org":
         try:
             roots = vault_roots()
