@@ -453,13 +453,22 @@ def build_elicitor(conversation_id: str, *, interactive: bool = True):
     questions, the browser hand-over and the confirmation cards reach the
     person watching the turn.
 
-    A scheduled run (``interactive`` False) gets an elicitor that takes only
-    approval cards (APPROVAL_KIND). A person who opens the run can still
-    approve a held write. A question, a browser hand-over or a tool's own
-    confirmation card (confirm_card) still comes back at once, because the
-    elicitor doesn't take "choice": nobody waits to answer them, so they would
-    only wait out their timeout. An anton that predates APPROVAL_KIND takes no
-    card from this elicitor, so it refuses the held write at once as well.
+    A scheduled run (``interactive`` False) with ANTON_WRITE_APPROVAL on gets
+    an elicitor that takes only approval cards (APPROVAL_KIND). A person who
+    opens the run can still approve a held write. A question, a browser
+    hand-over or a tool's own confirmation card (confirm_card) still comes
+    back at once, because the elicitor doesn't take "choice": nobody waits to
+    answer them, so they would only wait out their timeout. anton's write
+    gate remembers a card nobody answered (WriteGate.unanswered, which
+    ask_approval_choice and ask_approval_card set and read) and refuses the
+    turn's later cards without asking, so the run waits out one card at most. An anton that
+    predates APPROVAL_KIND takes no card from this elicitor, so it refuses the
+    held write at once as well.
+
+    A scheduled run with ANTON_WRITE_APPROVAL off gets None. With no write
+    gate, nothing remembers an unanswered card, so each approval card the run
+    raises, such as a live app's launch or a browser step, would wait out its
+    timeout with nobody watching.
 
     The kill switch holds only as long as the ChatSessionConfig built from
     this value is not also given a `console`: with elicitor=None and a
@@ -475,6 +484,8 @@ def build_elicitor(conversation_id: str, *, interactive: bool = True):
     # timeout_s deliberately not passed: elicitor.DEFAULT_TIMEOUT_S is the one
     # place the number lives, so this call site does not restate it.
     if not interactive:
+        if not settings.write_approval:
+            return None
         return CoworkElicitor(conversation_id, broker, supported_kinds=(APPROVAL_KIND,))
     return CoworkElicitor(conversation_id, broker)
 
