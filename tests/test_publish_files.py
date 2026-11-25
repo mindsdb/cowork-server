@@ -95,10 +95,10 @@ def _pptx(slides: list[list[str]]) -> bytes:
 def test_every_page_names_the_file_and_links_to_download_it():
     body = file_page.file_page_body(data=b"a,b\n1,2\n", suffix=".csv", name="Q3 sales: final?.csv")
 
-    assert "<h1>Q3 sales: final?.csv</h1>" in body
-    # The link's name holds no ':', '#' or '?', so the publisher bundles the file.
-    assert 'href="Q3_sales_final.csv"' in body
-    assert 'download="Q3 sales: final?.csv"' in body
+    assert '<header class="file-bar"><h1>Q3 sales: final?.csv</h1>' in body
+    # A button, not a bare link: the name is already in the bar.
+    assert '<a class="file-download" href="Q3_sales_final.csv" download="Q3 sales: final?.csv">' in body
+    assert "Download</a>" in body
 
 
 def test_a_csv_is_a_table_with_its_first_row_as_the_header():
@@ -156,7 +156,9 @@ def test_a_deck_shows_each_slide_with_its_title_and_text():
 def test_a_pdf_shows_in_the_browsers_viewer_with_its_text_below():
     body = file_page.file_page_body(data=_pdf(["First page", "Second page"]), suffix=".pdf", name="report.pdf")
 
-    assert '<object data="report.pdf" type="application/pdf"' in body
+    # The whole width and the rest of the window, fit to the width, no thumbnails.
+    assert '<object class="file-pdf" data="report.pdf#view=FitH&amp;navpanes=0" type="application/pdf">' in body
+    assert "max-width: none" in body
     assert "<h3>Page 1</h3>" in body and "First page" in body
     assert "Second page" in body
 
@@ -206,6 +208,8 @@ def test_the_page_renders_in_the_conversion_process_with_the_file_beside_it(tmp_
     assert "<title>Board update</title>" in html
     assert "<h2>Board update</h2>" in html
     assert 'href="Board_update.docx"' in html
+    # The bar's look rides in the body, over the shared page template.
+    assert '<header class="file-bar">' in html and ".file-download {" in html
     assert (out / "Board_update.docx").read_bytes() == source.read_bytes()
 
 

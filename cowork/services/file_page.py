@@ -37,6 +37,34 @@ MAX_TEXT_CHARS = 2 * 1024 * 1024
 MAX_CELL_CHARS = 2000
 
 
+# The page's own look, over the published page template's: a bar that stays at
+# the top with the file's name and a Download button, then the file. Its
+# colours are the template's variables.
+_PAGE_STYLE = """<style>
+  .doc { max-width: 1100px; padding: 0 24px 48px; }
+  .file-bar { position: sticky; top: 0; z-index: 1; display: flex; align-items: center;
+              justify-content: space-between; gap: 16px; padding: 12px 0; margin: 0 0 16px;
+              background: var(--bg); border-bottom: 1px solid var(--border); }
+  .file-bar h1 { margin: 0; padding: 0; border: 0; font-size: 1.05em; font-weight: 600;
+                 overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .file-download { flex-shrink: 0; display: inline-flex; align-items: center; gap: 8px;
+                   padding: 8px 16px; border-radius: 8px; background: var(--accent); color: #0d1117;
+                   font-weight: 600; font-size: 14px; line-height: 1; }
+  .file-download:hover { text-decoration: none; filter: brightness(1.1); }
+  .file-download svg { width: 16px; height: 16px; }
+</style>"""
+# A PDF takes the whole width and the rest of the window's height.
+_PDF_STYLE = """<style>
+  .doc { max-width: none; padding: 0 16px 16px; }
+  .file-pdf { display: block; width: 100%; height: calc(100vh - 74px); border: 0; border-radius: 8px; }
+</style>"""
+_DOWNLOAD_ICON = (
+    '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" '
+    'stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">'
+    '<path d="M12 3v12"/><path d="m7 10 5 5 5-5"/><path d="M5 21h14"/></svg>'
+)
+
+
 class FilePageRefused(Exception):
     """The file can't be read as its kind: it fails the same way every time."""
 
@@ -59,12 +87,14 @@ def file_page_body(*, data: bytes, suffix: str, name: str) -> str:
     if render is None:
         raise FilePageRefused(f"{suffix} files aren't published as a page")
     link = published_file_name(name)
-    download = (
-        f'<p class="file-download"><a href="{html.escape(link)}" '
-        f'download="{html.escape(name)}">Download {html.escape(name)}</a></p>'
+    bar = (
+        f'<header class="file-bar"><h1>{html.escape(name)}</h1>'
+        f'<a class="file-download" href="{html.escape(link)}" download="{html.escape(name)}">'
+        f"{_DOWNLOAD_ICON}Download</a></header>"
     )
+    style = _PAGE_STYLE + (_PDF_STYLE if suffix == ".pdf" else "")
     body = render(data, link) if suffix == ".pdf" else render(data)
-    return f"<h1>{html.escape(name)}</h1>\n{download}\n{body}"
+    return f"{style}\n{bar}\n{body}"
 
 
 def _esc(value: object) -> str:
@@ -107,9 +137,9 @@ def _pdf(data: bytes, link: str) -> str:
             texts.append((index + 1, (reader.pages[index].extract_text() or "").strip()))
     except (PyPdfError, ValueError, KeyError, TypeError) as exc:
         raise FilePageRefused("not a PDF that can be read") from exc
+    # Opens fit to the width, without the page thumbnails, where the browser's viewer takes the hint.
     viewer = (
-        f'<object data="{html.escape(link)}" type="application/pdf" '
-        'style="display:block;width:100%;height:80vh;border:1px solid var(--border);border-radius:10px">'
+        f'<object class="file-pdf" data="{html.escape(link)}#view=FitH&amp;navpanes=0" type="application/pdf">'
         "<p><em>This browser can't show the PDF here. Download it, or read its text below.</em></p>"
         "</object>"
     )
