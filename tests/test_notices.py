@@ -152,6 +152,9 @@ def test_a_person_sees_and_updates_only_their_own_notices(monkeypatch):
 
 def test_shared_schedule_notices_are_visible_without_exposing_personal_notices():
     subject = f"shared {uuid4()}"
+    # The shared inbox is one for the whole database: clear what earlier
+    # tests' runs posted to it, so this passes in any order.
+    _delete_notices(org_id=None, user_id=None)
     try:
         with get_open_session() as session:
             shared = _post(session, user_id=None, org_id=None, subject=subject)

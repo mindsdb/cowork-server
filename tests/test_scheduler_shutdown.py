@@ -244,6 +244,16 @@ async def test_a_run_refused_for_shutdown_leaves_its_slot_due_and_no_empty_conve
     assert _scheduler_records(caplog) == [
         (logging.INFO, "Schedule run did not start; the server is shutting down"),
     ]
+    # It did nothing and runs again, so its owner's inbox hears nothing.
+    from cowork.db.session import get_open_session
+    from cowork.models.notice import Notice
+    from sqlmodel import select
+
+    session = get_open_session()
+    try:
+        assert session.exec(select(Notice).where(Notice.source_id == str(run.id))).all() == []
+    finally:
+        session.close()
 
 
 async def test_a_manual_run_refused_for_shutdown_keeps_the_conversation_its_request_made(

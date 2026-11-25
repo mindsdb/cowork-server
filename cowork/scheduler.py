@@ -977,7 +977,6 @@ async def _execute_schedule(
             outcome = AttemptOutcome.failed_before_execution
             if isinstance(refused, ServerShuttingDown):
                 error = _SHUTDOWN_RUN_ERROR
-                shutdown_failed = True
                 logger.info(
                     "Schedule run did not start; the server is shutting down",
                     extra=log_context(schedule_id=schedule_id, conversation_id=conversation_id),
@@ -1095,7 +1094,9 @@ async def _execute_schedule(
         # cron run still going. The finally saves it as failed.
         error = _INTERRUPTED_RUN_ERROR
         outcome = AttemptOutcome.interrupted if turn_started else AttemptOutcome.failed_before_execution
-        shutdown_failed = True
+        # A run cut before its turn started did nothing, and its slot stays
+        # due: nothing to tell its owner, as when a start is refused.
+        shutdown_failed = turn_started
         raise
     except Exception as exc:
         # The ids travel as record attributes: a database error's sanitized
