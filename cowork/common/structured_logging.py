@@ -73,6 +73,13 @@ EVENT_FIELDS = frozenset(
         "slot",
         "model_alias",
         "managed_connection_file",
+        # A saved connection that won't open with the key file, named as
+        # engine/name or its record's file name
+        # (cowork.services.connectors.sealed_vault.SealedRecordError).
+        "connection",
+        # A vault folder the no-key start check can't search
+        # (cowork.services.sealing.refuse_sealed_state_without_key_file).
+        "vault_folder",
         "retryable",
         "statement_fingerprint",
         # cowork.common.loop_watchdog and the lifespan's step timings.
@@ -84,6 +91,11 @@ EVENT_FIELDS = frozenset(
         "share",
         "step",
         "steps",
+        # A turn key mint's purpose and the lifetimes it asked for and got
+        # (cowork.turnqueue.auth_keys._request_turn_key).
+        "purpose",
+        "requested_ttl_seconds",
+        "ttl_seconds",
     ]
 )
 HEALTH_PATHS = frozenset(

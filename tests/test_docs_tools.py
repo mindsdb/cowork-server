@@ -11,7 +11,7 @@ import pytest
 
 from cowork.docs.hub import conv_topic, doc_topic, hub
 from cowork.docs.model import MAX_CHART_SERIES, MAX_METRICS
-from cowork.docs.prompt import DOC_PROMPT
+from cowork.docs.prompt import DOC_SKILL_MD
 from cowork.docs.store import DOC_FILENAME, doc_lock, find_doc_folder, list_doc_folders, list_history, load_doc, open_session
 from cowork.harnesses.anton_harness.doc_tools import DOC_TOOL_NAMES, DocToolContext, build_doc_tools
 
@@ -55,10 +55,10 @@ def _steps(defs, session, name, **args):
     return asyncio.run(_drain(defs[name].handler(session, args)))[0]
 
 
-def test_the_four_tools_are_built_and_create_doc_carries_the_prompt(tools):
+def test_the_four_tools_are_built_and_list_docs_carries_the_prompt(tools):
     defs, _session, _ = tools
     assert tuple(defs) == DOC_TOOL_NAMES
-    assert "## Docs" in defs["create_doc"].prompt
+    assert "## Docs" in defs["list_docs"].prompt
     for name in DOC_TOOL_NAMES:
         assert defs[name].input_schema["type"] == "object"
 
@@ -109,6 +109,28 @@ def test_read_doc_returns_editable_ids_and_the_rev(tools):
     assert "- [x] Budget" in _text(_call(defs, session, "read_doc", doc="Notes"))
     outline = _text(_call(defs, session, "read_doc", doc="Notes", view="outline"))
     assert "task [x]" in outline
+
+
+def test_the_edit_report_names_words_the_person_typed_after_the_agent_read_the_doc(tools, monkeypatch):
+    """The ops apply to the doc as it is under the lock; the report reads that doc, not the one read before."""
+    from cowork.docs import service
+    from cowork.docs import tools as doc_tools
+
+    defs, session, _ = tools
+    _call(defs, session, "create_doc", title="Plan", markdown="Ship the beta.")
+    full = _text(_call(defs, session, "read_doc", doc="Plan"))
+    para = re.search(r"\[(b_[a-z0-9]{8})\] paragraph", full).group(1)
+    real_apply = service.apply
+
+    def person_types_first(folder, ops, **kw):
+        service.apply(folder, [{"op": "update", "id": para, "set": {"text": "Ship the beta. Call legal first."}}],
+                      by="user")
+        return real_apply(folder, ops, **kw)
+
+    monkeypatch.setattr(doc_tools, "apply", person_types_first)
+    out = _text(_call(defs, session, "edit_doc", doc="Plan", ops=[
+        {"op": "replace", "target": para, "markdown": "Ship the beta on Monday."}]))
+    assert "Words this edit took out: “Call legal first.”" in out
 
 
 def test_an_edit_that_rewrites_a_block_names_the_words_it_took_out(tools):
@@ -255,7 +277,7 @@ def test_the_conversation_hears_about_a_new_doc_as_it_is_made(tools):
 def test_a_card_that_fails_is_logged_as_a_warning_and_the_doc_still_opens(tools, monkeypatch, caplog):
     """The card is extra: the doc is already written. But a failure must be seen,
     not dropped at debug, where a bug left every doc.created without its card."""
-    from cowork.harnesses.anton_harness import doc_tools
+    from cowork.docs import tools as doc_tools
 
     defs, session, _ = tools
     conv = "c0ffee00-0000-4000-8000-000000000001"
@@ -377,9 +399,9 @@ def test_every_field_an_op_takes_is_in_the_schema(tools):
     assert "3 weeks" in next(b for b in blocks if b["type"] == "callout")["text"]
 
 
-def test_the_prompt_gives_the_limits_the_format_enforces():
-    assert f"(up to {MAX_METRICS} tiles)" in DOC_PROMPT
-    assert f"up to {MAX_CHART_SERIES} series" in DOC_PROMPT
+def test_the_guide_gives_the_limits_the_format_enforces():
+    assert f"(up to {MAX_METRICS} tiles)" in DOC_SKILL_MD
+    assert f"up to {MAX_CHART_SERIES} series" in DOC_SKILL_MD
 
 
 def test_an_attached_image_lands_beside_the_doc_and_another_local_path_is_refused(tmp_path):
@@ -420,3 +442,21 @@ def test_the_edit_tools_schema_takes_rows_in_both_forms_the_prompt_teaches():
 
     for rows in ([["Backend", "Open"]], [{"Role": "Backend", "Status": "Open"}], [0, "r_abc"]):
         jsonschema.validate({"doc": "Plan", "ops": [{"op": "add_rows", "table": "b_1", "rows": rows}]}, EDIT_DOC_SCHEMA)
+
+
+def test_an_agent_create_and_edit_ask_for_the_page_with_the_project(tmp_path, monkeypatch):
+    from cowork.docs import republish
+
+    artifacts = tmp_path / ".anton" / "artifacts"
+    ctx = DocToolContext(artifacts_base=artifacts, conversation_id="c0ffee00-0000-4000-8000-000000000001",
+                         project_id="p1")
+    defs = {t.name: t for t in build_doc_tools(ctx)}
+    session = SimpleNamespace(_workspace=SimpleNamespace(artifacts_dir=artifacts), _artifacts_touched=set(),
+                              _session_id="", _turn_count=0)
+    asked = []
+    monkeypatch.setattr(republish, "schedule",
+                        lambda folder, **kw: asked.append((folder.name, kw["project_id"], kw["artifact_id"])) or False)
+    assert _ok(_call(defs, session, "create_doc", title="Plan", markdown="Hi."))
+    assert _ok(_call(defs, session, "edit_doc", doc="Plan", ops=[{"op": "edit_text", "find": "Hi", "replace": "Hello"}]))
+    assert [a[1] for a in asked] == ["p1", "p1"]
+    assert asked[0][0] == asked[1][0] and asked[0][2] == asked[1][2] and asked[0][2]

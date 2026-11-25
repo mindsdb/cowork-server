@@ -76,3 +76,30 @@ def test_an_image_is_never_written_through_a_link_planted_at_the_images_folder(t
         store_image(folder, PNG)
     assert refused.value.code == "bad_doc"
     assert list(elsewhere.iterdir()) == []
+
+
+def test_a_windows_path_is_taken_as_a_local_image():
+    """The desktop app runs on Windows too: C:\\… is a path on this computer, not text to keep."""
+    seen = []
+
+    def reader(path: str) -> bytes:
+        seen.append(path)
+        return PNG
+
+    md, files = localize_images("![chart](C:\\Users\\me\\chart.png)", within(), reader=reader)
+    (src,) = files
+    assert md == f"![chart]({src})"
+    assert seen == ["C:\\Users\\me\\chart.png"]
+    ops, files = localize_images([{"op": "update", "id": "b_1", "set": {"src": "file:///C:/Users/me/chart.png"}}],
+                                 within(), reader=lambda _p: PNG)
+    assert ops[0]["set"]["src"] in files
+
+
+def test_a_path_in_angle_brackets_is_taken_as_a_local_image(tmp_path):
+    """CommonMark writes a destination with spaces as <…>."""
+    upload = tmp_path / "My Project" / "a b.png"
+    upload.parent.mkdir()
+    upload.write_bytes(PNG)
+    md, files = localize_images(f"![x](<{upload}>)", within(upload))
+    (src,) = files
+    assert md == f"![x]({src})"

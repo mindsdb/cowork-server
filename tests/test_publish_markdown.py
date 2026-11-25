@@ -484,7 +484,7 @@ def _wire_publish(monkeypatch, tmp_path, target: Path, key: str, *, is_fullstack
     monkeypatch.setattr(
         publish, "get_app_settings",
         lambda: SimpleNamespace(
-            tenancy_mode="local", connector=SimpleNamespace(vault_dir=str(tmp_path / "vault"))
+            tenancy_mode="local", publish_token="", connector=SimpleNamespace(vault_dir=str(tmp_path / "vault")),
         ),
     )
     monkeypatch.setattr(

@@ -10,6 +10,7 @@ units run inline on fakes (inline_run_db) unless a test needs the real ones.
 from __future__ import annotations
 from tests._event_loop import on_the_event_loop
 from tests._logging_assertions import assert_log_fields
+from tests.turnqueue.test_producer import turn_key_details_from
 
 import asyncio
 import itertools
@@ -1707,6 +1708,68 @@ async def test_produce_remote_failure_carries_the_workers_reset_at(
 
 
 @pytest.mark.asyncio
+async def test_produce_remote_failure_carries_the_budget_scope(monkeypatch):
+    # The hosted budget card names whose budget is spent, on the frame and on reload.
+    message = "This workspace's spending budget is used up. An administrator can raise it in Budgets."
+    frame, events = await _remote_failure_frames(monkeypatch, {
+        "error": "BudgetExceededError: spent", "code": "budget_exceeded", "message": message,
+        "budget_scope": "workspace",
+    })
+    expected = {
+        "type": "response.failed", "code": "budget_exceeded", "error": message,
+        "budget_scope": "workspace", "request_id": "corr-reset-at",
+    }
+    assert frame == expected
+    assert events[-1] == expected
+
+
+@pytest.mark.asyncio
+async def test_produce_remote_failure_carries_the_budget_period(monkeypatch):
+    message = "Your team's monthly spending budget is used up. An administrator can raise it in Budgets."
+    frame, events = await _remote_failure_frames(monkeypatch, {
+        "error": "BudgetExceededError: spent", "code": "budget_exceeded", "message": message,
+        "budget_scope": "team", "budget_period": "month",
+    })
+    expected = {
+        "type": "response.failed", "code": "budget_exceeded", "error": message,
+        "budget_scope": "team", "budget_period": "month", "request_id": "corr-reset-at",
+    }
+    assert frame == expected
+    assert events[-1] == expected
+
+
+@pytest.mark.asyncio
+async def test_produce_remote_failure_carries_a_spent_plan_window(monkeypatch):
+    # ENG-4186: the hosted card says when the window frees up and which one it is.
+    message = "You've used your plan's allowance for now. Add credits to keep working now, or wait for it to reset."
+    frame, events = await _remote_failure_frames(monkeypatch, {
+        "error": "WindowAllowanceExhaustedError: spent", "code": "window_allowance_exhausted",
+        "message": message, "reset_at": _RESET_AT, "window": "7d",
+    })
+    expected = {
+        "type": "response.failed", "code": "window_allowance_exhausted", "error": message,
+        "reset_at": _RESET_AT, "window": "7d", "request_id": "corr-reset-at",
+    }
+    assert frame == expected
+    assert events[-1] == expected
+
+
+@pytest.mark.asyncio
+async def test_produce_remote_failure_carries_the_required_tier(monkeypatch):
+    message = "Your plan doesn't include this model. Upgrade your plan or add credits to use it."
+    frame, events = await _remote_failure_frames(monkeypatch, {
+        "error": "ModelNotInTierError: not covered", "code": "model_not_in_tier",
+        "message": message, "required_tier": "pro",
+    })
+    expected = {
+        "type": "response.failed", "code": "model_not_in_tier", "error": message,
+        "required_tier": "pro", "request_id": "corr-reset-at",
+    }
+    assert frame == expected
+    assert events[-1] == expected
+
+
+@pytest.mark.asyncio
 async def test_produce_remote_failure_without_reset_at_keeps_its_shape(monkeypatch):
     # An older worker sends none, so the frame stays exactly as before.
     frame, events = await _remote_failure_frames(monkeypatch, {
@@ -1827,6 +1890,9 @@ async def test_produce_remote_treats_a_controller_cancel_as_a_real_cancel_not_a_
     assert buffer.frames[-1] == "CLOSE:cancelled"
     assert not any("response.failed" in f for f in buffer.frames)
     assert saved["assistant"] == "partial"
+    # The saved turn ends on the Stop, so a reload shows it as stopped (ENG-4345).
+    assert saved["events"][-1]["type"] == "response.cancelled"
+    assert isinstance(saved["events"][-1]["at_ms"], int)
 
 
 @pytest.mark.asyncio
@@ -4215,6 +4281,7 @@ async def test_the_selected_effort_reaches_the_queued_job_on_every_turn(monkeypa
         return []
 
     monkeypatch.setattr(prod, "mint_turn_key", mint)
+    monkeypatch.setattr(prod, "mint_turn_key_details", turn_key_details_from(mint))
     monkeypatch.setattr(prod, "list_active_connections", no_connections)
 
     async def allowed(scope, permission):
@@ -4234,6 +4301,47 @@ async def test_the_selected_effort_reaches_the_queued_job_on_every_turn(monkeypa
         )
     efforts = [job["params"].get("reasoning_effort", "absent") for job in redis.jobs]
     assert efforts == ["high", "high", "absent"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("key_ttl", "time_limit_sent"), [(1200, None), (6000, 3600)])
+async def test_the_gate_keys_lifetime_reaches_the_queued_job(monkeypatch, key_ttl, time_limit_sent):
+    """Handler to the real producer with the routing gate's key: the job's
+    time limit follows the lifetime auth gave that key, and nothing mints again."""
+    from unittest.mock import AsyncMock
+
+    monkeypatch.setenv("COWORK_TURN_TIME_LIMIT_SECONDS", "3600")
+    redis = _QueueRedis()
+    monkeypatch.setattr(prod, "get_redis", lambda: redis)
+    monkeypatch.setattr(prod, "mint_turn_key_details", AsyncMock(side_effect=AssertionError("minted again")))
+
+    async def no_connections(**kw):
+        return []
+
+    async def require(scope, permission):
+        return None
+
+    async def allowed(scope, permission):
+        return True
+
+    monkeypatch.setattr(prod, "list_active_connections", no_connections)
+    monkeypatch.setattr(prod, "require_product_permission", require)
+    monkeypatch.setattr(prod.product_permissions, "has_product_permission", allowed)
+    handler = _remote_handler(monkeypatch, {})
+    gate_key = {
+        "correlation_id": "corr-gate",
+        "llm": prod.TurnLlm(block={"provider": "minds-cloud", "api_key": "mdb_gate", "base_url": "http://gw/v1"},
+                            turn_key_id=None, ttl_seconds=key_ttl),
+    }
+
+    await handler._produce_remote(
+        conv_id=uuid4(), input_text="hi", original_content="hi", model="anton",
+        harness_id="anton", buffer=_FakeBuffer(), turn_llm=gate_key,
+    )
+
+    [job] = redis.jobs
+    assert job["params"]["llm"]["api_key"] == "mdb_gate"
+    assert job["params"]["limits"].get("max_turn_seconds") == time_limit_sent
 
 
 @pytest.mark.asyncio

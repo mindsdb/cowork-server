@@ -1,5 +1,6 @@
 import asyncio
 import json
+import logging
 from collections import OrderedDict
 from pathlib import Path
 from types import SimpleNamespace
@@ -13,7 +14,7 @@ from cowork.turnqueue.redis_client import cancel_flag_key
 from cowork.handlers import turn_errors as te
 from cowork.services import providers as pv
 from cowork.turnqueue import producer as prod
-from cowork.turnqueue.auth_keys import MintedTurnKey
+from cowork.turnqueue.auth_keys import DATASOURCE_CONNECTIONS_ROUTE, DATASOURCE_GRANTS_ROUTE, MintedTurnKey
 
 from _fakes import QueuedPipeline
 
@@ -29,11 +30,22 @@ def _stub_llm_mint(monkeypatch):
         return "mdb_turnkey"
 
     async def _fake_mint_details(**kw):
-        return MintedTurnKey(key="mdb_turnkey", prefix="turnkey")
+        return MintedTurnKey(key="mdb_turnkey", prefix="turnkey", ttl_seconds=kw["ttl_seconds"])
 
     monkeypatch.setattr(prod, "mint_turn_key", _fake_mint)
-    # Minted when a turn key prefix is needed: the datasource or the custom connector setting.
+    # Every turn key mints here (mint_turn_llm); the connector key through mint_turn_key.
     monkeypatch.setattr(prod, "mint_turn_key_details", _fake_mint_details)
+
+
+def turn_key_details_from(mint):
+    """The turn-key mint as mint_turn_llm calls it, answered by a fake of
+    mint_turn_key: the turn key now comes from mint_turn_key_details, the
+    connector key still from mint_turn_key."""
+
+    async def details(**kw):
+        return MintedTurnKey(key=await mint(**kw), prefix="turnkey", ttl_seconds=kw["ttl_seconds"])
+
+    return details
 
 
 class FakeRedis:
@@ -293,6 +305,67 @@ async def test_turn_failed_keeps_the_workers_reset_at_for_a_timed_stop(
     assert data["reset_at"] == _RESET_AT
 
 
+_BUDGET_STOP = "BudgetExceededError: Server returned 402: budget used up."
+
+
+@pytest.mark.asyncio
+async def test_turn_failed_keeps_the_workers_budget_scope_and_names_it(monkeypatch):
+    data = await _failed_turn(monkeypatch, {"error": _BUDGET_STOP, "budget_scope": "workspace"})
+    assert data["code"] == te.BUDGET_EXCEEDED_CODE
+    assert data["budget_scope"] == "workspace"
+    assert data["message"].startswith("This workspace's spending budget is used up.")
+
+
+@pytest.mark.asyncio
+async def test_turn_failed_keeps_the_workers_budget_period_and_names_it(monkeypatch):
+    data = await _failed_turn(monkeypatch, {"error": _BUDGET_STOP, "budget_scope": "team", "budget_period": "month"})
+    assert data["budget_period"] == "month"
+    assert data["message"].startswith("Your team's monthly spending budget is used up.")
+
+
+@pytest.mark.asyncio
+async def test_turn_failed_keeps_the_workers_budget_model_and_names_it(monkeypatch):
+    import cowork.services.providers as providers
+
+    monkeypatch.setattr(providers, "cached_minds_model_label", lambda m: "Claude Haiku")
+    data = await _failed_turn(
+        monkeypatch,
+        {"error": _BUDGET_STOP, "budget_scope": "team", "budget_period": "day", "budget_model": "haiku-4-5"},
+    )
+    assert data["budget_model"] == "haiku-4-5"
+    assert data["message"].startswith("Your team's daily spending budget for Claude Haiku is used up.")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("error", "model"), [(_BUDGET_STOP, "bad model"), (_WALLET_STOP, "haiku-4-5")])
+async def test_turn_failed_drops_a_budget_model_it_cannot_use(monkeypatch, error, model):
+    data = await _failed_turn(monkeypatch, {"error": error, "budget_model": model})
+    assert "budget_model" not in data
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("error", "period"),
+    [(_BUDGET_STOP, "week"), (_WALLET_STOP, "day"), (_BUDGET_STOP, None)],
+)
+async def test_turn_failed_drops_a_budget_period_it_cannot_use(monkeypatch, error, period):
+    reply = {"error": error} if period is None else {"error": error, "budget_period": period}
+    data = await _failed_turn(monkeypatch, reply)
+    assert "budget_period" not in data
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("error", "scope"),
+    [(_BUDGET_STOP, "Not A Scope!"), (_WALLET_STOP, "workspace"), (_BUDGET_STOP, None)],
+)
+async def test_turn_failed_drops_a_budget_scope_it_cannot_use(monkeypatch, error, scope):
+    # A malformed scope, a scope on another code, and an older worker that sends none.
+    reply = {"error": error} if scope is None else {"error": error, "budget_scope": scope}
+    data = await _failed_turn(monkeypatch, reply)
+    assert "budget_scope" not in data
+
+
 @pytest.mark.asyncio
 async def test_turn_failed_sends_reset_at_in_the_extended_iso_form(monkeypatch):
     # Python parses compact and `Z` forms that a browser's Date may not, so the
@@ -333,6 +406,47 @@ async def test_turn_failed_never_carries_reset_at_outside_the_reset_codes(monkey
     data = await _failed_turn(monkeypatch, {"error": _WALLET_STOP, "reset_at": _RESET_AT})
     assert data["code"] == te.TOKEN_LIMIT_CODE
     assert "reset_at" not in data
+
+
+# ENG-4186's plan stops, under the type names the worker will send them as.
+_WINDOW_STOP = "WindowAllowanceExhaustedError: You have used your plan's 5-hour allowance for 'x'."
+_TIER_STOP = "ModelNotInTierError: Your plan's included allowance does not cover the model 'x'."
+
+
+@pytest.mark.asyncio
+async def test_turn_failed_keeps_a_spent_windows_reset_at_and_window(monkeypatch):
+    data = await _failed_turn(monkeypatch, {"error": _WINDOW_STOP, "reset_at": _RESET_AT, "window": "5h"})
+    assert data["code"] == te.WINDOW_ALLOWANCE_EXHAUSTED_CODE
+    assert data["message"] == te.WINDOW_ALLOWANCE_EXHAUSTED_USER_MESSAGE
+    assert data["reset_at"] == _RESET_AT
+    assert data["window"] == "5h"
+
+
+@pytest.mark.asyncio
+async def test_turn_failed_keeps_a_model_outside_the_tiers_required_tier(monkeypatch):
+    data = await _failed_turn(monkeypatch, {"error": _TIER_STOP, "required_tier": "pro", "reset_at": _RESET_AT})
+    assert data["code"] == te.MODEL_NOT_IN_TIER_CODE
+    assert data["required_tier"] == "pro"
+    # No wait lifts it, so no reset instant rides it.
+    assert "reset_at" not in data
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("error", "field", "value"),
+    [
+        (_WINDOW_STOP, "window", "1d"),
+        (_WINDOW_STOP, "window", 5),
+        (_ALLOWANCE_STOP, "window", "5h"),
+        (_TIER_STOP, "required_tier", "enterprise"),
+        (_TIER_STOP, "required_tier", "free"),
+        (_WALLET_STOP, "required_tier", "pro"),
+    ],
+)
+async def test_turn_failed_drops_a_plan_field_it_cannot_use(monkeypatch, error, field, value):
+    # A malformed value, and a value on another code.
+    data = await _failed_turn(monkeypatch, {"error": error, field: value})
+    assert field not in data
 
 
 @pytest.mark.asyncio
@@ -454,6 +568,7 @@ async def test_stream_remote_replies_forwards_started_at_only_when_known(monkeyp
         return "mdb_turnkey"
 
     monkeypatch.setattr(prod, "mint_turn_key", fake_mint)
+    monkeypatch.setattr(prod, "mint_turn_key_details", turn_key_details_from(fake_mint))
 
     async def fake_list_active_connections(**kw):
         return []
@@ -729,6 +844,7 @@ async def test_stream_remote_replies_attaches_oauth_block_with_the_llm_turn_key(
         return "mdb_turnkey"
 
     monkeypatch.setattr(prod, "mint_turn_key", fake_mint)
+    monkeypatch.setattr(prod, "mint_turn_key_details", turn_key_details_from(fake_mint))
 
     async def fake_list_active_connections(**kw):
         assert kw["org_id"] == "o1" and kw["user_id"] == "u1"
@@ -787,11 +903,13 @@ async def test_the_connector_key_lives_as_long_as_the_turn_key(monkeypatch, time
     assert by_purpose["execution"] == prod.TurnQueueSettings().turn_key_lifetime_seconds
 
 
-async def _turn_params(monkeypatch, connections, mint):
+async def _turn_params(monkeypatch, connections, mint, *, details=None):
+    """The job of one turn; ``mint`` answers both mints unless ``details`` answers the turn key's."""
     fake = FakeRedis(replies=[("scratchpad:reply:conv-1", _reply("turn_completed", {}))])
     monkeypatch.setattr(prod, "get_redis", lambda: fake)
     monkeypatch.setattr(prod, "_new_correlation_id", lambda: "r")
     monkeypatch.setattr(prod, "mint_turn_key", mint)
+    monkeypatch.setattr(prod, "mint_turn_key_details", details or turn_key_details_from(mint))
 
     async def fake_list_active_connections(**kw):
         return connections
@@ -826,12 +944,12 @@ async def test_an_mcp_connection_gets_anton_a_connector_key_and_the_scratchpad_k
 @pytest.mark.asyncio
 async def test_with_datasource_grants_on_an_mcp_connection_still_gets_a_connector_key(monkeypatch):
     monkeypatch.setenv("COWORK_TURN_DATASOURCE_ENABLED", "true")
-    monkeypatch.setattr(prod, "mint_turn_key_details", AsyncMock(
-        return_value=SimpleNamespace(key="mdb_prefix.secret", prefix="mdb_prefix"),
-    ))
+    details = AsyncMock(return_value=SimpleNamespace(key="mdb_prefix.secret", prefix="mdb_prefix", ttl_seconds=1200))
     monkeypatch.setattr(prod, "list_verified_datasource_connections", AsyncMock(return_value=[]))
     calls = []
-    params = await _turn_params(monkeypatch, [{"engine": "notion", "name": "acme"}], _purpose_keyed_mint(calls))
+    params = await _turn_params(
+        monkeypatch, [{"engine": "notion", "name": "acme"}], _purpose_keyed_mint(calls), details=details,
+    )
     assert params["oauth"]["turn_key"] == "mdb_connector"
     assert params["llm"]["api_key"] == "mdb_prefix.secret"
 
@@ -937,6 +1055,7 @@ async def test_a_failed_turn_key_mint_revokes_the_connector_key(monkeypatch):
         revoked.append((instance_id, list(minted)))
 
     monkeypatch.setattr(prod, "mint_turn_key", mint)
+    monkeypatch.setattr(prod, "mint_turn_key_details", turn_key_details_from(mint))
     monkeypatch.setattr(prod, "revoke_turn_key", revoke)
     monkeypatch.setenv("COWORK_TURN_AUTH_INTERNAL_BASE_URL", "http://auth")
     monkeypatch.setenv("COWORK_TURN_AUTH_INTERNAL_SECRET", "s")
@@ -997,6 +1116,7 @@ async def test_stream_remote_replies_omits_oauth_block_when_no_connections(monke
         return []
 
     monkeypatch.setattr(prod, "mint_turn_key", fake_mint)
+    monkeypatch.setattr(prod, "mint_turn_key_details", turn_key_details_from(fake_mint))
     monkeypatch.setattr(prod, "list_active_connections", fake_list_active_connections)
 
     await _drain(prod.stream_remote_replies(
@@ -1118,7 +1238,7 @@ async def test_datasource_grants_are_registered_before_refs_are_enqueued(monkeyp
 
     async def fake_mint_details(**_kw):
         events.append("mint")
-        return SimpleNamespace(key="mdb_prefix.secret", prefix="mdb_prefix")
+        return SimpleNamespace(key="mdb_prefix.secret", prefix="mdb_prefix", ttl_seconds=1200)
 
     async def fake_list(**kw):
         events.append("list")
@@ -1184,7 +1304,7 @@ async def test_datasource_grant_mismatch_fails_before_enqueue(monkeypatch):
     monkeypatch.setattr(
         prod,
         "mint_turn_key_details",
-        AsyncMock(return_value=SimpleNamespace(key="mdb_prefix.secret", prefix="mdb_prefix")),
+        AsyncMock(return_value=SimpleNamespace(key="mdb_prefix.secret", prefix="mdb_prefix", ttl_seconds=1200)),
     )
     monkeypatch.setattr(
         prod,
@@ -1231,7 +1351,7 @@ async def test_datasource_grant_binding_mismatch_fails_before_enqueue(monkeypatc
     monkeypatch.setattr(
         prod,
         "mint_turn_key_details",
-        AsyncMock(return_value=SimpleNamespace(key="mdb_prefix.secret", prefix="mdb_prefix")),
+        AsyncMock(return_value=SimpleNamespace(key="mdb_prefix.secret", prefix="mdb_prefix", ttl_seconds=1200)),
     )
     monkeypatch.setattr(
         prod,
@@ -1283,7 +1403,7 @@ async def test_an_auth_outage_during_turn_setup_ends_the_turn_as_permission_unav
     monkeypatch.setattr(prod, "_new_correlation_id", lambda: "r")
     monkeypatch.setenv("COWORK_TURN_DATASOURCE_ENABLED", "true")
     calls = {
-        "mint_turn_key_details": AsyncMock(return_value=SimpleNamespace(key="mdb_prefix.secret", prefix="mdb_prefix")),
+        "mint_turn_key_details": AsyncMock(return_value=SimpleNamespace(key="mdb_prefix.secret", prefix="mdb_prefix", ttl_seconds=1200)),
         "list_verified_datasource_connections": AsyncMock(return_value=[{
             "id": 7, "connector_id": "postgres", "name": "events", "status": "verified", "credential_version": 3,
         }]),
@@ -1326,6 +1446,7 @@ async def test_llm_mint_and_oauth_connections_fetch_run_concurrently(monkeypatch
         return []
 
     monkeypatch.setattr(prod, "mint_turn_key", slow_mint)
+    monkeypatch.setattr(prod, "mint_turn_key_details", turn_key_details_from(slow_mint))
     monkeypatch.setattr(prod, "list_active_connections", tracking_list_active_connections)
 
     try:
@@ -1353,6 +1474,7 @@ async def test_stream_remote_replies_mints_and_attaches_llm_block(monkeypatch):
         return "mdb_turnkey"
 
     monkeypatch.setattr(prod, "mint_turn_key", _fake_mint)
+    monkeypatch.setattr(prod, "mint_turn_key_details", turn_key_details_from(_fake_mint))
 
     await _drain(prod.stream_remote_replies(
         conversation_id="conv-1", org_id="o1", user_id="u1", input_text="hi",
@@ -1400,6 +1522,7 @@ async def test_stream_remote_replies_forwards_the_active_hub_workspace(monkeypat
         return "mdb_turnkey"
 
     monkeypatch.setattr(prod, "mint_turn_key", _fake_mint)
+    monkeypatch.setattr(prod, "mint_turn_key_details", turn_key_details_from(_fake_mint))
 
     await _drain(prod.stream_remote_replies(
         conversation_id="conv-1", org_id="o1", user_id="u1", input_text="hi",
@@ -1429,7 +1552,7 @@ async def test_the_active_hub_workspace_binds_the_key_with_datasources_on_too(mo
 
     async def _fake_mint(**kw):
         captured.update(kw)
-        return SimpleNamespace(key="mdb_prefix.secret", prefix="mdb_prefix")
+        return SimpleNamespace(key="mdb_prefix.secret", prefix="mdb_prefix", ttl_seconds=1200)
 
     monkeypatch.setattr(prod, "mint_turn_key_details", _fake_mint)
     monkeypatch.setattr(prod, "list_verified_datasource_connections", AsyncMock(return_value=[]))
@@ -1462,6 +1585,7 @@ async def test_stream_remote_replies_omits_workspace_id_when_none_picked(monkeyp
         return "mdb_turnkey"
 
     monkeypatch.setattr(prod, "mint_turn_key", _fake_mint)
+    monkeypatch.setattr(prod, "mint_turn_key_details", turn_key_details_from(_fake_mint))
 
     await _drain(prod.stream_remote_replies(
         conversation_id="conv-1", org_id="o1", user_id="u1", input_text="hi",
@@ -1951,7 +2075,7 @@ async def test_artifact_authority_outage_stops_before_queue_side_effects(monkeyp
     with pytest.raises(prod.product_permissions.ProductPermissionUnavailable):
         await _drain(prod.stream_remote_replies(
             conversation_id="conv-1", org_id="org", user_id="user", input_text="run",
-            model="m", llm={"api_key": "already-minted-key"},
+            model="m", llm=prod.TurnLlm(block={"api_key": "already-minted-key"}, turn_key_id=None, ttl_seconds=1200),
         ))
     assert permissions == ["product.execute", "artifact.manage"]
     redis.assert_not_called()
@@ -1973,6 +2097,73 @@ def _echo(refs, **overrides):
 
 
 @pytest.mark.asyncio
+async def test_a_datasource_listing_auth_cannot_answer_logs_no_permission_unavailable(monkeypatch, caplog, owned_logger):
+    """The turn runs without its databases, and no permission_unavailable is
+    logged for an answer nobody got: the producer's own line says what was left out."""
+    from cowork.services.product_permissions import permission_unavailable
+
+    owned_logger("cowork.services.product_permissions", level=logging.WARNING)
+    fake = FakeRedis(replies=[("scratchpad:reply:conv-1", _reply("turn_completed", {}))])
+    monkeypatch.setattr(prod, "get_redis", lambda: fake)
+    monkeypatch.setattr(prod, "_new_correlation_id", lambda: "r")
+    monkeypatch.setenv("COWORK_TURN_DATASOURCE_ENABLED", "true")
+    monkeypatch.setattr(prod, "mint_turn_key_details", AsyncMock(
+        return_value=MintedTurnKey(key="mdb_prefix.secret", prefix="mdb_prefix", ttl_seconds=1200)))
+    monkeypatch.setattr(prod, "list_verified_datasource_connections", AsyncMock(
+        side_effect=permission_unavailable(route=DATASOURCE_CONNECTIONS_ROUTE, cause=httpx.ReadTimeout("slow"))))
+
+    items = await _drain(prod.stream_remote_replies(
+        conversation_id="conv-1", org_id="o1", user_id="u1", input_text="hi", model="m",
+    ))
+
+    assert [kind for kind, _ in items] == ["turn_completed"]
+    assert "datasource" not in json.loads(fake.added[0][1]["payload"])["params"]
+    assert not [
+        r for r in caplog.records
+        if r.name == "cowork.services.product_permissions" and getattr(r, "event", None) == "permission_unavailable"
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("listing", "grants", "route", "reason"),
+    [
+        (["not an object"], None, DATASOURCE_CONNECTIONS_ROUTE, "listing carries a connection that is not an object"),
+        ([_verified(7)], _echo([(7, 3)], turn_key_id="other"), DATASOURCE_GRANTS_ROUTE,
+         "grant response binding does not match this turn"),
+    ],
+    ids=["listing", "grant-answer"],
+)
+async def test_a_refused_datasource_grant_logs_its_route_and_reason(
+    monkeypatch, caplog, owned_logger, listing, grants, route, reason
+):
+    """The line the console prints for a grant check that fails the turn, not only the 503."""
+    logged = owned_logger("cowork.services.product_permissions", level=logging.WARNING)
+    fake = FakeRedis(replies=[("scratchpad:reply:conv-1", _reply("turn_completed", {}))])
+    monkeypatch.setattr(prod, "get_redis", lambda: fake)
+    monkeypatch.setattr(prod, "_new_correlation_id", lambda: "r")
+    monkeypatch.setenv("COWORK_TURN_DATASOURCE_ENABLED", "true")
+    monkeypatch.setattr(prod, "mint_turn_key_details", AsyncMock(
+        return_value=MintedTurnKey(key="mdb_prefix.secret", prefix="mdb_prefix", ttl_seconds=1200)))
+    monkeypatch.setattr(prod, "list_verified_datasource_connections", AsyncMock(return_value=listing))
+    monkeypatch.setattr(prod, "register_datasource_grants", AsyncMock(return_value=grants))
+
+    items = await _drain(prod.stream_remote_replies(
+        conversation_id="conv-1", org_id="o1", user_id="u1", input_text="hi", model="m",
+    ))
+
+    assert [(kind, data["code"]) for kind, data in items] == [("turn_failed", "permission_unavailable")]
+    [record] = [
+        r for r in caplog.records
+        if r.name == "cowork.services.product_permissions" and getattr(r, "event", None) == "permission_unavailable"
+    ]
+    assert (record.route, record.reason) == (route, reason)
+    line = json.loads(logged.output().strip())
+    assert (line["event"], line["route"], line["reason"]) == ("permission_unavailable", route, reason)
+    assert "mdb_prefix.secret" not in logged.output()
+
+
+@pytest.mark.asyncio
 async def test_a_hosted_turn_registers_grants_against_the_gate_minted_key(monkeypatch):
     """The path a hosted org runs: the routing gate minted the turn key and hands
     its prefix through; the producer registers grants against that key and mints
@@ -1983,7 +2174,7 @@ async def test_a_hosted_turn_registers_grants_against_the_gate_minted_key(monkey
     monkeypatch.setattr(prod, "get_redis", lambda: fake)
     monkeypatch.setenv("COWORK_TURN_DATASOURCE_ENABLED", "true")
     assert TurnQueueSettings().datasource_enabled is True
-    for name in ("mint_turn_key", "mint_turn_key_details", "mint_llm_block", "_mint_llm_block_with_turn_key_id"):
+    for name in ("mint_turn_key", "mint_turn_key_details", "mint_llm_block", "mint_turn_llm"):
         monkeypatch.setattr(prod, name, AsyncMock(side_effect=AssertionError(f"{name} minted a second key")))
     monkeypatch.setattr(prod, "list_verified_datasource_connections", AsyncMock(return_value=[_verified(7)]))
     register = AsyncMock(return_value=_echo([(7, 3)], turn_key_id="mdb_gate"))
@@ -1992,7 +2183,7 @@ async def test_a_hosted_turn_registers_grants_against_the_gate_minted_key(monkey
 
     await _drain(prod.stream_remote_replies(
         conversation_id="conv-1", org_id="o1", user_id="u1", input_text="hi", model="m",
-        correlation_id="r", llm=block, turn_key_id="mdb_gate",
+        correlation_id="r", llm=prod.TurnLlm(block=block, turn_key_id="mdb_gate", ttl_seconds=1200),
     ))
 
     assert register.await_args.kwargs["turn_key_id"] == "mdb_gate"
@@ -2025,7 +2216,7 @@ async def test_a_listing_auth_cannot_answer_costs_the_turn_its_databases_not_the
 
     await _drain(prod.stream_remote_replies(
         conversation_id="conv-1", org_id="o1", user_id="u1", input_text="hi", model="m",
-        correlation_id="r", llm=block, turn_key_id="mdb_gate",
+        correlation_id="r", llm=prod.TurnLlm(block=block, turn_key_id="mdb_gate", ttl_seconds=1200),
     ))
 
     params = json.loads(fake.added[0][1]["payload"])["params"]
@@ -2068,7 +2259,7 @@ async def _queued_datasource(monkeypatch, listing, *, labels: bool) -> dict | No
     block = {"provider": "minds-cloud", "api_key": "mdb_gate.secret", "base_url": "https://minds.internal/v1"}
     await _drain(prod.stream_remote_replies(
         conversation_id="conv-1", org_id="o1", user_id="u1", input_text="hi", model="m",
-        correlation_id="r", llm=block, turn_key_id="mdb_gate",
+        correlation_id="r", llm=prod.TurnLlm(block=block, turn_key_id="mdb_gate", ttl_seconds=1200),
     ))
     return json.loads(fake.added[0][1]["payload"])["params"].get("datasource")
 
@@ -2151,24 +2342,23 @@ def test_the_connection_cap_applies_to_the_grant_set_not_the_listing():
 
 @pytest.mark.asyncio
 async def test_a_refused_grant_names_the_failed_check_and_never_a_secret(monkeypatch):
-    """Recorded at the module logger rather than through caplog: another test's
-    logging setup must not decide whether this assertion sees the record."""
+    """Carried on the exception for the place that answers it to log
+    (product_permissions.report_permission_unavailable)."""
     from cowork.common.settings.app_settings import TurnQueueSettings
     from cowork.services.product_permissions import ProductPermissionUnavailable
 
-    warnings: list[str] = []
-    monkeypatch.setattr(prod.logger, "warning", lambda msg, *args, **kw: warnings.append(msg % args))
     monkeypatch.setattr(prod, "list_verified_datasource_connections", AsyncMock(return_value=[_verified(7)]))
     monkeypatch.setattr(prod, "register_datasource_grants", AsyncMock(return_value=_echo([(7, 3)], turn_key_id="mdb_other")))
     settings = TurnQueueSettings(
         datasource_enabled=True, datasource_producer_key_id="producer-v1", datasource_producer_key="producer-secret"
     )
-    with pytest.raises(ProductPermissionUnavailable):
+    with pytest.raises(ProductPermissionUnavailable) as raised:
         await prod._mint_datasource_block(
             org_id="o1", user_id="u1", correlation_id="r", turn_key_id="mdb_prefix", disabled=None, settings=settings
         )
-    assert len(warnings) == 1 and "binding" in warnings[0]
-    assert "producer-secret" not in warnings[0] and "mdb_" not in warnings[0]
+    cause = raised.value.auth_cause
+    assert "binding" in cause.reason and cause.route == DATASOURCE_GRANTS_ROUTE
+    assert "producer-secret" not in repr(cause) and "mdb_" not in repr(cause)
 
 
 @pytest.mark.asyncio
@@ -2516,7 +2706,9 @@ async def test_the_users_image_model_reaches_the_pod_and_an_upstream_pick_is_kep
         return fake
 
     monkeypatch.setattr(prod, "_new_correlation_id", lambda: "r")
-    monkeypatch.setattr(prod, "mint_turn_key", AsyncMock(return_value="mdb_turnkey"))
+    mint = AsyncMock(return_value="mdb_turnkey")
+    monkeypatch.setattr(prod, "mint_turn_key", mint)
+    monkeypatch.setattr(prod, "mint_turn_key_details", turn_key_details_from(mint))
     monkeypatch.setattr(
         user_settings.UserSettings,
         "image_model_for_agent",
@@ -2533,7 +2725,7 @@ async def test_the_users_image_model_reaches_the_pod_and_an_upstream_pick_is_kep
     block = {"provider": "minds-cloud", "api_key": "k", "base_url": "https://minds.internal/v1", "image_model": "x"}
     await asyncio.wait_for(_drain(prod.stream_remote_replies(
         conversation_id="conv-1", org_id="o1", user_id="u1", input_text="hi", model="m",
-        correlation_id="r", llm=block,
+        correlation_id="r", llm=prod.TurnLlm(block=block, turn_key_id=None, ttl_seconds=1200),
     )), timeout=5)
     assert json.loads(fake.added[0][1]["payload"])["params"]["llm"]["image_model"] == "x"
 
@@ -2547,7 +2739,9 @@ async def test_no_image_model_reaches_the_pod_before_mindshub_lists_one(monkeypa
     fake = FakeRedis(replies=[("scratchpad:reply:conv-1", _reply("turn_completed", {}))])
     monkeypatch.setattr(prod, "get_redis", lambda: fake)
     monkeypatch.setattr(prod, "_new_correlation_id", lambda: "r")
-    monkeypatch.setattr(prod, "mint_turn_key", AsyncMock(return_value="mdb_turnkey"))
+    mint = AsyncMock(return_value="mdb_turnkey")
+    monkeypatch.setattr(prod, "mint_turn_key", mint)
+    monkeypatch.setattr(prod, "mint_turn_key_details", turn_key_details_from(mint))
     monkeypatch.setattr(user_settings.UserSettings, "image_model_for_agent", property(lambda self: None))
 
     await asyncio.wait_for(_drain(prod.stream_remote_replies(
@@ -2789,6 +2983,26 @@ async def test_the_job_carries_the_organizations_jev_opt_out(monkeypatch, enable
     assert json.loads(fake.added[0][1]["payload"])["params"]["jev_decisions"] is enabled
 
 
+@pytest.mark.parametrize("enabled", [True, False])
+async def test_the_job_carries_the_organizations_classify_switch(monkeypatch, enabled):
+    from cowork.common.settings import user_settings
+
+    monkeypatch.setattr(
+        user_settings, "get_user_settings",
+        lambda scope: SimpleNamespace(limits_enabled=False, resolved_planning_model="m", hub_workspace_id="",
+                                      jev_decisions_enabled=True, jev_classify_enabled=enabled),
+    )
+    fake = FakeRedis(replies=[("scratchpad:reply:conv-1", _reply("turn_completed", {}))])
+    monkeypatch.setattr(prod, "get_redis", lambda: fake)
+    monkeypatch.setattr(prod, "_new_correlation_id", lambda: "r")
+    await _drain(prod.stream_remote_replies(
+        conversation_id="conv-1", org_id=None, user_id=None, input_text="hi", model="m"))
+
+    params = json.loads(fake.added[0][1]["payload"])["params"]
+    assert params["jev_classify"] is enabled
+    assert params["jev_decisions"] is True
+
+
 @pytest.fixture
 def revokes(monkeypatch):
     """Internal auth configured, as in every hosted deployment; records each
@@ -2810,7 +3024,10 @@ def _turn_with_key(monkeypatch, replies):
     monkeypatch.setattr(prod, "_new_correlation_id", lambda: "r")
     return prod.stream_remote_replies(
         conversation_id="conv-1", org_id=None, user_id=None, input_text="hi", model="m",
-        llm={"provider": "minds-cloud", "api_key": "mdb_turnkey", "base_url": "https://gateway.example.test/v1"},
+        llm=prod.TurnLlm(
+            block={"provider": "minds-cloud", "api_key": "mdb_turnkey", "base_url": "https://gateway.example.test/v1"},
+            turn_key_id=None, ttl_seconds=1200,
+        ),
     )
 
 
@@ -2861,7 +3078,10 @@ async def _cancel_mid_turn(monkeypatch, *, stopped: bool) -> None:
     monkeypatch.setattr(prod, "_new_correlation_id", lambda: "r")
     task = asyncio.create_task(_drain(prod.stream_remote_replies(
         conversation_id="conv-1", org_id=None, user_id=None, input_text="hi", model="m",
-        llm={"provider": "minds-cloud", "api_key": "mdb_turnkey", "base_url": "https://gateway.example.test/v1"},
+        llm=prod.TurnLlm(
+            block={"provider": "minds-cloud", "api_key": "mdb_turnkey", "base_url": "https://gateway.example.test/v1"},
+            turn_key_id=None, ttl_seconds=1200,
+        ),
     )))
     await fake.waiting.wait()
     if stopped:
@@ -2974,3 +3194,63 @@ async def test_preview_checks_reaches_the_job_only_for_an_interactive_turn(
                                             preview_checks=preview_checks))
     params = json.loads(fake.added[0][1]["payload"])["params"]
     assert params.get("preview_checks") is expected
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("interactive,host_tools,expected", [
+    (True, [{"name": "read_doc", "description": "Read a doc.", "input_schema": {"type": "object"}}], True),
+    (False, [{"name": "read_doc", "description": "Read a doc.", "input_schema": {"type": "object"}}], False),
+    (True, [], False),
+    (True, None, False),
+])
+async def test_host_tools_reach_the_job_only_for_an_interactive_turn(monkeypatch, interactive, host_tools, expected):
+    """Their answers reach the pod on the stdin only an interactive turn keeps open."""
+    fake = FakeRedis(replies=[("scratchpad:reply:conv-1", _reply("turn_completed", {}))])
+    monkeypatch.setattr(prod, "get_redis", lambda: fake)
+    monkeypatch.setattr(prod, "_new_correlation_id", lambda: "r")
+    await _drain(prod.stream_remote_replies(conversation_id="conv-1", org_id=None, user_id=None,
+                                            input_text="hi", model="m", interactive=interactive,
+                                            host_tools=host_tools))
+    params = json.loads(fake.added[0][1]["payload"])["params"]
+    assert params.get("host_tools") == (host_tools if expected else None)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("interactive", [True, False])
+async def test_a_skill_only_dropped_host_tools_wait_for_is_dropped_with_them(monkeypatch, interactive):
+    """It would unlock nothing in the pod; the caller's other skills stay."""
+    from cowork.schemas.turn_skills import TurnSkillEntry
+
+    fake = FakeRedis(replies=[("scratchpad:reply:conv-1", _reply("turn_completed", {}))])
+    monkeypatch.setattr(prod, "get_redis", lambda: fake)
+    monkeypatch.setattr(prod, "_new_correlation_id", lambda: "r")
+    host_tools = [{"name": "edit_doc", "description": "Edit a doc.", "input_schema": {"type": "object"},
+                   "unlock_skill": "doc-tools"}]
+    skills = {"doc-tools": TurnSkillEntry(files={"SKILL.md": "guide"}),
+              "notes": TurnSkillEntry(files={"SKILL.md": "n"})}
+    await _drain(prod.stream_remote_replies(conversation_id="conv-1", org_id=None, user_id=None,
+                                            input_text="hi", model="m", interactive=interactive,
+                                            host_tools=host_tools, skills=skills))
+    params = json.loads(fake.added[0][1]["payload"])["params"]
+    assert sorted(params["skills"]) == (["doc-tools", "notes"] if interactive else ["notes"])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("can_manage,expected", [(True, True), (False, False)])
+async def test_host_tools_reach_the_job_only_for_a_persistent_workspace(monkeypatch, can_manage, expected):
+    """Without artifact.manage the caller may not change artifacts, and the turn end
+    records nothing for a workspace that is not persistent: no doc tools then."""
+    async def allowed(scope, permission):
+        return permission == "product.execute" or can_manage
+
+    monkeypatch.setattr(prod.product_permissions, "has_product_permission", allowed)
+    host_tools = [{"name": "read_doc", "description": "Read a doc.", "input_schema": {"type": "object"}}]
+    fake = FakeRedis(replies=[("scratchpad:reply:conv-1", _reply("turn_completed", {}))],
+                     workspace_mode="persistent" if can_manage else "ephemeral")
+    monkeypatch.setattr(prod, "get_redis", lambda: fake)
+    monkeypatch.setattr(prod, "_new_correlation_id", lambda: "r")
+    await _drain(prod.stream_remote_replies(conversation_id="conv-1", org_id=None, user_id=None,
+                                            input_text="hi", model="m", interactive=True,
+                                            host_tools=host_tools))
+    params = json.loads(fake.added[0][1]["payload"])["params"]
+    assert params.get("host_tools") == (host_tools if expected else None)

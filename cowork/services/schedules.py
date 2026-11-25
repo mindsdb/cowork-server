@@ -489,26 +489,6 @@ class ScheduleRunService:
             return False
         return self._running_run(schedule_id) is not None
 
-    def last_successful_finish(self, schedule_id: UUID) -> datetime | None:
-        """When the schedule's most recent successful run (manual or cron)
-        finished, or None if it never succeeded. Used by the scheduler's
-        freshness guard to skip a due slot right after e.g. a manual run. A
-        trial run doesn't count: it tries the task out, so the slot after it
-        still runs.
-        """
-        run = self.session.exec(
-            self.session.select(ScheduleRun)
-            .where(ScheduleRun.schedule_id == schedule_id)
-            .where(ScheduleRun.status == RunStatus.success)
-            .where(ScheduleRun.trial.is_(False))  # type: ignore[attr-defined]
-            .order_by(ScheduleRun.finished_at.desc())  # type: ignore[union-attr]
-            .limit(1)
-        ).first()
-        if run is None or run.finished_at is None:
-            return None
-        finished = run.finished_at
-        return finished if finished.tzinfo else finished.replace(tzinfo=timezone.utc)
-
     def still_exists(self, conversation_id: UUID | None) -> UUID | None:
         """The conversation id back, or None once the conversation is gone.
 

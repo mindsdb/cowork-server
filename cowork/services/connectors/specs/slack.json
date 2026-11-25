@@ -18,7 +18,7 @@
     "integration",
     "communication"
   ],
-  "description": "Read and send messages in Slack channels and DMs using a bot installed in your workspace.",
+  "description": "Read and send messages in Slack channels and DMs.",
   "category": "communication",
   "logo": "chats",
   "logo_color": "#4A154B",
@@ -30,10 +30,59 @@
     "logo_color": "#4A154B",
     "methods": [
       {
+        "id": "mcp",
+        "label": "In-Browser Connect",
+        "description": "Opens Slack sign-in in your browser through Slack MCP, the same mechanism Claude's own Slack connector uses. No credentials required, just click Connect. Anton acts as you and can reach whatever you can reach in the workspace you pick. Anton can read; it posts or edits only when you allow it in Tool access. Code Projects posts an update only after you confirm it.",
+        "recommended": true,
+        "hidden": false,
+        "fields": [],
+        "oauth": {
+          "auth_url": "https://slack.com/oauth/v2_user/authorize",
+          "token_url": "https://slack.com/api/oauth.v2.user.access",
+          "scopes": [
+            "search:read.public",
+            "search:read.private",
+            "search:read.im",
+            "search:read.mpim",
+            "search:read.files",
+            "search:read.users",
+            "channels:history",
+            "channels:read",
+            "channels:write",
+            "groups:history",
+            "groups:read",
+            "groups:write",
+            "im:history",
+            "im:read",
+            "im:write",
+            "mpim:history",
+            "mpim:read",
+            "mpim:write",
+            "chat:write",
+            "reactions:read",
+            "reactions:write",
+            "canvases:read",
+            "canvases:write",
+            "lists:read",
+            "lists:write",
+            "files:read",
+            "files:write",
+            "emoji:read",
+            "users:read",
+            "users:read.email"
+          ],
+          "service_id": "slack",
+          "supports_refresh": true,
+          "supports_revoke": true,
+          "redirect_host": "localhost",
+          "redirect_port": 47297
+        }
+      },
+      {
         "id": "bot-token",
         "label": "Bot User OAuth Token",
         "description": "Paste an xoxb- token from a Slack app installed in your workspace. Simplest path — no OAuth dance required, just create an app, add scopes, install it, and copy the token.",
-        "recommended": true,
+        "recommended": false,
         "how_to": "## Create a Slack App and get a Bot Token\n\nThis is the fastest way to connect Anton to Slack. You create a Slack app, grant it the permissions Anton needs, install it to your workspace, and paste the token.\n\n### Steps\n\n1. Go to [api.slack.com/apps](https://api.slack.com/apps) and click **Create New App → From scratch**.\n2. Give it a name (e.g. `Anton`) and pick the workspace you want to connect.\n3. In the left sidebar, click **OAuth & Permissions**.\n4. Scroll to **Scopes → Bot Token Scopes** and add the scopes Anton needs, for example:\n   - `channels:history` — read messages in public channels\n   - `channels:read` — list public channels\n   - `chat:write` — post messages\n   - `im:history` / `im:read` — read direct messages\n   - `groups:history` / `groups:read` — read private channels the bot is invited to\n5. Scroll back up and click **Install to Workspace**, then click **Allow**.\n6. After installation, the page shows a **Bot User OAuth Token** starting with `xoxb-`. Copy it.\n7. Paste the token into the **Bot Token** field below.\n\n### Notes\n\n- The token is only shown once per install. If you lose it, reinstall the app from the same page to generate a new one.\n- The bot must be invited to any private channel it should read (type `/invite @YourAppName` in the channel).\n- Tokens are workspace-scoped — repeat this process for each additional workspace.\n",
         "help_url": "https://api.slack.com/authentication/token-types#bot",
         "fields": [
@@ -103,7 +152,8 @@
             "placeholder": "#general",
             "description": "Optional. The channel Anton posts to when no channel is specified."
           }
-        ]
+        ],
+        "hidden": true
       }
     ],
     "logo_url": "logos/slack.svg"

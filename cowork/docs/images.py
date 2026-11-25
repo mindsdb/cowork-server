@@ -13,7 +13,7 @@ from __future__ import annotations
 import hashlib
 import re
 from collections.abc import Callable
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from typing import Any
 
 from .markdown import _IMAGE
@@ -69,23 +69,43 @@ def store_image(folder: Path, data: bytes) -> str:
     return src
 
 
-def _local_path(src: str) -> Path | None:
+def _unbracketed(src: str) -> str:
+    """A Markdown destination without the <…> that lets it hold spaces."""
     s = (src or "").strip()
+    return s[1:-1].strip() if s.startswith("<") and s.endswith(">") else s
+
+
+def _local_path(src: str) -> Path | None:
+    s = _unbracketed(src)
     if s.startswith("file://"):
         s = s[len("file://"):]
+        if PureWindowsPath(s[1:]).is_absolute():  # file:///C:/…
+            s = s[1:]
     if s.startswith("~"):
         s = str(Path(s).expanduser())
-    return Path(s) if s.startswith("/") else None
+    # A Windows path (C:\…, \\server\share\…) as well: the desktop app runs there too.
+    return Path(s) if s.startswith("/") or PureWindowsPath(s).is_absolute() else None
 
 
-def localize_images(value: Any, allowed: Callable[[Path], bool]) -> tuple[Any, dict[str, bytes]]:
+def _read_allowed(path: Path, allowed: Callable[[Path], bool]) -> bytes | None:
+    resolved = path.resolve()
+    if allowed(resolved) and resolved.is_file() and resolved.stat().st_size <= MAX_IMAGE_BYTES:
+        return resolved.read_bytes()
+    return None
+
+
+def localize_images(
+    value: Any, allowed: Callable[[Path], bool], *, reader: Callable[[str], bytes] | None = None,
+) -> tuple[Any, dict[str, bytes]]:
     """``value`` (ops, or a create's markdown or tabs) with each usable local image pointed beside the doc.
 
     Returns the rewritten value and the images to write there (``write_images``).
     A local image ``allowed`` accepts, that is a real image within the size
     limit, is taken; any other local path is refused here with a message the
     agent can act on: as a Markdown line it would otherwise stay in the doc as
-    its literal text.
+    its literal text. ``reader`` replaces ``allowed`` for a path the server must
+    not resolve itself (a remote pod's): it returns the file's bytes or raises
+    OSError, and the refusal names the path as the agent wrote it.
     """
     files: dict[str, bytes] = {}
 
@@ -94,13 +114,11 @@ def localize_images(value: Any, allowed: Callable[[Path], bool]) -> tuple[Any, d
         if path is None:
             return src
         try:
-            resolved = path.resolve()
-            if allowed(resolved) and resolved.is_file() and resolved.stat().st_size <= MAX_IMAGE_BYTES:
-                data = resolved.read_bytes()
-                if image_kind(data):
-                    name = image_name(data)
-                    files[name] = data
-                    return name
+            data = reader(str(path)) if reader is not None else _read_allowed(path, allowed)
+            if data is not None and image_kind(data):
+                name = image_name(data)
+                files[name] = data
+                return name
         except OSError:
             pass
         raise DocError("bad_block", _LOCAL_PATH_MESSAGE.format(src=src))
@@ -108,7 +126,7 @@ def localize_images(value: Any, allowed: Callable[[Path], bool]) -> tuple[Any, d
     def fix_markdown(md: str) -> str:
         def line(m: re.Match[str]) -> str:
             src = m.group(2)
-            return m.group(0) if image_src_ok(src) else m.group(0).replace(src, fix_src(src), 1)
+            return m.group(0) if image_src_ok(_unbracketed(src)) else m.group(0).replace(src, fix_src(src), 1)
         return _IMAGE_LINE.sub(line, md)
 
     def walk(v: Any) -> Any:

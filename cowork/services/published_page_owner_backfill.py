@@ -45,7 +45,8 @@ class PublishedPageBackfillUnavailable(RuntimeError):
 
 
 class _HistoryRow(BaseModel):
-    # cowork.services.publish.publish_artifact writes exactly these history fields.
+    # The history fields cowork.services.publish.publish_artifact writes, but
+    # approvalChecked, which isn't read here (pydantic ignores extra fields).
     model_config = ConfigDict(strict=True)
 
     artifact: str = Field(min_length=1)

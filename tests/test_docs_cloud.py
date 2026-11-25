@@ -416,7 +416,9 @@ def test_the_services_know_a_doc_only_by_its_files():
                 reached.add(node.module)
             elif isinstance(node, ast.Import):
                 reached.update(a.name for a in node.names if a.name.startswith("cowork.docs"))
-    assert reached == {"cowork.docs.store"}
+    # Besides the files: live_publish follows a cloud doc's page through the
+    # hub's events, and skills ships the doc skill's folder.
+    assert reached == {"cowork.docs.store", "cowork.docs.hub", "cowork.docs.model", "cowork.docs.prompt"}
 
 
 def test_any_other_artifact_publishes_as_before(publishing, monkeypatch):

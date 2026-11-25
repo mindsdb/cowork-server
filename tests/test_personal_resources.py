@@ -129,9 +129,12 @@ _ALLOWED_UNSCOPED_ROOT_READS: dict[str, str] = {
     "server.py": "startup reads of the managed vault and cowork_home, deployment-wide",
     "services/connectors/persist.py": "the managed vault is deployment-wide (own_vault_root scopes the person's own)",
     "services/connectors/probe.py": "cowork_home() for a desktop probe, not a partitioned store",
+    "services/sealing.py": "the start checks for sealing read every local vault, the base, managed and each "
+    "partition's, deployment-wide, before any request; org tenancy reads none",
     "code_sandbox.py": "the code sandbox's trusted and forbidden roots and cowork-home's own entries; "
     "its sandbox store goes through scoped_storage_root (_sandbox_root)",
     "services/projects.py": "projects_root passes this into scoped_storage_root at its one call site",
+    "services/conversation_folders.py": "refusal roots only: no working folder may overlap any of Cowork's data",
     "services/skill_links.py": "the unpartitioned fan-out only runs where skills and projects stay shared (links_apply_to)",
     "services/skills.py": "remove_project_memory_tiers walks the shared root with an O_NOFOLLOW guard",
     "api/v1/endpoints/settings.py": "cowork_home() for the .env a desktop setting writes",

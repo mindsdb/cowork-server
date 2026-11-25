@@ -37,6 +37,10 @@ def shared_doc_folders() -> list[Path]:
         if not root.is_dir():
             continue
         for folder in root.iterdir():
-            if folder.is_dir() and not folder.name.startswith(".") and is_doc_folder(folder) and is_shared(folder):
+            # One stat first: only a doc has its page, so a library of other
+            # artifacts costs a stat each, not a metadata read.
+            if folder.name.startswith(".") or not (folder / DOC_HTML).is_file():
+                continue
+            if is_doc_folder(folder) and is_shared(folder):
                 found.append(folder)
     return found

@@ -57,6 +57,7 @@ from cowork.common.paths import (
     pinned_dir,
     read_bounded,
 )
+from cowork.services.artifact_identity import _write_metadata
 from cowork.services.artifact_journal import (
     read_journal_file,
     read_journal_json,
@@ -64,6 +65,7 @@ from cowork.services.artifact_journal import (
     write_journal_file,
 )
 from cowork.services.artifact_lock import artifact_lock
+from cowork.services.artifact_metadata import ArtifactMetadata
 
 from .model import Doc, DocError, normalize_doc
 from .render import doc_html
@@ -90,6 +92,7 @@ SESSION_PAUSE_S = 5 * 60
 SESSION_MAX_S = 30 * 60
 MAX_DOC_BYTES = 8 * 1024 * 1024
 _MAX_DOC_MB = MAX_DOC_BYTES // (1024 * 1024)
+_MAX_METADATA_BYTES = 1024 * 1024
 
 _locks: dict[str, _DocLock] = {}
 _locks_guard = threading.Lock()
@@ -260,10 +263,16 @@ def remove_child(folder: Path, name: str) -> None:
 def _meta_in(d: PinnedDir) -> dict[str, Any]:
     """The ``metadata.json`` in the artifact's opened folder; {} when it is missing or unreadable."""
     try:
-        meta = json.loads(read_child(d, "metadata.json", max_bytes=1024 * 1024))
+        meta = json.loads(read_child(d, "metadata.json", max_bytes=_MAX_METADATA_BYTES))
     except (OSError, ValueError, DocError):
         return {}
     return meta if isinstance(meta, dict) else {}
+
+
+def read_metadata(d: PinnedDir) -> ArtifactMetadata:
+    """The ``metadata.json`` in the artifact's opened folder, not following a link
+    (read_child). Raises what read_child raises, and ValueError when it won't parse."""
+    return ArtifactMetadata.parse(read_child(d, "metadata.json", max_bytes=_MAX_METADATA_BYTES).decode("utf-8"))
 
 
 def _read_meta(folder: Path) -> dict[str, Any]:
@@ -487,6 +496,21 @@ def write_html(folder: Path, doc: Doc, *, editor: bool = False) -> None:
         logger.warning("could not render %s", folder / DOC_HTML, exc_info=True)
 
 
+def _sync_card_title(folder: Path, title: str) -> None:
+    """Best-effort: set ``name`` in ``metadata.json``, which the card and a lookup by
+    title read, to the doc's title. A link at ``metadata.json`` is left as it is."""
+    try:
+        with doc_subfolder(folder) as d:
+            if _meta_in(d).get("name") == title:
+                return
+            _write_metadata(d, read_metadata(d).with_value("name", title))
+    except FileNotFoundError:
+        return  # no metadata, no card to rename
+    except (OSError, ValueError, DocError) as exc:
+        # No stack: it runs on every write of such a doc.
+        logger.warning("could not set the card title of %s (%s)", folder, exc)
+
+
 def doc_lock(folder: Path) -> _DocLock:
     """The lock every write to this doc holds, in this process and across processes.
 
@@ -540,6 +564,9 @@ def mutate_doc(
             # History is a safety net; never fail the edit over it.
             logger.warning("could not keep a version of %s", folder, exc_info=True)
         write_child(folder, path.name, payload)
+        # Against the metadata, not the previous doc: a doc renamed before this
+        # sync existed catches up on its next write.
+        _sync_card_title(folder, new_doc["title"])
         if after is not None:
             after(new_doc)
         return new_doc, result

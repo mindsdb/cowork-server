@@ -40,9 +40,10 @@ def captured(monkeypatch):
     monkeypatch.setattr(prod, "get_redis", lambda: _FakeRedis(box))
 
     async def _fake_llm(**_kw):
-        return {"provider": "minds-cloud", "api_key": "k", "base_url": "u"}
+        return prod.TurnLlm(block={"provider": "minds-cloud", "api_key": "k", "base_url": "u"},
+                            turn_key_id=None, ttl_seconds=1200)
 
-    monkeypatch.setattr(prod, "mint_llm_block", _fake_llm)
+    monkeypatch.setattr(prod, "mint_turn_llm", _fake_llm)
     return box
 
 

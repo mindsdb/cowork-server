@@ -60,6 +60,31 @@ async def test_list_connections_passes_on_needs_reconnect_only(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_list_connections_passes_on_method_and_access_mode(monkeypatch):
+    async def fake_proxy_catalogue(request, settings):
+        return {
+            "items": [
+                {
+                    "id": "hubspot",
+                    "connections": [
+                        {"engine": "hubspot", "name": "crm", "method": "mcp", "access_mode": "write"},
+                    ],
+                },
+                {"id": "gmail", "connections": [{"engine": "gmail", "name": "inbox", "method": "browser_oauth_builtin"}]},
+            ]
+        }
+
+    monkeypatch.setattr(connections_endpoints.auth_proxy, "proxy_catalogue", fake_proxy_catalogue)
+
+    result = await connections_endpoints.list_connections(ORG_SCOPE, FakeRequest())
+
+    assert {c.name: (c.method, c.access_mode) for c in result} == {
+        "crm": ("mcp", "write"),
+        "inbox": ("browser_oauth_builtin", None),
+    }
+
+
+@pytest.mark.asyncio
 async def test_get_connection_surfaces_non_secret_fields_only(monkeypatch):
     async def fake_proxy_connection_detail(engine, name, request, settings):
         assert engine == "google_drive" and name == "work"

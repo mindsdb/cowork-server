@@ -794,6 +794,9 @@ def _op_delete_tab(op: dict[str, Any], ctx: _Ctx) -> dict[str, Any]:
     for b in tab["blocks"]:
         ctx.guard(b)  # a tab the person typed in since the caller read it is not theirs to drop
     ctx.doc["tabs"] = [t for t in ctx.doc["tabs"] if t["id"] != tab["id"]]
+    # Writes earlier in the batch went with the tab: nothing is left to link or report.
+    ctx.touched.pop(tab["id"], None)
+    ctx.removed.pop(tab["id"], None)
     return {"tab": tab["id"], "deleted_tab": True}
 
 

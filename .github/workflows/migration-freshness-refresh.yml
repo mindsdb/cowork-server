@@ -1,0 +1,68 @@
+# run-tree-ok: a status writer, not a stage of the staging or main pipeline.
+# Folding it into publish-staging.yml or publish.yml would tie it to a release
+# that has nothing to do with stale pull requests, and a failed publish would
+# leave every stale PR unmarked.
+name: Migration freshness refresh
+
+# A push to staging or main leaves every open PR that changes a migration or a
+# builtin skill behind its base. GitHub does not re-run a PR's checks when its
+# base moves, so this marks each such PR's head with a failing
+# `migration-freshness` status until its author merges the base in. The check
+# itself is the `migration-freshness` job in migration-freshness.yml, which
+# re-runs on its own when a PR is retargeted.
+
+on:
+  push:
+    branches: [staging, main]
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "refresh marks stale PRs; backfill also marks unprotected PRs as passing"
+        type: choice
+        options: [refresh, backfill]
+        default: backfill
+
+permissions: {}
+
+concurrency:
+  # One group per event and ref: a newer push to a base supersedes the refresh
+  # of the older one, and a dispatch never cancels a push refresh.
+  group: migration-freshness-refresh-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      pull-requests: read
+      statuses: write
+    steps:
+      - uses: mindsdb/github-actions/migration-freshness@db1df71c808bfcba90fb688ac20fe3f88070ca9a
+        with:
+          mode: ${{ github.event_name == 'workflow_dispatch' && inputs.mode || 'refresh' }}
+          protected-paths: |
+            cowork/db/alembic/versions/*
+            cowork/skills_builtin/*
+          constant-file: cowork/services/skills.py
+          constant-pattern: '^(CODE_)?BUILTIN_SKILLS_VERSION\s*='
+
+  notify:
+    # Alert the eng channel when a refresh fails. A failed refresh leaves stale
+    # PRs green and mergeable on any day, on staging as much as on main, so this
+    # is not freeze-scoped.
+    # One job covers both outcomes: a `uses:` job cannot branch on status, so
+    # the aggregate result picks the failed or recovered message, and a
+    # cancelled run stays silent.
+    needs: [refresh]
+    if: ${{ !cancelled() && !contains(needs.*.result, 'cancelled') }}
+    permissions:
+      contents: read
+      actions: read  # the prior-run lookup behind the recovery message
+    uses: mindsdb/github-actions/.github/workflows/notify-main-failure.yml@main
+    with:
+      env-name: "migration-freshness refresh (${{ github.ref_name }})"
+      status: ${{ contains(needs.*.result, 'failure') && 'failed' || 'recovered' }}
+      runs-on: ubuntu-latest
+    secrets: inherit

@@ -384,3 +384,15 @@ def test_a_chart_drawn_from_a_table_keeps_the_series_cap():
 def test_escaped_marks_read_as_the_editor_reads_them(text, html_out):
     """The editor saves a typed * or _ escaped; the shared page and the exports show it as typed."""
     assert inline_html(text) == html_out
+
+
+def test_an_empty_paragraph_keeps_its_line_on_the_page_and_in_the_exports():
+    """An empty <p> has no height, so a blank line the editor shows would vanish from the page."""
+    from cowork.docs.render import export_body_html
+
+    blocks = [{"type": "paragraph", "text": t} for t in ("First", "", "  ", "Second")]
+    doc = normalize_doc({"schema": SCHEMA, "title": "T", "rev": 1,
+                         "tabs": [{"id": "t_1", "title": "T", "blocks": blocks}]})
+    expected = "<p>First</p>\n<p><br></p>\n<p><br></p>\n<p>Second</p>"
+    assert expected in doc_html(doc)
+    assert expected in export_body_html(doc)

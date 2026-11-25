@@ -81,6 +81,8 @@ _DELEGATE_TOOL = {
         "required": ["reason"],
     },
 }
+DOC_OPEN_MARKER = "[a doc is open beside the chat]"
+
 _SYSTEM_PROMPT = """You are the fast front-line responder for Cowork, an assistant
 that analyzes data, connects to services, runs code, and builds things for the
 user. Answer the latest user message directly only when it can be answered from
@@ -97,7 +99,10 @@ platforms or editions exist, where a setting or feature lives, what it costs.
 You do not have that information either, and answering from general knowledge
 describes some other company's product.
 Delegate any request to change, send, confirm or approve something, and any
-reply to a question asked earlier in this conversation. Never ask the user to
+reply to a question asked earlier in this conversation.
+A line "[a doc is open beside the chat]" means the user is looking at a doc you
+cannot read. Delegate anything about that doc: its content, a change to it, or
+words like "this", "here", "the table" or "it" that may point at it. Never ask the user to
 confirm or approve, and never say that something was done.
 Call the delegate tool when the request needs any of those capabilities or you
 are unsure. Direct answers must be short, helpful, and in the user's language.
@@ -793,10 +798,11 @@ def ineligible_reason(
     own model, so a direct answer would compare the gate against itself.
     A pinned schedule also requires its selected model to answer.
 
-    `has_doc`: the turn was sent with a doc open (its view context) or asks
-    for its answer as a doc. Either way the answer belongs in the doc, which
-    only the agent's doc tools can read and write; a direct reply would put
-    the rewrite in the chat and leave the doc as it was.
+    `has_doc`: the turn asks for its answer as a doc, or acts on the open
+    doc ("Edit with agent", a selection). The answer belongs in the doc,
+    which only the agent's doc tools can read and write; a direct reply would
+    put the rewrite in the chat and leave the doc as it was. A doc that is
+    merely open does not count: the gate decides, told by DOC_OPEN_MARKER.
     """
     if is_comparison_side:
         return "comparison_side"

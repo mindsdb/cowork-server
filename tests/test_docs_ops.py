@@ -198,6 +198,19 @@ def test_tabs_can_be_added_renamed_and_removed():
         apply_ops(new, [{"op": "delete_tab", "tab": new["tabs"][0]["id"]}])
 
 
+def test_an_agent_batch_may_write_in_a_tab_and_then_delete_it():
+    doc = _doc()
+    doc, result = apply_ops(doc, [{"op": "add_tab", "title": "Scratch", "markdown": "Draft."}], by="agent")
+    tab_id = result["results"][0]["tab"]
+    new, result = apply_ops(doc, [
+        {"op": "insert", "tab": tab_id, "position": "end", "markdown": "More."},
+        {"op": "rename_tab", "tab": tab_id, "title": "Old scratch"},
+        {"op": "delete_tab", "tab": tab_id},
+    ], by="agent")
+    assert [t["id"] for t in new["tabs"]] == [doc["tabs"][0]["id"]]
+    assert tab_id not in result["touched"]
+
+
 def test_renaming_a_one_tab_doc_renames_its_page():
     doc = _doc()
     new, _ = apply_ops(doc, [{"op": "rename_doc", "title": "Q4 launch plan"}])

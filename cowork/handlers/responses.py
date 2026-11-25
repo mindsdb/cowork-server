@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import re
 import time
 from collections.abc import AsyncGenerator, Awaitable, Callable
 from contextlib import aclosing
@@ -18,6 +19,7 @@ from sqlalchemy.exc import TimeoutError as PoolTimeoutError
 
 from cowork.build_info import build_trace_metadata
 from cowork.common.chat_session import in_process_agent_allowed
+from cowork.common.event_clock import event_at_ms
 from cowork.common.history_scrub import scrub_credentials, scrubbed_openai_dump
 from cowork.common.logger import log_context
 from cowork.common.settings.app_settings import MINDS_FREE_MODEL, TurnQueueSettings, get_app_settings
@@ -48,6 +50,7 @@ from cowork.handlers import direct_answer, jev_route
 from cowork.services.providers import build_llm_client, minds_chat_base_url
 from cowork.handlers.first_take import FirstTake, clears_take as first_take_clears
 from cowork.handlers.response_routing import (
+    DOC_OPEN_MARKER,
     DELEGATED_AGENTIC,
     DIRECT_CONTEXT,
     ANSWER_HISTORY_MESSAGES,
@@ -81,9 +84,11 @@ from cowork.streaming.liveness import MODEL_WAIT_PHASE, WORKER_ALIVE_PHASE, Mode
 from cowork.streaming.records import TerminalReason
 from cowork.streaming.registry import RunHandle, RunIdentity, mark_question_saved
 from cowork.turnqueue.addons import ADDON_STEP, relay_addon_step
+from cowork.turnqueue.host_tools import HOST_TOOL_CALL_STEP
 from cowork.turnqueue.preview_checks import ARTIFACT_CHECK_STEP, register_remote_check
 from cowork.turnqueue.producer import (
     RemoteWorkspace,
+    TurnLlm,
     revoke_turn_key_quietly,
     step_stream_events,
     stream_remote_replies,
@@ -96,6 +101,9 @@ from cowork.turnqueue.redis_client import (
     get_redis,
 )
 from cowork.docs.prompt import CONTEXT_PREFIXES, DOC_OUTPUT_NOTE, doc_context_block
+from anton.core.artifacts.models import ARTIFACT_ID_SLUG_PREFIX_LEN
+from cowork.docs.remote import RemoteDocTools, start_remote_doc_tools, with_docs_skill
+from cowork.docs.tools import DOC_WRITE_TOOL_NAMES
 from cowork.schemas.responses import (
     Content,
     ContentType,
@@ -112,10 +120,12 @@ from cowork.handlers._turn_history import (
 )
 from cowork.handlers.turn_errors import (
     AUTH_ERROR_CODE,
+    BUDGET_EXCEEDED_CODE,
     CONTENT_REPAIR_CODES,
     GENERIC_TURN_ERROR_CODE,
     GENERIC_TURN_ERROR_MESSAGE,
     INTERRUPTED_TURN_MESSAGE,
+    MODEL_NOT_IN_TIER_CODE,
     MODEL_UNAVAILABLE_CODES,
     PROVIDER_OVERLOADED_CODE,
     RATE_LIMITED_CODE,
@@ -127,9 +137,15 @@ from cowork.handlers.turn_errors import (
     STALLED_TURN_MESSAGE,
     TURN_LOST_CODE,
     TURN_LOST_MESSAGE,
+    WINDOW_ALLOWANCE_EXHAUSTED_CODE,
     auth_error_detail,
     friendly_turn_error,
+    gate_budget_model,
+    gate_budget_period,
+    gate_budget_scope,
+    gate_required_tier,
     gate_reset_at,
+    gate_window,
     model_unavailable_info,
     provider_overloaded_info,
     remote_error_label,
@@ -158,6 +174,7 @@ from cowork.services.connectors.vault_secrets import register_vault_secrets
 from cowork.services.conversations import ConversationService, read_earlier_answers
 from cowork.services.files import FileService, attachment_purpose, project_holds_files
 from cowork.services.live_apps import use_live_app_launcher
+from cowork.services import product_permissions
 from cowork.services.product_permissions import (
     ProductPermissionDenied, ProductPermissionUnavailable, require_product_permission,
 )
@@ -176,15 +193,45 @@ import logging
 logger = logging.getLogger(__name__)
 
 
-def _title_text(blocks: list[dict]) -> str:
-    """What the person typed, for a new conversation's title.
-
-    The doc open beside the chat and the Output: Doc choice travel as text
-    blocks ahead of the message; titled from those, the sidebar showed
-    "<doc-view-context>{"artifactId"…" instead of the question.
-    """
+def _typed_text(blocks: list[dict]) -> str:
+    """What the person typed, without the blocks the client puts ahead of it:
+    the doc open beside the chat and the Output: Doc choice. Empty when they
+    typed nothing ("Edit with agent")."""
     own = [b for b in blocks if b.get("type") == "text" and not str(b.get("text", "")).startswith(CONTEXT_PREFIXES)]
-    return prompt_text(own) or prompt_text(blocks)
+    return prompt_text(own)
+
+
+def _pod_input_text(blocks: list[dict]) -> str:
+    """A remote turn's input for the pod. With the doc blocks ahead of the
+    typed text, each text block is its own paragraph, as the in-process
+    harness sees them; otherwise the same text prompt_text gives."""
+    texts = [b for b in blocks if b.get("type") == "text"]
+    if any(str(b.get("text", "")).startswith(CONTEXT_PREFIXES) for b in texts):
+        return "\n\n".join(b["text"] for b in texts)
+    return prompt_text(blocks)
+
+
+def _title_text(blocks: list[dict]) -> str:
+    """What the person typed, for a new conversation's title; titled from the
+    doc blocks, the sidebar showed "<doc-view-context>{"artifactId"…" instead
+    of the question. With nothing typed, the blocks, rather than an empty row."""
+    return _typed_text(blocks) or prompt_text(blocks)
+
+
+_DOC_REF_FOR_LOG = re.compile(
+    r"[0-9a-f]{32}|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
+    rf"|[a-z0-9]+(?:-[a-z0-9]+)*-[0-9a-f]{{{ARTIFACT_ID_SLUG_PREFIX_LEN}}}",
+    re.IGNORECASE,
+)
+
+
+def _doc_ref_for_log(call_input: dict) -> str | None:
+    """The doc a doc tool call names, when it names it by an artifact id or a
+    slug; a title is the person's text and stays out of the logs."""
+    ref = call_input.get("doc")
+    if isinstance(ref, str) and len(ref) <= 100 and _DOC_REF_FOR_LOG.fullmatch(ref.strip()):
+        return ref.strip()
+    return None
 
 
 def _runs_remotely(request: ResponsesRequest) -> bool:
@@ -192,15 +239,33 @@ def _runs_remotely(request: ResponsesRequest) -> bool:
     return bool(request.stream) and TurnQueueSettings().is_remote
 
 
-def _turn_has_doc(request: ResponsesRequest) -> bool:
+def _turn_has_doc(request: ResponsesRequest, *, remote_docs: bool = False) -> bool:
     """Sent with a doc open, or asking for the answer as a doc (see ineligible_reason).
 
-    Never a remote turn: the pod has no doc tools, so there the open doc and
-    Output: Doc are dropped and the turn is answered like any other.
+    A remote turn has it only when the request's one decision gives its pod
+    the doc tools (ResponsesHandler._remote_docs); otherwise the open doc and
+    Output: Doc are dropped there and the turn is answered like any other.
     """
-    if _runs_remotely(request):
+    if _runs_remotely(request) and not remote_docs:
         return False
     return request.doc_context is not None or request.output == "doc"
+
+
+def _turn_needs_doc_agent(request: ResponsesRequest, *, remote_docs: bool = False) -> bool:
+    """A doc turn only the agent can answer: Output: Doc, "Edit with agent", or a selection.
+
+    With the doc merely open, the gate still decides: a "thanks" needs no
+    agent turn, and the gate is told to delegate anything about the doc.
+    """
+    if not _turn_has_doc(request, remote_docs=remote_docs):
+        return False
+    if request.output == "doc":
+        return True
+    ctx = request.doc_context
+    if ctx is None:
+        return False
+    picked = ctx.selection is not None and (bool(ctx.selection.blockIds) or bool(ctx.selection.quote))
+    return bool(ctx.request) or picked
 
 
 def _client_shows_docs(request: ResponsesRequest) -> bool:
@@ -277,6 +342,25 @@ def cancelled_ask_user_retirements(events: list[dict]) -> list[dict]:
             "text": "",
         })
     return synthesized
+
+
+#: The terminal a Stop saves with the turn's events. The live stream ends a
+#: stopped turn with this frame too, but the stream is not saved, so without it
+#: a reload could not tell a stopped turn from one still running (ENG-4345).
+STOPPED_EVENT = "response.cancelled"
+
+
+def stopped_turn_events(events: list[dict]) -> list[dict]:
+    """What a Stop adds to the turn's saved *events*: a retirement for each
+    question it left open, then the ``response.cancelled`` terminal. Its
+    ``at_ms`` is when the turn stopped, so a reload ends the turn's time there.
+
+    Nothing when the turn produced no events: a Stop that came before any
+    output saves no answer row, and the terminal alone must not create one.
+    """
+    if not events:
+        return []
+    return [*cancelled_ask_user_retirements(events), {"type": STOPPED_EVENT, "at_ms": event_at_ms()}]
 
 
 async def _remote_cancel_confirmed(error: str | None, correlation_id: str) -> bool:
@@ -529,8 +613,20 @@ def _routing_history(gate_rows: list[Message], harness_input: list[dict]) -> lis
     handle(), not _build_chat_session. Scrubbed on the loop, after that
     registration, never inside the unit."""
     history = [scrubbed_openai_dump(m) for m in gate_rows]
-    history.append({"role": "user", "content": scrub_credentials(prompt_text(harness_input))})
+    history.append({"role": "user", "content": scrub_credentials(prompt_text(_doc_blocks_as_marker(harness_input)))})
     return history
+
+
+def _doc_blocks_as_marker(blocks: list[dict]) -> list[dict]:
+    """The doc view block as one short line the gate prompt knows: the gate
+    never needs the doc's ids, only that a doc is open."""
+    out = []
+    for block in blocks:
+        text = str(block.get("text", "")) if block.get("type") == "text" else ""
+        if text.startswith(CONTEXT_PREFIXES):
+            block = {"type": "text", "text": DOC_OPEN_MARKER}
+        out.append(block)
+    return out
 
 
 def _conversation_for_harness(session: ScopedSession, *, conversation_id: UUID) -> Conversation:
@@ -775,7 +871,8 @@ def _start_first_take(
     Its trace is its own (tag ``cowork-first-take``), joined to the gate's by
     the correlation id, so its cost is countable apart from the gate's.
     """
-    if not _first_take_enabled():
+    from cowork.services.content_safety import ContentSafetySettings
+    if ContentSafetySettings().required or not _first_take_enabled():
         return None
     binding = _first_take_binding(minted, binding_factory=binding_factory)
     if binding is None:
@@ -814,6 +911,12 @@ async def _drop_gate_key(turn_llm: dict | None) -> None:
     """Revoke the turn key the routing gate minted, for a turn that won't run."""
     if turn_llm and turn_llm.get("correlation_id"):
         await revoke_turn_key_quietly(turn_llm["correlation_id"])
+
+
+def _gate_block(turn_llm: dict | None) -> dict:
+    """The llm block of the turn key the routing gate minted; empty when it minted none."""
+    gate: TurnLlm | None = (turn_llm or {}).get("llm")
+    return gate.block if gate is not None else {}
 
 
 class ResponsesHandler:
@@ -874,10 +977,35 @@ class ResponsesHandler:
             self.harness = get_harness(self.harness_name)
         return self.harness
 
+    async def _remote_docs(self, request: ResponsesRequest) -> bool:
+        """Whether this remote turn's pod gets the doc tools. Decided once per
+        request, before its first unit (the artifact.manage check is async and
+        the unit is not), and passed to every place that decides about docs: the
+        pod's input, the gate and the host tools never disagree."""
+        settings = get_app_settings()
+        if not (
+            settings.remote_docs_available()
+            and _runs_remotely(request)
+            and _client_shows_docs(request)
+            # A doc tool's answer reaches the pod on the stdin only an
+            # interactive turn keeps open.
+            and self.interactive
+            and self.schedule_id is None
+        ):
+            return False
+        try:
+            return await product_permissions.has_product_permission(self.scope, "artifact.manage")
+        except Exception:
+            logger.warning("[responses] could not check artifact.manage; the turn runs without doc tools",
+                           exc_info=True)
+            return False
+
     async def handle(self, request: ResponsesRequest) -> AsyncGenerator[str, None] | Response:
         logger.info("[responses] handle() called — conversation=%s, stream=%s", request.conversation, request.stream)
 
         await require_product_permission(self.scope, "product.execute")
+        from cowork.services.content_safety import check_request
+        await check_request(request, scope=self.scope)
 
         # "memory": "off" runs the turn as MEMORY_ENABLED=false would. On a
         # deployment where that still reads stored memory (memory_policy: the
@@ -912,6 +1040,7 @@ class ResponsesHandler:
         # The unit reads which always-on skills reach the caller, so their
         # teams are read first (cached per caller). A no-op outside MindsHub mode.
         await self._resolve_skill_viewer(self.scope)
+        remote_docs = await self._remote_docs(request)
 
         # The request's reads run as one unit in a worker thread, which holds a
         # connection only while it reads: none is held across the gate's model
@@ -922,7 +1051,10 @@ class ResponsesHandler:
         # conversation create without a project id does.
         read_unit = run_efs_unit if _carries_attachments(request) or request.project_id is None else run_db
         start = await read_unit(
-            partial(self._read_turn_start, request=request, has_disabled_connections=bool(disabled)),
+            partial(
+                self._read_turn_start, request=request, has_disabled_connections=bool(disabled),
+                remote_docs=remote_docs,
+            ),
             scope=self.scope,
         )
         if start.always_on_unread:
@@ -988,7 +1120,8 @@ class ResponsesHandler:
                     is_pinned_schedule=self.schedule_id is not None and request.model is not None,
                     trace_metadata=trace_metadata,
                     first_take=bool(request.stream) and self.interactive,
-                    has_doc=_turn_has_doc(request),
+                    has_doc=_turn_needs_doc_agent(request, remote_docs=remote_docs),
+                    doc_open=_turn_has_doc(request, remote_docs=remote_docs),
                 )
             except BaseException:
                 # A refused or cancelled request must not leave the take's model call running.
@@ -1136,6 +1269,7 @@ class ResponsesHandler:
                         turn_llm=turn_llm,
                         first_take=first_take,
                         docs=_client_shows_docs(request),
+                        remote_docs=remote_docs,
                     )
 
                 def produce(buffer: StreamBuffer):
@@ -1232,6 +1366,7 @@ class ResponsesHandler:
 
     def _read_turn_start(
         self, session: ScopedSession, *, request: ResponsesRequest, has_disabled_connections: bool,
+        remote_docs: bool = False,
     ) -> _TurnStart:
         """The request's database work, run as one unit: the turn's settings,
         its attachments, the conversation (read, adopted or created), the turn
@@ -1250,7 +1385,7 @@ class ResponsesHandler:
         if request.harness and request.harness in available_harness_ids():
             harness_name = request.harness
 
-        harness_input = self._build_harness_input(request, session=session)
+        harness_input = self._build_harness_input(request, session=session, remote_docs=remote_docs)
         conversation_service = ConversationService(session)
 
         if request.conversation:
@@ -1340,7 +1475,7 @@ class ResponsesHandler:
             has_disabled_connections=has_disabled_connections,
             is_comparison_side=comparison_pin is not None,
             is_pinned_schedule=self.schedule_id is not None and request.model is not None,
-            has_doc=_turn_has_doc(request),
+            has_doc=_turn_needs_doc_agent(request, remote_docs=remote_docs),
         ) is None
         attached_files = False
         project_path = None
@@ -1499,6 +1634,7 @@ class ResponsesHandler:
         trace_metadata: dict[str, str] | None = None,
         first_take: bool = False,
         has_doc: bool = False,
+        doc_open: bool = False,
     ) -> tuple[RouteDecision, dict | None]:
         """Run Cowork's narrow pre-Anton gate with only safe text context.
 
@@ -1616,7 +1752,8 @@ class ResponsesHandler:
                             has_files=has_files,
                             binding=binding,
                             binding_factory=binding_for_turn,
-                            jev=jev,
+                            # Jev cannot be told a doc is open; the LLM gate is.
+                            jev=None if doc_open else jev,
                             ui_locale=self.ui_locale,
                         )
                     gate_ms = round((time.monotonic() - gate_started) * 1000)
@@ -1697,7 +1834,7 @@ class ResponsesHandler:
             target = jev_route.own_decision_target(settings)
             model = settings.decision_model or queue_settings.jev_route_model
         else:
-            block = (turn_llm or {}).get("llm") or {}
+            block = _gate_block(turn_llm)
             if block.get("base_url") and block.get("api_key"):
                 target = jev_route.JevTarget.mindshub(block["base_url"], block["api_key"])
             else:
@@ -1734,7 +1871,7 @@ class ResponsesHandler:
         if not answer_model:
             return None
         provider_kind = settings.resolved_planning_provider
-        block = (turn_llm or {}).get("llm") or {}
+        block = _gate_block(turn_llm)
         try:
             if provider_kind is Provider.MINDS_CLOUD and block.get("base_url") and block.get("api_key"):
                 from anton.core.llm.openai import OpenAIProvider
@@ -1765,31 +1902,19 @@ class ResponsesHandler:
                 or provider_api_key(settings, Provider.MINDS_CLOUD) is not None):
             return None, None
         from anton.core.llm.openai import OpenAIProvider
-        from cowork.turnqueue.producer import _mint_llm_block_with_turn_key_id, mint_llm_block
+        from cowork.turnqueue.producer import mint_turn_llm
 
         corr = str(uuid4())
-        queue_settings = TurnQueueSettings()
-        turn_key_id = None
-        workspace_id = getattr(settings, "hub_workspace_id", "") or None
-        if queue_settings.needs_turn_key_id:
-            block, turn_key_id = await _mint_llm_block_with_turn_key_id(
-                org_id=self.scope.org_id,
-                user_id=self.scope.user_id,
-                correlation_id=corr,
-                settings=queue_settings,
-                workspace_id=workspace_id,
-            )
-        else:
-            block = await mint_llm_block(
-                org_id=self.scope.org_id,
-                user_id=self.scope.user_id,
-                correlation_id=corr,
-                settings=queue_settings,
-                workspace_id=workspace_id,
-            )
+        gate = await mint_turn_llm(
+            org_id=self.scope.org_id,
+            user_id=self.scope.user_id,
+            correlation_id=corr,
+            settings=TurnQueueSettings(),
+            workspace_id=getattr(settings, "hub_workspace_id", "") or None,
+        )
         provider = OpenAIProvider(
-            api_key=block["api_key"],
-            base_url=block["base_url"],
+            api_key=gate.block["api_key"],
+            base_url=gate.block["base_url"],
             flavor=OpenAIProvider.FLAVOR_MINDS_PASSTHROUGH,
         )
         # Built outside LLMClient, so nothing else names this call's role.
@@ -1799,10 +1924,8 @@ class ResponsesHandler:
             model=settings.resolved_gate_model or MINDS_FREE_MODEL,
             label=Provider.MINDS_CLOUD.value,
         )
-        turn_context = {"correlation_id": corr, "llm": block}
-        if turn_key_id is not None:
-            turn_context["turn_key_id"] = turn_key_id
-        return binding, turn_context
+        # The producer reuses this key, with its prefix and the lifetime auth gave it.
+        return binding, {"correlation_id": corr, "llm": gate}
 
     async def _handle_direct_response(
         self,
@@ -1823,6 +1946,8 @@ class ResponsesHandler:
         # which registry.start records in the turn index on the Redis backend,
         # so there the Reference a user reports resolves in the index too; the
         # non-streaming half leaves only the log line.
+        from cowork.services.content_safety import check_content
+        await check_content(route.text, purpose="output", scope=self.scope)
         corr = f"direct-{uuid4()}"
         if not request.stream:
             text = route.text
@@ -2181,6 +2306,8 @@ class ResponsesHandler:
             reaches the open stream before Uvicorn's request drain cuts it."""
             # A turn stopped before its answer started saves no answer row.
             events = [text_delta("".join(parts), sequence_number=2), _DIRECT_MEMORY_READ.payload()] if parts else []
+            if reason == "cancelled":
+                events.extend(stopped_turn_events(events))
             if lifecycle.shutdown_frame_deadline is None:
                 saved = await persist(events)
             else:
@@ -2230,7 +2357,20 @@ class ResponsesHandler:
 
             if first_take is not None:
                 first_take.cancel()
-            parts.append(answer.first_text)
+            from cowork.services.content_safety import ContentSafetySettings, MAX_CONTENT_CHARS, check_content
+            first_text = answer.first_text
+            remaining_text = answer.rest()
+            if ContentSafetySettings().required:
+                held = [first_text]
+                size = len(first_text)
+                async for chunk in remaining_text:
+                    size += len(chunk)
+                    if size > MAX_CONTENT_CHARS:
+                        raise HTTPException(413, "This content is too large for a safety check.")
+                    held.append(chunk)
+                first_text = "".join(held)
+                await check_content(first_text, purpose="output", scope=scope)
+            parts.append(first_text)
             response = Response(status=ResponseStatus.created, model=binding.model)
             await buffer.append("sse", {"sse": sse_frame("response.created", {
                 "type": "response.created",
@@ -2241,8 +2381,8 @@ class ResponsesHandler:
                 "user_message_id": str(question_id),
                 "response": response.model_dump(),
             })})
-            await buffer.append("sse", {"sse": sse_frame("response.output_text.delta", text_delta(answer.first_text))})
-            async for text in answer.rest():
+            await buffer.append("sse", {"sse": sse_frame("response.output_text.delta", text_delta(first_text))})
+            async for text in remaining_text:
                 parts.append(text)
                 await buffer.append("sse", {"sse": sse_frame("response.output_text.delta", text_delta(text))})
 
@@ -2375,6 +2515,7 @@ class ResponsesHandler:
         turn_llm: dict | None = None,
         first_take: FirstTake | None = None,
         docs: bool = False,
+        remote_docs: bool = False,
     ):
         """Choose the streaming producer coroutine.
 
@@ -2388,7 +2529,8 @@ class ResponsesHandler:
         a fresh one so a directly-called producer (tests) still has a flag to
         read.
 
-        `docs` reaches only the in-process turn: a remote pod has no doc tools.
+        `docs` reaches only the in-process turn. A remote turn's pod gets the
+        doc tools when `remote_docs` says so (ResponsesHandler._remote_docs).
         """
         lifecycle = lifecycle if lifecycle is not None else TurnLifecycle(identity=RunIdentity(
             correlation_id=(turn_llm or {}).get("correlation_id") or str(uuid4()),
@@ -2398,7 +2540,7 @@ class ResponsesHandler:
             return self._produce_remote(
                 lifecycle=lifecycle,
                 conv_id=conv_id,
-                input_text=prompt_text(harness_input),
+                input_text=_pod_input_text(harness_input),
                 original_content=original_content,
                 model=model,
                 reasoning_effort=reasoning_effort,
@@ -2408,6 +2550,10 @@ class ResponsesHandler:
                 turn_llm=turn_llm,
                 disabled=disabled,
                 first_take=first_take,
+                # What the person typed, without the doc blocks ahead of it:
+                # the turn's question and its revision labels read this.
+                question_text=_typed_text(harness_input),
+                remote_docs=remote_docs,
             )
         return self._produce(
             lifecycle=lifecycle,
@@ -2837,6 +2983,8 @@ class ResponsesHandler:
         disabled: list[dict] | None = None,
         reasoning_effort: str | None = None,
         first_take: FirstTake | None = None,
+        remote_docs: bool = False,
+        question_text: str | None = None,
     ) -> None:
         """Remote-backend counterpart of _run_turn: pipe the pod's replies
         through the same SSE formatter as the in-process path (full step /
@@ -2871,6 +3019,8 @@ class ResponsesHandler:
         question_id: UUID | None = None
         turn_artifacts: _RemoteTurnArtifacts | None = None
         failure: dict = {}
+        # The pod's doc tools, run here, when the request's remote_docs gives them.
+        doc_tools: RemoteDocTools | None = None
         # Resolved once, up front — not left for stream_remote_replies to mint
         # internally on a None — so every failure branch below (classified or
         # not) can attach the SAME id a support/log lookup would use. Each of
@@ -2878,6 +3028,8 @@ class ResponsesHandler:
         # the deployed environments run at; this INFO line is only the
         # per-turn breadcrumb that ties a successful turn to its id in dev.
         corr = lifecycle.identity.correlation_id
+        # The input may open with the doc blocks; the question is what was typed.
+        question = question_text if question_text is not None else input_text
         logger.info(
             "[responses] remote turn conversation=%s correlation_id=%s", conv_id, corr,
         )
@@ -2937,6 +3089,24 @@ class ResponsesHandler:
                 turn_artifact_changes,
             )
 
+            if doc_tools is not None:
+                # Never cancelled: a call's worker thread writes on regardless,
+                # so the turn end waits for the calls, a bounded time, and
+                # claims what they wrote with what the pod's own tools touched.
+                # finish() waits once per turn; later passes return [] at once.
+                for call in await doc_tools.runner.finish():
+                    # The slug is known only once the write landed; a call still
+                    # waiting for the doc's lock is named by the id or slug it asked for.
+                    logger.warning(
+                        "[responses] a doc tool call was still running when the turn ended: the pod got no "
+                        "answer, and a doc it writes after this keeps no index or card until the self-heal "
+                        "tool=%s call_id=%s doc=%s", call.tool, call.call_id, _doc_ref_for_log(call.input),
+                        extra=log_context(request_id=corr, conversation_id=conv_id,
+                                          artifact_slug=doc_tools.writes.slug_for(call.call_id)),
+                    )
+                # On every pass, not only the first: each pass records with its own `touched`.
+                if touched is not None:
+                    touched = touched | doc_tools.writes.slugs()
             if turn_artifacts is None or not turn_artifacts.writes_allowed or turn_artifacts.recorded:
                 return None
             turn_artifacts.recorded = True
@@ -2975,7 +3145,7 @@ class ResponsesHandler:
                             # Each revision's label: the editor's summary in
                             # the pod's tool rows, the reply, or the request.
                             summaries=summaries_from_messages(
-                                turn_rows, reply="".join(collected_text), request=input_text,
+                                turn_rows, reply="".join(collected_text), request=question,
                             ),
                         ),
                         scope=scope,
@@ -3216,7 +3386,7 @@ class ResponsesHandler:
                 await mark_question_saved(lifecycle=lifecycle, conversation_id=str(conv_id))
 
         async def replies_as_stream_events():
-            nonlocal turn_artifacts
+            nonlocal turn_artifacts, doc_tools
             from anton.core.llm.provider import StreamTaskProgress, StreamTextDelta
             from cowork.harnesses.anton_harness.stream_formatter import ArtifactCreated
             from cowork.services.task_objects import (
@@ -3245,8 +3415,29 @@ class ResponsesHandler:
             )
             # A unit of its own, so a failed read can't abort the seed's.
             earlier = await read_earlier_answers(conversation_id=conv_id, scope=scope)
-            yield TurnContext(question=input_text, files=seed.files, history=seed.history, earlier_answers=earlier)
-            if seed.artifacts is not None:
+            yield TurnContext(question=question, files=seed.files, history=seed.history, earlier_answers=earlier)
+            artifacts = seed.artifacts
+            if remote_docs and artifacts is None:
+                # The pod's input already carries the doc blocks: without a folder
+                # it would get no tools for them. Read the project's artifacts
+                # folder (project_artifacts_base) again, in a unit of its own.
+                try:
+                    artifacts = await run_db(partial(self._remote_artifacts_context, conv_id=conv_id), scope=scope)
+                except Exception:
+                    logger.warning(
+                        "[responses] a remote turn whose input carries the open doc could not read the "
+                        "artifacts folder; its pod gets no doc tools", exc_info=True,
+                        extra=log_context(request_id=corr, conversation_id=conv_id),
+                    )
+                    artifacts = None
+                else:
+                    if artifacts is None:
+                        logger.warning(
+                            "[responses] a remote turn whose input carries the open doc found no artifacts "
+                            "folder; its pod gets no doc tools",
+                            extra=log_context(request_id=corr, conversation_id=conv_id),
+                        )
+            if artifacts is not None:
                 # The worker writes artifacts into the shared tree while this
                 # turn runs, so cowork-server does the same before/after diff
                 # it does for an in-process turn. Snapshotting here rather than
@@ -3254,14 +3445,32 @@ class ResponsesHandler:
                 # stream_remote_replies below only enqueues the job once this
                 # generator is first iterated.
                 before_slugs, before_mtimes = await run_efs(
-                    partial(snapshot_artifact_state, seed.artifacts.base), scope=scope, deadline=False
+                    partial(snapshot_artifact_state, artifacts.base), scope=scope, deadline=False
                 )
                 from cowork.services.queued_repairs import queued_repair_folders
 
                 turn_artifacts = _RemoteTurnArtifacts(
-                    directory=seed.artifacts, before_slugs=before_slugs, before_mtimes=before_mtimes,
+                    directory=artifacts, before_slugs=before_slugs, before_mtimes=before_mtimes,
                     repairs=await queued_repair_folders(conversation_id=conv_id, scope=scope),
                 )
+            if remote_docs and artifacts is not None:
+                # On the folder the pod writes, with this turn's owner and provenance.
+                doc_tools = start_remote_doc_tools(
+                    scope=scope,
+                    correlation_id=corr,
+                    conversation_id=str(conv_id),
+                    # Provenance only: turn_id counts messages, so these indexes
+                    # differ from the desktop's turn count; nothing orders by them.
+                    turn_index=turn_id + 1,
+                    artifacts_base=artifacts.base,
+                    project_id=artifacts.project_id,
+                    project_name=artifacts.project_name,
+                    creator=artifacts.creator,
+                    files=seed.files,
+                )
+            # A pod left without its doc tools gets what a turn without docs gets:
+            # the typed text, without the doc blocks that tell it to call them.
+            pod_input = question if remote_docs and doc_tools is None and question else input_text
             # Set only on turn_completed: any other exit (Stop, cancel, failure)
             # may have cut anton off between writing an artifact's metadata and
             # appending its provenance, see `turn_created_slugs`.
@@ -3284,7 +3493,7 @@ class ResponsesHandler:
                 conversation_id=str(conv_id),
                 org_id=self.scope.org_id,
                 user_id=self.scope.user_id,
-                input_text=input_text,
+                input_text=pod_input,
                 model=model,
                 reasoning_effort=reasoning_effort,
                 turn_id=turn_id,
@@ -3294,13 +3503,12 @@ class ResponsesHandler:
                 # a bounded, sheddable wire block. Skills travel as the
                 # caller's whole recallable set (remote_turn_skills).
                 memory=seed.memory,
-                skills=skills,
+                skills=with_docs_skill(skills) if doc_tools is not None else skills,
                 workspace=seed.workspace,
                 started_at=seed.started_at,
                 correlation_id=corr,
                 run_id=lifecycle.identity.run_id,
                 llm=(turn_llm or {}).get("llm"),
-                turn_key_id=(turn_llm or {}).get("turn_key_id"),
                 disabled=disabled,
                 # Questions need someone to answer them: this path serves
                 # the web UI, which renders the card and posts /answer.
@@ -3309,6 +3517,8 @@ class ResponsesHandler:
                 # viewer (ENG-4227); the producer sends it only with
                 # interactive, whose stdin the answer comes back on.
                 preview_checks=self.interactive and self.schedule_id is None,
+                # The doc tools this server runs for the pod (cowork/docs/remote.py).
+                host_tools=doc_tools.specs if doc_tools is not None else None,
                 # This handler serves the cowork UI (scheduled turns show
                 # there too), which renders a tool's message whether or
                 # not it can answer questions. Channel turns build their
@@ -3356,6 +3566,19 @@ class ResponsesHandler:
                         # question waits, so a cell's start, progress or end
                         # means it is over, even if the answered reply was lost.
                         open_questions.clear()
+                    if step == HOST_TOOL_CALL_STEP:
+                        # Runs as a task of its own, so this loop goes on reading Stop and liveness.
+                        if doc_tools is not None:
+                            # The turn end records nothing for a workspace that is not
+                            # persistent, so a write would go unclaimed: refuse it at once
+                            # rather than let the pod wait out its timeout. Reads still run.
+                            may_write = turn_artifacts is not None and turn_artifacts.writes_allowed
+                            refused = data.get("tool") in DOC_WRITE_TOOL_NAMES and not may_write
+                            doc_tools.runner.start(
+                                data,
+                                refusal="Refused (not_allowed): this turn cannot change files." if refused else None,
+                            )
+                        continue
                     if step == ADDON_STEP:
                         # A message added mid-task (ENG-4194): relayed only for
                         # an addon /addon accepted for this turn.
@@ -3535,10 +3758,18 @@ class ResponsesHandler:
             # an offset-aware instant (`_remote_reset_at` in producer.py), so
             # it rides both the frame and the persisted event as sent.
             reset_at = failure.get("reset_at")
+            # Kept by the producer for budget_exceeded only, already validated.
+            budget_scope = failure.get("budget_scope")
+            budget_period = failure.get("budget_period")
+            budget_model = failure.get("budget_model")
+            # Kept by the producer for their own ENG-4186 codes only, already validated.
+            window = failure.get("window")
+            required_tier = failure.get("required_tier")
             # The pod never got to retire a question it was blocked on.
             collected_events.extend(cancelled_ask_user_retirements(collected_events))
             collected_events.append(response_failed_payload(
-                message, code, reset_at=reset_at, request_id=corr))
+                message, code, reset_at=reset_at, budget_scope=budget_scope, budget_period=budget_period,
+                budget_model=budget_model, window=window, required_tier=required_tier, request_id=corr))
 
             async def fail() -> None:
                 if code in CONTENT_REPAIR_CODES:
@@ -3570,7 +3801,8 @@ class ResponsesHandler:
                             "validation error", extra=log_context(conversation_id=conv_id),
                         )
                 await end_turn("error", lambda message_id: response_failed_sse(
-                    message, code, reset_at=reset_at, request_id=corr,
+                    message, code, reset_at=reset_at, budget_scope=budget_scope, budget_period=budget_period,
+                    budget_model=budget_model, window=window, required_tier=required_tier, request_id=corr,
                     assistant_message_id=message_id,
                 ))
 
@@ -3602,8 +3834,8 @@ class ResponsesHandler:
                 )))
                 return
             # Partial text generated before cancellation is persisted, with
-            # every question the Stop left open retired.
-            collected_events.extend(cancelled_ask_user_retirements(collected_events))
+            # every question the Stop left open retired, and the Stop itself.
+            collected_events.extend(stopped_turn_events(collected_events))
             await run_to_completion(end_turn("cancelled"))
         except Exception as exc:
             if isinstance(exc, PoolTimeoutError):
@@ -3632,6 +3864,9 @@ class ResponsesHandler:
                 message, code, request_id=corr, assistant_message_id=message_id, **extra,
             )))
         finally:
+            if doc_tools is not None:
+                # Whichever way the turn ended, nothing more goes to its pod.
+                doc_tools.runner.close()
             await _seal_unterminated_buffer(
                 buffer, lifecycle, conv_id, request_id=corr
             )
@@ -3899,13 +4134,13 @@ class ResponsesHandler:
                     message, code, request_id=corr, assistant_message_id=message_id,
                 )))
                 return
-            # Nothing special is emitted on cancellation.
             # The partial text and events generated before cancellation are persisted.
             # A question that was on screen when Stop was pressed never got its
             # `response.ask_user_answered` (see cancelled_ask_user_retirements),
             # so retire it here — otherwise the persisted log holds a published
-            # question that nothing in it ever closes.
-            collected_events.extend(cancelled_ask_user_retirements(collected_events))
+            # question that nothing in it ever closes. The Stop's own terminal
+            # follows, so a reload shows the turn as stopped.
+            collected_events.extend(stopped_turn_events(collected_events))
             await run_to_completion(end_turn("cancelled"))
             return
         except Exception as exc:
@@ -3977,6 +4212,26 @@ class ResponsesHandler:
                 _reset = gate_reset_at(exc)
                 if _reset is not None:
                     extra = {"reset_at": _reset}
+                # A spent plan window also says which one (ENG-4186), so the
+                # card can tell a five-hour pause from a weekly one.
+                if code == WINDOW_ALLOWANCE_EXHAUSTED_CODE:
+                    _window = gate_window(exc)
+                    if _window is not None:
+                        extra["window"] = _window
+            elif code == MODEL_NOT_IN_TIER_CODE:
+                # The tier that covers the model, so the card can offer that
+                # upgrade beside adding credits.
+                _tier = gate_required_tier(exc)
+                if _tier is not None:
+                    extra["required_tier"] = _tier
+            elif code == BUDGET_EXCEEDED_CODE:
+                # Whose budget is spent and its period, so the card can name them.
+                _budget = {
+                    "budget_scope": gate_budget_scope(exc),
+                    "budget_period": gate_budget_period(exc),
+                    "budget_model": gate_budget_model(exc),
+                }
+                extra = {key: value for key, value in _budget.items() if value is not None}
             elif code == RATE_LIMITED_CODE:
                 # Pass the server's own wait interval so the card can time-gate
                 # its Retry (ENG-1537). An ungated Retry re-sends a large
@@ -4254,10 +4509,20 @@ class ResponsesHandler:
                             extra=log_context(request_id=corr, conversation_id=conversation_id),
                         )
                 # The ladder already produced a code; carry it instead of dropping
-                # it here. Same wire shape the streaming twin emits.
+                # it here. Same wire shape the streaming twin emits. The reset
+                # instant, the plan fields and the budget fields ride along for
+                # their own codes, as they do there.
                 raise HTTPException(
                     status_code=400,
-                    detail=response_failed_payload(message, code, request_id=corr),
+                    detail=response_failed_payload(
+                        message, code, request_id=corr,
+                        reset_at=gate_reset_at(exc) if code in RESET_AT_CODES else None,
+                        window=gate_window(exc) if code == WINDOW_ALLOWANCE_EXHAUSTED_CODE else None,
+                        required_tier=gate_required_tier(exc) if code == MODEL_NOT_IN_TIER_CODE else None,
+                        budget_scope=gate_budget_scope(exc) if code == BUDGET_EXCEEDED_CODE else None,
+                        budget_period=gate_budget_period(exc) if code == BUDGET_EXCEEDED_CODE else None,
+                        budget_model=gate_budget_model(exc) if code == BUDGET_EXCEEDED_CODE else None,
+                    ),
                 )
             logger.exception(
                 "[responses] turn failed",
@@ -4303,7 +4568,9 @@ class ResponsesHandler:
             output=[self._build_output(str(anchor_id), assistant_text, figure_sources=figure_sources)],
         )
 
-    def _build_harness_input(self, request: ResponsesRequest, *, session: ScopedSession) -> list[dict]:
+    def _build_harness_input(
+        self, request: ResponsesRequest, *, session: ScopedSession, remote_docs: bool = False,
+    ) -> list[dict]:
         blocks: list[dict] = []
 
         # Resolve attachment_ids to image/file blocks
@@ -4326,8 +4593,9 @@ class ResponsesHandler:
         # The doc open beside the chat goes ahead of what the person typed, as
         # data the agent reads ("this section" = their selection), not as part
         # of their message: it is never saved with the user turn. Both blocks
-        # tell the agent to use the doc tools, which only a turn run here has.
-        if _turn_has_doc(request):
+        # tell the agent to use the doc tools, so a remote turn carries them
+        # only when its pod gets those tools (remote_docs).
+        if _turn_has_doc(request, remote_docs=remote_docs):
             if request.doc_context is not None:
                 blocks.append({"type": "text", "text": doc_context_block(request.doc_context.model_dump(exclude_none=True))})
             if request.output == "doc":

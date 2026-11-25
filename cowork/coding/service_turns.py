@@ -123,13 +123,19 @@ class CodingTurnOperations:
                 running = self._running.get(session_id)
                 return running is not None and running.cancel_requested
 
+        # Project rollback checks this event while holding its workspace lock.
+        with self._lock:
+            deleted = self._running[session_id].delete_requested.is_set
+
         try:
-            prepared = self.session_factory.complete(pending, cancelled)
+            prepared = self.session_factory.complete(pending, cancelled, deleted=deleted)
         except Exception as exc:
             with self._lock:
                 preparing = self._running.pop(session_id, None)
-            if preparing is not None and preparing.delete_requested:
-                # ``complete`` has already released what it made.
+            if preparing is not None and deleted():
+                # Rollback has finished, so it cannot recreate recovery files
+                # after this removal (including partial preparation failures).
+                self._discard_deleted_recovery(session_id)
                 return
             logger.warning("Coding task %s could not prepare its workspace", session_id, exc_info=True)
             message = f"The task workspace could not be prepared: {exc}"
@@ -144,8 +150,11 @@ class CodingTurnOperations:
         self.workspace_usage.invalidate()
         with self._lock:
             preparing = self._running.pop(session_id, None)
-            if preparing is not None and preparing.delete_requested:
-                self.session_factory.release(prepared, request)
+            if preparing is not None and deleted():
+                try:
+                    self.session_factory.release(prepared, request)
+                finally:
+                    self._discard_deleted_recovery(session_id)
                 return
             if preparing is None or preparing.cancel_requested:
                 self._emit(

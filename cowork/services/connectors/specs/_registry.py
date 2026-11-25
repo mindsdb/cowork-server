@@ -4,6 +4,8 @@ import json
 import re
 from collections.abc import Iterable
 from pathlib import Path
+
+from cowork.common.settings.app_settings import OAuthSettings
 from cowork.schemas.connectors import (
     ConnectorMetadataResponse,
     ConnectorSpecResponse,
@@ -48,8 +50,25 @@ def connector_metadata(c: dict) -> ConnectorMetadataResponse:
         featured=c.get("featured", False),
         notice=c.get("notice"),
         custom=c.get("custom", False),
+        needs_rebuild=c.get("needs_rebuild", False),
         api_key=_takes_api_key(c),
     )
+
+
+def _without_slack_mcp(form: dict) -> dict:
+    """Slack's form while its `mcp` method is switched off, as it was before
+    that method: `mcp` hidden, the bot token the default, and the
+    bring-your-own-app `oauth` method visible again."""
+    methods = []
+    for method in form.get("methods") or []:
+        if isinstance(method, dict) and method.get("id") == "mcp":
+            method = {**method, "hidden": True, "recommended": False}
+        elif isinstance(method, dict) and method.get("id") == "bot-token":
+            method = {**method, "recommended": True}
+        elif isinstance(method, dict) and method.get("id") == "oauth":
+            method = {**method, "hidden": False}
+        methods.append(method)
+    return {**form, "methods": methods}
 
 
 class ConnectorSpecRegistry:
@@ -113,6 +132,9 @@ class ConnectorSpecRegistry:
         return items
 
     def _to_connector_spec_response(self, c: dict) -> ConnectorSpecResponse:
+        form = c.get("form", {})
+        if c.get("id") == "slack" and not OAuthSettings().slack_connector_enabled:
+            form = _without_slack_mcp(form)
         return ConnectorSpecResponse(
             id=c.get("id"),
             label=c.get("label", c.get("id", "")),
@@ -125,9 +147,10 @@ class ConnectorSpecRegistry:
             featured=c.get("featured", False),
             notice=c.get("notice"),
             custom=c.get("custom", False),
+            needs_rebuild=c.get("needs_rebuild", False),
             api_key=_takes_api_key(c),
             keywords=c.get("keywords", []),
-            form=c.get("form", {}),
+            form=form,
             check=c.get("check"),
             auth_summary=c.get("auth_summary"),
         )

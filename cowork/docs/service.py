@@ -60,15 +60,19 @@ def apply(
     by: str,
     if_rev: int | None = None,
     turn: str | None = None,
+    replaced: list[Doc] | None = None,
 ) -> tuple[Doc, dict[str, Any]]:
     """Apply ``ops`` atomically and re-render the page; returns (new doc, apply_ops result).
 
     ``turn``: the agent reply the edit is part of, so one reply is one version.
     The person's writes (``by="user"``) also answer ``undo``: the ops that put
-    back what this one changed.
+    back what this one changed. ``replaced``, when given, gets the doc the ops
+    were applied to, as read under the doc's lock.
     """
 
     def change(current: Doc) -> tuple[Doc, dict[str, Any]]:
+        if replaced is not None:
+            replaced.append(current)
         new, result = apply_ops(current, ops, tab=tab, by=by, if_rev=if_rev)
         if by == "user":
             # Worked out here, against the doc this write replaced (undo.py).
