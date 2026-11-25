@@ -1833,6 +1833,11 @@ class AntonHarness:
             project_label=display_label(conversation.project),
         ) if docs else None
         DOC_TOOLS = build_doc_tools(doc_tool_ctx) if doc_tool_ctx is not None else []
+        # A published full-stack artifact's stored data (ENG-4686). Only
+        # MindsHub publishing runs full-stack apps, so a self-hosted
+        # deployment, whose publisher stores static pages, leaves it out.
+        from .artifact_data_tool import build_artifact_data_tool
+        ARTIFACT_DATA_TOOL = build_artifact_data_tool() if identity_for_turn() is None else None
 
         try:
             from anton.core.datasources.data_vault import LocalDataVault
@@ -2450,6 +2455,7 @@ class AntonHarness:
                     LABEL_CONNECTION_TOOL,
                     CREATE_SKILL_DRAFT_TOOL,
                     *DOC_TOOLS,
+                    *([ARTIFACT_DATA_TOOL] if ARTIFACT_DATA_TOOL else []),
                     # FETCH_SUBMISSION_TOOL,
                     # UPDATE_FORM_TOOL,
                     *([RECALL_HISTORY_TOOL] if RECALL_HISTORY_TOOL else []),
