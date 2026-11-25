@@ -306,7 +306,7 @@ def delete_artifact_stats_endpoint(
     """Delete the artifact's viewer analytics: views, visits and viewers."""
     api_key, publish_url = _stats_credential()
     try:
-        report_id = _stats.report_id_for_path(path, scope=scope)
+        report_id = _stats.report_id_for_path(path, scope=scope, allow_website=True)
         _stats.delete_stats(publish_url=publish_url, key=api_key, report_id=report_id)
     except _stats.STATS_ROUTE_ERRORS as e:
         raise _stats.stats_http_exception(e, desktop=True) from e

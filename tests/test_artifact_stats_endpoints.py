@@ -195,8 +195,8 @@ def _lock_is_free(folder) -> bool:
     return True
 
 
-@pytest.mark.parametrize("route", [_read, _toggle, _viewer, _delete], ids=["read", "toggle", "viewer", "delete"])
-async def test_every_stats_route_answers_unavailable_for_a_website(as_owner, keys, stats_calls, route):
+@pytest.mark.parametrize("route", [_read, _toggle, _viewer], ids=["read", "toggle", "viewer"])
+async def test_reading_and_settings_answer_unavailable_for_a_website(as_owner, keys, stats_calls, route):
     (as_owner / ".published.json").write_text(json.dumps({"report.html": {
         "report_id": "rid-1", "url": "https://hk1.mindshub.co/", "published": True, "mode": "website",
     }}))
@@ -208,6 +208,17 @@ async def test_every_stats_route_answers_unavailable_for_a_website(as_owner, key
     assert stats_calls == []
     assert keys.minted == []
     assert _lock_is_free(as_owner)
+
+
+async def test_the_owner_of_a_website_can_delete_its_old_stats(as_owner, keys, stats_calls):
+    (as_owner / ".published.json").write_text(json.dumps({"report.html": {
+        "report_id": "rid-1", "url": "https://hk1.mindshub.co/", "published": True, "mode": "website",
+    }}))
+    res = await _delete()
+
+    assert res.status_code == 204
+    assert stats_calls == [("delete", "https://view.example", "turnkey-1", "rid-1")]
+    assert keys.minted[0].revoked is True
 
 
 async def test_owner_reads_stats_with_a_key_minted_for_the_request(as_owner, keys, stats_calls):

@@ -554,20 +554,22 @@ def test_the_prompt_tells_the_model_about_websites_where_the_share_panel_offers_
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(("tenancy_mode", "websites"), [("org", "on"), ("local", "on")])
-async def test_a_taken_down_website_is_not_republished_without_access(
+async def test_a_taken_down_website_is_republished_with_the_servers_default_access(
     tmp_path, websites_offered, tenancy_mode, websites,
 ):
     websites_offered(tenancy_mode, websites)
     f = _artifact(tmp_path)
-    fake = mock.Mock(return_value={"url": "https://v/r/1"})
+    fake = mock.Mock(return_value={"url": "https://v/r/1", "result": {"report_id": "r1"}})
     entry = {"report_id": "r1", "url": "", "published": False, "mode": "website"}
     with mock.patch.object(htools, "_publish_artifact", fake), \
          mock.patch.object(htools, "_published_owner_state", return_value=entry):
         out = await htools._cowork_publish_or_preview(
             _session(tmp_path), {"file_path": str(f), "action": "publish"},
         )
-    fake.assert_not_called()
-    assert _text(out) == htools._website_request_answer()
+    fake.assert_called_once()
+    assert fake.call_args.kwargs["access"] is None
+    assert "Published successfully" in _text(out)
+    assert "no longer a public website" in _text(out)
 
 
 @pytest.mark.asyncio

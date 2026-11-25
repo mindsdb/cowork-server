@@ -403,6 +403,13 @@ def test_a_website_has_no_viewer_analytics(tmp_path):
     )
 
 
+def test_a_website_keeps_its_report_id_for_deleting_old_stats(tmp_path):
+    folder = _artifact(tmp_path, {"report_id": "rid-1", "url": "u", "published": True, "mode": "website"})
+    assert stats.report_id_for_folder(folder, allow_website=True) == "rid-1"
+    with patch("cowork.services.artifacts._scan_artifact_dirs", lambda *, scope: [folder.parent]):
+        assert stats.report_id_for_path(str(folder / "report.html"), scope=LOCAL_SCOPE, allow_website=True) == "rid-1"
+
+
 def test_unreadable_record_is_a_runtime_error(tmp_path):
     folder = _artifact(tmp_path, raw="{not json")
     with pytest.raises(RuntimeError, match="Could not read publish record"):

@@ -374,6 +374,8 @@ class WebsiteRefused(PublishRejected):
 # forgets it. Per process.
 WEBSITE_REFUSAL_TTL_S = 15 * 60.0
 _website_refusals: dict[str, tuple[tuple, float]] = {}
+# Autopublish threads, live sync and request threads all touch the table.
+_website_refusals_lock = threading.Lock()
 
 
 def _clock() -> float:
@@ -388,21 +390,23 @@ def _entry_stamp(entry: Any) -> tuple:
 
 
 def _website_refusal_remembered(published_dir: Path, entry: Any) -> bool:
-    remembered = _website_refusals.get(str(published_dir))
-    if remembered is None:
-        return False
-    stamp, until = remembered
-    if _clock() >= until or stamp != _entry_stamp(entry):
-        _website_refusals.pop(str(published_dir), None)
-        return False
-    return True
+    with _website_refusals_lock:
+        remembered = _website_refusals.get(str(published_dir))
+        if remembered is None:
+            return False
+        stamp, until = remembered
+        if _clock() >= until or stamp != _entry_stamp(entry):
+            _website_refusals.pop(str(published_dir), None)
+            return False
+        return True
 
 
 def _remember_website_refusal(published_dir: Path, entry: Any) -> None:
     now = _clock()
-    for key in [k for k, (_, until) in _website_refusals.items() if until <= now]:
-        del _website_refusals[key]
-    _website_refusals[str(published_dir)] = (_entry_stamp(entry), now + WEBSITE_REFUSAL_TTL_S)
+    with _website_refusals_lock:
+        for key in [k for k, (_, until) in _website_refusals.items() if until <= now]:
+            del _website_refusals[key]
+        _website_refusals[str(published_dir)] = (_entry_stamp(entry), now + WEBSITE_REFUSAL_TTL_S)
 
 
 class UploadError(NamedTuple):
@@ -2114,7 +2118,8 @@ def publish_artifact(
             if md_tmp_dir is not None:
                 md_tmp_dir.cleanup()
 
-        _website_refusals.pop(str(published_dir), None)
+        with _website_refusals_lock:
+            _website_refusals.pop(str(published_dir), None)
         # Owner-side state for the next publish, stored in the entry below and
         # never part of the response.
         password_hash = result.pop("password_hash", None)

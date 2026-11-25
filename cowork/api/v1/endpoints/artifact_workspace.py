@@ -1682,13 +1682,15 @@ class CommentsAccessResponse(CamelResponse):
     current_revision: dict[str, Any] | None
 
 
-async def _call_stats_service(scope: TenantScope, folder: Path, call: Callable[..., Any]) -> Any:
+async def _call_stats_service(
+    scope: TenantScope, folder: Path, call: Callable[..., Any], *, allow_website: bool = False
+) -> Any:
     """Run one stats request with a publish key minted for it, then revoke the key."""
     from cowork.services import artifact_stats as stats
 
     key = None
     try:
-        report_id = await run_efs(partial(stats.report_id_for_folder, folder), scope=scope)
+        report_id = await run_efs(partial(stats.report_id_for_folder, folder, allow_website=allow_website), scope=scope)
         _artifacts_base, publish_url, key = await run_on_unit_threads(
             partial(_owner_publish_context, scope, folder)
         )
@@ -1827,7 +1829,7 @@ async def delete_artifact_stats(
     _source, folder, _metadata, _capabilities = await _owner_workspace(
         scope, project_ref, artifact_id
     )
-    await _call_stats_service(scope, folder, stats.delete_stats)
+    await _call_stats_service(scope, folder, stats.delete_stats, allow_website=True)
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 

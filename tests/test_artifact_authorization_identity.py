@@ -2653,6 +2653,50 @@ async def test_a_remembered_website_refusal_ends_after_its_ttl(
     assert len(attempts) == 2
 
 
+def test_a_refusal_remembered_while_another_thread_reads_the_table_does_not_raise(
+    tmp_path, monkeypatch, fresh_website_refusals,
+):
+    import threading
+
+    publish_service = fresh_website_refusals
+    monkeypatch.setattr(publish_service, "_clock", lambda: 1000.0)
+    errors = []
+    other_threads = []
+
+    class InsertWhileIterating(dict):
+        """Lets another thread remember a refusal after the first item is read."""
+
+        def items(self):
+            def walk():
+                for number, pair in enumerate(super(InsertWhileIterating, self).items()):
+                    yield pair
+                    if number == 0 and not other_threads:
+                        thread = threading.Thread(target=other)
+                        other_threads.append(thread)
+                        thread.start()
+                        thread.join(timeout=0.5)
+
+            return walk()
+
+    def other():
+        try:
+            publish_service._remember_website_refusal(tmp_path / "other", {})
+        except Exception as exc:  # pragma: no cover - the failure being tested
+            errors.append(exc)
+
+    table = InsertWhileIterating()
+    table[str(tmp_path / "a")] = ((), 2000.0)
+    table[str(tmp_path / "b")] = ((), 2000.0)
+    monkeypatch.setattr(publish_service, "_website_refusals", table)
+
+    publish_service._remember_website_refusal(tmp_path / "c", {})
+    for thread in other_threads:
+        thread.join()
+
+    assert errors == []
+    assert {str(tmp_path / name) for name in ("a", "b", "c", "other")} <= set(dict.keys(table))
+
+
 def test_remembering_a_website_refusal_drops_expired_ones(tmp_path, monkeypatch, fresh_website_refusals):
     publish_service = fresh_website_refusals
     now = [1000.0]

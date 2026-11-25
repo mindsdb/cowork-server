@@ -436,14 +436,16 @@ async def _cowork_publish_or_preview(session: Any, tc_input: dict):
         access = ArtifactAccessRequest(mode=AccessMode.PUBLIC)
     else:
         # No access fields: preserve the artifact's previous access on re-publish.
-        # A taken-down website can't be rebuilt from its entry: only its owner publishes one.
-        if prev.get("mode") == AccessMode.WEBSITE:
-            return _website_request_answer()
         try:
-            # None on a first publish: publish_artifact applies the default
+            # None on a first publish, and for a taken-down website (which only
+            # its owner publishes): publish_artifact applies the default
             # (owner-only, or a refusal where a shared publish token can't
             # publish privately).
-            access = _access_from_state(prev) if prev.get("report_id") else None
+            access = (
+                _access_from_state(prev)
+                if prev.get("report_id") and prev.get("mode") != AccessMode.WEBSITE
+                else None
+            )
         except ValidationError as exc:
             # The entry is a file the agent can write, so its access fields can
             # hold any type; publishing without them would change who sees it.
@@ -606,6 +608,11 @@ async def _cowork_publish_or_preview(session: Any, tc_input: dict):
     if access is None and isinstance(result, dict) and result.get("accessMode") == AccessMode.RESTRICTED:
         notes += (
             " Only the user can open the link; they can change who can open it in the Share dialog."
+        )
+    if prev.get("mode") == AccessMode.WEBSITE and access is None:
+        notes += (
+            " It is no longer a public website: it was published with the default access, "
+            "and only its owner can make it a website again in the Share panel."
         )
     if unapproved:
         notes += " It was published without the credentials of: " + ", ".join(

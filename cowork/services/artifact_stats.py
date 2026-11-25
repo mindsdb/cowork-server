@@ -241,7 +241,7 @@ def delete_stats(*, publish_url: str, key: str, report_id: str) -> None:
     _request("DELETE", _stats_url(publish_url, report_id), key=key)
 
 
-def _report_id_from_record(published_dir: Path, published_key: str) -> str:
+def _report_id_from_record(published_dir: Path, published_key: str, *, allow_website: bool = False) -> str:
     published_json = published_dir / ".published.json"
     if not published_json.is_file():
         raise FileNotFoundError(NOT_PUBLISHED_MESSAGE)
@@ -252,7 +252,7 @@ def _report_id_from_record(published_dir: Path, published_key: str) -> str:
     entry = published_map.get(published_key) if isinstance(published_map, dict) else None
     if not isinstance(entry, dict) or not entry.get("published", True):
         raise FileNotFoundError(NOT_PUBLISHED_MESSAGE)
-    if entry.get("mode") == AccessMode.WEBSITE:
+    if entry.get("mode") == AccessMode.WEBSITE and not allow_website:
         raise StatsUnavailable(WEBSITE_STATS_MESSAGE)
     report_id = str(entry.get("report_id") or "").strip()
     if report_id:
@@ -267,23 +267,25 @@ def _report_id_from_record(published_dir: Path, published_key: str) -> str:
     raise FileNotFoundError(NOT_PUBLISHED_MESSAGE)
 
 
-def report_id_for_path(raw_path: str, *, scope: TenantScope | None) -> str:
-    """Desktop: the report id of a published artifact path inside ``scope``'s roots."""
+def report_id_for_path(raw_path: str, *, scope: TenantScope | None, allow_website: bool = False) -> str:
+    """Desktop: the report id of a published artifact path inside ``scope``'s roots.
+
+    ``allow_website`` lets a website's id through, for deleting stats gathered before it became one."""
     artifact = _artifacts.resolve_artifact_path(raw_path, scope=scope, allow_dir=True)
     if artifact is None:
         raise FileNotFoundError("Artifact not found")
     _target, published_dir, published_key, _is_fullstack = _resolve_publish_target(
         artifact, container_dirs=_artifacts._scan_artifact_dirs(scope=scope)
     )
-    return _report_id_from_record(published_dir, published_key)
+    return _report_id_from_record(published_dir, published_key, allow_website=allow_website)
 
 
-def report_id_for_folder(folder: Path) -> str:
+def report_id_for_folder(folder: Path, *, allow_website: bool = False) -> str:
     """Org: the report id of a published artifact folder."""
     _target, published_dir, published_key, _is_fullstack = _resolve_publish_target(
         folder, container_dirs=[folder.parent]
     )
-    return _report_id_from_record(published_dir, published_key)
+    return _report_id_from_record(published_dir, published_key, allow_website=allow_website)
 
 
 def stats_http_exception(exc: Exception, *, desktop: bool) -> HTTPException:
