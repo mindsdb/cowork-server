@@ -52,6 +52,15 @@ def main() -> None:
         else:
             os.environ[name] = value
     settings = get_app_settings()
+    # The desktop app always runs local tenancy, so a hand-off start whose
+    # settings name org tenancy got that from the .env file, which agent code
+    # can write. It stops here with one line the desktop shows; create_app
+    # refuses the same start for a caller that builds the app directly.
+    if app_secret.held_handoff() is not None and settings.tenancy_mode == "org":
+        raise SystemExit(
+            f"{app_secret.SERVER_REFUSAL_PREFIX}the desktop app's launch hand-off needs local tenancy, "
+            "and the settings name org tenancy (COWORK_TENANCY_MODE)"
+        )
     if stdin_protocol == str(app_secret.SECRET_PROTOCOL) and settings.tenancy_mode != "org":
         app_secret.read_from_stdin()
     # Every process this server starts inherits its environment: git, project

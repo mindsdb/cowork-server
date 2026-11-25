@@ -378,12 +378,19 @@ class TestCli:
         assert "UVICORN_STARTED" in result.stdout
         assert _held(result.stdout) == {"protocol": 2, "auth_token": TOKEN, "app_secret": SECRET}
 
-    def test_value_2_reads_stdin_even_when_the_env_file_names_org_tenancy(self, tmp_path):
+    def test_value_2_under_org_tenancy_exits_with_one_line_the_desktop_shows(self, tmp_path):
+        """The .env file can name org tenancy, so the hand-off is read first
+        and the start then stops with one line that carries the refusal
+        prefix, which the desktop shows in place of its generic exit message."""
         (tmp_path / "home").mkdir()
         (tmp_path / "home" / ".env").write_text("COWORK_TENANCY_MODE=org\n", encoding="utf-8")
         result = self._run(tmp_path, "2", _line(GOOD))
-        assert result.returncode == 0, result.stderr
-        assert _held(result.stdout)["protocol"] == 2
+        assert result.returncode != 0
+        assert "UVICORN_STARTED" not in result.stdout
+        assert result.stderr.strip().splitlines() == [
+            f"{app_secret.SERVER_REFUSAL_PREFIX}the desktop app's launch hand-off needs local tenancy, "
+            "and the settings name org tenancy (COWORK_TENANCY_MODE)"
+        ]
 
     @pytest.mark.parametrize(
         ("stdin", "message"),

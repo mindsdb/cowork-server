@@ -67,7 +67,7 @@ default. It then ends `failed` with outcome `interrupted`.
 |---|---|---|
 | Hosted (MindsHub) | `https://cowork.mindshub.ai` (staging: `https://cowork.staging.mindshub.ai`) | An `mdb_` API key from your MindsHub account |
 | Desktop app | None a script can use | The hosted API with an `mdb_` key, or a `cowork-server` you start from a terminal |
-| `cowork-server` started from a terminal | `http://127.0.0.1:26866` | Its local token: `COWORK_AUTH_TOKEN` in `~/.cowork/.env`, or in `~/.cowork-scripts/.env` when it has its own home beside the desktop app |
+| `cowork-server` started from a terminal | `http://127.0.0.1:26866`, or `http://127.0.0.1:28866` when it has its own home and port beside the desktop app | Its local token: `COWORK_AUTH_TOKEN` in `~/.cowork/.env`, or in `~/.cowork-scripts/.env` when it has its own home |
 | Self-hosted | Your deployment's address | A tester's Keycloak access token |
 
 Send it as `Authorization: Bearer <credential>`.
@@ -83,12 +83,18 @@ Send it as `Authorization: Bearer <credential>`.
 - **`cowork-server` from a terminal.** The server writes its token to
   `~/.cowork/.env` when it starts and finds none, or takes `COWORK_AUTH_TOKEN`
   from its environment. Only processes on your machine can reach the port.
-  If you also run the desktop app, give this server its own home:
-  `COWORK_HOME=~/.cowork-scripts cowork-server`. The desktop app's server can
-  share `~/.cowork/.env`, and it removes the token line there each time it
-  starts, so a script that reads the token from that file then gets nothing.
+  If you also run the desktop app, give this server its own home and port:
+  `COWORK_HOME=~/.cowork-scripts COWORK_SERVER_PORT=28866 cowork-server`. The
+  desktop app's server can share `~/.cowork/.env`, and it removes the token
+  line there each time it starts, so a script that reads the token from that
+  file then gets nothing. The desktop app's server listens on a port from
+  26866 to 28865, and on 26866 in a development build. It stops whatever holds
+  that port when it starts, so a server on the same port either stops or
+  fails to start, and a script that reaches the desktop's server gets a 401.
   A server with its own home keeps its own tasks, data and sign-in, and
-  writes its token to `~/.cowork-scripts/.env`.
+  writes its token to `~/.cowork-scripts/.env`. It builds its Google sign-in
+  callback from `COWORK_SERVER_ORIGIN`, so a server on port 28866 that
+  connects Google also needs `COWORK_SERVER_ORIGIN=http://127.0.0.1:28866`.
 - **Self-hosted.** Sign the tester in the way the web app does: Keycloak's
   authorization-code flow with PKCE, against the client the web app uses.
   Send the access token it returns, and before each call trade the refresh
@@ -139,10 +145,12 @@ Against a `cowork-server` you started from a terminal, use
 AUTH="Authorization: Bearer $(sed -n 's/^COWORK_AUTH_TOKEN=//p' ~/.cowork/.env)"
 ```
 
-If you also run the desktop app, start that server with its own home,
-`COWORK_HOME=~/.cowork-scripts cowork-server`, and read the token from there:
+If you also run the desktop app, start that server with its own home and
+port, `COWORK_HOME=~/.cowork-scripts COWORK_SERVER_PORT=28866 cowork-server`,
+and use that port and the token from its home:
 
 ```sh
+BASE=http://127.0.0.1:28866/api/v1
 AUTH="Authorization: Bearer $(sed -n 's/^COWORK_AUTH_TOKEN=//p' ~/.cowork-scripts/.env)"
 ```
 
@@ -150,9 +158,9 @@ AUTH="Authorization: Bearer $(sed -n 's/^COWORK_AUTH_TOKEN=//p' ~/.cowork-script
 
 The server describes every route in OpenAPI.
 
-- **`cowork-server` from a terminal:** `curl -H "$AUTH" http://127.0.0.1:26866/openapi.json`.
-  The interactive page at `/docs` needs the same token, so a browser can't open
-  it directly.
+- **`cowork-server` from a terminal:** `curl -H "$AUTH" http://127.0.0.1:26866/openapi.json`,
+  or port 28866 for a server with its own home and port. The interactive page
+  at `/docs` needs the same token, so a browser can't open it directly.
 - **Hosted:** not published. The hosted address serves only `/api` from
   cowork-server, and `/openapi.json` there is the web app's page.
 

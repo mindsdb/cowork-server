@@ -508,6 +508,31 @@ def test_remove_auth_token_keeps_every_other_line(tmp_path):
     assert env.read_text(encoding="utf-8") == "A=1\nCOWORK_AUTH_TOKEN_NOTE=kept\nB=2"
 
 
+def test_remove_auth_token_drops_every_spelling_of_the_key(tmp_path):
+    """python-dotenv reads a single-quoted key, and the settings read the name
+    in any case, so each of these lines is the token. A double-quoted key goes
+    too, as the desktop app's filter drops it. Names that only contain the key,
+    and a key with mismatched quotes, stay."""
+    env = tmp_path / ".env"
+    env.write_text(
+        "A=1\n"
+        "'COWORK_AUTH_TOKEN'=one\n"
+        "export 'COWORK_AUTH_TOKEN' = two\n"
+        '"COWORK_AUTH_TOKEN"=three\n'
+        "cowork_auth_token=four\n"
+        "  export Cowork_Auth_Token=five\n"
+        "COWORK_AUTH_TOKEN_OLD=kept\n"
+        "MY_COWORK_AUTH_TOKEN=kept\n"
+        "'COWORK_AUTH_TOKEN\"=kept\n"
+        "B=2\n",
+        encoding="utf-8",
+    )
+    assert remove_auth_token(env) is True
+    assert env.read_text(encoding="utf-8") == (
+        "A=1\nCOWORK_AUTH_TOKEN_OLD=kept\nMY_COWORK_AUTH_TOKEN=kept\n'COWORK_AUTH_TOKEN\"=kept\nB=2\n"
+    )
+
+
 def test_remove_auth_token_replaces_the_file_and_keeps_its_mode(tmp_path):
     """The kept lines are written beside .env and moved over it, never into
     it, so a second name for the old file keeps what it held."""

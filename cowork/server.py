@@ -1281,7 +1281,8 @@ def create_app() -> FastAPI:
         # no values file sets it; guarded so turning it on is not a trap. A
         # desktop launch that holds the hand-off is refused too: only the
         # .env file, which agent code can write, could have named org tenancy
-        # there.
+        # there. cowork.cli.main refuses that launch first, with a line the
+        # desktop shows; this covers a caller that builds the app directly.
         if settings.tenancy_mode == "org":
             raise RuntimeError(
                 "COWORK_REQUIRE_AUTH is not supported in org tenancy mode, nor is the desktop "

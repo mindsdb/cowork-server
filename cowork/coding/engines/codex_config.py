@@ -52,13 +52,13 @@ def persistent_home(cowork_root: Path) -> Path:
 
 
 def prepare_home(*, cowork_root: Path) -> Path:
-    """Create the persistent Codex home, open to this OS user alone, and
-    return it.
+    """Create the persistent Codex home with mode 0700, and return it.
 
     Codex keeps thread rollouts there, and its shell snapshot, which records
-    the session's inference token (``INFERENCE_KEY_ENV``). The mode is set at
-    every start, so a home an earlier start created with the default mode is
-    closed too.
+    the session's inference token (``INFERENCE_KEY_ENV``). The mode keeps
+    other OS accounts out, not an agent running as this user, which can read
+    every session's snapshot. The mode is set at every start, so a home an
+    earlier start created with the default mode is closed too.
     """
     home = persistent_home(cowork_root)
     home.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -291,8 +291,12 @@ def prepare_launch(config: EngineSessionConfig, workspace: Path, endpoint: str) 
         # A single `set` key merges with a project's own policy, where an
         # `exclude` list would replace the project's list and clash with its
         # `filters`. Codex's shell snapshot under codex-home still records the
-        # token as `export MINDSHUB_CODEX_API_KEY=...`, so codex-home is open
-        # to this OS user alone (prepare_home).
+        # token as `export MINDSHUB_CODEX_API_KEY=...`. codex-home's 0700 mode
+        # (prepare_home) keeps other OS accounts out, not an agent running as
+        # this user: every session shares codex-home and Codex's sandbox
+        # doesn't limit reads, so an agent can read another session's token.
+        # That token opens the same inference routes as the agent's own, for
+        # as long as that session runs, a same-user read the design accepts.
         f"shell_environment_policy.set.{INFERENCE_KEY_ENV}={toml_string('')}",
     ]
     if config.reasoning_effort:

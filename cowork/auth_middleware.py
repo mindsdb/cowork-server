@@ -153,9 +153,18 @@ def remove_auth_token(env_path: Path) -> bool:
 
 # ── private helpers ────────────────────────────────────────────────────────
 
-_TOKEN_RE = re.compile(r"^COWORK_AUTH_TOKEN\s*=\s*(.+)$", re.MULTILINE)
-# The whole line, as python-dotenv reads it: optional indent and `export`.
-_TOKEN_LINE_RE = re.compile(r"^[ \t]*(?:export[ \t]+)?COWORK_AUTH_TOKEN[ \t]*=.*(?:\r?\n|\Z)", re.MULTILINE)
+# `[ \t]*`, not `\s*`, which crosses a line break: an empty value would read
+# the next line as the token, and a write would replace that line with it.
+_TOKEN_RE = re.compile(r"^COWORK_AUTH_TOKEN[ \t]*=[ \t]*(.+)$", re.MULTILINE)
+# The whole line, as python-dotenv reads it: optional indent and `export`, and
+# the key bare or quoted, in any case. python-dotenv reads a single-quoted key,
+# and the settings read the name in any case. The desktop app's filter of the
+# same file (envForRenderer in cowork's src/main/server-auth.ts) drops the same
+# spellings, a double-quoted key included.
+_TOKEN_LINE_RE = re.compile(
+    r"""^[ \t]*(?:export[ \t]+)?(['"]?)COWORK_AUTH_TOKEN\1[ \t]*=.*(?:\r?\n|\Z)""",
+    re.MULTILINE | re.IGNORECASE,
+)
 
 
 def _read_token(env_path: Path) -> str:
