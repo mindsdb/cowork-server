@@ -439,7 +439,19 @@ def _inside_project(base: Path, *, folder: Path) -> Path:
 settings = AntonHarnessSettings()
 
 
-def build_elicitor(conversation_id: str, *, interactive: bool = True):
+def _anton_approval_kind() -> str | None:
+    """anton's approval capability, or None for an anton that predates it.
+    Such an anton's artifact brief reads any elicitor as someone who can
+    confirm it, so a scheduled run there gets no elicitor. Read with
+    getattr, so the anton floor doesn't move."""
+    from anton.core.interaction import elicit
+
+    return getattr(elicit, "APPROVAL_KIND", None)
+
+
+def build_elicitor(
+    conversation_id: str, *, interactive: bool = True, write_approval: bool = False
+):
     """The question strategy for this conversation's turn.
 
     With questions off (COWORK_ASK_USER_ENABLED=false) it is None, the kill
@@ -453,22 +465,30 @@ def build_elicitor(conversation_id: str, *, interactive: bool = True):
     questions, the browser hand-over and the confirmation cards reach the
     person watching the turn.
 
-    A scheduled run (``interactive`` False) with ANTON_WRITE_APPROVAL on gets
-    an elicitor that takes only approval cards (APPROVAL_KIND). A person who
-    opens the run can still approve a held write. A question, a browser
-    hand-over or a tool's own confirmation card (confirm_card) still comes
-    back at once, because the elicitor doesn't take "choice": nobody waits to
-    answer them, so they would only wait out their timeout. anton's write
-    gate remembers a card nobody answered (WriteGate.unanswered, which
-    ask_approval_choice and ask_approval_card set and read) and refuses the
-    turn's later cards without asking, so the run waits out one card at most. An anton that
-    predates APPROVAL_KIND takes no card from this elicitor, so it refuses the
-    held write at once as well.
+    ``write_approval`` is the turn's own AntonSettings.write_approval, the
+    value anton's write gate reads, not this server's import-time settings.
 
-    A scheduled run with ANTON_WRITE_APPROVAL off gets None. With no write
+    A scheduled run (``interactive`` False) with ``write_approval`` on gets
+    an elicitor that takes only approval cards (anton's APPROVAL_KIND). A
+    person who opens the run can still approve a held write. A question, a
+    browser hand-over or a tool's own confirmation card (confirm_card) still
+    comes back at once, because the elicitor doesn't take "choice": nobody
+    waits to answer them, so they would only wait out their timeout. anton's
+    write gate remembers a card nobody answered (WriteGate.unanswered, which
+    ask_approval_choice sets and reads for every approval card) and refuses
+    the turn's later cards without asking, so the run waits out one card at
+    most.
+
+    On an anton that predates APPROVAL_KIND, a scheduled run gets no
+    elicitor even with ``write_approval`` on. That anton's artifact brief
+    reads any elicitor as someone who can confirm it, so an approvals-only
+    elicitor would stop a changed repeat brief at its confirmation. With no
+    elicitor, that anton refuses the held write at once.
+
+    A scheduled run with ``write_approval`` off gets None. With no write
     gate, nothing remembers an unanswered card, so each approval card the run
-    raises, such as a live app's launch or a browser step, would wait out its
-    timeout with nobody watching.
+    raises, such as a browser step, would wait out its timeout with nobody
+    watching.
 
     The kill switch holds only as long as the ChatSessionConfig built from
     this value is not also given a `console`: with elicitor=None and a
@@ -478,15 +498,16 @@ def build_elicitor(conversation_id: str, *, interactive: bool = True):
     """
     if not get_app_settings().ask_user_enabled:
         return None
-    from cowork.harnesses.anton_harness.elicitor import APPROVAL_KIND, CoworkElicitor
+    from cowork.harnesses.anton_harness.elicitor import CoworkElicitor
     from cowork.streaming.answers import broker
 
     # timeout_s deliberately not passed: elicitor.DEFAULT_TIMEOUT_S is the one
     # place the number lives, so this call site does not restate it.
     if not interactive:
-        if not settings.write_approval:
+        approval_kind = _anton_approval_kind()
+        if not write_approval or approval_kind is None:
             return None
-        return CoworkElicitor(conversation_id, broker, supported_kinds=(APPROVAL_KIND,))
+        return CoworkElicitor(conversation_id, broker, supported_kinds=(approval_kind,))
     return CoworkElicitor(conversation_id, broker)
 
 
@@ -1837,7 +1858,11 @@ class AntonHarness:
         _overlay_user_settings(anton_settings, user)
 
         RECALL_HISTORY_TOOL = self._recall_history_tool(conversation, user)
-        elicitor = build_elicitor(str(conversation.id), interactive=interactive)
+        elicitor = build_elicitor(
+            str(conversation.id),
+            interactive=interactive,
+            write_approval=anton_settings.write_approval is True,
+        )
         # Asks the user's open preview whether an edited artifact runs. Only
         # where the cowork app tails the turn: a scheduled run or a channel
         # bot has no preview to answer, and would only wait out the timeout.
