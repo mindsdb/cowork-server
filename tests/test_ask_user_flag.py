@@ -114,9 +114,11 @@ def test_the_approval_kind_is_antons():
 
 async def test_a_scheduled_run_refuses_a_tools_confirmation_card(monkeypatch):
     """A tool's own confirmation card (publishing credentials, changing a
-    scheduled task) is a question, not an approval card, so a scheduled run
-    refuses it at once and publishes no card."""
-    from cowork.harnesses.anton_harness.confirm_card import confirm_card
+    scheduled task) is a plain choice question, not an approval card, so a
+    scheduled run refuses it at once and publishes no card. It asks through
+    anton's elicit() exactly as the tools' confirmation cards do."""
+    from anton.core.interaction.elicit import AskOption, AskRequest, elicit
+
     from cowork.harnesses.anton_harness.harness import build_elicitor
 
     _questions(monkeypatch, enabled=True)
@@ -131,14 +133,16 @@ async def test_a_scheduled_run_refuses_a_tools_confirmation_card(monkeypatch):
         async def emit(self, event):
             published.append(event)
 
-    decision = await confirm_card(
-        _Session(),
-        key="publish",
+    request = AskRequest(
         prompt="Publish this app?",
-        confirm=("publish", "Publish", "Publish the app"),
-        cancel_detail="Publish nothing",
+        options=(
+            AskOption(value="publish", label="Publish", detail="Publish the app"),
+            AskOption(value="cancel", label="Cancel", detail="Publish nothing"),
+        ),
+        allow_custom=False,
     )
-    assert decision == "unavailable"
+    answer = await elicit(_Session(), "publish:1", request, counted=False)
+    assert answer.status == "unavailable"
     assert published == []
 
 
