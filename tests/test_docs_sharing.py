@@ -32,6 +32,16 @@ def _settle(pending, timeout: float = 2.0) -> None:
         time.sleep(0.01)
 
 
+@pytest.fixture(autouse=True)
+def _no_republish_left_waiting():
+    """The republish debouncer is one for the process. A republish an earlier
+    test left waiting would fire during a later one, against that test's
+    stand-ins, so none crosses a test's edge."""
+    republish._republishes.cancel_all()
+    yield
+    republish._republishes.cancel_all()
+
+
 @pytest.fixture
 def folder(tmp_path):
     """A doc, shared at PAGE_URL."""
