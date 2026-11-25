@@ -161,7 +161,7 @@ def convert_in_child(
 ) -> Conversion:
     """Convert *source* in a conversion process, serving its reads through *read_asset*.
 
-    A ``PublishMarkdownRequest`` reads nothing and takes no *read_asset*, so
+    A ``PublishMarkdownRequest`` or ``PublishFileRequest`` reads nothing and takes no *read_asset*, so
     a read it asks for breaks the protocol.
 
     Blocking: it runs in the export's worker thread, which holds the pinned

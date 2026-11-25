@@ -19,7 +19,8 @@ parser can bypass it, and the process runs as the server's user.
 
 ``convert`` is the conversion itself, and the server's tests call it in their
 own process too. Publishing a Markdown artifact renders its page here as well
-(``publish_markdown_body``), for the same reason.
+(``publish_markdown_body``), for the same reason, and so does publishing a
+file that isn't a web page (``cowork.services.file_page``, ENG-4687).
 """
 from __future__ import annotations
 
@@ -45,6 +46,7 @@ from cowork.schemas.export_child import (
     ConversionFailed,
     Converted,
     ConvertRequest,
+    PublishFileRequest,
     PublishMarkdownRequest,
     ServerMessage,
 )
@@ -55,6 +57,7 @@ from cowork.services.artifact_files import (
 )
 from cowork.services.artifact_inline import AssetReader, inline_html
 from cowork.services.docx_writer import write_docx
+from cowork.services.file_page import FilePageRefused, file_page_body
 from cowork.services.markdown_render import MarkdownRefused, render_markdown
 
 MARKDOWN_SOURCES = frozenset({".md", ".markdown"})
@@ -81,7 +84,7 @@ MAX_HEADER_BYTES = 64 * 1024
 MAX_PAYLOAD_BYTES = 64 * 1024 * 1024
 _LENGTH = struct.Struct(">I")
 
-_SERVER_MESSAGE: TypeAdapter[ConvertRequest | PublishMarkdownRequest | AssetReply] = TypeAdapter(
+_SERVER_MESSAGE: TypeAdapter[ConvertRequest | PublishMarkdownRequest | PublishFileRequest | AssetReply] = TypeAdapter(
     ServerMessage
 )
 CHILD_MESSAGE: TypeAdapter[AssetRequest | Converted | ConversionFailed] = TypeAdapter(
@@ -393,6 +396,9 @@ def main() -> None:
         if isinstance(request, PublishMarkdownRequest):
             body = publish_markdown_body(text=source.decode("utf-8"))
             conversion = Conversion(data=body.encode("utf-8"), omitted_count=0, scripts_dropped=False)
+        elif isinstance(request, PublishFileRequest):
+            body = file_page_body(data=source, suffix=request.suffix, name=request.name)
+            conversion = Conversion(data=body.encode("utf-8"), omitted_count=0, scripts_dropped=False)
         else:
             conversion = convert(
                 request=request,
@@ -411,7 +417,7 @@ def main() -> None:
             ),
             payload=conversion.data,
         )
-    except (MarkdownRefused, MemoryError):
+    except (MarkdownRefused, FilePageRefused, MemoryError):
         why = ""
         try:
             # Types and locations only, so a real bug behind a refusal shows

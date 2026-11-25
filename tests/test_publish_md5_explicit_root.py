@@ -63,7 +63,8 @@ def test_md5_changes_when_content_changes(tmp_path):
 
 def test_md5_none_for_unpublishable_primary(tmp_path):
     base = tmp_path / "a" / ".anton" / "artifacts"
-    folder = _make_artifact(base, "data", files={"rows.csv": "a,b\n1,2"},
+    # A CSV shares as a page now (ENG-4687); an archive still has nothing to publish.
+    folder = _make_artifact(base, "data", files={"rows.zip": "PK"},
                             meta={"slug": "data", "type": "dataset"})
 
     assert compute_publish_md5(folder, artifacts_base=base) is None
