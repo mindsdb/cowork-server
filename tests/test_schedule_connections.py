@@ -111,6 +111,44 @@ async def test_the_api_saves_keeps_and_clears_a_tasks_left_out_connections(sched
         assert not cleared["disabledConnections"]
 
 
+async def test_a_task_stays_editable_after_a_connection_it_leaves_out_is_removed(schedule_id, monkeypatch):
+    url = f"/api/v1/schedules/{schedule_id}"
+    async with _client() as client:
+        saved = (await client.patch(url, json={"disabledConnections": [GMAIL]})).json()
+        monkeypatch.setattr(schedules_api, "turn_vault_for_scope", lambda _: SimpleNamespace(
+            list_connections=lambda: [],
+        ))
+        # The editor resends the stored list with every save.
+        edit = await client.patch(url, json={"title": "Renamed", "disabledConnections": saved["disabledConnections"]})
+        assert edit.status_code == 200
+        # Still left out, should the connection come back.
+        assert edit.json()["disabledConnections"] == [GMAIL]
+        other = {"engine": "gmail", "name": "Never saved"}
+        added = await client.patch(url, json={"disabledConnections": [GMAIL, other]})
+        assert added.status_code == 422
+
+
+async def test_a_stored_hosted_exclusion_survives_its_datasource_being_deleted(monkeypatch):
+    async def none(*_):
+        return []
+
+    async def catalogue(*_):
+        return {"items": []}
+
+    monkeypatch.setattr(schedules_api.auth_proxy, "proxy_catalogue", catalogue)
+    monkeypatch.setattr(schedules_api.auth_proxy, "proxy_datasource_list", none)
+    monkeypatch.setattr(schedules_api.auth_proxy, "proxy_custom_connection_list", none)
+    stored = {"engine": "postgres", "name": "Primary", "datasource_id": 12}
+    scope, request = TenantScope(org_mode=True), Request({"type": "http"})
+    assert await schedules_api._resolve_exclusions(
+        [DisabledConnection(**stored)], scope, request, stored=[stored],
+    ) == [stored]
+    with pytest.raises(HTTPException, match="could not be found"):
+        await schedules_api._resolve_exclusions(
+            [DisabledConnection(engine="postgres", name="Primary", datasource_id=13)], scope, request, stored=[stored],
+        )
+
+
 async def test_a_hosted_datasource_exclusion_binds_the_visible_id(monkeypatch):
     datasource = {"id": 12, "connector_id": "postgres", "name": "Primary"}
 

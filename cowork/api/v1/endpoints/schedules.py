@@ -69,10 +69,19 @@ async def create_schedule(body: ScheduleCreateRequest, scope: TenantScopeDep, re
 
 async def _resolve_exclusions(
     exclusions: list[DisabledConnection] | None, scope: TenantScope, request: Request,
+    *, stored: list[dict] | None = None,
 ) -> list[dict]:
-    """Validate against this member's visible connections and store stable datasource IDs."""
+    """Validate against this member's visible connections and store stable datasource IDs.
+
+    An entry the task already holds (``stored``) stays as it is when its
+    connection is gone: the editor resends the whole list with every save and
+    shows no box for a missing connection, so refusing it would refuse every
+    later edit. Kept rather than dropped, so a connection that comes back
+    under the same name or id is still left out.
+    """
     if not exclusions:
         return []
+    kept = {(e.get("engine"), e.get("name"), e.get("datasource_id")): e for e in stored or [] if isinstance(e, dict)}
     if scope.org_mode:
         settings = OAuthSettings()
         catalogue, datasources, custom = await asyncio.gather(
@@ -102,6 +111,10 @@ async def _resolve_exclusions(
                 canonical.append(item.model_dump())
                 continue
         if source is None:
+            already = kept.get((item.engine, item.name, item.datasource_id))
+            if already is not None:
+                canonical.append(already)
+                continue
             raise HTTPException(status_code=422, detail="An excluded connector could not be found in your connections.")
         canonical.append(DisabledConnection(
             engine=item.engine, name=source["name"], datasource_id=source["id"],
@@ -144,9 +157,19 @@ async def update_schedule(schedule_id: UUID, body: ScheduleUpdateRequest, scope:
     if "project_id" in body.model_fields_set and body.project_id is None:
         changes["project_id"] = None
     if body.disabled_connections is not None:
-        changes["disabled_connections"] = await _resolve_exclusions(body.disabled_connections, scope, request)
+        stored = await run_db(partial(_stored_exclusions, schedule_id=schedule_id), scope=scope) if body.disabled_connections else None
+        changes["disabled_connections"] = await _resolve_exclusions(
+            body.disabled_connections, scope, request, stored=stored,
+        )
     unit = run_efs_unit if "project_id" in changes and changes["project_id"] is None else run_db
     return await unit(partial(_update_schedule, schedule_id=schedule_id, changes=changes), scope=scope)
+
+
+def _stored_exclusions(scoped: ScopedSession, *, schedule_id: UUID) -> list[dict]:
+    try:
+        return list(ScheduleService(scoped).get_schedule(schedule_id).disabled_connections or [])
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
 
 
 def _update_schedule(scoped: ScopedSession, *, schedule_id: UUID, changes: dict) -> ScheduleResponse:
