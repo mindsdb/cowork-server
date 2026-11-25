@@ -17,7 +17,7 @@ import tempfile
 import threading
 import urllib.error
 from collections import OrderedDict
-from collections.abc import Callable
+from collections.abc import Callable, Collection
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, NamedTuple
@@ -95,6 +95,7 @@ from cowork.services.artifacts import (
     _load_published_map,
     _org_mode,
     PUBLISHABLE_STATIC_SUFFIXES,
+    _artifact_dirs_for,
     _scan_artifact_dirs,
     html_artifacts,
     is_non_content_path,
@@ -106,6 +107,7 @@ from cowork.services.artifacts import (
 # from the harness turn path where that is dead weight.
 if TYPE_CHECKING:
     from cowork.db.scoped import TenantScope
+    from cowork.services.artifact_roots import ProjectRow
     from cowork.services.artifact_access import ArtifactRule
     from cowork.services.artifact_owner_choice import Narrowing
 
@@ -2458,7 +2460,9 @@ def activate_version(raw_path: str, md5: str, *, scope: TenantScope | None) -> d
     }
 
 
-def published_state(raw_path: str, *, scope: TenantScope | None) -> dict:
+def published_state(
+    raw_path: str, *, scope: TenantScope | None, adopted: Collection[ProjectRow] = ()
+) -> dict:
     """Owner-side publish state for an artifact path, resolved exactly the way
     `publish_artifact` resolves it (so the chat tool and the GUI never disagree
     on where `.published.json` lives).
@@ -2472,13 +2476,13 @@ def published_state(raw_path: str, *, scope: TenantScope | None) -> dict:
     # artifacts dir, so guard the whole resolution — the documented contract is
     # to return the blank default for any unresolvable path, never to raise.
     try:
-        artifact = resolve_artifact_path(raw_path, scope=scope, allow_dir=True)
+        artifact = resolve_artifact_path(raw_path, scope=scope, allow_dir=True, adopted=adopted)
     except Exception:
         return dict(blank)
     if artifact is None:
         return dict(blank)
     _publish_target, published_dir, published_key, _is_fullstack = _resolve_publish_target(
-        artifact, container_dirs=_scan_artifact_dirs(scope=scope)
+        artifact, container_dirs=_artifact_dirs_for(scope=scope, adopted=adopted)
     )
     entry = _load_published_map(published_dir).get(published_key)
     if not isinstance(entry, dict):
@@ -2491,19 +2495,23 @@ def published_state(raw_path: str, *, scope: TenantScope | None) -> dict:
     }
 
 
-def published_link_owner_recorded(raw_path: str, *, scope: TenantScope | None) -> bool | None:
+def published_link_owner_recorded(
+    raw_path: str, *, scope: TenantScope | None, adopted: Collection[ProjectRow] = ()
+) -> bool | None:
     """Whether Cowork can still update or take down the artifact's live page,
     resolved exactly like `published_state`. True with no live page; False
     when no owner record ties the page to this artifact; None when that can't
     be read."""
     from cowork.services.published_page_ownership import link_owner_recorded
 
-    state = published_state(raw_path, scope=scope)
+    state = published_state(raw_path, scope=scope, adopted=adopted)
     if not state["published"]:
         return True
     try:
-        artifact = resolve_artifact_path(raw_path, scope=scope, allow_dir=True)
-        publish_target, *_rest = _resolve_publish_target(artifact, container_dirs=_scan_artifact_dirs(scope=scope))
+        artifact = resolve_artifact_path(raw_path, scope=scope, allow_dir=True, adopted=adopted)
+        publish_target, *_rest = _resolve_publish_target(
+            artifact, container_dirs=_artifact_dirs_for(scope=scope, adopted=adopted)
+        )
         publish_url, _api_key = _resolve_publish_endpoint(get_user_settings())
     except Exception:
         return None

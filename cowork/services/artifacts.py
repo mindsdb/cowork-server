@@ -337,6 +337,18 @@ def _artifact_dirs_for(*, scope: TenantScope | None, adopted: Collection[Project
     return list(dirs.values())
 
 
+def _adopted_source_holding(path: Path, adopted: Collection[ProjectRow]) -> ProjectArtifacts | None:
+    """The source in `adopted` whose artifacts root holds `path`, for a serve
+    URL: its segment is the row's name, which the scan cannot rediscover."""
+    from cowork.services.artifact_roots import adopted_artifacts_sources
+
+    resolved = path.resolve()
+    for source in adopted_artifacts_sources(adopted):
+        if resolved.is_relative_to(Path(source.base).resolve()):
+            return source
+    return None
+
+
 def _load_metadata(folder: Path) -> ArtifactMetadata | None:
     path = folder / "metadata.json"
     try:
@@ -2177,12 +2189,15 @@ def preview_artifact(path: Path) -> dict:
     return preview
 
 
-async def mount_preview(path: Path, *, scope: TenantScope | None) -> dict:
+async def mount_preview(
+    path: Path, *, scope: TenantScope | None, adopted: Collection[ProjectRow] = ()
+) -> dict:
     """Register an artifact for iframe preview.
 
     ``path`` is already resolved inside ``scope``'s artifacts roots; ``scope``
     bounds the climb to its artifact root and keys a live backend's
-    connections and launch.
+    connections and launch. `adopted` adds the caller's projects in a folder
+    the user chose to both.
 
     Two payload shapes share a `kind` discriminator:
       - `kind: "static"` (HTML asset bundles) — token + relUrl that
@@ -2196,7 +2211,7 @@ async def mount_preview(path: Path, *, scope: TenantScope | None) -> dict:
     # primary file's parent — fullstack apps keep their frontend in a
     # `static/` subdir. Resolve it explicitly for all backend lookups so
     # we read the `port` from the root, not from `static/`.
-    root = _artifact_root_for(path, scope=scope)
+    root = _artifact_root_for(path, scope=scope, adopted=adopted)
 
     # Backend+frontend artifacts: detect them by a `port` field in the
     # root's metadata.json. The iframe will load through our proxy
@@ -2237,7 +2252,7 @@ async def mount_preview(path: Path, *, scope: TenantScope | None) -> dict:
         # reach us.
         root_token = hashlib.sha256(str(root).encode("utf-8")).hexdigest()[:16]
         _PREVIEW_MOUNTS[root_token] = root
-        backend = await _ensure_backend_running(root, backend_port, scope=scope)
+        backend = await _ensure_backend_running(root, backend_port, scope=scope, adopted=adopted)
         return {
             "kind": "proxy",
             "token": root_token,
@@ -2258,13 +2273,19 @@ async def mount_preview(path: Path, *, scope: TenantScope | None) -> dict:
         raise ValueError("Preview mount is only available for HTML artifacts")
     token = hashlib.sha256(str(parent).encode("utf-8")).hexdigest()[:16]
     _PREVIEW_MOUNTS[token] = parent
+    adopted_source = _adopted_source_holding(path, adopted)
 
     return {
         "kind": "static",
         "token": token,
         "entry": path.name,
         "relUrl": f"/artifacts/preview-asset/{token}/{path.name}",
-        "serveUrl": serve_url_for(path, scope=scope),
+        "serveUrl": serve_url_for(
+            path,
+            scope=scope,
+            artifacts_base=Path(adopted_source.base) if adopted_source else None,
+            project_name=adopted_source.project_name if adopted_source else None,
+        ),
         # Route through _published_url_for so a soft-deleted (published=False)
         # record reports an empty URL — matching the artifact grid and the
         # fullstack branch, instead of surfacing a dead 4nton.ai link.
@@ -2273,7 +2294,9 @@ async def mount_preview(path: Path, *, scope: TenantScope | None) -> dict:
     }
 
 
-def preview_mount_for(token: str, *, scope: TenantScope | None) -> Path | None:
+def preview_mount_for(
+    token: str, *, scope: TenantScope | None, adopted: Collection[ProjectRow] = ()
+) -> Path | None:
     """The directory ``token`` mounts, only when it lies inside one of
     ``scope``'s artifacts roots; None otherwise, the same answer as an unknown
     token.
@@ -2295,7 +2318,7 @@ def preview_mount_for(token: str, *, scope: TenantScope | None) -> Path | None:
         resolved = mounted.resolve(strict=False)
     except OSError:
         return None
-    for container in _scan_artifact_dirs(scope=scope):
+    for container in _artifact_dirs_for(scope=scope, adopted=adopted):
         try:
             resolved.relative_to(container.resolve())
         except (ValueError, OSError):
@@ -2562,7 +2585,11 @@ def _resolve_project_root(
 
 
 async def _ensure_backend_running(
-    artifact_dir: Path, port: int, *, scope: TenantScope | None
+    artifact_dir: Path,
+    port: int,
+    *,
+    scope: TenantScope | None,
+    adopted: Collection[ProjectRow] = (),
 ) -> BackendStatus:
     """Bring up the artifact's backend if it isn't already listening.
 
@@ -2583,7 +2610,7 @@ async def _ensure_backend_running(
     slug = artifact_dir.name
     # The project root first, so nothing about the port is reported for an
     # artifact outside the caller's own projects.
-    project_root = _resolve_project_root(artifact_dir, scope=scope)
+    project_root = _resolve_project_root(artifact_dir, scope=scope, adopted=adopted)
     if project_root is None:
         return BackendStatus(running=False, detail="Artifact is not in a registered project.", port=0)
     if _backend_answers(project_root=project_root, slug=slug, port=port, scope=scope):

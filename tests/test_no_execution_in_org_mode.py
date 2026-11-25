@@ -82,7 +82,7 @@ async def test_open_artifact_endpoint_refused_in_org_mode(org_mode):
     from cowork.api.v1.endpoints.artifacts import _PathBody, open_artifact
 
     with pytest.raises(HTTPException) as exc:
-        await open_artifact(_PathBody(path="/tmp/whatever"), scope=LOCAL_SCOPE)
+        await open_artifact(_PathBody(path="/tmp/whatever"), scope=LOCAL_SCOPE, adopted=())
     assert exc.value.status_code == 403
 
 
@@ -197,7 +197,7 @@ async def test_open_not_refused_on_desktop(desktop, tmp_path):
     from cowork.api.v1.endpoints.artifacts import _PathBody, open_artifact
 
     with pytest.raises(HTTPException) as exc:
-        await open_artifact(_PathBody(path=str(tmp_path / "missing.html")), scope=LOCAL_SCOPE)
+        await open_artifact(_PathBody(path=str(tmp_path / "missing.html")), scope=LOCAL_SCOPE, adopted=())
     assert exc.value.status_code == 404
 
 
@@ -418,7 +418,7 @@ async def test_reveal_artifact_endpoint_maps_execution_refused_to_403(monkeypatc
 
     from cowork.services.artifacts import ExecutionRefused
 
-    monkeypatch.setattr(artifacts_ep, "_resolve_reveal_path", lambda path, session: tmp_path)
+    monkeypatch.setattr(artifacts_ep, "_resolve_reveal_path", lambda path, session, adopted: tmp_path)
     # A desktop session: the route refuses a person's partition before this.
     session = SimpleNamespace(scope=LOCAL_SCOPE)
 
@@ -427,7 +427,7 @@ async def test_reveal_artifact_endpoint_maps_execution_refused_to_403(monkeypatc
     monkeypatch.setattr(artifacts_ep, "reveal_in_file_manager", _refuse)
 
     with pytest.raises(HTTPException) as exc:
-        await artifacts_ep.reveal_artifact(artifacts_ep._PathBody(path=str(tmp_path)), session=session)
+        await artifacts_ep.reveal_artifact(artifacts_ep._PathBody(path=str(tmp_path)), session=session, adopted=())
     assert exc.value.status_code == 403
 
     def _boom(_path):
@@ -435,7 +435,7 @@ async def test_reveal_artifact_endpoint_maps_execution_refused_to_403(monkeypatc
     monkeypatch.setattr(artifacts_ep, "reveal_in_file_manager", _boom)
 
     with pytest.raises(HTTPException) as exc:
-        await artifacts_ep.reveal_artifact(artifacts_ep._PathBody(path=str(tmp_path)), session=session)
+        await artifacts_ep.reveal_artifact(artifacts_ep._PathBody(path=str(tmp_path)), session=session, adopted=())
     assert exc.value.status_code == 500
 
 
