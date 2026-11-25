@@ -16,6 +16,7 @@ from fastapi import APIRouter, Depends
 from pydantic import BaseModel, ConfigDict, SecretStr, field_validator, model_validator
 
 from cowork.api.v1.permissions import LoopbackDesktopOnly, require
+from cowork.common.settings import runtime_credential
 from cowork.common.settings.runtime_credential import (
     LocalBrowserHost,
     clear_browser_host,
@@ -24,6 +25,7 @@ from cowork.common.settings.runtime_credential import (
     set_browser_host,
     set_minds_credential,
 )
+from cowork.services.inference_key import refresh_inference_key, revoke_all_inference_keys
 from cowork.schemas.base import CamelResponse
 
 # Both guards sit on the router rather than on the route, so a second route
@@ -43,14 +45,32 @@ class MindsCredentialBody(BaseModel):
     """
 
     value: str = ""
+    # The organization the desktop has mounted. When sent, LLM calls bill a
+    # turn key pinned to it rather than the session token.
+    organization_id: str | None = None
+    # Sign-out only: a live token to revoke turn keys with, since the held one may have expired.
+    revoke_token: str | None = None
 
 
 @router.put("/minds")
 def put_minds_credential(body: MindsCredentialBody) -> dict[str, bool]:
-    if body.value:
-        set_minds_credential(body.value)
-    else:
+    if not body.value:
+        token = body.revoke_token or runtime_credential.get_minds_credential()
         clear_minds_credential()
+        if token:
+            # Earlier keys may still sit in a scratchpad, so revoke them all, not just the held one.
+            revoke_all_inference_keys(token)
+        return {"ok": True}
+
+    set_minds_credential(body.value)
+    # A hand-entered mdb_ key already names its organization, and auth won't mint with one.
+    # A token with no organization keeps the pin; only sign-out or an mdb_ key clears it.
+    organization_id = (
+        None if body.value.startswith("mdb_") else body.organization_id or runtime_credential.get_organization()
+    )
+    runtime_credential.set_organization(organization_id)
+    if organization_id:
+        refresh_inference_key(body.value, organization_id)
     return {"ok": True}
 
 
@@ -72,6 +92,9 @@ async def get_minds_credential_organization() -> MindsCredentialOrganization:
     credential = get_minds_credential()
     if not credential:
         return MindsCredentialOrganization()
+    # A pinned desktop bills its mounted organization, whatever Keycloak has active.
+    if pinned := runtime_credential.get_organization():
+        return MindsCredentialOrganization(organization_id=pinned)
     permissions = await fetch_mindshub_permissions(bearer_token=credential, org_id="", user_id="")
     return MindsCredentialOrganization(organization_id=permissions.organization_id)
 

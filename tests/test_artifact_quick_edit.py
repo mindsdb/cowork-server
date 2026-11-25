@@ -1400,6 +1400,30 @@ def test_a_jev_402_is_logged_with_mindshub_s_reason_and_goes_to_the_agent(client
     assert "HTTP 402 (wallet_empty: no free decision allowance left)" in caplog.text
 
 
+def test_a_pinned_desktops_quick_edit_decisions_bill_its_turn_key(monkeypatch):
+    from datetime import datetime, timedelta, timezone
+
+    from cowork.common.settings import runtime_credential
+    from cowork.common.settings.user_settings import Provider, UserSettings
+
+    monkeypatch.setattr(runtime_credential, "_minds_credential", "session-jwt")
+    monkeypatch.setattr(runtime_credential, "_organization_id", "org-a")
+    monkeypatch.setattr(
+        runtime_credential,
+        "_inference_key",
+        runtime_credential.InferenceKey(
+            value="mdb_turn_a",
+            organization_id="org-a",
+            instance_id="desktop-1",
+            expires_at=datetime.now(timezone.utc) + timedelta(minutes=30),
+        ),
+    )
+    user = UserSettings(planning_provider=Provider.MINDS_CLOUD, minds_api_key="session-jwt")
+    decisions = quick_edit_service.decisions_for(FakeAnton().api(), user)
+
+    assert decisions.api_key == "mdb_turn_a"
+
+
 # ── images pasted into the bar (ENG-4410) ─────────────────────────────────
 
 PNG = b"\x89PNG\r\n\x1a\n" + b"\x00" * 32

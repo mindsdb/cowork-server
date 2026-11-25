@@ -312,7 +312,7 @@ def decisions_for(anton: AntonQuickEdit | None, user) -> Decisions:
             return NO_DECISIONS
         from cowork.harnesses.anton_harness.harness import anton_settings_for_user
 
-        from cowork.common.settings.user_settings import Provider, provider_api_key_str
+        from cowork.common.settings.user_settings import Provider, inference_api_key_str
 
         settings = anton_settings_for_user(user)
         # Only what the person configured decides. AntonSettings also reads
@@ -324,7 +324,8 @@ def decisions_for(anton: AntonQuickEdit | None, user) -> Decisions:
         if hasattr(settings, "openai_base_url"):
             settings.openai_base_url = getattr(user, "openai_base_url", None) or ""
         if hasattr(settings, "minds_api_key"):
-            settings.minds_api_key = provider_api_key_str(user, Provider.MINDS_CLOUD) or ""
+            # The key turns bill with, so a desktop's decisions bill its pinned organization.
+            settings.minds_api_key = inference_api_key_str(user, Provider.MINDS_CLOUD) or ""
             if _hosted_minted(user):
                 settings.minds_api_key = _MINTED_KEY
         if not anton.decisions_available(settings):

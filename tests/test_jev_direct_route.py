@@ -193,7 +193,7 @@ def _gate(monkeypatch, settings, *, stored_key=None):
     import cowork.handlers.responses as responses
 
     monkeypatch.setattr(responses, "get_user_settings", lambda *_a, **_k: settings)
-    monkeypatch.setattr(responses, "provider_api_key_str", lambda *_a, **_k: stored_key or "")
+    monkeypatch.setattr(responses, "inference_api_key_str", lambda *_a, **_k: stored_key or "")
     return ResponsesHandler()
 
 
@@ -1380,3 +1380,39 @@ async def test_complete_answer_delegates_what_a_streamed_answer_could_only_log(m
     provider = _Provider([_text("Revenue was $4.81M. "), *ending])
 
     assert await direct_answer.complete_answer(_binding(provider), history=_RECALL) is None
+
+
+def _pin_desktop(monkeypatch, *, token="session-jwt", key="mdb_turn_a"):
+    """A desktop that sent its mounted organization and holds a turn key for it."""
+    from datetime import datetime, timedelta, timezone
+
+    from cowork.common.settings import runtime_credential
+
+    monkeypatch.setattr(runtime_credential, "_minds_credential", token)
+    monkeypatch.setattr(runtime_credential, "_organization_id", "org-a")
+    monkeypatch.setattr(
+        runtime_credential,
+        "_inference_key",
+        runtime_credential.InferenceKey(
+            value=key,
+            organization_id="org-a",
+            instance_id="desktop-1",
+            expires_at=datetime.now(timezone.utc) + timedelta(minutes=30),
+        ),
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_pinned_desktops_jev_gate_bills_its_turn_key(monkeypatch):
+    """After a web org switch the session token names the other organization,
+    so the decision must go out on the key pinned to the desktop's own."""
+    import cowork.handlers.responses as responses
+    from cowork.common.settings.user_settings import UserSettings
+
+    _pin_desktop(monkeypatch)
+    settings = UserSettings.model_validate({"planning_provider": "minds_cloud", "minds_api_key": "session-jwt"})
+    monkeypatch.setattr(responses, "get_user_settings", lambda *_a, **_k: settings)
+
+    seen = await _asked(monkeypatch, ResponsesHandler())
+
+    assert seen["target"].api_key == "mdb_turn_a"

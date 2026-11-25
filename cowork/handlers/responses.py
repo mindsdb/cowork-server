@@ -26,8 +26,8 @@ from cowork.common.settings.user_settings import (
     Provider,
     UserSettings,
     get_user_settings,
+    inference_api_key_str,
     provider_api_key,
-    provider_api_key_str,
     use_settings_scope,
     use_turn_settings,
 )
@@ -1692,7 +1692,8 @@ class ResponsesHandler:
             if block.get("base_url") and block.get("api_key"):
                 target = jev_route.JevTarget.mindshub(block["base_url"], block["api_key"])
             else:
-                key = provider_api_key_str(settings, Provider.MINDS_CLOUD)
+                # The key turns bill with, so a desktop's decision bills its pinned organization.
+                key = inference_api_key_str(settings, Provider.MINDS_CLOUD)
                 if not key:
                     return None
                 target = jev_route.JevTarget.mindshub(minds_chat_base_url(settings.minds_url), key)

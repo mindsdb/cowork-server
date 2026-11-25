@@ -187,10 +187,10 @@ async def _current_runtime_minds_credential() -> str:
     the seed captured when the chat session was created. That seed can be an
     expired access token after the desktop refreshes or signs out.
     """
-    credential = runtime_credential.get_minds_credential()
+    credential = runtime_credential.get_inference_credential()
     if credential is None:
         raise _provider_auth_error(
-            "The MindsHub session credential is no longer available."
+            "The MindsHub credential for this organization is not available."
         )
     return credential
 
@@ -967,8 +967,10 @@ async def model_value_rejection(
 
         if provider_attr is not None and getattr(settings, provider_attr, None) != Provider.MINDS_CLOUD:
             return None
-        stored_key = settings.minds_api_key
-        api_key = stored_key.get_secret_value() if stored_key is not None else ""
+        from cowork.common.settings.user_settings import inference_api_key_str
+
+        # The key turns bill with, so validation answers for the billed organization.
+        api_key = inference_api_key_str(settings, Provider.MINDS_CLOUD)
     except Exception:
         # Settings shapes vary across versions/scopes; a resolution failure is
         # not grounds to block a write.
@@ -1268,11 +1270,13 @@ async def warm_enabled_model_map(session, scope=None) -> bool:
 
     scope = scope if scope is not None else LOCAL_SCOPE
     s = SettingService(session, scope).load()
-    if s.minds_api_key is None or not s.minds_url:
+    from cowork.common.settings.user_settings import Provider, inference_api_key_str
+
+    # The key turns bill with, so the stored map is the billed organization's.
+    minds_key = inference_api_key_str(s, Provider.MINDS_CLOUD)
+    if not minds_key or not s.minds_url:
         return False
-    listing = await fetch_minds_models(
-        s.minds_url, s.minds_api_key.get_secret_value(), mindshub=True
-    )
+    listing = await fetch_minds_models(s.minds_url, minds_key, mindshub=True)
     changed = persist_enabled_model_map(
         session, scope, s.minds_model_enabled, listing.enabled, listing.ids
     )
@@ -1819,6 +1823,7 @@ def build_llm_client(
     from cowork.common.settings.user_settings import (
         Provider,
         get_user_settings,
+        inference_api_key_str,
         provider_api_key,
     )
 
@@ -1883,8 +1888,13 @@ def build_llm_client(
         # or misroute another's key.
         key = provider_api_key(settings, role)
         if role == Provider.MINDS_CLOUD:
+            # The construction-time key: an anton without a live supplier keeps it, so it must be the pinned one.
             if key is None:
                 raise ValueError(f"{role.label} API key is not configured")
+            key = SecretStr(inference_api_key_str(settings, role))
+            if not key.get_secret_value():
+                # Pinned with no live key: the same Reconnect card a mid-turn loss shows.
+                raise _provider_auth_error("The MindsHub credential for this organization is not available.")
             # The runtime credential is local-only by contract. A static
             # settings/env key and every org-mode per-turn credential leave
             # this callback unset and keep their existing lifetime.
@@ -1896,11 +1906,8 @@ def build_llm_client(
             # desktop refreshes; passing the unsupported kwarg would TypeError
             # on every signed-in MindsHub turn.
             #
-            # This refreshes the MAIN-PROCESS provider only. anton snapshots
-            # export_connection_info().api_key once per ChatSession and hands
-            # that string to the scratchpad subprocess, which has no supplier —
-            # so a pad-side LLM call still runs on the construction-time token.
-            # ENG-2116 scopes that out; it needs a pad IPC contract.
+            # anton passes the same supplier to the scratchpad as its
+            # coding_api_key_supplier, so pad-side calls follow it too.
             credential_kw: dict = {}
             if runtime_credential.get_minds_credential() is not None:
                 if supports_api_key_provider:
@@ -2072,14 +2079,14 @@ def build_llm_client(
 
 
 def resolve_stored_key(settings: UserSettings, ptype: str) -> str:
-    """Get the stored (unmasked) API key for a UI provider type."""
+    """Get the stored (unmasked) API key for a UI provider type, as the Test button pings with."""
     from cowork.common.settings.user_settings import (
         UI_TYPE_TO_PROVIDER,
-        provider_api_key_str,
+        inference_api_key_str,
     )
     provider = UI_TYPE_TO_PROVIDER.get(ptype)
     if provider is None:
         return ""
-    # provider_api_key_str applies the gemini/openai-compatible → openai fallback,
-    # so existing single-key configs still resolve here (Test button, key reveal).
-    return provider_api_key_str(settings, provider)
+    # The key turns bill with: a desktop's ping spends its pinned organization and fails with
+    # its turns. Applies the gemini/openai-compatible → openai fallback for single-key configs.
+    return inference_api_key_str(settings, provider)

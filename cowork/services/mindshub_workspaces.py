@@ -26,6 +26,7 @@ from typing import Any, Optional
 
 from pydantic import BaseModel, Field
 
+from cowork.common.settings import runtime_credential
 from cowork.services.mindshub_client import CallerCacheKey, CallerTtlCache, get_mindshub_json
 
 logger = logging.getLogger(__name__)
@@ -73,7 +74,7 @@ _listing_cache: CallerTtlCache[MindsHubWorkspaceListing] = CallerTtlCache()
 async def fetch_mindshub_workspaces(*, bearer_token: str, org_id: str, user_id: str) -> MindsHubWorkspaceListing:
     """The workspaces this caller may use in their active organization.
 
-    Reads ``GET /v1/organizations/current/workspaces/``, which MindsHub gates on its
+    Reads ``GET /v1/organizations/current/workspaces/`` (``<id>`` for a pinned desktop), which MindsHub gates on its
     role catalog rather than the relationship engine, so it answers in an
     environment with no OpenFGA configured. Every route under
     ``/v1/workspaces/<id>/`` does not, and would answer 503 there.
@@ -92,12 +93,18 @@ async def fetch_mindshub_workspaces(*, bearer_token: str, org_id: str, user_id: 
     if not bearer_token:
         return MindsHubWorkspaceListing()
 
+    # A desktop lists the organization it bills, not the one Keycloak has active,
+    # which follows a switch on the web. None in org mode.
+    pinned = runtime_credential.get_organization()
+    org_id = pinned or org_id
+    path = f"/organizations/{pinned}/workspaces/" if pinned else "/organizations/current/workspaces/"
+
     cache_key = CallerCacheKey.for_caller(org_id=org_id, user_id=user_id, bearer_token=bearer_token)
     cached = _listing_cache.fresh(cache_key)
     if cached is not None:
         return cached
 
-    payload = await get_mindshub_json("/organizations/current/workspaces/", bearer_token)
+    payload = await get_mindshub_json(path, bearer_token)
     listing = _parse_listing(payload)
     _listing_cache.put(cache_key, listing)
     return listing

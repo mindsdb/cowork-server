@@ -11,13 +11,11 @@ The listing is answered whatever its length. Whether a client draws a control
 is the client's decision, and Cowork's is to draw nothing below two rows.
 
 **Which workspace a usage row carries is decided by the credential the turn
-presents, not by this selector directly.** A desktop turn still runs against a
-long-lived key bound to a user and an organization only. A cloud turn now
-carries this stored pick: the remote producer reads `hub_workspace_id` and
-forwards it to the turn-key and artifact-publish-key mints (`cowork/turnqueue/
-producer.py`, `cowork/services/artifact_autopublish.py`), which bind the key's
-`workspace_id` to it. So the desktop path is still workspace-blind; the cloud
-path picks this up as soon as a caller uses the selector below.
+presents, not by this selector directly.** Both paths now carry this stored pick.
+A cloud turn's producer forwards it to the turn-key and artifact-publish-key
+mints (`cowork/turnqueue/producer.py`, `cowork/services/artifact_autopublish.py`).
+A desktop mints its own turn key with it (`cowork/services/inference_key.py`),
+and a switch below re-mints at once.
 
 **The stored key has a second writer, and it grants nothing.**
 ``hub_workspace_id`` is a declared ``UserSettings`` field, so
@@ -38,12 +36,14 @@ and talked the refusal into accepting it.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 
 from cowork.api.v1.permissions import AuthenticatedInOrgMode, require
+from cowork.common.settings import runtime_credential
 from cowork.db.scoped import TenantScope, get_tenant_scope
 from cowork.db.units import run_db
 from cowork.principal import mindshub_credential
@@ -57,6 +57,7 @@ from cowork.services.mindshub_workspaces import (
     resolve_active,
     selectable,
 )
+from cowork.services.inference_key import refresh_inference_key
 from cowork.services.settings import unit_setting_service
 
 logger = logging.getLogger(__name__)
@@ -153,4 +154,9 @@ async def set_active_mindshub_workspace(
         lambda session: unit_setting_service(session).upsert_setting(SETTING_KEY, body.workspace_id),
         scope=scope,
     )
+    # On a desktop, bill the new workspace from the next LLM call, not the next re-mint.
+    # Both are None in org mode, where every turn mints its own key.
+    token, organization_id = runtime_credential.get_minds_credential(), runtime_credential.get_organization()
+    if token and organization_id:
+        await asyncio.to_thread(refresh_inference_key, token, organization_id)
     return await _build_view(request, scope)
