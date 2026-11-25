@@ -23,6 +23,7 @@ from uuid import UUID, uuid4
 import pytest
 from sqlalchemy import delete
 
+from cowork.common.settings import user_settings
 from cowork.common.settings.app_settings import get_app_settings
 from cowork.db.personal_resources import ALL_PERSONAL_RESOURCES, PersonalResource
 from cowork.db.scoped import LOCAL_SCOPE, TenantScope
@@ -281,6 +282,50 @@ async def test_memory_off_reads_and_writes_no_learned_memory(
         for record in caplog.records
         if record.name == harness.__name__ and record.levelno == logging.WARNING
     )
+
+
+@pytest.mark.parametrize("resources", [ALL_PERSONAL_RESOURCES, WITHOUT_MEMORY], ids=["personal", "shared"])
+async def test_memory_mode_off_alone_reads_and_writes_no_learned_memory(
+    monkeypatch, trusted, managed_dir, caplog, resources
+):
+    """memory_mode "off" alone, MEMORY_ENABLED left true: the same empty
+    tiers and no-reads contract as MEMORY_ENABLED false above, so a person
+    who turned mode to Off without disabling memory outright gets the same
+    guarantee."""
+    from tests._fakes import MANAGED_RULE
+
+    _keep_memory(monkeypatch, resources)
+    person = _person(resources=resources)
+    personal_tier = trusted / "shared" / PARTITION / "memory" / "users" / SUB
+    shared = trusted / "base-memory"
+
+    def mode_off(_project_path: Path) -> None:
+        user_settings.get_user_settings().memory_mode = "off"
+
+    with _project_row(root=trusted, scope=person) as project:
+        _seed_learned(personal_tier, personal_tier / "projects" / str(project.id), tag="personal")
+        _seed_learned(shared, shared / "projects" / str(project.id), tag="shared")
+        _plant(Path(project.path))
+        project_memory = Path(project.path) / ".anton" / "memory"
+        before = _snapshot(personal_tier, shared, project_memory)
+        with caplog.at_level(logging.WARNING, logger=harness.__name__):
+            async with built_turn(
+                monkeypatch=monkeypatch, tmp_path=trusted, scope=person, project=project, before_build=mode_off,
+            ) as turn:
+                config, scratch = turn.config, turn.scratch
+                global_dir, project_dir = _tiers(config)
+                assert scratch is not None
+                assert global_dir.parent.parent == scratch and project_dir.parent.parent == scratch
+                assert config.cortex.mode == "off"
+                assert config.background_memory is False
+                assert turn.learns is False
+                context = await _everything_the_turn_reads(config)
+                assert list(global_dir.iterdir()) == [] and list(project_dir.iterdir()) == []
+                after = _snapshot(personal_tier, shared, project_memory)
+    assert MANAGED_RULE in context
+    for learned in ("personal ", "shared ", PLANTED_GLOBAL_RULE, PLANTED_PROJECT_RULE, PLANTED_PROFILE):
+        assert learned not in context
+    assert after == before
 
 
 @pytest.mark.parametrize("resources", [ALL_PERSONAL_RESOURCES, WITHOUT_MEMORY], ids=["personal", "shared"])

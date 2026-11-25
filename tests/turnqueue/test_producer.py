@@ -554,6 +554,48 @@ async def test_oversized_request_sheds_whole_project_memory_first(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_memory_off_reaches_the_job_params_with_no_memory_block(monkeypatch):
+    """A turn whose settings say memory reads are off carries no memory
+    block (nothing to send either way) and an explicit memory_off flag, so
+    the controller mounts no global memory tier for it."""
+    fake = FakeRedis(replies=[("scratchpad:reply:conv-1", _reply("turn_completed", {}))])
+    monkeypatch.setattr(prod, "get_redis", lambda: fake)
+    monkeypatch.setattr(prod, "_new_correlation_id", lambda: "r")
+
+    await _drain(
+        prod.stream_remote_replies(
+            conversation_id="conv-1", org_id="org-1", user_id="user-1", input_text="hi", model="m",
+            memory_off=True,
+        )
+    )
+
+    params = json.loads(fake.added[0][1]["payload"])["params"]
+    assert "memory" not in params
+    assert params["memory_off"] is True
+
+
+@pytest.mark.asyncio
+async def test_memory_on_reaches_the_job_params_with_no_memory_off_flag(monkeypatch):
+    """The same job with memory_off left at its default sends the project
+    memory block and no memory_off key at all, not a false one: an older
+    controller reading only for the key's presence must see nothing."""
+    fake = FakeRedis(replies=[("scratchpad:reply:conv-1", _reply("turn_completed", {}))])
+    monkeypatch.setattr(prod, "get_redis", lambda: fake)
+    monkeypatch.setattr(prod, "_new_correlation_id", lambda: "r")
+
+    await _drain(
+        prod.stream_remote_replies(
+            conversation_id="conv-1", org_id="org-1", user_id="user-1", input_text="hi", model="m",
+            memory={"project": {"rules": "r"}},
+        )
+    )
+
+    params = json.loads(fake.added[0][1]["payload"])["params"]
+    assert params["memory"] == {"project": {"rules": "r"}}
+    assert "memory_off" not in params
+
+
+@pytest.mark.asyncio
 async def test_stream_remote_replies_forwards_started_at_only_when_known(monkeypatch):
     # The pod renders this as the fixed "conversation started" date. Absent
     # entirely when unknown so an older controller sees no new key.
