@@ -81,7 +81,7 @@ from cowork.common.settings.app_settings import (
 )
 from cowork.common.settings.secret_files import file_variable, process_secret
 from cowork.dev_setup import run_dev_setup
-from cowork.scheduler import start_scheduler, stop_scheduler, wait_for_scheduled_runs
+from cowork.scheduler import start_scheduler, stop_scheduler, wait_for_scheduled_notices, wait_for_scheduled_runs
 from cowork.services.artifact_autopublish import cancel_self_heals
 from cowork.services.artifact_heal_sweep import cancel_heal_sweep
 from cowork.services.pending_credential_clear import consume_pending_credential_clear
@@ -276,6 +276,7 @@ async def _end_remote_turns() -> None:
             "Scheduled runs still recording their outcome at shutdown",
             extra={"event": "shutdown_scheduled_runs_unfinished", "count": unfinished},
         )
+    await wait_for_scheduled_notices(timeout_seconds=remaining())
 
 
 def _log_cancelled_turns(cancelled: int) -> None:

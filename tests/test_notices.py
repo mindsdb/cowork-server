@@ -8,6 +8,7 @@ posts at most one notice.
 """
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from uuid import UUID, uuid4
@@ -20,6 +21,7 @@ from cowork import scheduler
 from cowork.db.personal_resources import PersonalResource
 from cowork.db.scoped import SYSTEM_SCOPE, ScopedSession, TenantScope
 from cowork.db.session import get_open_session
+from cowork.db.units import DatabaseBusy
 from cowork.models.notice import Notice
 from cowork.schemas.notices import NoticeDestination, NoticeFallback
 from cowork.services import notices
@@ -363,6 +365,37 @@ async def test_a_failing_notice_never_fails_the_run(schedule_id, turns, monkeypa
 
     (run,) = _runs(schedule_id)
     assert run.status == "failed"
+
+
+async def test_notice_retries_after_database_pressure_without_holding_the_run(schedule_id, turns, monkeypatch):
+    from tests.test_schedule_run_outcomes import _runs
+
+    unlocked = asyncio.Event()
+    run_db = scheduler.run_db
+    refused = False
+
+    async def busy_once(unit, *, scope):
+        nonlocal refused
+        if getattr(unit, "func", None) is notices.post_scheduled_run_notice:
+            if not refused:
+                refused = True
+                raise DatabaseBusy("pool saturated")
+            await unlocked.wait()
+        return await run_db(unit, scope=scope)
+
+    monkeypatch.setattr(scheduler, "run_db", busy_once)
+    turns.reason = "error"
+    (slot,) = _poll(schedule_id)
+    try:
+        await asyncio.wait_for(_run(slot), timeout=3)
+        assert _runs(schedule_id)[0].status == "failed"
+        assert _notices_for(schedule_id) == []
+    finally:
+        unlocked.set()
+        await scheduler.wait_for_scheduled_notices(timeout_seconds=3)
+
+    (notice,) = _notices_for(schedule_id)
+    assert notice.kind == notices.SCHEDULED_RUN_FAILED
 
 
 def _claimed_run(schedule_id: UUID, *, lease_seconds: int, trial: bool = False) -> UUID:
