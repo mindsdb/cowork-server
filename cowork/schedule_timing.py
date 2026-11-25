@@ -95,8 +95,8 @@ def day_rule(cadence: str, recurrence: Mapping | None, anchor: date) -> Callable
 _RULE_SEARCH_DAYS = 62
 
 
-def _next_matching_date(after: date, matches: Callable[[date], bool], *, inclusive: bool = False) -> date:
-    candidate = after if inclusive else after + timedelta(days=1)
+def _next_matching_date(after: date, matches: Callable[[date], bool]) -> date:
+    candidate = after + timedelta(days=1)
     for _ in range(_RULE_SEARCH_DAYS):
         if matches(candidate):
             return candidate

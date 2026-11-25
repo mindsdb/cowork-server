@@ -106,7 +106,7 @@ def check_recurrence(cadence: str, recurrence: "Recurrence | None") -> None:
         return
     if cadence == Cadence.monthly and recurrence.days is None:
         return
-    raise ValueError(f"A {cadence} task can't take that `recurrence`")
+    raise ValueError(f"A {Cadence(cadence).value} task can't take that `recurrence`")
 
 
 class RunStatus(str, Enum):

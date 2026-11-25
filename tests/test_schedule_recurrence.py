@@ -2,12 +2,17 @@
 the month: how their runs are stepped, and how a save stores the rule."""
 from __future__ import annotations
 
+import importlib
+import os
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from zoneinfo import ZoneInfo
 
 import pytest
+import sqlalchemy as sa
 import test_turn_pool_connections as turn_pool
+from alembic.migration import MigrationContext
+from alembic.operations import Operations
 from pydantic import ValidationError
 
 from cowork import scheduler
@@ -25,6 +30,7 @@ from cowork.schedule_timing import (
 from cowork.schemas.schedules import Cadence, Recurrence, ScheduleCreateRequest
 from cowork.services.projects import GENERAL_PROJECT_ID
 from cowork.services.schedules import ScheduleService
+from tests.integration.prereq import missing_prerequisite
 
 NY = "America/New_York"
 
@@ -141,6 +147,9 @@ def test_cards_read_the_rule_back():
         f"The first Monday of every month at 09:00 ({NY})"
     )
     assert describe_cadence("monthly", at, NY, {"month_day": 22}) == f"The 22nd of every month at 09:00 ({NY})"
+    assert describe_cadence("monthly", at, NY, {"month_day": 31}) == (
+        f"The 31st of every month, or the last day of a shorter month, at 09:00 ({NY})"
+    )
     assert describe_cadence("weekly", at, NY) == f"Every Monday at 09:00 ({NY})"
 
 
@@ -204,9 +213,52 @@ async def test_the_api_saves_edits_and_clears_a_rule():
             assert monthly.json()["recurrence"]["week"] == -1
             assert monthly.json()["recurrence"]["weekday"] == "fri"
 
+            incompatible = await client.patch(url, json={"cadence": "daily", "recurrence": {"days": ["mon"]}})
+            assert incompatible.status_code == 422, incompatible.text
+            assert "A daily task" in incompatible.json()["detail"]
+            assert (await client.get(url)).json()["cadence"] == "monthly"
+
             daily = await client.patch(url, json={"cadence": "daily"})
             assert daily.status_code == 200, daily.text
             assert daily.json()["recurrence"] is None
+
+
+@pytest.mark.parametrize("dialect", ["sqlite", pytest.param("postgresql", marks=pytest.mark.postgres_service)])
+def test_downgrade_pauses_monthly_tasks_and_preserves_weekly_tasks(dialect, monkeypatch):
+    uri = "sqlite://"
+    if dialect == "postgresql":
+        uri = os.environ.get("COWORK_TEST_POSTGRES_URI")
+        if not uri:
+            missing_prerequisite("set COWORK_TEST_POSTGRES_URI to a disposable database",
+                                 required_by="COWORK_REQUIRE_SERVICES")
+    migration = importlib.import_module("cowork.db.alembic.versions.a7c3e9f1b5d2_schedule_recurrence")
+    engine = sa.create_engine(uri)
+    schedules = sa.Table(
+        "schedules", sa.MetaData(),
+        sa.Column("cadence", sa.String, primary_key=True),
+        sa.Column("recurrence", sa.JSON),
+        sa.Column("enabled", sa.Boolean),
+        sa.Column("paused_at", sa.DateTime(timezone=True)),
+        prefixes=["TEMPORARY"],
+    )
+    try:
+        with engine.begin() as connection:
+            schedules.create(connection)
+            connection.execute(schedules.insert(), [
+                {"cadence": "monthly", "recurrence": {"month_day": 31}, "enabled": True},
+                {"cadence": "weekly", "recurrence": {"days": ["mon", "fri"]}, "enabled": True},
+            ])
+            monkeypatch.setattr(migration, "op", Operations(MigrationContext.configure(connection)))
+            migration.downgrade()
+
+            assert "recurrence" not in {c["name"] for c in sa.inspect(connection).get_columns("schedules")}
+            rows = {
+                row.cadence: (row.enabled, row.paused_at is not None)
+                for row in connection.execute(sa.select(schedules.c.cadence, schedules.c.enabled, schedules.c.paused_at))
+            }
+            assert rows == {"monthly": (False, True), "weekly": (True, False)}
+    finally:
+        engine.dispose()
 
 
 # --- the scheduler, catch-up and resume -----------------------------------

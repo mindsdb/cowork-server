@@ -46,8 +46,6 @@ def settled_timing(
     rule allows, at the same time of day. Raises InvalidSchedule when the rule
     doesn't fit the cadence.
     """
-    if cadence not in _RULE_CADENCES:
-        return None, next_run_at
     if cadence == Cadence.monthly and not recurrence:
         local = _utc(next_run_at).astimezone(resolve_timezone(timezone_name))
         recurrence = {"month_day": local.day}
@@ -55,6 +53,8 @@ def settled_timing(
         check_recurrence(cadence, Recurrence.model_validate(recurrence) if recurrence else None)
     except ValueError as exc:
         raise InvalidSchedule(str(exc)) from exc
+    if cadence not in _RULE_CADENCES:
+        return None, next_run_at
     return recurrence, align_to_rule(cadence, next_run_at, timezone_name, recurrence)
 
 

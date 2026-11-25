@@ -126,8 +126,8 @@ at that time. timezone is an IANA name. This device's timezone is {device_tz}: u
 names another.
 - Unless the user specifies a later start, choose the next occurrence of the requested cadence \
 in their timezone. For example, hourly at 11:48 starts at 12:00 that day. Convert the UTC message \
-time to that timezone first; never reuse a UTC clock reading with a local offset. For a daily \
-or weekly request without a time of day, ask for the missing time. Preserve explicit delayed starts.
+time to that timezone first; never reuse a UTC clock reading with a local offset. For a daily, \
+weekly or monthly request without a time of day, ask for the missing time. Preserve explicit delayed starts.
 - Tasks created here belong to this chat's project and run on the account's default model."""
 
 
@@ -372,7 +372,8 @@ def _rule_text(cadence: str, recurrence: dict | None, local: datetime) -> str | 
         if rule.get("week") is not None and rule.get("weekday"):
             return f"The {_WEEK_NAMES[rule['week']]} {_DAY_NAMES[rule['weekday']]} of every month at {_clock(local)}"
         day = rule.get("month_day") or local.day
-        return f"The {_ordinal(day)} of every month at {_clock(local)}"
+        shorter_month = ", or the last day of a shorter month," if day > 28 else ""
+        return f"The {_ordinal(day)} of every month{shorter_month} at {_clock(local)}"
     return None
 
 
