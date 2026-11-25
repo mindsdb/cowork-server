@@ -17,9 +17,11 @@ and still gets the operator's managed rules, the Memories listing is empty
 through MemoryService answers 409 (MEMORY_OFF_KEPT), and the operator's clear
 refuses (cowork.ops.memory).
 
-The desktop and hosted org mode keep their own behavior: there
-``memory_enabled`` only turns anton's memory mode off, and neither field below
-is ever true.
+The desktop and hosted org mode use ``memory_reads_off`` below for their own
+settings (``memory_enabled``, ``memory_mode``): the same "off means neither
+read nor written" contract, gated per-turn rather than at the deployment
+level. There, too, stored memory stays on disk, listed under Memories, and
+comes back once memory goes back on.
 """
 
 from __future__ import annotations
@@ -98,6 +100,13 @@ def resolve_memory_policy(*, scope: TenantScope | None = None) -> MemoryPolicy:
     if not get_app_settings().trust_identity_headers:
         return MemoryPolicy(off=False, shared=False)
     return memory_policy(memory_enabled=get_user_settings(scope).memory_enabled)
+
+
+def memory_reads_off(*, memory_enabled: bool, memory_mode: str) -> bool:
+    """Whether a turn's own settings mean learned memory is not read: the
+    desktop and hosted org mode's ``memory_enabled``/``memory_mode`` pair,
+    not the deployment-level MemoryPolicy above."""
+    return not memory_enabled or memory_mode == "off"
 
 
 def memory_start_warning() -> str | None:

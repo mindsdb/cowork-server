@@ -61,7 +61,7 @@ from cowork.handlers.response_routing import (
 )
 from cowork.harnesses.anton_harness.agent_files import AgentFiles
 from cowork.harnesses.anton_harness.figure_sources import has_figures
-from cowork.harnesses.memory.policy import memory_policy
+from cowork.harnesses.memory.policy import memory_policy, memory_reads_off
 from cowork.schemas.figure_sources import EarlierAnswer, FigureSources
 from cowork.harnesses.anton_harness.stream_formatter import (
     ConnectorDrafted,
@@ -2628,7 +2628,7 @@ class ResponsesHandler:
             return
         try:
             settings = get_user_settings(session.scope)
-            if not settings.memory_enabled or settings.memory_mode == "off":
+            if memory_reads_off(memory_enabled=settings.memory_enabled, memory_mode=settings.memory_mode):
                 logger.info("[responses] memory is off; dropped %d memory entr(ies) for conversation %s",
                             len(entries), conv_id, extra=log_context(conversation_id=conv_id))
                 return
