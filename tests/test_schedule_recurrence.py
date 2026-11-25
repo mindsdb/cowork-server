@@ -377,3 +377,15 @@ def test_resume_waits_for_the_rules_next_day():
         assert next_run == slot + timedelta(days=1)
     finally:
         _delete(schedule_id)
+
+
+def test_the_agent_is_not_shown_how_a_monthly_day_was_chosen():
+    import json
+
+    from cowork.harnesses.anton_harness.schedule_tools import _result
+
+    inferred, _ = settled_timing("monthly", None, datetime(2027, 1, 31, 9, tzinfo=timezone.utc), "UTC")
+    task = {"schedule_id": "s", "recurrence": inferred}
+    assert json.loads(_result("ok", task))["task"]["recurrence"] == {"month_day": 31}
+    # The task the tools compare and save from keeps it.
+    assert task["recurrence"] == inferred

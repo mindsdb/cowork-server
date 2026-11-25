@@ -39,7 +39,7 @@ from cowork.schemas.schedules import (
     ScheduleUpdateRequest,
 )
 from cowork.schedule_timing import WEEKDAY_NAMES
-from cowork.services.schedules import InvalidSchedule, ScheduleService, edited_timing, settled_timing
+from cowork.services.schedules import _INFERRED_DAY, InvalidSchedule, ScheduleService, edited_timing, settled_timing
 
 logger = get_logger(__name__)
 
@@ -547,15 +547,24 @@ _NOT_CONFIRMED = {
 # ---------------------------------------------------------------------------
 
 
+def _shown(task: dict) -> dict:
+    """The task as the agent reads it. Whether a monthly day was chosen or
+    taken from the first run is the service's bookkeeping, not part of the rule."""
+    rule = task.get("recurrence")
+    if not rule or _INFERRED_DAY not in rule:
+        return task
+    return {**task, "recurrence": {key: value for key, value in rule.items() if key != _INFERRED_DAY}}
+
+
 def _result(message: str, task: dict | None = None) -> str:
-    return json.dumps({"result": message, **({"task": task} if task else {})})
+    return json.dumps({"result": message, **({"task": _shown(task)} if task else {})})
 
 
 async def _list_tasks(_session: Any, _tc_input: dict) -> str:
     tasks = await run_db(_list_unit, scope=_units_scope())
     if not tasks:
         return json.dumps({"tasks": [], "result": "The user has no scheduled tasks."})
-    return json.dumps({"tasks": tasks})
+    return json.dumps({"tasks": [_shown(task) for task in tasks]})
 
 
 async def _manage_task(session: Any, tc_input: dict, *, project_id: UUID | None) -> str:
