@@ -479,30 +479,33 @@ def classify_upload_error(exc: Exception) -> UploadError | None:
     ):
         raise exc
     if isinstance(exc, PublishJobFailed):
-        job_code = getattr(exc, "code", None)
-        if exc.status_code == 400 and job_code in WEBSITE_REFUSALS:
-            logger.warning(
-                "Publish service answered HTTP %s code=%s body=%r", 400, job_code, str(exc)[:200],
-                extra={"status_code": 400, "reason": job_code},
-            )
-            raise WebsiteRefused(job_code) from exc
-        if exc.status_code == 503:
+        status, code, body, error = exc.status_code, getattr(exc, "code", None), str(exc), None
+    elif isinstance(exc, urllib.error.HTTPError):
+        status = exc.code
+        body, code, error = _read_http_error_body(exc)
+    else:
+        return None
+    if status == 400 and code in WEBSITE_REFUSALS:
+        # Leaves publish_artifact before its own failure log. The deployments'
+        # log keeps only this template, so the status and code go in fields it
+        # keeps too.
+        logger.warning(
+            "Publish service answered HTTP %s code=%s body=%r", status, code, body[:200],
+            extra={"status_code": status, "reason": code},
+        )
+        raise WebsiteRefused(code) from exc
+    if isinstance(exc, PublishJobFailed):
+        if status == 503:
             # Leaves publish_artifact before its failure log, like the typed
             # refusals below; str(exc) names the job to find in the worker's log.
             logger.warning(
-                "Publish service answered HTTP %s code=%s body=%r", 503, None, str(exc)[:200],
+                "Publish service answered HTTP %s code=%s body=%r", 503, None, body[:200],
                 extra={"status_code": 503, "reason": "publish_job_failed"},
             )
             raise UploadServiceUnavailable() from exc
-        return UploadError(exc.status_code, None, exc.message)
-    if not isinstance(exc, urllib.error.HTTPError):
-        return None
-    status = exc.code
-    body, code, error = _read_http_error_body(exc)
-    typed: HTTPException | ShareOrgRequired | WebsiteRefused | None = None
-    if status == 400 and code in WEBSITE_REFUSALS:
-        typed = WebsiteRefused(code)
-    elif status == 413:
+        return UploadError(status, None, exc.message)
+    typed: HTTPException | ShareOrgRequired | None = None
+    if status == 413:
         typed = PublishTooLarge()
     elif status == 503:
         typed = ProductPermissionUnavailable() if code == "auth_unavailable" else UploadServiceUnavailable()
@@ -1857,11 +1860,14 @@ def publish_artifact(
     # them only to answer 400.
     if is_fullstack and not is_mindshub_publish_url(publish_url):
         raise ValueError(FULLSTACK_PUBLISH_UNSUPPORTED)
-    if access is not None and access.mode == AccessMode.WEBSITE:
-        _refuse_a_website(
-            scope=scope, owner_save=owner_save, is_fullstack=is_fullstack,
-            project_id=project_id, artifact_slug=published_dir.name,
-        )
+    def refuse_website(resolved: ArtifactAccessRequest | None) -> None:
+        if resolved is not None and resolved.mode == AccessMode.WEBSITE:
+            _refuse_a_website(
+                scope=scope, owner_save=owner_save, is_fullstack=is_fullstack,
+                project_id=project_id, artifact_slug=published_dir.name,
+            )
+
+    refuse_website(access)
 
     try:
         from anton.publisher import ArtifactOwnedByOtherUserError, StatePublishBlocked, publish
@@ -1913,11 +1919,8 @@ def publish_artifact(
         )
         # A republish without an access keeps the entry's mode, which can be a
         # website: the gate applies to the mode the publish resolves to.
+        refuse_website(access)
         if access is not None and access.mode == AccessMode.WEBSITE:
-            _refuse_a_website(
-                scope=scope, owner_save=owner_save, is_fullstack=is_fullstack,
-                project_id=project_id, artifact_slug=published_dir.name,
-            )
             if not owner_save and _website_refusal_remembered(published_dir, previous):
                 logger.warning(
                     "Skipped a website re-publish the upload service refused",

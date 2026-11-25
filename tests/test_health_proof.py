@@ -41,7 +41,7 @@ def probe():
         )
         settings = SimpleNamespace(
             owner="install-token", tenancy_mode="local", draft_links_enabled=lambda: False,
-            artifact_websites_enabled=lambda: False,
+            artifact_websites_offered=lambda: False,
             health_proof_key=SecretStr(key),
         )
         with (

@@ -2456,19 +2456,6 @@ SITE_URL = "https://hk1-staging.mindshub.co/"
 
 
 @pytest.fixture
-def websites_setting(monkeypatch):
-    """Sets COWORK_ARTIFACT_WEBSITES for the test; the settings cache is
-    cleared after each change and again at teardown, even when the test fails."""
-
-    def set_to(value: str) -> None:
-        monkeypatch.setenv("COWORK_ARTIFACT_WEBSITES", value)
-        get_app_settings.cache_clear()
-
-    yield set_to
-    get_app_settings.cache_clear()
-
-
-@pytest.fixture
 def websites_on(websites_setting):
     websites_setting("on")
 

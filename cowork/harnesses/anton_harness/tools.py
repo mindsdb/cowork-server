@@ -224,8 +224,7 @@ WEBSITES_UNAVAILABLE_ANSWER = (
 
 def _websites_offered() -> bool:
     """Whether the Share panel offers "Public website" here."""
-    settings = get_app_settings()
-    return settings.tenancy_mode == "org" and settings.artifact_websites_enabled()
+    return get_app_settings().artifact_websites_offered()
 
 
 def _website_request_answer() -> str:

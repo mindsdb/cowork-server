@@ -1479,6 +1479,10 @@ class AppSettings(Settings):
         """Whether the owner's save may turn an artifact into a public website."""
         return self.artifact_websites == "on"
 
+    def artifact_websites_offered(self) -> bool:
+        """Whether the Share panel offers "Public website": MindsHub mode with websites on."""
+        return self.tenancy_mode == "org" and self.artifact_websites_enabled()
+
     # Draft-preview links. Org web only. All six values together turn the
     # signed draft links on; any one missing leaves previews on the srcdoc
     # path (see draft_links_enabled).

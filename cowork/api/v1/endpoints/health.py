@@ -181,7 +181,7 @@ def health() -> dict:
         # boot and then opens an HTML draft by link instead of through srcdoc.
         "draft_links": get_app_settings().draft_links_enabled(),
         # Whether the Share panel offers "Public website" (MindsHub mode only).
-        "artifact_websites": _org_mode and get_app_settings().artifact_websites_enabled(),
+        "artifact_websites": get_app_settings().artifact_websites_offered(),
         "minds_runtime_credential_required": _minds_runtime_credential_required(
             settings, org_mode=_org_mode
         ),

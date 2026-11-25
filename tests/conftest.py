@@ -743,3 +743,17 @@ def without_gc_pauses():
         yield
     finally:
         gc.enable()
+
+
+@pytest.fixture
+def websites_setting(monkeypatch):
+    """Sets COWORK_ARTIFACT_WEBSITES; the settings cache is cleared after each
+    change and at teardown, even when the test fails."""
+    from cowork.common.settings.app_settings import get_app_settings
+
+    def set_to(value: str) -> None:
+        monkeypatch.setenv("COWORK_ARTIFACT_WEBSITES", value)
+        get_app_settings.cache_clear()
+
+    yield set_to
+    get_app_settings.cache_clear()

@@ -1390,19 +1390,6 @@ async def test_a_website_refusal_is_a_409_with_its_code(as_owner, publish_contex
     assert _lock_is_free(as_owner)
 
 
-@pytest.fixture
-def websites_setting(monkeypatch):
-    """Sets COWORK_ARTIFACT_WEBSITES; the settings cache is cleared after each
-    change and at teardown, even when the test fails."""
-
-    def set_to(value: str) -> None:
-        monkeypatch.setenv("COWORK_ARTIFACT_WEBSITES", value)
-        get_app_settings.cache_clear()
-
-    yield set_to
-    get_app_settings.cache_clear()
-
-
 async def test_a_website_save_while_websites_are_off_is_a_409_and_publishes_nothing(
     as_owner, publish_context, monkeypatch, websites_setting,
 ):
