@@ -39,6 +39,10 @@ A task has:
   rule on creation, a monthly task uses the day of its first run. If a
   month is too short for the chosen day, it runs on the month's last day.
   The API rejects a rule that does not fit its cadence with HTTP 422.
+  Editing just the next date also moves an inferred monthly day. An
+  explicitly chosen rule stays in effect. Editing just the rule uses the
+  first matching slot after the edit at the saved local time of day. Send
+  `nextRunAt` with the rule to start later.
 - `timezone`: the IANA zone the cadence follows, such as `Europe/London`.
   Defaults to `UTC`.
 - `project_id` (optional): the project the runs belong to. Defaults to your

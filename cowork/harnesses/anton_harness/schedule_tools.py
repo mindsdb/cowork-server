@@ -39,7 +39,7 @@ from cowork.schemas.schedules import (
     ScheduleUpdateRequest,
 )
 from cowork.schedule_timing import WEEKDAY_NAMES
-from cowork.services.schedules import InvalidSchedule, ScheduleService, settled_timing
+from cowork.services.schedules import InvalidSchedule, ScheduleService, edited_timing, settled_timing
 
 logger = get_logger(__name__)
 
@@ -149,13 +149,14 @@ def _units_scope():
 
 
 def _summary(schedule) -> dict:
+    recurrence = schedule.recurrence
     schedule = ScheduleResponse.model_validate(schedule)
     return {
         "schedule_id": str(schedule.id),
         "title": schedule.title,
         "prompt": schedule.prompt,
         "cadence": str(getattr(schedule.cadence, "value", schedule.cadence)),
-        "recurrence": schedule.recurrence.model_dump(exclude_none=True) if schedule.recurrence else None,
+        "recurrence": recurrence,
         "timezone": schedule.timezone,
         "next_run_at": ensure_utc(schedule.next_run_at).isoformat(),
         "state": schedule.state.value,
@@ -579,9 +580,6 @@ async def _manage_task(session: Any, tc_input: dict, *, project_id: UUID | None)
             preview = dict(before)
             if action == "update":
                 changes = _update_changes(tc_input)
-                if changes.get("cadence", preview["cadence"]) != preview["cadence"] and "recurrence" not in changes:
-                    # Another cadence's days don't carry over (ScheduleService.update_schedule).
-                    preview["recurrence"] = None
                 for field, value in changes.items():
                     preview[field] = (
                         ensure_utc(value).isoformat() if isinstance(value, datetime)
@@ -591,7 +589,15 @@ async def _manage_task(session: Any, tc_input: dict, *, project_id: UUID | None)
                     preview["cadence"], datetime.fromisoformat(preview["next_run_at"]), preview["timezone"],
                 )
                 if any(field in changes for field in ("cadence", "recurrence", "next_run_at", "timezone")):
-                    _settle_preview(preview)
+                    try:
+                        preview["recurrence"], first = edited_timing(
+                            cadence=before["cadence"], recurrence=before.get("recurrence"),
+                            next_run_at=datetime.fromisoformat(before["next_run_at"]),
+                            timezone_name=before["timezone"], changes=changes, now=datetime.now(timezone.utc),
+                        )
+                    except InvalidSchedule as exc:
+                        raise _Invalid(f"`recurrence`: {exc}.") from exc
+                    preview["next_run_at"] = ensure_utc(first).isoformat()
                 if preview == before:
                     return _result("Those values are what the task already has, so there's nothing to change.", before)
                 apply = partial(_update_unit, schedule_id=schedule_id, changes=changes)

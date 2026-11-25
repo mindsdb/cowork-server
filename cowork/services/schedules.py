@@ -33,6 +33,7 @@ class InvalidSchedule(Exception):
 
 
 _RULE_CADENCES = {Cadence.weekly, Cadence.monthly}
+_INFERRED_DAY = "_inferred_day"
 
 
 def settled_timing(
@@ -48,7 +49,7 @@ def settled_timing(
     """
     if cadence == Cadence.monthly and not recurrence:
         local = _utc(next_run_at).astimezone(resolve_timezone(timezone_name))
-        recurrence = {"month_day": local.day}
+        recurrence = {"month_day": local.day, _INFERRED_DAY: True}
     try:
         check_recurrence(cadence, Recurrence.model_validate(recurrence) if recurrence else None)
     except ValueError as exc:
@@ -56,6 +57,36 @@ def settled_timing(
     if cadence not in _RULE_CADENCES:
         return None, next_run_at
     return recurrence, align_to_rule(cadence, next_run_at, timezone_name, recurrence)
+
+
+def edited_timing(
+    *, cadence: str, recurrence: dict | None, next_run_at: datetime, timezone_name: str,
+    changes: dict, now: datetime,
+) -> tuple[dict | None, datetime]:
+    """Use the same timing decision for edits and their confirmation cards."""
+    new_cadence = changes.get("cadence", cadence)
+    new_zone = changes.get("timezone", timezone_name)
+    new_start = changes.get("next_run_at", next_run_at)
+    new_rule = changes.get("recurrence", recurrence)
+    if "recurrence" not in changes:
+        if new_cadence != cadence:
+            new_rule = None
+        elif "next_run_at" in changes and recurrence and recurrence.get(_INFERRED_DAY):
+            old_date = _utc(next_run_at).astimezone(resolve_timezone(timezone_name)).date()
+            new_date = _utc(new_start).astimezone(resolve_timezone(new_zone)).date()
+            if new_date != old_date:
+                new_rule = None
+
+    old_rule = {key: value for key, value in recurrence.items() if key != _INFERRED_DAY} if recurrence else None
+    if "next_run_at" not in changes and changes.get("recurrence") and new_rule != old_rule:
+        zone = resolve_timezone(new_zone)
+        local_time = _utc(next_run_at).astimezone(resolve_timezone(timezone_name)).time()
+        today = now.astimezone(zone).date()
+        new_start = datetime.combine(today, local_time, tzinfo=zone)
+        if _utc(new_start) <= now:
+            new_start = datetime.combine(today + timedelta(days=1), local_time, tzinfo=zone)
+
+    return settled_timing(new_cadence, new_rule, new_start, new_zone)
 
 
 def _settle_rule(schedule: Schedule) -> None:
@@ -179,18 +210,20 @@ class ScheduleService:
         # missed one-off back on, and the `enabled` the editor sent with the
         # old state must not pause it again.
         was_on = _runs_on_its_own(schedule)
-        if "cadence" in kwargs and kwargs["cadence"] != schedule.cadence and "recurrence" not in kwargs:
-            # Another cadence's days don't carry over.
-            kwargs["recurrence"] = None
-            schedule.recurrence = None
         timing_changed = any(
             field in kwargs for field in ("cadence", "recurrence", "next_run_at", "timezone")
         )
+        if timing_changed:
+            recurrence, next_run_at = edited_timing(
+                cadence=schedule.cadence, recurrence=schedule.recurrence,
+                next_run_at=schedule.next_run_at, timezone_name=schedule.timezone,
+                changes=kwargs, now=datetime.now(timezone.utc),
+            )
         for field, value in kwargs.items():
             if value is not None and hasattr(schedule, field):
                 setattr(schedule, field, value)
         if timing_changed:
-            _settle_rule(schedule)
+            schedule.recurrence, schedule.next_run_at = recurrence, next_run_at
         if (
             schedule.missed_at is not None
             and _utc(schedule.next_run_at) > datetime.now(timezone.utc)

@@ -29,7 +29,7 @@ from cowork.schedule_timing import (
 )
 from cowork.schemas.schedules import Cadence, Recurrence, ScheduleCreateRequest
 from cowork.services.projects import GENERAL_PROJECT_ID
-from cowork.services.schedules import ScheduleService
+from cowork.services.schedules import ScheduleService, edited_timing, settled_timing
 from tests.integration.prereq import missing_prerequisite
 
 NY = "America/New_York"
@@ -176,10 +176,51 @@ def test_a_monthly_task_saved_without_a_rule_keeps_its_first_runs_day():
     # Tue 1 Jan 2030.
     schedule_id, recurrence, first = _create(cadence="monthly", next_run_at=_ny(2030, 1, 31, 9, 0))
     try:
-        assert recurrence == {"month_day": 31}
+        assert recurrence["month_day"] == 31
         assert first.astimezone(ZoneInfo(NY)).day == 31
     finally:
         _delete(schedule_id)
+
+
+def test_a_date_edit_reanchors_only_an_inferred_monthly_day():
+    start = _ny(2030, 1, 31, 9, 0)
+    moved = _ny(2030, 2, 20, 9, 0)
+    inferred, _ = settled_timing("monthly", None, start, NY)
+    for rule, day, first in (
+        (inferred, 20, moved),
+        ({"month_day": 31}, 31, _ny(2030, 2, 28, 9, 0)),
+    ):
+        edited, at = edited_timing(
+            cadence="monthly", recurrence=rule, next_run_at=start, timezone_name=NY,
+            changes={"next_run_at": moved}, now=_ny(2030, 2, 5, 9, 0),
+        )
+        assert edited["month_day"] == day
+        assert at == first
+
+
+def test_a_rule_edit_uses_the_next_slot_unless_it_supplies_a_later_start():
+    old = _ny(2030, 1, 28, 9, 0)
+    for changes, first in (
+        ({"recurrence": {"month_day": 10}}, _ny(2030, 1, 10, 9, 0)),
+        ({"recurrence": {"month_day": 10}, "next_run_at": _ny(2030, 2, 11, 9, 0)}, _ny(2030, 3, 10, 9, 0)),
+    ):
+        _, at = edited_timing(
+            cadence="monthly", recurrence={"month_day": 28}, next_run_at=old, timezone_name=NY,
+            changes=changes, now=_ny(2030, 1, 5, 12, 0),
+        )
+        assert at == first
+
+
+def test_changing_only_the_time_on_a_short_month_keeps_the_inferred_day():
+    rule, _ = settled_timing("monthly", None, _ny(2030, 1, 31, 9, 0), NY)
+    start = _ny(2030, 2, 28, 9, 0)
+    moved = _ny(2030, 2, 28, 10, 0)
+    edited, at = edited_timing(
+        cadence="monthly", recurrence=rule, next_run_at=start, timezone_name=NY,
+        changes={"next_run_at": moved}, now=_ny(2030, 2, 5, 9, 0),
+    )
+    assert edited == rule
+    assert at == moved
 
 
 def test_a_save_moves_the_first_run_onto_the_rule():
@@ -221,6 +262,26 @@ async def test_the_api_saves_edits_and_clears_a_rule():
             daily = await client.patch(url, json={"cadence": "daily"})
             assert daily.status_code == 200, daily.text
             assert daily.json()["recurrence"] is None
+
+
+@pytest.mark.parametrize("explicit", [False, True])
+async def test_api_date_edits_keep_the_saved_rule_provenance(explicit):
+    fields = {"cadence": "monthly", "next_run_at": _ny(2030, 1, 31, 9, 0)}
+    if explicit:
+        fields["recurrence"] = {"month_day": 31}
+    schedule_id, _, _ = _create(**fields)
+    try:
+        async with turn_pool._client() as client:
+            changed = await client.patch(
+                f"/api/v1/schedules/{schedule_id}",
+                json={"nextRunAt": _ny(2030, 2, 20, 9, 0).isoformat()},
+            )
+        assert changed.status_code == 200, changed.text
+        data = changed.json()
+        assert data["recurrence"]["monthDay"] == (31 if explicit else 20)
+        assert datetime.fromisoformat(data["nextRunAt"]) == _ny(2030, 2, 28 if explicit else 20, 9, 0)
+    finally:
+        _delete(schedule_id)
 
 
 @pytest.mark.parametrize("dialect", ["sqlite", pytest.param("postgresql", marks=pytest.mark.postgres_service)])
