@@ -6,6 +6,7 @@ about not holding a finished turn open longer than a bounded time.
 from __future__ import annotations
 
 import json
+import os
 
 import pytest
 
@@ -71,9 +72,11 @@ def published(monkeypatch):
     calls = []
 
     def fake_publish(artifact, *, artifacts_base, api_key, publish_url, password=None,
-                     access=None, scope=None, project_id=None):
-        calls.append({"folder": artifact, "api_key": api_key, "access": access, "scope": scope,
-                      "project_id": project_id})
+                     access=None, scope=None, project_id=None, background=False,
+                     job_budget_s=None, on_job_accepted=None):
+        # The access as anton's publisher is handed it.
+        calls.append({"folder": artifact, "api_key": api_key, "access": access.publisher_access(),
+                      "scope": scope, "project_id": project_id, "background": background})
         (artifact / ".published.json").write_text(json.dumps({
             "index.html": {"report_id": "rid", "url": "u", "published": True,
                            "last_md5": "m", "published_mtime": 9_999_999_999},
@@ -200,8 +203,13 @@ async def test_new_artifact_is_published_owner_only(base, enabled, key, publishe
 
 async def test_republish_keeps_the_access_the_owner_chose(base, enabled, key, published):
     """Re-applying the first-publish default here would silently revoke a share
-    every time the agent touched the artifact — which would make the Share
-    control untrustworthy rather than merely incomplete (ENG-2316)."""
+    every time the agent touched the artifact, which would make the Share
+    control untrustworthy rather than merely incomplete.
+
+    The re-publish keeps the restricted mode and names nobody: who the
+    artifact is shared with is read from MindsHub's rule by the
+    publish itself (cowork.services.publish._plan_access), never taken from
+    the entry, which an agent can write."""
     folder = _make(base, "rep", files={"index.html": "<html>v2</html>"},
                    meta={"slug": "rep", "type": "html-app"})
     (folder / ".published.json").write_text(json.dumps({
@@ -217,10 +225,7 @@ async def test_republish_keeps_the_access_the_owner_chose(base, enabled, key, pu
     out = await ap.autopublish_project_artifacts(base, ORG_SCOPE, project_id=PROJECT_ID, touched={"rep"})
 
     assert out == {"rep"}
-    assert published[0]["access"] == {
-        "mode": "restricted", "emails": ["someone@example.com"],
-        "org_allowed": False, "owner_only": False,
-    }
+    assert published[0]["access"] == {"mode": "restricted", "owner_only": True}
 
 
 async def test_republish_of_an_owner_only_artifact_stays_owner_only(base, enabled, key, published):
@@ -260,7 +265,7 @@ async def test_scope_is_threaded_into_the_publisher(base, enabled, key, publishe
 
 async def test_publish_key_carries_the_active_hub_workspace(base, enabled, published, monkeypatch):
     """The caller's picked MindsHub workspace (UserSettings.hub_workspace_id,
-    written by the hub_workspaces selector) must reach the publish key mint,
+    written by the mindshub_workspaces selector) must reach the publish key mint,
     the same as it reaches the execution turn key."""
     captured = {}
 
@@ -293,6 +298,32 @@ async def test_key_is_revoked_after_reconciliation(base, enabled, key, published
     await ap.autopublish_project_artifacts(base, ORG_SCOPE, project_id=PROJECT_ID, touched={"rep"})
 
     assert key.revoked is True
+
+
+async def test_key_outlives_a_publish_thread_left_polling(base, enabled, key, monkeypatch):
+    """A timed-out publish thread keeps polling its job with the key, so the
+    key is left to its TTL rather than revoked under it."""
+    import threading
+
+    release = threading.Event()
+
+    def polling_publish(artifact, **kwargs):
+        kwargs["on_job_accepted"]({"job_id": "j"})
+        release.wait(5.0)
+
+    monkeypatch.setattr(ap, "publish_artifact", polling_publish)
+    _make(base, "rep", files={"report.html": "<html></html>"},
+          meta={"slug": "rep", "type": "html-app"})
+
+    try:
+        out = await ap.autopublish_project_artifacts(
+            base, ORG_SCOPE, project_id=PROJECT_ID, touched={"rep"}, timeout_s=0.2,
+        )
+    finally:
+        release.set()
+
+    assert out == set()
+    assert key.revoked is False
 
 
 async def test_nothing_to_publish_mints_no_key(base, enabled, published, monkeypatch):
@@ -497,6 +528,58 @@ async def test_publish_failure_leaves_no_record_so_next_turn_retries(base, enabl
     assert ap.needs_publish(base / "rep", base).action == "new"
 
 
+def _make_published(base, slug, *, entry: dict, mtime: int):
+    """An artifact published before, whose content changed since: its
+    entry is ``entry`` plus a stale md5, and its files are dated ``mtime``."""
+    folder = _make(base, slug, files={"index.html": f"<html>{slug} v2</html>"},
+                   meta={"slug": slug, "type": "html-app"})
+    (folder / ".published.json").write_text(json.dumps({
+        "index.html": {
+            "report_id": f"rid-{slug}", "url": "u", "published": True,
+            "last_md5": "stale", "published_mtime": 0, **entry,
+        },
+    }))
+    os.utime(folder / "index.html", (mtime, mtime))
+    return folder
+
+
+async def test_an_entry_with_access_fields_of_the_wrong_type_fails_only_its_own_republish(
+    base, enabled, key, published,
+):
+    """The pod can write an artifact's .published.json, so its access fields
+    can hold anything, such as a password that is a number. That entry's
+    re-publish fails, its lock is released, and the artifacts after it in
+    the same pass are still published."""
+    _make_published(base, "bad", entry={"mode": "password", "access_password": 1234}, mtime=2_000_000_000)
+    _make_published(base, "good", entry={"mode": "public"}, mtime=1_000_000_000)
+
+    out = await ap.autopublish_project_artifacts(
+        base, ORG_SCOPE, project_id=PROJECT_ID, touched={"bad", "good"},
+    )
+
+    assert out == {"good"}
+    assert [call["folder"].name for call in published] == ["good"]
+    assert locks.acquire(base, "bad", ttl_s=600) is True
+
+
+async def test_a_restricted_entry_is_kept_restricted_whatever_its_audience_fields_hold(
+    base, enabled, key, published,
+):
+    """In MindsHub mode a restricted entry's audience fields aren't the
+    record (MindsHub's rule is), so a value of the wrong type there, such as
+    emails as one string, doesn't stop the re-publish: it stays restricted
+    and names nobody, as any restricted entry's does."""
+    _make_published(
+        base, "rep", entry={"mode": "restricted", "emails": "someone@example.com", "owner_only": "yes"},
+        mtime=1_000_000_000,
+    )
+
+    out = await ap.autopublish_project_artifacts(base, ORG_SCOPE, project_id=PROJECT_ID, touched={"rep"})
+
+    assert out == {"rep"}
+    assert published[0]["access"] == {"mode": "restricted", "owner_only": True}
+
+
 async def test_busy_lock_skips_the_slug(base, enabled, key, published):
     _make(base, "rep", files={"report.html": "<html></html>"},
           meta={"slug": "rep", "type": "html-app"})
@@ -551,6 +634,8 @@ async def test_project_id_reaches_publish_artifact(base, enabled, key, published
     await ap.autopublish_project_artifacts(base, ORG_SCOPE, project_id=PROJECT_ID, touched={"rep"})
 
     assert published[0]["project_id"] == PROJECT_ID
+    # No person asked for it, so a Markdown page the conversion stopped isn't rendered again.
+    assert published[0]["background"] is True
 
 
 # ─── owner filter (F1) ───────────────────────────────────────────────────
@@ -631,6 +716,32 @@ async def test_a_too_large_artifact_is_skipped_without_a_traceback(base, enabled
     assert locks.acquire(base, "rep", ttl_s=600) is True
 
 
+async def test_an_app_whose_connections_need_approval_is_skipped_without_a_traceback(
+    base, enabled, key, monkeypatch, caplog
+):
+    """Only a person can approve connections; autopublish never can."""
+    import logging
+
+    from cowork.services.publish import DatasourceApprovalRequired
+
+    _make(base, "app", files={"report.html": "<html></html>"},
+          meta={"slug": "app", "type": "html-app"})
+
+    def needs_approval(artifact, **kwargs):
+        raise DatasourceApprovalRequired([{"engine": "pg", "name": "a", "label": "pg/a"}])
+
+    monkeypatch.setattr(ap, "publish_artifact", needs_approval)
+    with caplog.at_level(logging.DEBUG, logger="cowork.services.artifact_autopublish"):
+        out = await ap.autopublish_project_artifacts(base, ORG_SCOPE, project_id=PROJECT_ID, touched={"app"})
+
+    assert out == set()
+    assert "result=skipped slug=app reason=datasource_approval_required" in caplog.text
+    assert "result=failed" not in caplog.text
+    assert "artifact autopublish failed" not in caplog.text
+    assert all(record.exc_info is None for record in caplog.records)
+    assert locks.acquire(base, "app", ttl_s=600) is True
+
+
 async def test_a_rejected_publish_fails_without_a_second_traceback(base, enabled, key, monkeypatch, caplog):
     """publish_artifact already logged the traceback; the failure line stays."""
     import logging
@@ -652,3 +763,199 @@ async def test_a_rejected_publish_fails_without_a_second_traceback(base, enabled
     record = next(r for r in caplog.records if "artifact autopublish failed" in r.getMessage())
     assert not record.exc_info
     assert locks.acquire(base, "rep", ttl_s=600) is True
+
+
+async def test_reconciliation_reads_the_file_store_off_the_event_loop(
+    base, enabled, key, publish_url, published, monkeypatch,
+):
+    """The candidate walk, the plan and the publish lock each read the shared
+    file store. Made slow here, they leave the loop ticking."""
+    import asyncio
+    import time
+
+    real_candidates, real_plan = ap._candidate_slugs, ap._plan
+    steps = []
+
+    def slow_candidates(*, artifacts_base):
+        steps.append("candidates")
+        time.sleep(0.5)
+        return real_candidates(artifacts_base=artifacts_base)
+
+    def slow_plan(artifacts_base, slugs):
+        steps.append("plan")
+        time.sleep(0.5)
+        return real_plan(artifacts_base, slugs)
+
+    async def everyone_owns(*, slugs, **_kwargs):
+        return ap.OwnedSlugs(owned=list(slugs), not_owner=0, owner_unknown=0)
+
+    _make(base, "rep", files={"report.html": "<html></html>"}, meta={"slug": "rep", "type": "html-app"})
+    monkeypatch.setattr(ap, "_candidate_slugs", slow_candidates)
+    monkeypatch.setattr(ap, "_plan", slow_plan)
+    monkeypatch.setattr(ap, "_owned_slugs", everyone_owns)
+    ticks = 0
+
+    async def heartbeat():
+        nonlocal ticks
+        while True:
+            await asyncio.sleep(0.01)
+            ticks += 1
+
+    beat = asyncio.create_task(heartbeat())
+    try:
+        out = await ap.autopublish_project_artifacts(base, ORG_SCOPE, project_id=PROJECT_ID, touched={"rep"})
+    finally:
+        beat.cancel()
+
+    assert out == {"rep"}
+    assert steps == ["candidates", "plan"]
+    assert ticks >= 40, f"the loop ticked {ticks} times across 1s of file store work"
+
+
+async def test_a_cancel_while_a_lock_release_waits_for_a_slot_still_frees_the_lock(
+    base, enabled, key, monkeypatch,
+):
+    """A Stop lands after a publish, while the release of its lock waits for
+    a file store slot during a stall of the mount. The cancel waits for the
+    release, so the lock is free once the slots are, and the next turn
+    publishes the slug rather than skip it as `lock_busy`."""
+    import asyncio
+    import threading
+
+    from cowork.db import units
+
+    _make(base, "rep", files={"report.html": "<html></html>"}, meta={"slug": "rep", "type": "html-app"})
+    publishing, finish = threading.Event(), threading.Event()
+
+    def blocked_publish(artifact, **kwargs):
+        publishing.set()
+        finish.wait(timeout=5)
+        return {"status": "ok", "url": "u"}
+
+    monkeypatch.setattr(ap, "publish_artifact", blocked_publish)
+    slots = units._efs_slots()
+    holders = [object() for _ in range(units.db_session.settings.storage.efs_slots)]
+    reconcile = asyncio.create_task(
+        ap.autopublish_project_artifacts(base, ORG_SCOPE, project_id=PROJECT_ID, touched={"rep"})
+    )
+    try:
+        assert await asyncio.to_thread(publishing.wait, 5)
+        for holder in holders:
+            await slots.acquire_on_behalf_of(holder)
+        finish.set()
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + 5
+        while slots.statistics().tasks_waiting == 0:
+            assert loop.time() < deadline, "the lock release never waited for a slot"
+            await asyncio.sleep(0.01)
+        reconcile.cancel()
+        await asyncio.sleep(0.2)
+        assert not reconcile.done(), "the cancel did not wait for the lock release"
+    finally:
+        finish.set()
+        for holder in holders:
+            if holder in slots.statistics().borrowers:
+                slots.release_on_behalf_of(holder)
+    await asyncio.wait_for(asyncio.gather(reconcile, return_exceptions=True), timeout=5)
+
+    assert reconcile.cancelled()
+    assert locks.acquire(base, "rep", ttl_s=600) is True
+
+
+async def test_a_cancel_while_the_lock_is_taken_frees_the_lock_it_took(
+    base, enabled, key, published, monkeypatch,
+):
+    """A Stop lands while the take of a slug's publish lock runs on a file
+    store thread. The cancel waits for the take, then frees the lock it took,
+    so the next turn publishes the slug rather than skip it as `lock_busy`
+    until its TTL."""
+    import asyncio
+    import threading
+
+    _make(base, "rep", files={"report.html": "<html></html>"}, meta={"slug": "rep", "type": "html-app"})
+    taken, may_return = threading.Event(), threading.Event()
+
+    def slow_acquire(artifacts_base, slug, *, ttl_s):
+        took = locks.acquire(artifacts_base, slug, ttl_s=ttl_s)
+        taken.set()
+        may_return.wait(timeout=5)
+        return took
+
+    monkeypatch.setattr(ap, "acquire", slow_acquire)
+    reconcile = asyncio.create_task(
+        ap.autopublish_project_artifacts(base, ORG_SCOPE, project_id=PROJECT_ID, touched={"rep"})
+    )
+    try:
+        assert await asyncio.to_thread(taken.wait, 5)
+        reconcile.cancel()
+        await asyncio.sleep(0.1)
+        assert not reconcile.done(), "the cancel did not wait for the lock take"
+    finally:
+        may_return.set()
+    await asyncio.wait_for(asyncio.gather(reconcile, return_exceptions=True), timeout=5)
+
+    assert reconcile.cancelled()
+    assert published == []
+    assert locks.acquire(base, "rep", ttl_s=600) is True
+
+
+async def test_a_cancel_while_the_publish_key_is_minted_frees_the_lock(
+    base, enabled, published, monkeypatch,
+):
+    """A Stop lands after the slug's publish lock is taken, while the publish
+    key is minted. No publish has started, so the cancel frees the lock."""
+    import asyncio
+
+    _make(base, "rep", files={"report.html": "<html></html>"}, meta={"slug": "rep", "type": "html-app"})
+    minting = asyncio.Event()
+
+    class SlowKey:
+        instance_id = "inst-1"
+
+        def __init__(self, *a, **kw):
+            pass
+
+        async def get(self):
+            minting.set()
+            await asyncio.Event().wait()
+
+        async def revoke(self):
+            pass
+
+    monkeypatch.setattr(ap, "PublishKey", SlowKey)
+    reconcile = asyncio.create_task(
+        ap.autopublish_project_artifacts(base, ORG_SCOPE, project_id=PROJECT_ID, touched={"rep"})
+    )
+    await asyncio.wait_for(minting.wait(), timeout=5)
+    assert locks.acquire(base, "rep", ttl_s=600) is False, "the reconcile did not hold the lock"
+    reconcile.cancel()
+    await asyncio.wait_for(asyncio.gather(reconcile, return_exceptions=True), timeout=5)
+
+    assert reconcile.cancelled()
+    assert published == []
+    assert locks.acquire(base, "rep", ttl_s=600) is True
+
+
+async def test_a_publish_key_mint_that_raises_frees_the_lock(base, enabled, published, monkeypatch, caplog):
+    """The slug's publish lock is taken, then minting the publish key raises
+    something other than an authority failure: here the settings it reads
+    fail to load. No publish has started, so the lock is freed, and the
+    reconcile logs the failure rather than raise it."""
+    import logging
+
+    def settings_that_fail_to_load():
+        raise RuntimeError("settings failed to load")
+
+    monkeypatch.setattr("cowork.services.artifact_publish_key.TurnQueueSettings", settings_that_fail_to_load)
+    _make(base, "rep", files={"report.html": "<html></html>"}, meta={"slug": "rep", "type": "html-app"})
+
+    with caplog.at_level(logging.WARNING, logger="cowork.services.artifact_autopublish"):
+        out = await ap.autopublish_project_artifacts(base, ORG_SCOPE, project_id=PROJECT_ID, touched={"rep"})
+
+    assert out == set()
+    assert published == []
+    assert locks.acquire(base, "rep", ttl_s=600) is True, "the failed mint left the lock held"
+    failures = [r for r in caplog.records if r.name == ap.logger.name and r.exc_info]
+    assert [(r.getMessage(), type(r.exc_info[1])) for r in failures] == [
+        ("artifact autopublish reconciliation failed", RuntimeError),
+    ]

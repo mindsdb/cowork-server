@@ -1,7 +1,9 @@
 """Harness publish tool forwards access + preserves previous (ENG-322 follow-up)."""
 
 import hashlib
+import io
 import json
+import urllib.error
 from pathlib import Path
 from unittest import mock
 
@@ -39,7 +41,7 @@ async def test_harness_forwards_explicit_password(tmp_path):
              "access_mode": "password", "password": "hunter2"},
         )
     _, kwargs = fake.call_args
-    assert kwargs["access"] == {"mode": "password", "password": "hunter2"}
+    assert kwargs["access"].publisher_access() == {"mode": "password", "password": "hunter2"}
     assert "Published" in getattr(out, "content", out)
 
 
@@ -55,7 +57,28 @@ async def test_harness_preserves_previous(tmp_path):
             _session(tmp_path), {"file_path": str(f), "action": "publish"},
         )
     _, kwargs = fake.call_args
-    assert kwargs["access"] == {"mode": "password", "password": "old"}  # NOT public
+    assert kwargs["access"].publisher_access() == {"mode": "password", "password": "old"}  # NOT public
+
+
+@pytest.mark.asyncio
+async def test_harness_refuses_previous_access_it_cant_read(tmp_path):
+    """The kept entry is a file the agent can write, so a password that is a
+    number there is refused with a sentence, and nothing publishes: kept
+    without it, the artifact would publish to a different audience."""
+    f = _artifact(tmp_path)
+    fake = mock.Mock(return_value={"url": "https://v/r/1"})
+    prev_state = {"published": True, "url": "u", "report_id": "r",
+                  "mode": "password", "requires_password": True, "access_password": 1234}
+    with mock.patch.object(htools, "_publish_artifact", fake), \
+         mock.patch.object(htools, "_published_owner_state", return_value=prev_state):
+        out = await htools._cowork_publish_or_preview(
+            _session(tmp_path), {"file_path": str(f), "action": "publish"},
+        )
+    assert out == (
+        "PUBLISH FAILED: The access saved with this artifact can't be read: password must be text. "
+        "Tell the user to choose its access from the publish panel, and don't pick one for them."
+    )
+    fake.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -69,7 +92,7 @@ async def test_harness_forwards_owner_only(tmp_path):
              "access_mode": "restricted", "emails": [], "owner_only": True},
         )
     _, kwargs = fake.call_args
-    assert kwargs["access"] == {
+    assert kwargs["access"].publisher_access() == {
         "mode": "restricted", "emails": [], "org_allowed": False, "owner_only": True,
     }
 
@@ -85,8 +108,8 @@ async def test_harness_restricted_without_owner_only_omits_flag(tmp_path):
              "access_mode": "restricted", "emails": ["a@x.com"]},
         )
     _, kwargs = fake.call_args
-    assert kwargs["access"]["owner_only"] is False
-    assert kwargs["access"]["emails"] == ["a@x.com"]
+    assert kwargs["access"].publisher_access()["owner_only"] is False
+    assert kwargs["access"].publisher_access()["emails"] == ["a@x.com"]
 
 
 @pytest.mark.asyncio
@@ -101,7 +124,7 @@ async def test_harness_restricted_normalizes_emails(tmp_path):
              "access_mode": "restricted", "emails": [" A@X.com ", "a@x.com"]},
         )
     _, kwargs = fake.call_args
-    assert kwargs["access"]["emails"] == ["a@x.com"]
+    assert kwargs["access"].publisher_access()["emails"] == ["a@x.com"]
 
 
 @pytest.mark.asyncio
@@ -275,10 +298,10 @@ def test_publish_description_says_what_to_pass_not_where_artifacts_live():
     assert "open_artifact" not in description
 
 
-# The publish tool's description and prompt at staging 8b1ecf4, before
-# deployment identity support. Hosts without COWORK_DEPLOYMENT_KIND keep them.
+# The publish tool's description and prompt as hosts without
+# COWORK_DEPLOYMENT_KIND get them; update the hashes when that text changes.
 DEFAULT_DESCRIPTION_SHA256 = "5bae1e84c433d3e09c5b572e6b1e60221143a30086a8e71b4898e2239149a6b1"
-DEFAULT_PROMPT_SHA256 = "5e040dfeaca047ee2307d953989e2282106f6972c8d7aaf4655301e50ec1e73a"
+DEFAULT_PROMPT_SHA256 = "7445d67a5666f5ee19660dbab859b663a0dda921185143dbb34f69e05c89af5c"
 
 
 @pytest.mark.asyncio
@@ -358,3 +381,70 @@ async def test_harness_reports_a_rejected_publish_without_a_second_traceback(tmp
     assert out.reason == "PublishRejected"
     assert json.loads(out.content)["message"] == "PUBLISH FAILED: Publishing failed: This organization is archived."
     assert "Traceback" not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_harness_tells_the_model_not_to_publish_wider_when_sharing_with_everyone_is_refused(tmp_path):
+    """MindsHub refused a share with everyone. The model picks the access
+    mode itself, so the tool names the refusal by its code and tells the
+    model, after MindsHub's reason, not to get past it by publishing wider.
+    anton's own publish tool says the same sentence, word for word."""
+    from cowork.services.publish import classify_upload_error
+
+    reason = "Sharing an artifact with everyone in the organization needs the artifacts.share_org permission."
+    refusal = urllib.error.HTTPError(
+        "https://publish.example/upload", 403, "Forbidden", {},
+        io.BytesIO(json.dumps({"error": reason, "code": "share_org_required"}).encode()),
+    )
+    f = _artifact(tmp_path)
+    fake = mock.Mock(side_effect=lambda *args, **kwargs: classify_upload_error(refusal))
+    with mock.patch.object(htools, "_publish_artifact", fake):
+        out = await htools._cowork_publish_or_preview(
+            _session(tmp_path),
+            {"file_path": str(f), "action": "publish", "access_mode": "restricted", "org_allowed": True},
+        )
+
+    assert out.ok is False
+    assert out.reason == "share_org_required"
+    assert json.loads(out.content)["message"] == (
+        f"PUBLISH FAILED: {reason} Do not publish it publicly or to a wider audience instead. Tell the "
+        "user that an organization admin can share it with everyone, or offer to share it with specific "
+        "people by email."
+    )
+
+
+@pytest.mark.asyncio
+async def test_harness_tells_the_model_not_to_retry_a_markdown_page_the_server_stopped(tmp_path):
+    """Each try of the same file can hold the server's one conversion for 30 s."""
+    from cowork.services.publish import MARKDOWN_NOT_CONVERTED_MESSAGE, MarkdownNotPublishable
+
+    f = _artifact(tmp_path)
+    refused = mock.Mock(side_effect=MarkdownNotPublishable(MARKDOWN_NOT_CONVERTED_MESSAGE))
+    with mock.patch.object(htools, "_publish_artifact", refused):
+        out = await htools._cowork_publish_or_preview(
+            _session(tmp_path), {"file_path": str(f), "action": "publish"},
+        )
+
+    text = getattr(out, "content", out)
+    assert MARKDOWN_NOT_CONVERTED_MESSAGE in text
+    assert "Do not retry with the same file" in text
+
+
+@pytest.mark.asyncio
+async def test_harness_publishes_in_a_thread_off_the_event_loop(tmp_path):
+    """A Markdown page renders for up to 30 s, and the tool runs on the server's loop."""
+    import threading
+
+    f = _artifact(tmp_path)
+    threads = []
+
+    def publish(*_args, **_kwargs):
+        threads.append(threading.get_ident())
+        return {"url": "https://v/r/1"}
+
+    with mock.patch.object(htools, "_publish_artifact", publish):
+        await htools._cowork_publish_or_preview(
+            _session(tmp_path), {"file_path": str(f), "action": "publish"},
+        )
+
+    assert threads and threads[0] != threading.get_ident()

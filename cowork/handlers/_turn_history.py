@@ -51,6 +51,12 @@ _BLOCK_FOR_ROLE = {"assistant": "tool_use", "user": "tool_result"}
 _ID_FIELD = {"tool_use": "id", "tool_result": "tool_use_id"}
 
 
+def _is_narration(role: str, block: dict) -> bool:
+    """An assistant text block saved beside its tool calls, so the replayed
+    history matches what the model saw and the prompt cache holds across turns."""
+    return role == "assistant" and block.get("type") == "text" and isinstance(block.get("text"), str)
+
+
 def _wire_size(obj) -> int:
     """Bytes this object will occupy on the wire.
 
@@ -125,6 +131,8 @@ def reject_unreplayable_tool_rows(rows: object) -> list[dict]:
         content = row.get("content")
         if not isinstance(content, list):
             continue
+        if not any(isinstance(b, dict) and b.get("type") == want for b in content):
+            return _reject("in-process %s row carries no %s block", row.get("role"), want)
         for block in content:
             if not isinstance(block, dict) or block.get("type") != want:
                 continue
@@ -170,6 +178,9 @@ def sanitize_turn_history_rows(rows: object) -> list[dict]:
         for block in content:
             if not isinstance(block, dict):
                 return _reject("role %s carries a %s block", role, type(block).__name__)
+            if _is_narration(role, block):
+                blocks.append(block)
+                continue
             if block.get("type") != want:
                 return _reject("role %s carries a %r block, expected %r",
                                role, block.get("type"), want)
@@ -184,6 +195,8 @@ def sanitize_turn_history_rows(rows: object) -> list[dict]:
                 return _reject("%s block carries %s as its %s, expected a non-empty string",
                                want, type(block_id).__name__, _ID_FIELD[want])
             blocks.append(_cap_tool_result(block) if want == "tool_result" else block)
+        if not any(b.get("type") == want for b in blocks):
+            return _reject("role %s carries no %s block", role, want)
         clean.append({"role": role, "content": blocks})
 
     if not clean:
@@ -192,7 +205,7 @@ def sanitize_turn_history_rows(rows: object) -> list[dict]:
     # Counter, not set: two tool_use blocks sharing an id against one
     # tool_result would pass a set comparison and still replay invalidly.
     uses = Counter(
-        b["id"] for r in clean if r["role"] == "assistant" for b in r["content"]
+        b["id"] for r in clean if r["role"] == "assistant" for b in r["content"] if b["type"] == "tool_use"
     )
     results = Counter(
         b["tool_use_id"] for r in clean if r["role"] == "user" for b in r["content"]

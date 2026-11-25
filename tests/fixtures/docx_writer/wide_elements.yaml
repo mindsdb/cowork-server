@@ -1,0 +1,7 @@
+# html is open + child * repeat + close. With the node budget cut to
+# "budget", the writer queues an element's children one at a time as it
+# walks, so it creates far fewer pending visits than the element has
+# children, and the document ends with the closing note.
+- {name: wide_div, open: "<div>", child: "<i>x</i>", close: "</div>", repeat: 10000, budget: 50}
+- {name: wide_table_row, open: "<table><tr>", child: "<td>x</td>", close: "</tr></table>", repeat: 10000, budget: 50}
+- {name: wide_wrapper_in_a_table, open: "<table><form>", child: "<b>x</b>", close: "<tr><td>row</td></tr></form></table>", repeat: 10000, budget: 50}

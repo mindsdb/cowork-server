@@ -1,0 +1,66 @@
+# How text and blocks become paragraphs. paragraphs: [style, text] for every
+# body paragraph, in order. numbered, where given: whether each paragraph
+# carries its list item's numbering.
+- name: line_break
+  html: "<p>one<br>two</p>"
+  paragraphs: [[Normal, "one\ntwo"]]
+- name: whitespace_collapses
+  html: "<p>  a \n\n b   <b> c </b> d </p>"
+  paragraphs: [[Normal, "a b c d "]]
+- name: no_break_spaces_stay
+  html: "<p>a&nbsp;&nbsp;b</p>"
+  paragraphs: [[Normal, "a\u00a0\u00a0b"]]
+- name: blockquote
+  html: "<blockquote><p>quoted</p>loose</blockquote>"
+  paragraphs: [[Quote, quoted], [Quote, loose]]
+- name: loose_list_item
+  html: "<ul><li><p>one</p><p>two</p></li></ul>"
+  paragraphs: [[List Bullet, one], [List Continue, two]]
+- name: nested_divs
+  html: "<div>a<div>b</div>c</div>"
+  paragraphs: [[Normal, a], [Normal, b], [Normal, c]]
+- name: scripts_styles_and_templates_skipped
+  html: "<p>x</p><script>alert(1)</script><style>p { color: red }</style><template><p>hidden</p></template><p>y</p>"
+  paragraphs: [[Normal, x], [Normal, y]]
+- name: orphan_list_item
+  html: "<li>orphan</li>"
+  paragraphs: [[List Bullet, orphan]]
+- name: heading_with_inline_markup
+  html: "<h2>Notes <em>for</em> readers</h2>"
+  paragraphs: [[Heading 2, Notes for readers]]
+- name: text_directly_in_body
+  html: "<body>bare text<p>para</p>tail text</body>"
+  paragraphs: [[Normal, bare text], [Normal, para], [Normal, tail text]]
+- name: caption_before_table
+  html: "<table><caption>Table caption</caption><tr><td>cell</td></tr></table>"
+  paragraphs: [[Caption, Table caption]]
+- name: pre_drops_one_newline_after_its_start_tag
+  html: "<pre>\nline1\nline2</pre>"
+  paragraphs: [[Normal, "line1\nline2"]]
+- name: pre_keeps_a_second_leading_newline
+  html: "<pre>\n\nline</pre>"
+  paragraphs: [[Normal, "\nline"]]
+- name: pre_drops_a_leading_carriage_return_and_newline
+  html: "<pre>\r\nline</pre>"
+  paragraphs: [[Normal, line]]
+- name: pre_keeps_a_leading_newline_in_a_child
+  html: "<pre><code>\nline</code></pre>"
+  paragraphs: [[Normal, "\nline"]]
+- name: headings_as_the_first_block_of_list_items
+  html: "<ol><li><h3>Step one</h3><p>body</p></li><li><h3>Step two</h3></li></ol>"
+  paragraphs: [[Heading 3, Step one], [List Continue, body], [Heading 3, Step two]]
+  numbered: [true, false, true]
+- name: pre_as_the_first_block_of_a_list_item
+  html: "<ul><li><pre>code</pre>after</li></ul>"
+  paragraphs: [[List Bullet, code], [List Continue, after]]
+  numbered: [true, false]
+- name: blockquote_as_the_first_block_of_a_list_item
+  html: "<ol><li><blockquote><p>quoted</p><p>more</p></blockquote></li></ol>"
+  paragraphs: [[List Number, quoted], [Quote, more]]
+  numbered: [true, false]
+# Word can't set a number beside a table, so the item keeps its numbered
+# line above the table, and the items after it keep their numbers.
+- name: table_as_the_first_block_of_a_list_item
+  html: "<ol><li><table><tr><td>cell</td></tr></table></li><li>two</li></ol>"
+  paragraphs: [[List Number, ""], [List Number, two]]
+  numbered: [true, true]

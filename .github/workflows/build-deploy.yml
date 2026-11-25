@@ -7,8 +7,8 @@
 # What actually ships this repo is the PyPI wheel, not a container image: the
 # desktop app installs `cowork-server` from PyPI (or git, per channel), so
 # `publish.yml` and `publish-staging.yml` are the real deploy path. The image
-# build exists for the per-PR environments and for the staging/prod Helm deploy
-# below.
+# build exists for the per-PR environments, for the shared `dev` namespace, and
+# for the staging/prod Helm deploy below.
 #
 # ON PERMISSIONS. A called workflow can never exceed its caller's grant, and that
 # cap is checked when the workflow FILE IS LOADED, not when a job runs. A job here
@@ -37,7 +37,7 @@ on:
         type: string
         required: true
       build-runner:
-        description: "Runner label for deploy and integration; build stays on mdb-dev"
+        description: "Runner label for deploy and integration; the build runs on ubuntu-latest"
         type: string
         default: mdb-dev
       pr-environment:
@@ -51,6 +51,12 @@ on:
           has nothing deployed yet, where a rollout can only fail.
         type: boolean
         default: true
+      deploy-through-argocd:
+        description: >-
+          Deploy by recording the build in mindsdb/argocd-state for Argo CD to
+          sync (dev and staging) instead of running Helm from the runner (prod).
+        type: boolean
+        default: false
 
     outputs:
       pr-env-deployed:
@@ -69,8 +75,11 @@ defaults:
 jobs:
 
   build:
-    # Always build on dev runner because thats where buildkit is
-    runs-on: mdb-dev
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      # The OIDC token configure-aws-credentials exchanges for the ECR role.
+      id-token: write
     outputs:
       image: ${{ steps.build.outputs.image }}
     env:
@@ -106,19 +115,34 @@ jobs:
           # the Dockerfile COPYs the build context into the builder stage. It
           # deletes .git after the sync so the runtime image does not carry it.
           fetch-depth: 0
-      - uses: mindsdb/github-actions/setup-env@main
-      - id: build
-        uses: mindsdb/github-actions/build-push-ecr@main
+      - name: Assume the ECR push role
+        # github-ecr-push from terraform's github-oidc stack, which every
+        # mindsdb repository may assume.
+        uses: aws-actions/configure-aws-credentials@61815dcd50bd041e203e49132bacad1fd04d2708 # v5.1.1
         with:
-          module-name: ${{ env.CI_REPOSITORY_SLUG }}
+          role-to-assume: ${{ vars.ECR_PUSH_ROLE_ARN }}
+          aws-region: us-east-1
+      - id: build
+        uses: mindsdb/github-actions/build-image@main
+        with:
+          module-name: mindsdb-cowork-server
           build-for-environment: ${{ inputs.build-environment }}
 
   scan:
-    runs-on: mdb-dev
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
     needs: [build]
     name: Scan Minds Image
     steps:
       - uses: actions/checkout@v5
+      - name: Assume the ECR push role
+        # The same role; it may also pull the image it pushed.
+        uses: aws-actions/configure-aws-credentials@61815dcd50bd041e203e49132bacad1fd04d2708 # v5.1.1
+        with:
+          role-to-assume: ${{ vars.ECR_PUSH_ROLE_ARN }}
+          aws-region: us-east-1
       - uses: mindsdb/github-actions/snyk-docker-scan@main
         with:
           image: ${{ needs.build.outputs.image }}
@@ -158,12 +182,12 @@ jobs:
     # `scan` too: it is blocking on a deploy branch (see `allow-vulns` above), and
     # needing only `build` meant a failing scan and a rollout ran side by side.
     needs: [build, scan]
-    # Only the two long-lived environments have a cluster to deploy to. A
-    # `development` build is either a PR (handled by `deploy-pr-env`) or nothing.
+    # Only staging and production builds roll out here. A `development` build is
+    # a PR, which `deploy-pr-env` and `deploy-argocd` handle, or nothing.
     # `deploy-enabled` gates it further: having a cluster is not the same as
     # having something deployed in it, and a rollout into an environment that
     # was never stood up fails every run without saying anything useful.
-    if: inputs.deploy-enabled && (inputs.build-environment == 'staging' || inputs.build-environment == 'production')
+    if: inputs.deploy-enabled && !inputs.deploy-through-argocd && (inputs.build-environment == 'staging' || inputs.build-environment == 'production')
     env:
       # `build-environment` names the image flavour (production); the Helm chart,
       # namespace and Slack message name the environment (prod). One is not the
@@ -192,7 +216,7 @@ jobs:
         with:
           environment-slug: ${{ env.DEPLOY_ENV }}
           k8s-namespace: ${{ env.DEPLOY_ENV }}
-          # build-push-ecr tags the image `<build-for-environment>-<sha>`, so this
+          # build-image tags the image `<build-for-environment>-<sha>`, so this
           # is the image flavour, not DEPLOY_ENV.
           image-tag: ${{ inputs.build-environment }}-${{ env.SLUG }}
           timeout: 600s
@@ -209,9 +233,123 @@ jobs:
           update-message-id: ${{ steps.slack.outputs.ts }}
 
   integration-tests:
-    needs: [deploy]
+    # After whichever staging or prod deploy ran. There is no conditional
+    # `needs`, so both are listed and the condition picks the one that
+    # succeeded; a `deploy-to-dev` rollout through Argo CD runs no tests, as
+    # the Helm `deploy-dev` never did.
+    needs: [deploy, deploy-argocd]
+    if: >-
+      !cancelled()
+      && (needs.deploy.result == 'success'
+          || (needs.deploy-argocd.result == 'success' && inputs.build-environment == 'staging'))
     uses: ./.github/workflows/tests-integration.yml
     with:
       deploy-env: ${{ inputs.build-environment == 'production' && 'prod' || 'staging' }}
       runner: ${{ inputs.build-runner }}
     secrets: inherit
+
+  deploy-argocd:
+    # The dev and staging deploy. Records the commit and its image tag in
+    # mindsdb/argocd-state, which Argo CD in newdev watches and syncs, then
+    # waits for the argocd/<env>/cowork-server commit status Argo CD sets once the sync is
+    # healthy, so the Slack message still follows the rollout. `dev` on a PR
+    # labeled `deploy-to-dev` from a branch of this repository, on every push
+    # while the label stays, as `deploy-dev` did; `staging` on a staging
+    # build. No cluster credential, and no `environment:` block: Argo CD
+    # creates the GitHub Deployment itself.
+    runs-on: ubuntu-latest
+    needs: [build, scan]
+    if: >-
+      inputs.deploy-through-argocd
+      && ((inputs.pr-environment
+           && github.event.pull_request.head.repo.full_name == github.repository
+           && contains(github.event.pull_request.labels.*.name, 'deploy-to-dev'))
+          || inputs.build-environment == 'staging')
+    permissions:
+      contents: read
+      # write-env-state sets argocd/<env>/cowork-server to pending on the commit; the wait
+      # below reads it.
+      statuses: write
+    concurrency:
+      group: deploy-${{ inputs.pr-environment && 'dev' || 'staging' }}
+      cancel-in-progress: false
+    env:
+      DEPLOY_ENV: ${{ inputs.pr-environment && 'dev' || 'staging' }}
+      # The commit Argo CD renders the chart from, and the tag build-image
+      # pushed for it: the PR head on a pull request, since GitHub drops the
+      # merge commit once the PR closes; the pushed commit otherwise.
+      DEPLOY_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+      IMAGE_TAG: ${{ inputs.build-environment }}-${{ github.event.pull_request.head.sha && 'head-' || '' }}${{ github.event.pull_request.head.sha || github.sha }}
+      ENV_URL: https://cowork.${{ inputs.pr-environment && 'dev' || 'staging' }}.mindshub.ai
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      # Same check as the Helm deploy: a superseded run must not record an
+      # older commit over the newer one's.
+      - name: Check this commit is still the branch tip
+        id: freshness
+        if: github.event_name == 'push'
+        run: |
+          set -euo pipefail
+          tip="$(git ls-remote origin "refs/heads/${GITHUB_REF_NAME}" | cut -f1)"
+          if [ -n "$tip" ] && [ "$tip" != "$GITHUB_SHA" ]; then
+            echo "superseded=true" >> "$GITHUB_OUTPUT"
+            echo "::notice title=Deploy skipped::${GITHUB_SHA} is no longer the tip of ${GITHUB_REF_NAME} (now ${tip}). That commit's run deploys instead."
+          fi
+      - name: Notify of deployment starting
+        id: slack
+        if: steps.freshness.outputs.superseded != 'true'
+        uses: mindsdb/github-actions/slack-deploy-msg@main
+        with:
+          channel-id: ${{ secrets.SLACK_DEPLOYMENTS_CHANNEL_ID }}
+          status: 'started'
+          color: '#0099CC'
+          env-name: ${{ env.DEPLOY_ENV }}
+          env-url: ${{ env.ENV_URL }}
+          slack-token: ${{ secrets.GH_ACTIONS_SLACK_BOT_TOKEN }}
+      - name: Mint a token for argocd-state
+        id: release-train
+        if: steps.freshness.outputs.superseded != 'true'
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          client-id: ${{ vars.RELEASE_APP_CLIENT_ID }}
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+          owner: mindsdb
+          repositories: argocd-state
+          permission-contents: write
+      - uses: mindsdb/github-actions/write-env-state@main
+        if: steps.freshness.outputs.superseded != 'true'
+        with:
+          env: ${{ env.DEPLOY_ENV }}
+          service: cowork-server
+          sha: ${{ env.DEPLOY_SHA }}
+          tag: ${{ env.IMAGE_TAG }}
+          token: ${{ steps.release-train.outputs.token }}
+      - name: Wait for Argo CD
+        if: steps.freshness.outputs.superseded != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          for _ in $(seq 1 45); do
+            state="$(gh api "repos/$GITHUB_REPOSITORY/commits/$DEPLOY_SHA/status" --jq ".statuses[] | select(.context == \"argocd/$DEPLOY_ENV/cowork-server\") | .state")"
+            case "$state" in
+              success) echo "Argo CD synced $DEPLOY_SHA to $DEPLOY_ENV"; exit 0 ;;
+              failure|error) echo "::error::Argo CD reported $state for $DEPLOY_SHA in $DEPLOY_ENV: see the argocd/$DEPLOY_ENV/cowork-server status on the commit"; exit 1 ;;
+            esac
+            sleep 20
+          done
+          echo "::error::Argo CD has not reported on $DEPLOY_SHA in $DEPLOY_ENV: see the argocd/$DEPLOY_ENV/cowork-server status on the commit"
+          exit 1
+      - name: Notify of deployment finish
+        uses: mindsdb/github-actions/slack-deploy-msg@main
+        if: always() && steps.freshness.outputs.superseded != 'true'
+        with:
+          channel-id: ${{ secrets.SLACK_DEPLOYMENTS_CHANNEL_ID }}
+          status: "${{ job.status == 'success' && 'finished' || 'failed' }}"
+          color: "${{ job.status == 'success' && '#00C851' || '#FF4444' }}"
+          env-name: ${{ env.DEPLOY_ENV }}
+          env-url: ${{ env.ENV_URL }}
+          slack-token: ${{ secrets.GH_ACTIONS_SLACK_BOT_TOKEN }}
+          update-message-id: ${{ steps.slack.outputs.ts }}

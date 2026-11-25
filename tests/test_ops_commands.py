@@ -27,7 +27,6 @@ from pathlib import Path
 from uuid import uuid4
 
 import pytest
-from anton.core.datasources.data_vault import LocalDataVault
 from sqlalchemy import delete
 
 from cowork import shared_skills
@@ -43,7 +42,7 @@ from cowork.ops import connections as connections_ops
 from cowork.ops import memory as memory_ops
 from cowork.ops import skills as skills_ops
 from cowork.schemas.memory import MemoryScope
-from cowork.services.connectors.persist import own_vault_for_scope, vault_for_scope
+from cowork.services.connectors.persist import data_vault_at, own_vault_for_scope, vault_for_scope
 from cowork.services.memory import MemoryService
 from cowork.services.skills import BUILTIN_SKILL_SLUGS, SKILL_SHARING_UNAVAILABLE, SkillService
 from cowork.shared_skills import shared_skills_file
@@ -377,7 +376,7 @@ def _listed_skills(person: Person) -> dict[str, dict]:
     raw = get_open_session()
     try:
         scoped = ScopedSession(raw, personal_scope(person))
-        return {s["id"]: s for s in skills_ep.list_skills(scoped, None)["skills"]}
+        return {s["id"]: s for s in skills_ep._list_skills(scoped, principal=None, viewer=None)["skills"]}
     finally:
         raw.close()
 
@@ -764,6 +763,7 @@ def _registry(folder: Path) -> list[dict]:
     return json.loads((folder / "shared" / "connections.json").read_text())
 
 
+@pytest.mark.usefixtures("with_and_without_key_file")
 def test_share_connection_adds_it_to_the_registry_for_everyone(stack, capsys):
     own_vault_for_scope(personal_scope(ALICE)).save(
         "postgres", "erp", {"host": "erp.example", "password": "erpSecret"}, secure_keys=["password"]
@@ -782,7 +782,7 @@ def test_share_connection_adds_it_to_the_registry_for_everyone(stack, capsys):
     ]
     assert registry_file.stat().st_mode & 0o777 == 0o644
     # Nothing is copied: the operator's own connections stay as they were.
-    assert LocalDataVault(stack.vault_dir).list_connections() == []
+    assert data_vault_at(stack.vault_dir).list_connections() == []
     bob_vault = vault_for_scope(personal_scope(BOB))
     assert not bob_vault.can_change("postgres", "erp")
     assert bob_vault.is_shared("postgres", "erp")
@@ -790,6 +790,7 @@ def test_share_connection_adds_it_to_the_registry_for_everyone(stack, capsys):
     assert vault_for_scope(personal_scope(ALICE)).can_change("postgres", "erp")
 
 
+@pytest.mark.usefixtures("with_and_without_key_file")
 def test_unshare_connection_removes_it_and_keeps_the_persons_own(stack, capsys):
     own_vault_for_scope(personal_scope(ALICE)).save("postgres", "erp", {"host": "erp.example"})
     own_vault_for_scope(personal_scope(BOB)).save("mysql", "crm", {"host": "crm.example"})
@@ -862,11 +863,12 @@ def test_the_engine_option_shares_and_unshares_one_of_two(stack, capsys):
     assert [entry["engine"] for entry in _registry(stack.root)] == ["google_calendar"]
 
 
+@pytest.mark.usefixtures("with_and_without_key_file")
 def test_share_connection_refuses_one_already_shared_or_hidden(stack, capsys):
     own_vault_for_scope(personal_scope(ALICE)).save("postgres", "erp", {"host": "alice.example"})
     own_vault_for_scope(personal_scope(BOB)).save("postgres", "erp", {"host": "bob.example"})
     own_vault_for_scope(personal_scope(BOB)).save("postgres", "warehouse", {"host": "bob.example"})
-    LocalDataVault(stack.vault_dir).save("postgres", "warehouse", {"host": "operator.example"})
+    data_vault_at(stack.vault_dir).save("postgres", "warehouse", {"host": "operator.example"})
     _share(ALICE, "erp", stack.root, capsys)
 
     for person, name, message in (

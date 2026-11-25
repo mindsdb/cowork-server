@@ -1,0 +1,22 @@
+# What Stop sharing answers for an artifact whose publish record names a page.
+# `page` is what that page id is to the tester: `no_owner_record`, as for a
+# page published before Cowork recorded owners; `other_artifact`, an id copied
+# from another artifact's record; or `owned`, the tester's own page.
+- name: a page with no owner record stays live, and Cowork says so
+  page: no_owner_record
+  taken_down: false
+  live_link: true
+  reason: no_owner_record
+  publisher_deletes: false
+- name: another artifact's page is never sent to the publisher, and nothing is removed
+  page: other_artifact
+  taken_down: false
+  live_link: true
+  reason: other_artifact
+  publisher_deletes: false
+- name: the tester's own page is taken down
+  page: owned
+  taken_down: true
+  live_link: false
+  reason: null
+  publisher_deletes: true

@@ -1,0 +1,38 @@
+# Inputs that try to make the writer fetch or read. Each html is written
+# with {server} replaced by the recording server's URL, {sentinel_path} by a
+# file holding the sentinel bytes and {sentinel_uri} by that file's file:
+# URI. Every case must make no network or process call, read no file, keep
+# the sentinel bytes out of the package, and show "text" in the document.
+- name: remote_image
+  html: '<p><img src="{server}/img.png" alt="remote"></p>'
+  text: "[image: remote]"
+- name: file_uri_image
+  html: '<p><img src="{sentinel_uri}" alt="file uri"></p>'
+  text: "[image: file uri]"
+- name: path_image
+  html: '<p><img src="{sentinel_path}" alt="path"></p>'
+  text: "[image: path]"
+- name: relative_image_under_base
+  html: '<base href="{server}/"><p><img src="chart.png" alt="relative"></p>'
+  text: "[image: relative]"
+- name: srcset_and_picture
+  html: '<p><picture><source srcset="{server}/a.png"><img src="{server}/b.png" srcset="{server}/c.png 2x" alt="pic"></picture></p>'
+  text: "[image: pic]"
+- name: external_entities
+  html: '<!DOCTYPE html [<!ENTITY file SYSTEM "{sentinel_uri}"><!ENTITY remote SYSTEM "{server}/entity">]><html><body><p>entities: &file;&remote;</p></body></html>'
+  text: "entities:"
+- name: xinclude
+  html: '<p>include: <xi:include xmlns:xi="http://www.w3.org/2001/XInclude" href="{sentinel_uri}" parse="text"/></p>'
+  text: "include:"
+- name: stylesheets_and_css_urls
+  html: '<link rel="stylesheet" href="{server}/a.css"><style>@import url("{server}/b.css"); p { background: url("{server}/c.png") }</style><p style="background:url({server}/d.png)">styled</p>'
+  text: "styled"
+- name: frames_and_embeds
+  html: '<p>frames</p><iframe src="{server}/frame"></iframe><object data="{server}/object"></object><embed src="{server}/embed"><svg><image href="{server}/svg.png"/></svg><video src="{server}/video" poster="{server}/poster.png"></video>'
+  text: "frames"
+- name: meta_refresh
+  html: '<meta http-equiv="refresh" content="0;url={server}/refresh"><p>refresh</p>'
+  text: "refresh"
+- name: file_and_server_links
+  html: '<p><a href="{sentinel_uri}">file link</a> <a href="{sentinel_path}">path link</a> <a href="{server}/page">server link</a></p>'
+  text: "file link path link server link"

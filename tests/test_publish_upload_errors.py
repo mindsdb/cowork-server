@@ -12,7 +12,10 @@ from fastapi import HTTPException
 
 from cowork.services.product_permissions import ProductPermissionDenied, ProductPermissionUnavailable
 from cowork.services.publish import (
+    ARTIFACT_ORG_REFUSAL,
+    PublishRejected,
     PublishTooLarge,
+    ShareOrgRequired,
     UploadError,
     UploadServiceUnavailable,
     _publisher_http_detail,
@@ -78,6 +81,40 @@ def test_a_confirmed_403_is_a_permission_denial():
         classify_upload_error(_http_error(403, {"code": "permission_denied", "error": "nope"}))
 
 
+# MindsHub's reason for refusing a share with everyone, as the upload service
+# passes it on. Written here because neither of them can be imported.
+SHARE_ORG_REASON = "Sharing an artifact with everyone in the organization needs the artifacts.share_org permission."
+
+
+def test_mindshubs_refusal_of_a_share_with_everyone_is_its_own_refusal():
+    """A 403 with share_org_required is ShareOrgRequired: MindsHub's reason
+    as its text, with nothing in front of it, and the 403 and code a route
+    answers. A PublishRejected, so every caller that shows a rejected
+    publish's text shows it."""
+    with pytest.raises(ShareOrgRequired) as error:
+        classify_upload_error(_http_error(403, {"error": SHARE_ORG_REASON, "code": "share_org_required"}))
+    assert isinstance(error.value, PublishRejected)
+    assert str(error.value) == SHARE_ORG_REASON
+    assert (error.value.status_code, error.value.refusal().model_dump()) == (
+        403, {"detail": SHARE_ORG_REASON, "code": "share_org_required"},
+    )
+
+
+def test_a_share_with_everyone_refused_without_a_reason_says_why_anyway():
+    with pytest.raises(ShareOrgRequired) as error:
+        classify_upload_error(_http_error(403, {"code": "share_org_required"}))
+    assert str(error.value) == ARTIFACT_ORG_REFUSAL
+
+
+def test_a_long_reason_for_refusing_a_share_with_everyone_is_clipped():
+    """The reason reaches the person's screen and the agent's model, so a long
+    one is cut as every other upload-service text is: its start and its end."""
+    reason = "A" * 300 + "B" * 300 + "C" * 300
+    with pytest.raises(ShareOrgRequired) as error:
+        classify_upload_error(_http_error(403, {"error": reason, "code": "share_org_required"}))
+    assert str(error.value) == "A" * 100 + " … " + "B" * 100 + "C" * 300
+
+
 @pytest.mark.parametrize("status, body, expected", [
     (403, {"code": "organization_inactive", "error": "This organization is archived or still being provisioned."},
      UploadError(403, "organization_inactive", "This organization is archived or still being provisioned.")),
@@ -96,6 +133,7 @@ def test_a_failure_without_an_http_answer_returns_none():
 
 @pytest.mark.parametrize("exc", [
     ProductPermissionDenied(), ProductPermissionUnavailable(), PublishTooLarge(), UploadServiceUnavailable(),
+    ShareOrgRequired(SHARE_ORG_REASON),
 ])
 def test_an_already_typed_error_is_raised_unchanged(exc):
     with pytest.raises(type(exc)) as error:
@@ -113,6 +151,32 @@ def test_the_refusals_that_skip_the_publish_failure_log_are_logged(status, body,
         with pytest.raises(HTTPException):
             classify_upload_error(_http_error(status, body))
     assert f"Publish service answered HTTP {status}" in caplog.text
+
+
+def test_a_refused_share_with_everyone_is_logged_once_as_a_warning(caplog):
+    """The refusal skips publish_artifact's failure log, so this warning is
+    its one record."""
+    with caplog.at_level(logging.WARNING, logger="cowork.services.publish"):
+        with pytest.raises(ShareOrgRequired):
+            classify_upload_error(_http_error(403, {"error": SHARE_ORG_REASON, "code": "share_org_required"}))
+    [record] = [r for r in caplog.records if r.name == "cowork.services.publish"]
+    assert (record.levelno, record.args[:2]) == (logging.WARNING, (403, "share_org_required"))
+
+
+def test_a_refused_share_with_everyone_says_its_status_and_code_in_the_deployments_log(caplog):
+    """The deployments' JSON log prints this warning's template without its
+    arguments, so the status and code reach the operator only as fields it
+    keeps. Without them the line can't be told from a 413 or a 503."""
+    from cowork.common.structured_logging import make_formatter
+
+    with caplog.at_level(logging.WARNING, logger="cowork.services.publish"):
+        with pytest.raises(ShareOrgRequired):
+            classify_upload_error(_http_error(403, {"error": SHARE_ORG_REASON, "code": "share_org_required"}))
+    [record] = [r for r in caplog.records if r.name == "cowork.services.publish"]
+    line = json.loads(make_formatter().format(record))
+    assert {field: line.get(field) for field in ("log_level", "status_code", "reason")} == {
+        "log_level": "WARNING", "status_code": 403, "reason": "share_org_required",
+    }
 
 
 @pytest.mark.parametrize("status, body", [

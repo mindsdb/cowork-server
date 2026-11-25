@@ -1,0 +1,148 @@
+# Same shape as elements.yaml, plus `scripts_dropped`.
+
+- id: no-script
+  html: '<p>kept</p>'
+  scripts_dropped: false
+
+- id: inline-script-outside-pdf
+  html: '<script>alert(1)</script><p>kept</p>'
+  modes: [html, word]
+  present: ['<p>kept</p>']
+  absent: ['<script', 'alert']
+  scripts_dropped: true
+
+- id: inline-script-in-pdf
+  html: '<script>window.chartData = [1, 2];</script><p>kept</p>'
+  modes: [pdf]
+  present: ['<script>window.chartData = [1, 2];</script>']
+  scripts_dropped: false
+
+# A browser reads a script inside SVG or MathML as markup, so its content
+# could build elements, such as an img with an outside source, that libxml2
+# keeps as script text. Only a script in HTML stays.
+- id: inline-script-in-svg-in-pdf
+  html: '<svg><script>draw()</script></svg>'
+  modes: [pdf]
+  present: ['<svg></svg>']
+  absent: ['<script', 'draw']
+  scripts_dropped: true
+
+- id: script-in-svg-carrying-markup-in-pdf
+  html: '<svg><script>1;<img src="{outside}/svg-img"><p><link rel=stylesheet href="{outside}/svg-link.css"><meta http-equiv=refresh content="1;url={outside}/svg-refresh"></script></svg><p>kept</p>'
+  modes: [pdf]
+  present: ['<svg></svg><p>kept</p>']
+  absent: ['<script', '<img', '<link', '<meta http-equiv', '{outside}']
+  scripts_dropped: true
+
+- id: script-in-math-carrying-markup-in-pdf
+  html: '<math><script>1;<img src="{outside}/math-img"></script><mi>x</mi></math>'
+  modes: [pdf]
+  present: ['<math><mi>x</mi></math>']
+  absent: ['<script', '<img', '{outside}']
+  scripts_dropped: true
+
+- id: pinned-cdn-script-in-svg-in-pdf
+  html: '<svg><script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script></svg>'
+  modes: [pdf]
+  present: ['<svg></svg>']
+  absent: ['<script', 'jsdelivr']
+  scripts_dropped: true
+  omitted: [[scheme, 'https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js']]
+
+- id: inline-script-that-a-reparse-could-end-elsewhere
+  html: '<p>kept</p><script>document.write("<!--<script>")</script>'
+  modes: [pdf]
+  present: ['<p>kept</p>']
+  absent: ['<script', 'document.write']
+  scripts_dropped: true
+
+- id: pinned-cdn-script-in-pdf
+  html: '<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js" onload="go()" integrity="sha384-x" type="text/javascript">ignored()</script>'
+  modes: [pdf]
+  present: ['<script type="text/javascript" src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>']
+  absent: ['ignored', 'onload', 'integrity']
+  scripts_dropped: false
+
+- id: pinned-scoped-cdn-script-in-pdf
+  html: '<script src="https://cdn.jsdelivr.net/npm/@observablehq/plot@0.6.16/dist/plot.umd.min.js"></script>'
+  modes: [pdf]
+  present: ['<script src="https://cdn.jsdelivr.net/npm/@observablehq/plot@0.6.16/dist/plot.umd.min.js"></script>']
+  scripts_dropped: false
+
+- id: pinned-cdn-script-outside-pdf
+  html: '<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script><p>kept</p>'
+  modes: [html, word]
+  absent: ['<script', 'jsdelivr']
+  scripts_dropped: true
+  omitted: [[scheme, 'https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js']]
+
+- id: script-sources-outside-pdf
+  html: '<script src="app.js"></script><script src="{outside}/x.js"></script><svg><script src="../other/app.js"></script></svg><p>kept</p>'
+  modes: [html, word]
+  absent: ['<script', 'app.js', '{outside}']
+  scripts_dropped: true
+  omitted: [[unsupported_type, app.js], [scheme, '{outside}/x.js'], [traversal, ../other/app.js]]
+
+# An SVG script loads from href, so a dropped one lists that too.
+- id: svg-script-href-is-listed
+  html: '<svg><script href="{outside}/a.js"></script><script xlink:href="b.js"></script></svg><p>kept</p>'
+  absent: ['<script', 'a.js', 'b.js']
+  scripts_dropped: true
+  omitted: [[scheme, '{outside}/a.js'], [unsupported_type, b.js]]
+
+- id: every-other-script-source-in-pdf
+  modes: [pdf]
+  html: >-
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4/dist/chart.umd.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@latest/dist/chart.umd.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@^4.4.1/dist/chart.umd.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1-beta.1/dist/chart.umd.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.js?v=1"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/../../gh/x/y@1.0.0/z.js"></script>
+    <script src="https://cdn.jsdelivr.net/gh/user/repo@1.0.0/x.js"></script>
+    <script src="http://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.js"></script>
+    <script src="https://cdn.jsdelivr.net.example.com/npm/chart.js@4.4.1/dist/chart.js"></script>
+    <script src=" https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.js"></script>
+    <script src="{outside}/x.js"></script>
+    <script src="//cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.js"></script>
+    <script src="app.js"></script>
+    <script src="../other/app.js"></script>
+    <script src="https://cdn.jsdelivr.net@evil.example/npm/chart.js@4.4.1/dist/chart.js"></script>
+    <script src="https://cdn.jsdelivr.net:444/npm/chart.js@4.4.1/dist/chart.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/%2e%2e/%2e%2e/gh/user/repo/x.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/.%2e/x.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist%2fchart.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/../../gh/user/repo/x.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/./dist/chart.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1//dist/chart.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.js#x"></script>
+    <p>kept</p>
+  present: ['<p>kept</p>']
+  absent: ['<script']
+  scripts_dropped: true
+  omitted:
+    - [scheme, 'https://cdn.jsdelivr.net/npm/chart.js@4/dist/chart.umd.min.js']
+    - [scheme, 'https://cdn.jsdelivr.net/npm/chart.js@latest/dist/chart.umd.min.js']
+    - [scheme, 'https://cdn.jsdelivr.net/npm/chart.js@^4.4.1/dist/chart.umd.min.js']
+    - [scheme, 'https://cdn.jsdelivr.net/npm/chart.js@4.4.1-beta.1/dist/chart.umd.min.js']
+    - [scheme, 'https://cdn.jsdelivr.net/npm/chart.js@4.4.1']
+    - [scheme, 'https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.js?v=1']
+    - [scheme, 'https://cdn.jsdelivr.net/npm/chart.js@4.4.1/../../gh/x/y@1.0.0/z.js']
+    - [scheme, 'https://cdn.jsdelivr.net/gh/user/repo@1.0.0/x.js']
+    - [scheme, 'http://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.js']
+    - [scheme, 'https://cdn.jsdelivr.net.example.com/npm/chart.js@4.4.1/dist/chart.js']
+    - [scheme, 'https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.js']
+    - [scheme, '{outside}/x.js']
+    - [absolute, '//cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.js']
+    - [unsupported_type, app.js]
+    - [traversal, ../other/app.js]
+    - [scheme, 'https://cdn.jsdelivr.net@evil.example/npm/chart.js@4.4.1/dist/chart.js']
+    - [scheme, 'https://cdn.jsdelivr.net:444/npm/chart.js@4.4.1/dist/chart.js']
+    - [scheme, 'https://cdn.jsdelivr.net/npm/chart.js@4.4.1/%2e%2e/%2e%2e/gh/user/repo/x.js']
+    - [scheme, 'https://cdn.jsdelivr.net/npm/chart.js@4.4.1/.%2e/x.js']
+    - [scheme, 'https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist%2fchart.js']
+    - [scheme, 'https://cdn.jsdelivr.net/npm/chart.js@4.4.1/../../gh/user/repo/x.js']
+    - [scheme, 'https://cdn.jsdelivr.net/npm/chart.js@4.4.1/./dist/chart.js']
+    - [scheme, 'https://cdn.jsdelivr.net/npm/chart.js@4.4.1//dist/chart.js']
+    - [scheme, 'https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.js#x']

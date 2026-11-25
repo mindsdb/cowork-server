@@ -7,7 +7,11 @@ test asserts the set of sites EQUALS the allowlist, so a new one fails and a
 removed one also fails (keeping the list honest).
 
 Each allowlisted site must be guarded by `_org_mode()`; see
-tests/test_no_execution_in_org_mode.py for the runtime half of this.
+tests/test_no_execution_in_org_mode.py for the runtime half of this. Two
+entries run in every tenancy by design, and each says why: the code sandbox's
+self-test, and the export's conversion process, which runs cowork's own
+`export_child` module from a fixed command so the server can kill a
+conversion. Neither runs a file an agent wrote.
 
 A site is keyed by (file, enclosing function/method, labeled call), NOT by
 (file, callable name). Keying by (file, callable) alone lets two different
@@ -110,9 +114,14 @@ BANNED_MODULES = {
     # attacker-authored HTML (SSRF / local-file read) while rendering.
     "xhtml2pdf",
     "htmldocx",
+    # A fork of htmldocx that fetches images the same way.
+    "html4docx",
     "weasyprint",
     "pdfkit",
     "imgkit",
+    # Runs the pandoc binary in a child process, and pandoc fetches the
+    # images and stylesheets the source names.
+    "pypandoc",
 }
 BANNED_ATTRS = {
     "system",
@@ -163,8 +172,10 @@ BANNED_IMPORT_PATHS = {"anton.core.artifacts.backend_launcher"}
 
 #: (relative path, enclosing function/method or "<module>", labeled call,
 #: reason). Desktop-only, each guarded by _org_mode(), EXCEPT the
-#: build_chat_session entry, which is itself the guard. One entry per
-#: occurrence: two identical sites need two entries (see the module docstring).
+#: build_chat_session entry, which is itself the guard, and the code sandbox's
+#: self-test and the export conversion process, which run in every tenancy and
+#: never run an agent's file. One entry per occurrence: two identical sites
+#: need two entries (see the module docstring).
 ALLOWLIST = (
     (
         "coding/project_actions.py",
@@ -257,6 +268,21 @@ ALLOWLIST = (
         "open_artifact endpoint",
     ),
     (
+        "services/export_runner.py",
+        "<module>",
+        "subprocess",
+        "import backing the export conversion process below",
+    ),
+    (
+        "services/export_runner.py",
+        "_run",
+        "subprocess.Popen",
+        "the export's conversion process, in every tenancy so the server can kill "
+        "a conversion: a fixed command that runs cowork's own "
+        "cowork.services.export_child module, never a name or path from input or "
+        "an agent's file",
+    ),
+    (
         "common/chat_session.py",
         "build_chat_session",
         "ChatSession",
@@ -285,33 +311,6 @@ ALLOWLIST = (
         "imports packaged cowork.channels.plugins modules discovered via "
         "pkgutil.iter_modules, never an attacker-supplied name",
     ),
-    (
-        "services/artifact_export.py",
-        "_to_pdf",
-        "xhtml2pdf",
-        "PDF export renderer; the export endpoint refuses pdf in org mode "
-        "(endpoints/artifacts.py), so it is desktop-only",
-    ),
-    (
-        "services/artifact_export.py",
-        "_to_pdf",
-        "xhtml2pdf.CreatePDF",
-        "PDF export render call (`pisa.CreatePDF`); same endpoint org-mode "
-        "refusal as the import",
-    ),
-    (
-        "services/artifact_export.py",
-        "_to_docx",
-        "htmldocx",
-        "DOCX export renderer import; the export endpoint refuses docx in org "
-        "mode, so it is desktop-only",
-    ),
-    (
-        "services/artifact_export.py",
-        "_to_docx",
-        "htmldocx.HtmlToDocx",
-        "DOCX export render call; same endpoint org-mode refusal as the import",
-    ),
 )
 
 
@@ -336,7 +335,7 @@ POLICY_CARRIERS = {
 #: Where each carrier is constructed today, so the scan below is known to see
 #: them: (relative path, enclosing function, carrier).
 POLICY_CARRIER_SITES = (
-    ("harnesses/anton_harness/harness.py", "AntonHarness._build_chat_session", "ChatSessionConfig"),
+    ("harnesses/anton_harness/harness.py", "AntonHarness._build_turn_session", "ChatSessionConfig"),
     ("services/connectors/probe.py", "CredentialProbe.run", "ChatSessionConfig"),
     ("handlers/probe.py", "ProbeHandler.run", "CredentialProbe"),
     ("services/scratchpad_runtime.py", "_make_runtime", "LocalScratchpadRuntime"),
@@ -907,3 +906,14 @@ def test_a_thread_pool_is_not_a_spawn():
     assert _snippet_labels(
         "from concurrent.futures import ThreadPoolExecutor\nThreadPoolExecutor()\n"
     ) == []
+
+
+@pytest.mark.parametrize("module", ["xhtml2pdf", "htmldocx", "html4docx", "pypandoc"])
+def test_a_document_converter_that_fetches_is_caught(module):
+    """Export builds Word files from the artifact's own bytes, so no converter
+    that fetches what the source names may come back under cowork/."""
+    assert _snippet_labels(f"import {module}\n") == [module]
+    assert _snippet_labels(f"from {module} import convert\nconvert(source)\n") == [
+        module,
+        f"{module}.convert",
+    ]

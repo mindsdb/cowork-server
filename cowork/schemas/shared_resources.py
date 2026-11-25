@@ -20,6 +20,8 @@ class ProjectCapabilities(CamelResponse):
     can_rename: bool
     can_delete: bool
     can_edit_instructions: bool
+    can_run: bool = True
+    can_write_files: bool = True
     # The project's directory is a folder the user chose, not one Cowork
     # allocated. Renaming it is refused and deleting the project leaves it in
     # place, so the client has to say both things differently.

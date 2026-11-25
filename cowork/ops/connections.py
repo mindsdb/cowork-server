@@ -24,7 +24,6 @@ import argparse
 import sys
 from pathlib import Path
 
-from anton.core.datasources.data_vault import LocalDataVault
 
 from cowork.db.personal_resources import PersonalResource
 from cowork.managed import SharedConnection, SharedConnections, managed_folder
@@ -42,7 +41,8 @@ from cowork.ops import (
     read_registry,
     run_operator_command,
 )
-from cowork.services.connectors.persist import own_vault_for_scope
+from cowork.ops.connection_inventory import connection_inventory
+from cowork.services.connectors.persist import data_vault_at, own_vault_for_scope
 
 # How the refusal of a name in two engines says to pick one, for this module
 # and for the make target that runs it.
@@ -76,7 +76,7 @@ def share_connection(
         )
     (engine,) = engines
     managed = managed_folder()
-    if managed is not None and LocalDataVault(managed.vault_dir).read_record(engine, name):
+    if managed is not None and data_vault_at(managed.vault_dir).read_record(engine, name):
         # Everyone reads the operator's own entry first, so the share would
         # reach nobody.
         raise OperatorCommandError(
@@ -130,9 +130,11 @@ def unshare_connection(
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="python -m cowork.ops.connections",
-        description="Share one person's saved connection with everyone, or stop sharing it.",
+        description="List connection ownership, share a saved connection, or stop sharing it.",
     )
     actions = parser.add_subparsers(dest="action", required=True)
+    inventory = actions.add_parser("list", help="list stored connection metadata, never credentials")
+    add_person_arguments(inventory, required=False)
     share = actions.add_parser(
         "share", help="share the person's saved connection with everyone, read-only"
     )
@@ -154,6 +156,11 @@ def main(argv: list[str] | None = None) -> int:
         )
         add_registry_stdout_argument(action)
     arguments = parser.parse_args(argv)
+    if arguments.action == "list":
+        if (arguments.organization_id is None) != (arguments.user_id is None):
+            parser.error("list takes both --organization-id and --user-id, or neither for all spaces")
+        person = None if arguments.user_id is None else person_from_arguments(arguments)
+        return run_operator_command(lambda: connection_inventory(person=person).model_dump_json(indent=2))
     person = person_from_arguments(arguments)
 
     def command() -> str:

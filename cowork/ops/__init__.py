@@ -5,13 +5,16 @@ acts for one person on a local deployment that trusts identity headers
 (COWORK_TRUST_IDENTITY_HEADERS). Every action takes the pair that deployment's
 proxy sends for the person: ``--organization-id``, the deployment's own id
 (X-Organization-Id), and ``--user-id``, the person's ``sub`` (X-User-Id).
-The one exception is memory left shared, where the memory actions act on the
-deployment's one store and take neither (cowork.ops.memory). cowork-server
+Memory left shared acts on the deployment's one store and takes neither
+(cowork.ops.memory). Connections list also takes neither to enumerate all
+stored partitions (cowork.ops.connections). cowork-server
 works out the person's space from the pair, as it does for their requests, so
 a caller never repeats the storage layout.
 
 Results go to stdout as plain text, and errors and log lines to stderr. A
 command that can't do what it was asked prints why and exits with status 1.
+One that an error stopped part-way through its writes prints why and exits
+with status 2 (cowork.ops.reseal).
 A connection share or unshare given ``--registry-stdout`` writes nothing: it
 prints the new registry on stdout, exactly the bytes it would have written,
 and its message on stderr, so a caller can check the registry and write it
@@ -62,6 +65,12 @@ from cowork.principal import Principal, personal_partition_id
 class OperatorCommandError(Exception):
     """A command that can't do what it was asked. run_operator_command prints
     the message on stderr and exits with status 1."""
+
+
+class OperatorCommandStopped(Exception):
+    """A command that an error stopped part-way through its writes, so some of
+    them happened. run_operator_command prints the message on stderr and exits
+    with status 2, which a caller can tell from a refusal that changed nothing."""
 
 
 class Person(BaseModel):
@@ -150,13 +159,17 @@ def _logs_to_stderr() -> None:
 
 def run_operator_command(command: Callable[[], str]) -> int:
     """Run one command: print what it returns on stdout and return 0, or
-    print an OperatorCommandError on stderr and return 1."""
+    print an OperatorCommandError on stderr and return 1, or an
+    OperatorCommandStopped on stderr and return 2."""
     _logs_to_stderr()
     try:
         output = command()
     except OperatorCommandError as error:
         print(f"error: {error}", file=sys.stderr)
         return 1
+    except OperatorCommandStopped as error:
+        print(f"error: {error}", file=sys.stderr)
+        return 2
     sys.stdout.write(output if output.endswith("\n") else output + "\n")
     return 0
 

@@ -12,12 +12,15 @@ from cowork.deployment_identity import identity_for_turn
 from cowork.handlers import first_take, response_routing, responses
 from cowork.schemas.responses import ResponsesRequest
 from cowork.server import create_app
+from _self_hosted import enable_self_hosted
 
 
 PRODUCT = "Acme & Co's $workbench"
-# Exact prompts at staging 8b1ecf4, before deployment identity support. These
+# Exact unbranded prompts: the gate's since it delegates write, approval and
+# reply-to-a-question turns and anything about an open doc, the take's since
+# staging 8b1ecf4. These
 # compatibility assertions exercise provider requests, not just the constants.
-DEFAULT_GATE_SHA256 = "e77c722af7fd7011d9ffc717120760c7cb369b6612bd533addb2b90628b66f6d"
+DEFAULT_GATE_SHA256 = "b343d70dd550bc75c26370aa840cec7b8e0b615396efacb5dfa6c947d2b41e85"
 DEFAULT_TAKE_SHA256 = "423cf10dd88589f84adadb158b7851a89cfd32da4bad967c473062f07a51427a"
 
 
@@ -26,8 +29,6 @@ def isolated_identity(monkeypatch):
     for name in ("COWORK_DEPLOYMENT_KIND", "COWORK_DEPLOYMENT_BRAND_FILE"):
         monkeypatch.delenv(name, raising=False)
     get_app_settings.cache_clear()
-    # The shadow probe is unrelated to the user-visible gate response.
-    monkeypatch.setattr(responses, "_spawn_jev_shadow_probe", lambda *args, **kwargs: None)
     yield
     get_app_settings.cache_clear()
 
@@ -36,7 +37,7 @@ def _initialize(monkeypatch, tmp_path, *, branded: bool, name: str = PRODUCT):
     if branded:
         pack = tmp_path / "pack.json"
         pack.write_text(json.dumps({"name": name}), encoding="utf-8")
-        monkeypatch.setenv("COWORK_DEPLOYMENT_KIND", "self-hosted")
+        enable_self_hosted(monkeypatch)
         monkeypatch.setenv("COWORK_DEPLOYMENT_BRAND_FILE", str(pack))
         get_app_settings.cache_clear()
     else:
@@ -136,7 +137,7 @@ async def test_real_routing_starts_a_first_take_with_the_same_startup_identity(
     decision, _ = await handler._route_request(
         conversation_id=None,
         gate_rows=[],
-        harness_input=[{"type": "text", "text": "How do I update this installation?"}],
+        harness_input=[{"type": "text", "text": "How do I install this on another computer?"}],
         has_attachments=False,
         has_disabled_connections=False,
         first_take=True,

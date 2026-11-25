@@ -411,7 +411,7 @@ async def test_first_take_and_gate_build_one_provider_per_request(monkeypatch):
         providers.append(provider)
         return SimpleNamespace(router_provider=provider)
 
-    async def gate(binding, *, history):
+    async def gate(binding, *, history, **_kwargs):
         gated.append(binding)
         await _settle()
         return None
@@ -464,18 +464,24 @@ async def test_no_gate_model_is_resolved_once_for_take_and_gate(monkeypatch):
 async def test_skipped_gate_and_disabled_take_do_not_resolve_a_provider(monkeypatch, requested, enabled):
     from unittest.mock import Mock
 
+    from uuid import uuid4
+
     import cowork.handlers.response_routing as routing
     import cowork.handlers.responses as responses
+    from cowork.models.message import Message
+    from cowork.models.message_event import MessageEvent  # noqa: F401 — resolves the ORM relationship
+    from cowork.schemas.responses import Role
 
     resolve = Mock(side_effect=AssertionError("no provider is needed"))
     monkeypatch.setattr(routing, "_settings_binding", resolve)
     monkeypatch.setattr(responses, "_settings_binding", resolve)
     monkeypatch.setattr(responses, "_first_take_enabled", lambda: enabled)
-    monkeypatch.setattr(responses, "scrubbed_openai_dump", lambda row: row)
     handler = _handler()
     decision, _ = await handler._route_request(
         conversation_id=None,
-        gate_rows=[{"role": "assistant", "content": [{"type": "tool_use", "name": "scratchpad"}]}],
+        gate_rows=[Message(conversation_id=uuid4(), role=Role.assistant, content=[
+            {"type": "tool_use", "id": "t1", "name": "scratchpad", "input": {}},
+        ])],
         harness_input=[{"type": "text", "text": "summarize that"}],
         has_attachments=False, has_disabled_connections=False, first_take=requested,
     )
@@ -650,7 +656,7 @@ async def test_route_request_hands_the_gates_binding_over(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_a_routing_error_cancels_the_take(monkeypatch):
+async def test_a_routing_error_cancels_the_take(monkeypatch, tmp_path):
     from types import SimpleNamespace
     from uuid import uuid4
 
@@ -664,8 +670,9 @@ async def test_a_routing_error_cancels_the_take(monkeypatch):
         responses,
         "ConversationService",
         lambda scoped: SimpleNamespace(
-            get_conversation=lambda _cid: SimpleNamespace(id=conv_id),
+            get_conversation=lambda _cid: SimpleNamespace(id=conv_id, project=SimpleNamespace(path=str(tmp_path))),
             message_count=lambda _conversation: 0,
+            record_turn_picks=lambda **_picks: None,
             get_recent_messages=lambda *_args, **_kwargs: [],
         ),
     )
@@ -711,7 +718,7 @@ async def test_anton_speaking_does_not_clear_it_the_turns_end_does():
 
     take = _take(_Provider(["Pulling your sales now."])).start()
 
-    async def formatter(stream, model, event_sink):
+    async def formatter(stream, model, event_sink, **_kwargs):
         yield "event: response.created\ndata: {}\n\n"
         await asyncio.sleep(0.05)  # Anton's first model call, still silent
         yield 'event: response.in_progress\ndata: {"thought_role": "thought.progress"}\n\n'

@@ -19,6 +19,7 @@ from cowork.db.personal_resources import ALL_PERSONAL_RESOURCES, PersonalResourc
 from cowork.db.scoped import LOCAL_SCOPE, TenantScope
 from cowork.deployment_identity import identity_for_turn
 from tests._turns import built_turn
+from _self_hosted import enable_self_hosted
 
 PRODUCT = "Example Workbench"
 SUB = "9a8b7c6d-5e4f-4a3b-8c2d-1e0f9a8b7c6d"
@@ -37,7 +38,7 @@ def isolated_identity(monkeypatch, tmp_path):
 
 
 def _enable(monkeypatch, path: Path | None) -> None:
-    monkeypatch.setenv("COWORK_DEPLOYMENT_KIND", "self-hosted")
+    enable_self_hosted(monkeypatch)
     if path is not None:
         monkeypatch.setenv("COWORK_DEPLOYMENT_BRAND_FILE", str(path))
     get_app_settings.cache_clear()
@@ -104,8 +105,8 @@ def test_startup_freezes_the_validated_pack_name(monkeypatch, tmp_path, name):
 
 @pytest.mark.parametrize("encoding", ["utf-8-sig", "utf-16", "utf-32"])
 def test_startup_accepts_the_pack_loaders_json_encodings(monkeypatch, tmp_path, encoding):
-    # cowork-self-hosted scripts/branding.py:read_pack_json passes bytes to
-    # json.loads, which accepts a BOM and detects UTF-16/32 as well as UTF-8.
+    # A self-hosted deployment's pack loader passes bytes to json.loads,
+    # which accepts a BOM and detects UTF-16/32 as well as UTF-8.
     pack = tmp_path / "pack.json"
     pack.write_bytes(json.dumps({"name": PRODUCT}).encode(encoding))
     _enable(monkeypatch, pack)
@@ -341,3 +342,20 @@ async def test_self_hosted_publish_tool_names_neither_the_desktop_app_nor_mindsh
     for text in (publish.description, publish.prompt, answer):
         assert "desktop" not in text
         assert "MindsHub" not in text
+
+
+async def test_self_hosted_publish_tool_says_full_stack_apps_cant_be_published(monkeypatch, tmp_path):
+    """The stack's own publisher refuses every full-stack artifact
+    (`publish.FULLSTACK_PUBLISH_UNSUPPORTED`), live apps on or off, so the
+    agent reads it in the tool before it builds one, not when the share fails.
+    Default hosts keep their text (test_harness_publish_access's digests)."""
+    from cowork.harnesses.anton_harness import tools
+
+    _enable(monkeypatch, _pack(tmp_path))
+    cowork_server.create_app()
+
+    description = tools.build_cowork_publish_tool().description
+    assert description.endswith(
+        "Full-stack apps (a backend with its frontend) can't be published from this "
+        "deployment: publish an HTML page or a Markdown document."
+    )

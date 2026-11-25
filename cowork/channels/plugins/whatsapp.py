@@ -7,7 +7,6 @@ import logging
 import mimetypes
 from collections.abc import Mapping
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import httpx
@@ -20,6 +19,7 @@ from cowork.channels.plugin import (
     CredentialSchema,
     WebhookRoute,
 )
+from cowork.channels.sharing import mark_shared
 from cowork.channels.text import split_for_limit
 from cowork.channels.webhooks import SignatureError, WebhookHandshake
 
@@ -59,6 +59,10 @@ def extract_media(msg: dict) -> tuple[str, list[Attachment]]:
 
 
 class WhatsAppBridge:
+    # The largest file send_attachment takes. A channel turn skips a larger
+    # artifact before it reads the file (AntonChannelRuntime.send_turn_artifacts).
+    max_attachment_bytes = WHATSAPP_MAX_UPLOAD_BYTES
+
     def __init__(self, credentials: Mapping[str, str]) -> None:
         self._secrets = dict(credentials)
         self._setup: ChannelSetup | None = None
@@ -160,23 +164,24 @@ class WhatsAppBridge:
             ),
         )
         event._dedupe_key = f"whatsapp:{message_id}"  # type: ignore[attr-defined]
+        mark_shared(event, False)
         return event
 
-    async def send_attachment(self, *, address: PlatformAddress, path: str, filename: str | None = None) -> str:
-        """Upload to the Graph media endpoint, then send as a document message."""
+    async def send_attachment(self, *, address: PlatformAddress, data: bytes, filename: str) -> str:
+        """Upload ``data`` to the Graph media endpoint, then send it as a
+        document message named ``filename``."""
         phone_number_id = (self._secrets.get("phone_number_id") or "").strip()
         access_token = (self._secrets.get("access_token") or "").strip()
         if not phone_number_id or not access_token:
             raise RuntimeError("whatsapp phone_number_id/access_token not configured")
         recipient = address.platform_id
         self.require_care_window(recipient)
-        source = Path(path)
-        if source.stat().st_size > WHATSAPP_MAX_UPLOAD_BYTES:
+        if len(data) > WHATSAPP_MAX_UPLOAD_BYTES:
             raise RuntimeError("whatsapp attachment exceeds the upload size cap")
-        name = (filename or source.name).strip() or "file"
+        name = filename.strip() or "file"
         mime = mimetypes.guess_type(name)[0] or "application/octet-stream"
 
-        media_id = await self.upload_media(access_token, phone_number_id, name, mime, source.read_bytes())
+        media_id = await self.upload_media(access_token, phone_number_id, name, mime, data)
         if not media_id:
             raise ConnectionError("whatsapp media upload failed")
         result = await self.send_media_message(access_token, phone_number_id, recipient, media_id, name)

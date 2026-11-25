@@ -6,6 +6,7 @@ import sys
 from pathlib import Path
 
 from cowork.db.scoped import LOCAL_SCOPE
+from cowork.services.artifact_metadata import ArtifactMetadata
 from cowork.services.artifacts import _content_mtime, _user_files_with_mtimes
 
 
@@ -105,7 +106,7 @@ def test_prepare_artifact_card_walks_folder_once(tmp_path: Path, monkeypatch):
         tmp_path,
         0,
         artifact_id=artifact_id,
-        meta=meta,
+        meta=ArtifactMetadata.model_validate(meta),
         published_map={},
         project_id=None,
         project_name="proj",
@@ -147,12 +148,10 @@ def _patch_scan(container: Path):
 
 
 def _patch_publish_scan(container: Path):
-    """publish.py binds `_artifact_dirs_for_scope` at import, so patching only
-    the artifacts module leaves its own reference pointing at the real projects
-    root, which `desktop_publish_context` then scans and finds nothing in."""
-    return patch.object(
-        publish_mod, "_artifact_dirs_for_scope", lambda *, scope, session=None: [container]
-    )
+    """publish.py binds `_scan_artifact_dirs` at import, so patching only the
+    artifacts module leaves its own reference pointing at the real projects
+    root — which `desktop_publish_context` then scans and finds nothing in."""
+    return patch.object(publish_mod, "_scan_artifact_dirs", lambda *, scope: [container])
 
 
 def _publish(root: Path, container: Path, **kw):
@@ -246,14 +245,14 @@ def _publish_static(tmp_path: Path) -> Path:
 def test_modified_false_when_unchanged(tmp_path: Path):
     root = _publish_static(tmp_path)
     with _patch_scan(tmp_path):
-        card = card_for_folder(root, scope=LOCAL_SCOPE)
+        card = card_for_folder(root, scope=LOCAL_SCOPE).to_json()
     assert card["modified"] is False
 
 
 def test_modified_false_for_unpublished(tmp_path: Path):
     root = _make_static_html(tmp_path)  # never published
     with _patch_scan(tmp_path):
-        card = card_for_folder(root, scope=LOCAL_SCOPE)
+        card = card_for_folder(root, scope=LOCAL_SCOPE).to_json()
     assert card["modified"] is False
 
 
@@ -264,7 +263,7 @@ def test_modified_true_after_content_change(tmp_path: Path):
     idx.write_text("<h1>CHANGED</h1>", encoding="utf-8")
     _touch(idx, publish_mod._content_mtime(root) + 100)
     with _patch_scan(tmp_path):
-        card = card_for_folder(root, scope=LOCAL_SCOPE)
+        card = card_for_folder(root, scope=LOCAL_SCOPE).to_json()
     assert card["modified"] is True
 
 
@@ -276,7 +275,7 @@ def test_touch_without_change_self_heals(tmp_path: Path):
     idx = root / "index.html"
     _touch(idx, old + 100)
     with _patch_scan(tmp_path):
-        card = card_for_folder(root, scope=LOCAL_SCOPE)
+        card = card_for_folder(root, scope=LOCAL_SCOPE).to_json()
     assert card["modified"] is False
     # Self-heal: published_mtime advanced so the next listing hits the cheap gate.
     healed = json.loads(pub.read_text(encoding="utf-8"))["index.html"]["published_mtime"]
@@ -359,7 +358,10 @@ def test_update_preserves_password_access(tmp_path: Path):
     assert entry["access_password"] == "s3cret"
 
 
-def test_update_refreshes_mtime_when_publish_does_not_rewrite_state(tmp_path: Path):
+def test_update_leaves_the_state_write_to_publish(tmp_path: Path):
+    # publish_artifact saves the entry, published_mtime included, under its
+    # folder lock. A second write after it returns would save a map read
+    # outside that lock, so update leaves .published.json as publish left it.
     root = _make_static_html(tmp_path)
     published_json = root / ".published.json"
     published_json.write_text(
@@ -370,6 +372,7 @@ def test_update_refreshes_mtime_when_publish_does_not_rewrite_state(tmp_path: Pa
         }}),
         encoding="utf-8",
     )
+    before = published_json.read_bytes()
 
     with ExitStack() as stack:
         stack.enter_context(_patch_scan(tmp_path))
@@ -380,10 +383,10 @@ def test_update_refreshes_mtime_when_publish_does_not_rewrite_state(tmp_path: Pa
         stack.enter_context(patch.object(
             publish_mod, "publish_artifact", lambda *args, **kwargs: {"status": "ok"}
         ))
-        publish_mod.update_artifact(str(root), scope=LOCAL_SCOPE)
+        out = publish_mod.update_artifact(str(root), scope=LOCAL_SCOPE)
 
-    entry = json.loads(published_json.read_text(encoding="utf-8"))["index.html"]
-    assert entry["published_mtime"] == publish_mod._content_mtime(root)
+    assert out == {"status": "ok"}
+    assert published_json.read_bytes() == before
 
 
 def test_update_unpublished_raises(tmp_path: Path):
@@ -410,9 +413,10 @@ def test_update_endpoint_delegates(tmp_path: Path):
 
     captured = {}
 
-    def _fake_update(path, *, scope, session=None):
+    def _fake_update(path, *, scope, approved_datasources=None):
         captured["path"] = path
         captured["scope"] = scope
+        captured["approved_datasources"] = approved_datasources
         return {"status": "ok", "url": "https://4nton.ai/a/uuid-1"}
 
     with patch.object(publish_ep, "_update", _fake_update):
@@ -422,6 +426,7 @@ def test_update_endpoint_delegates(tmp_path: Path):
     assert captured["path"] == "/some/art"
     # The request's own scope, which resolves the path; no person here.
     assert captured["scope"] == LOCAL_SCOPE
+    assert captured["approved_datasources"] is None
 
 
 def test_update_endpoint_404_when_not_published(tmp_path: Path):
@@ -433,7 +438,7 @@ def test_update_endpoint_404_when_not_published(tmp_path: Path):
     app.include_router(publish_ep.router, prefix="/api/v1/publish")
     client = TestClient(app)
 
-    def _raise(path, *, scope, session=None):
+    def _raise(path, *, scope, approved_datasources=None):
         raise FileNotFoundError("No published version to update")
 
     with patch.object(publish_ep, "_update", _raise):
@@ -445,7 +450,12 @@ def test_update_endpoint_404_when_not_published(tmp_path: Path):
 # Task 6: artifact_status — the preview viewer's live in-place refresh (ENG-468)
 # ---------------------------------------------------------------------------
 
-from cowork.services.artifacts import artifact_status
+from cowork.services.artifacts import artifact_status as _artifact_status
+
+
+def artifact_status(raw_path: str, *, scope) -> dict:
+    """The service's status as the wire carries it, under the app's names."""
+    return _artifact_status(raw_path, scope=scope).model_dump(by_alias=True, mode="json")
 
 
 def test_artifact_status_unpublished(tmp_path: Path):
@@ -484,6 +494,24 @@ def test_artifact_status_unknown_path_is_blank(tmp_path: Path):
     assert s["publishedUrl"] == ""
     assert s["modified"] is False
     assert s["accessMode"] == "public"
+
+
+def test_artifact_status_leaves_an_audience_the_card_does_not_know_null(tmp_path: Path, monkeypatch):
+    """In MindsHub mode a restricted artifact's card doesn't know who it is
+    shared with and answers null, so its status answers null too, never a
+    false that would say the artifact is shared with nobody."""
+    from cowork.services import artifacts
+
+    root = _make_static_html(tmp_path)
+    (root / ".published.json").write_text(json.dumps({"index.html": {
+        "report_id": "rid", "url": "https://4nton.ai/a/rid", "published": True,
+        "mode": "restricted", "emails": [], "org_allowed": False, "owner_only": True,
+    }}), encoding="utf-8")
+    monkeypatch.setattr(artifacts, "_org_mode", lambda: True)
+    with _patch_scan(tmp_path):
+        s = artifact_status(str(root), scope=LOCAL_SCOPE)
+    assert (s["accessMode"], s["orgAllowed"], s["ownerOnly"]) == ("restricted", None, None)
+    assert "accessPassword" not in s
 
 
 def test_artifact_status_loose_file_never_leaks_password(tmp_path: Path):
@@ -589,7 +617,7 @@ def test_fullstack_modified_false_when_only_backend_log_changes(tmp_path: Path):
     log.write_text("server started\n", encoding="utf-8")
     _touch(log, publish_mod._content_mtime(root) + 10_000)
     with _patch_scan(tmp_path):
-        card = card_for_folder(root, scope=LOCAL_SCOPE)
+        card = card_for_folder(root, scope=LOCAL_SCOPE).to_json()
     assert card["modified"] is False
 
 
@@ -653,7 +681,7 @@ def test_fullstack_modified_true_after_real_change(tmp_path: Path):
     idx.write_text("<h1>CHANGED</h1>", encoding="utf-8")
     _touch(idx, publish_mod._content_mtime(root) + 100)
     with _patch_scan(tmp_path):
-        card = card_for_folder(root, scope=LOCAL_SCOPE)
+        card = card_for_folder(root, scope=LOCAL_SCOPE).to_json()
     assert card["modified"] is True
 
 
@@ -666,7 +694,100 @@ def test_fullstack_binary_touch_self_heals(tmp_path: Path):
     png = root / "static" / "logo.png"
     _touch(png, old + 100)  # bump past the gate, identical bytes
     with _patch_scan(tmp_path):
-        card = card_for_folder(root, scope=LOCAL_SCOPE)
+        card = card_for_folder(root, scope=LOCAL_SCOPE).to_json()
     assert card["modified"] is False
     healed = json.loads(pub.read_text(encoding="utf-8"))["index.html"]["published_mtime"]
     assert healed >= old + 100
+
+
+# ---------------------------------------------------------------------------
+# The card names the live page's report id, for the client's sharing analytics
+# ---------------------------------------------------------------------------
+
+def _record(root: Path, **entry) -> None:
+    (root / ".published.json").write_text(json.dumps({"index.html": {
+        "report_id": "rid-1", "url": "https://4nton.ai/view/u/rid-1", "published": True, **entry,
+    }}), encoding="utf-8")
+
+
+def test_card_names_the_live_pages_report_id(tmp_path: Path):
+    root = _make_static_html(tmp_path)
+    _record(root)
+    with _patch_scan(tmp_path):
+        card = card_for_folder(root, scope=LOCAL_SCOPE).to_json()
+    assert card["reportId"] == "rid-1"
+    assert card["publishedUrl"] == "https://4nton.ai/view/u/rid-1"
+
+
+def test_card_names_no_report_id_without_a_live_page(tmp_path: Path):
+    root = _make_static_html(tmp_path)
+    with _patch_scan(tmp_path):
+        assert card_for_folder(root, scope=LOCAL_SCOPE).to_json()["reportId"] == ""
+    # A soft-deleted record keeps its report_id for a later re-publish; the
+    # page is down, so the card names none.
+    _record(root, published=False)
+    with _patch_scan(tmp_path):
+        assert card_for_folder(root, scope=LOCAL_SCOPE).to_json()["reportId"] == ""
+
+
+def test_status_names_the_live_pages_report_id(tmp_path: Path):
+    """The viewer's on-open status read carries the id, so an artifact opened
+    from a chat message, whose card is built from the stream, learns it."""
+    root = _make_static_html(tmp_path)
+    _record(root)
+    with _patch_scan(tmp_path):
+        assert artifact_status(str(root), scope=LOCAL_SCOPE)["reportId"] == "rid-1"
+    _record(root, published=False)
+    with _patch_scan(tmp_path):
+        assert artifact_status(str(root), scope=LOCAL_SCOPE)["reportId"] == ""
+
+
+def test_loose_file_status_names_the_live_pages_report_id(tmp_path: Path):
+    f = tmp_path / "page.html"
+    f.write_text("<h1>hi</h1>", encoding="utf-8")
+    (tmp_path / ".published.json").write_text(json.dumps({"page.html": {
+        "report_id": "rid-loose", "url": "https://4nton.ai/view/u/rid-loose", "published": True,
+    }}), encoding="utf-8")
+    with _patch_scan(tmp_path):
+        assert artifact_status(str(f), scope=LOCAL_SCOPE)["reportId"] == "rid-loose"
+
+
+def test_access_view_names_the_live_pages_report_id_in_every_mode(tmp_path: Path, monkeypatch):
+    """GET .../access (MindsHub mode's on-open read) is built from this view,
+    restricted to MindsHub's rule when there is one; every branch keeps the id."""
+    from cowork.services.artifact_access import ArtifactRule
+    from cowork.services import artifacts
+    from cowork.services.artifacts import published_access_view
+
+    root = _make_static_html(tmp_path)
+    primary = root / "index.html"
+    for mode in ({}, {"mode": "password", "access_password": "x"}, {"mode": "restricted", "emails": []}):
+        _record(root, **mode)
+        assert published_access_view(root, primary).report_id == "rid-1"
+    monkeypatch.setattr(artifacts, "_org_mode", lambda: True)
+    unknown = published_access_view(root, primary)
+    assert unknown.report_id == "rid-1"
+    rule = ArtifactRule(org_allowed=True, allowed_team_ids=[], allowed_user_ids=[], allowed_emails=[])
+    assert unknown.restricted_to(rule).model_dump(by_alias=True)["reportId"] == "rid-1"
+
+
+def test_card_names_no_report_id_for_a_record_without_a_live_link(tmp_path: Path):
+    """The card reads the id through the access fields; a record that keeps
+    its report_id but has no URL names no page."""
+    root = _make_static_html(tmp_path)
+    _record(root, url="")
+    with _patch_scan(tmp_path):
+        assert card_for_folder(root, scope=LOCAL_SCOPE).to_json()["reportId"] == ""
+
+
+def test_publish_answer_names_its_page_only_under_result(tmp_path: Path):
+    """The app reads a publish's page id from ``result``. A top-level
+    ``reportId`` would change what the viewer's ``artifact_published`` sends as
+    its ``artifact_id`` (it reads ``r.report_id || r.reportId`` first), so the
+    event's history would stop being comparable."""
+    root = _make_static_html(tmp_path)
+    with _patched_publish(tmp_path, report_id="rid-top"):
+        answer = _publish(root, tmp_path)
+    assert answer["result"]["report_id"] == "rid-top"
+    assert "reportId" not in answer
+    assert "report_id" not in answer

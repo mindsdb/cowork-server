@@ -40,7 +40,7 @@ from cowork.code_sandbox import NO_CODE_MODE_DETAIL, PlantedLinkError, build_cel
 from cowork.common.paths import makedirs_below_nofollow
 from cowork.common.settings.app_settings import get_app_settings
 from cowork.common.settings.user_settings import current_settings_scope
-from cowork.db.personal_resources import ALL_PERSONAL_RESOURCES, PersonalResource
+from cowork.db.personal_resources import ALL_PERSONAL_RESOURCES, STORE_RESOURCE, PersonalResource
 from cowork.db.scoped import LOCAL_SCOPE, MissingTenantScopeError, TenantScope
 from cowork.harnesses.anton_harness import harness
 from cowork.principal import personal_partition_id
@@ -283,13 +283,22 @@ def _sandbox_warnings(caplog) -> list[str]:
 
 
 def test_shared_projects_start_with_a_warning(stack, owned_logger, caplog):
-    stack.setenv("COWORK_PERSONAL_RESOURCES", SHARED_PROJECTS)
+    stack.setenv("COWORK_PERSONAL_RESOURCES", SHARED_PROJECTS.replace("connections,", ""))
     owned_logger("cowork.code_sandbox", level=logging.WARNING)
     get_app_settings.cache_clear()
     cowork_server.create_app()
     (warning,) = _sandbox_warnings(caplog)
     assert "projects are left off COWORK_PERSONAL_RESOURCES" in warning
     assert "venvs and saved cell state" in warning
+
+
+def test_private_connections_with_shared_project_execution_refuse_before_kernel_probe(stack):
+    stack.setenv("COWORK_PERSONAL_RESOURCES", SHARED_PROJECTS)
+    stack.setattr(code_sandbox, "_probe_abi", _never)
+    message = _refusal()
+    assert "private connections require personal projects" in message
+    assert "COWORK_PERSONAL_RESOURCES" in message
+    assert "venvs and saved cell state" in message
 
 
 def test_personal_projects_start_without_the_warning(stack, owned_logger, caplog):
@@ -332,6 +341,47 @@ def test_a_link_at_one_of_cowork_homes_own_entries_is_refused(stack, tmp_path, n
     assert list(where_it_leads.iterdir()) == []
 
 
+@pytest.mark.parametrize("store", [None, *STORE_RESOURCE], ids=["partition", *STORE_RESOURCE])
+def test_a_link_at_a_persons_partition_or_store_is_refused(stack, tmp_path, store):
+    """Agent code before the sandbox could swap B's partition folder, or one
+    of its stores, for a link to A's, and the server would read and write A's
+    projects, memory and connections as B's."""
+    home = tmp_path / "home"
+    if store is None:
+        alices, bobs = _project(home, PARTITION_A), home / PARTITION_B
+    else:
+        alices, bobs = _project(home, PARTITION_A, store), _project(home, PARTITION_B) / store
+    _plant_link(bobs, alices)
+    message = _refusal()
+    assert message.startswith(f"COWORK_CODE_SANDBOX=landlock: {bobs} is a link")
+    assert "remove the link and put the real folder back" in message
+    assert list(alices.iterdir()) == []
+
+
+def test_real_partitions_and_stores_start(stack, tmp_path):
+    home = tmp_path / "home"
+    for partition in (PARTITION_A, PARTITION_B):
+        for store in STORE_RESOURCE:
+            _project(home, partition, store)
+    # A link that names no partition is left to the other checks.
+    _plant_link(home / "not-a-partition", _project(tmp_path, "elsewhere"))
+    cowork_server.create_app()
+
+
+@pytest.mark.skipif(os.name == "nt" or os.geteuid() == 0, reason="root reads any folder")
+def test_a_partition_the_server_cant_read_is_refused_by_name(stack, tmp_path):
+    """The server can't tell whether a store in an unreadable partition is a
+    link, so it refuses to start and names the folder."""
+    bobs = _project(tmp_path / "home", PARTITION_B, "projects").parent
+    bobs.chmod(0)
+    try:
+        message = _refusal()
+    finally:
+        bobs.chmod(0o755)
+    assert message.startswith(f"COWORK_CODE_SANDBOX=landlock: the server can't check whether {bobs / 'projects'}")
+    assert "Give the server's user access to it" in message
+
+
 def test_cowork_homes_own_entries_start_as_real_files_and_folders(stack, tmp_path):
     home = tmp_path / "home"
     for name in ("streams", "tmp", "shared"):
@@ -361,8 +411,49 @@ def test_identity_headers_never_copy_the_token(stack, tmp_path):
 def test_identity_headers_need_the_token_in_the_environment(stack):
     stack.setenv("COWORK_AUTH_TOKEN", "")
     assert _refusal().startswith(
-        "COWORK_TRUST_IDENTITY_HEADERS needs COWORK_AUTH_TOKEN in the server's environment"
+        "COWORK_TRUST_IDENTITY_HEADERS needs COWORK_AUTH_TOKEN or COWORK_AUTH_TOKEN_FILE "
+        "in the server's environment"
     )
+
+
+def test_identity_headers_take_the_token_from_its_file(stack, tmp_path):
+    token_file = tmp_path / "run" / "COWORK_AUTH_TOKEN"
+    token_file.parent.mkdir()
+    token_file.write_text("token-from-the-file\n", encoding="utf-8")
+    stack.delenv("COWORK_AUTH_TOKEN")
+    stack.setenv("COWORK_AUTH_TOKEN_FILE", str(token_file))
+    get_app_settings.cache_clear()
+
+    app = cowork_server.create_app()
+
+    bearer = [m for m in app.user_middleware if m.cls is cowork_server.BearerTokenMiddleware]
+    assert [m.kwargs["token"] for m in bearer] == ["token-from-the-file"]
+    env = tmp_path / "home" / ".env"
+    assert not env.exists() or "token-from-the-file" not in env.read_text(encoding="utf-8")
+
+
+def test_a_token_from_its_file_gets_no_copy_with_identity_headers_off(stack, tmp_path):
+    """A token the file COWORK_AUTH_TOKEN_FILE names stays off the disk with
+    identity headers off too: no copy goes in cowork-home's .env, and a copy
+    an earlier start wrote there is removed."""
+    token_file = tmp_path / "run" / "COWORK_AUTH_TOKEN"
+    token_file.parent.mkdir()
+    token_file.write_text("token-from-the-file\n", encoding="utf-8")
+    env = tmp_path / "home" / ".env"
+    env.parent.mkdir(parents=True)
+    env.write_text("A=1\nCOWORK_AUTH_TOKEN=an-earlier-copy\n", encoding="utf-8")
+    stack.setenv("COWORK_TRUST_IDENTITY_HEADERS", "false")
+    stack.setenv("COWORK_AUTH_TOKEN", "")
+    stack.setenv("COWORK_AUTH_TOKEN_FILE", str(token_file))
+    get_app_settings.cache_clear()
+
+    app = cowork_server.create_app()
+
+    bearer = [m for m in app.user_middleware if m.cls is cowork_server.BearerTokenMiddleware]
+    assert [m.kwargs["token"] for m in bearer] == ["token-from-the-file"]
+    left = env.read_text(encoding="utf-8")
+    assert "COWORK_AUTH_TOKEN" not in left
+    assert "A=1" in left
 
 
 def test_identity_headers_never_take_the_token_from_cowork_homes_env(stack, tmp_path):
@@ -380,7 +471,8 @@ def test_identity_headers_never_take_the_token_from_cowork_homes_env(stack, tmp_
     get_app_settings.cache_clear()
     assert get_app_settings().auth_token == "only-in-the-file"
     assert _refusal().startswith(
-        "COWORK_TRUST_IDENTITY_HEADERS needs COWORK_AUTH_TOKEN in the server's environment"
+        "COWORK_TRUST_IDENTITY_HEADERS needs COWORK_AUTH_TOKEN or COWORK_AUTH_TOKEN_FILE "
+        "in the server's environment"
     )
 
 
@@ -1103,6 +1195,7 @@ async def test_a_turn_off_passes_what_it_passed_before(monkeypatch, tmp_path):
     assert off_keys - set(calls[-1]) == set()
     assert BACKEND_SENTENCE in off_suffix
     assert "datasets, fullstack apps, etc." in off_suffix
+    assert "runtime-local address" not in off_suffix
     assert BACKEND_SENTENCE not in on_suffix
     assert harness._SANDBOXED_BACKENDS_RULE in on_suffix
     assert "fullstack apps" not in on_suffix
@@ -1554,7 +1647,7 @@ def test_a_backend_pad_without_the_policy_is_refused_under_the_sandbox(landlock_
     monkeypatch.setattr(_RecordingRuntime, "calls", [])
     monkeypatch.setattr("anton.core.backends.local.LocalScratchpadRuntime", _RecordingRuntime)
     monkeypatch.setattr(scratchpad_runtime, "_pads", {})
-    monkeypatch.setattr(scratchpad_runtime, "_resolve_coding", lambda **coding: tuple(coding.values()))
+    monkeypatch.setattr(scratchpad_runtime, "_resolve_coding", lambda settings=None, **coding: tuple(coding.values()))
     refusal = "a backend pool's scratchpad was built without a code-sandbox policy"
 
     with pytest.raises(RuntimeError, match=refusal):
@@ -1617,9 +1710,7 @@ async def test_a_sandboxed_backend_preview_mints_no_token(landlock_alone, monkey
     from cowork.services import artifacts
 
     folder = _backend_artifact(tmp_path, port=26866)
-    monkeypatch.setattr(
-        artifacts, "_artifact_root_for", lambda path, *, scope, session=None: folder
-    )
+    monkeypatch.setattr(artifacts, "_artifact_root_for", lambda path, *, scope: folder)
     monkeypatch.setattr(artifacts, "_PREVIEW_MOUNTS", {})
     monkeypatch.setattr(artifacts, "_ensure_backend_running", _never)
 
@@ -1725,7 +1816,7 @@ async def test_the_pool_hands_its_policy_to_each_pad(monkeypatch, tmp_path):
     monkeypatch.setattr(_RecordingRuntime, "calls", [])
     monkeypatch.setattr("anton.core.backends.local.LocalScratchpadRuntime", _RecordingRuntime)
     monkeypatch.setattr(scratchpad_runtime, "_pads", {})
-    monkeypatch.setattr(scratchpad_runtime, "_resolve_coding", lambda **coding: tuple(coding.values()))
+    monkeypatch.setattr(scratchpad_runtime, "_resolve_coding", lambda settings=None, **coding: tuple(coding.values()))
     pool = scratchpad_runtime.WorkspaceScopedPool(str(tmp_path), cell_sandbox=policy)
 
     await pool.get_or_create("app")
@@ -1745,7 +1836,7 @@ def test_a_pad_is_never_handed_to_a_caller_under_another_policy(monkeypatch, tmp
     monkeypatch.setattr(_RecordingRuntime, "calls", [])
     monkeypatch.setattr("anton.core.backends.local.LocalScratchpadRuntime", _RecordingRuntime)
     monkeypatch.setattr(scratchpad_runtime, "_pads", {})
-    monkeypatch.setattr(scratchpad_runtime, "_resolve_coding", lambda **coding: tuple(coding.values()))
+    monkeypatch.setattr(scratchpad_runtime, "_resolve_coding", lambda settings=None, **coding: tuple(coding.values()))
     workspace = str(tmp_path)
 
     pad = scratchpad_runtime.get_or_create("app", workspace_path=workspace, cell_sandbox=alices)

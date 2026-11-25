@@ -28,12 +28,24 @@ EVENT_FIELDS = frozenset(
         "turn_request_id",
         "artifact_slug",
         "artifact_slugs",
+        # The slugs a turn-end artifact record writes rows for
+        # (cowork.db.units.drain_turn_end_records).
+        "touched",
         "sqlstate",
         "provider_error",
         "conversation_id",
         "project_id",
         "schedule_id",
         "turn_id",
+        # The turn whose saved question refused a stale start
+        # (cowork.streaming.registry).
+        "saved_turn_id",
+        # A turn's run, the run holding its conversation's turn claim, and
+        # that run's pod (cowork.streaming.turn_claim).
+        "run_id",
+        "holder_run_id",
+        "holder_pod",
+        "pod",
         "job_id",
         "trace_id",
         "method",
@@ -45,12 +57,55 @@ EVENT_FIELDS = frozenset(
         "attempt",
         "attempts",
         "count",
+        # A heal sweep pass's projects that fell short, and those it listed
+        # again only because an earlier pass fell short
+        # (cowork.services.artifact_heal_sweep.run_heal_sweep).
+        "failed_count",
+        "retried_count",
+        # A turn request's size and the cap it was shed to fit
+        # (cowork.turnqueue.producer._fit_request).
+        "request_bytes",
+        "cap_bytes",
+        # A remote turn reply's number and the last one the relay applied
+        # (cowork.turnqueue.producer.stream_remote_replies).
+        "reply_n",
+        "last_reply_n",
+        "slot",
         "model_alias",
+        "managed_connection_file",
+        # A saved connection that won't open with the key file, named as
+        # engine/name or its record's file name
+        # (cowork.services.connectors.sealed_vault.SealedRecordError).
+        "connection",
+        # A vault folder the no-key start check can't search
+        # (cowork.services.sealing.refuse_sealed_state_without_key_file).
+        "vault_folder",
         "retryable",
+        "statement_fingerprint",
+        # cowork.common.loop_watchdog and the lifespan's step timings.
+        "stack",
+        "in_flight",
+        "limiter",
+        # The key of the file store share a refused request waited for
+        # (cowork.db.units._efs_share_key): a user id, or org:<org id>.
+        "share",
+        "step",
+        "steps",
+        # A turn key mint's purpose and the lifetimes it asked for and got
+        # (cowork.turnqueue.auth_keys._request_turn_key).
+        "purpose",
+        "requested_ttl_seconds",
+        "ttl_seconds",
     ]
 )
 HEALTH_PATHS = frozenset(
-    ["/health", "/api/v1/health", "/api/v1/health/", "/api/v1/health/live"]
+    [
+        "/health",
+        "/api/v1/health",
+        "/api/v1/health/",
+        "/api/v1/health/live",
+        "/api/v1/health/ready",
+    ]
 )
 
 
@@ -165,7 +220,7 @@ def _event_schema(logger, method_name, event_dict):
     for field in EVENT_FIELDS:
         value = event_dict.get(field)
         if (
-            field == "artifact_slugs"
+            field in ("artifact_slugs", "touched")
             and isinstance(value, (list, tuple))
             and all(type(slug) is str for slug in value)
         ):

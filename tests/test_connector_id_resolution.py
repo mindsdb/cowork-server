@@ -21,6 +21,7 @@ from cowork.schemas.connectors import (
     validate_engine_id,
 )
 from cowork.services.connectors.specs._registry import registry
+from tests._connector_test_request import bearer_test_request, with_test_request
 
 _REJECTED_IDS = [
     "fm_ec163d25cf",
@@ -161,6 +162,7 @@ class TestRequestCredentialsTool:
                 "_connector_id": "linkedin",
                 "title": "Finish",
                 "extends_connection": "linkedin-1a2b3c4d",
+                "test_request": bearer_test_request("client_id"),
             },
         )
         assert '"_extends_connection": "linkedin-1a2b3c4d"' in result
@@ -171,7 +173,10 @@ class TestRequestCredentialsTool:
         # which 404s; without the stamp it routes by `engine` instead.
         result = await _cowork_request_credentials(
             session=None,
-            tc_input={"engine": "linked-in", "_connector_id": "linkedin", "title": "Connect"},
+            tc_input=with_test_request({
+                "engine": "linked-in", "_connector_id": "linkedin", "title": "Connect",
+                "fields": [{"name": "token", "label": "Token", "type": "password", "secret": True}],
+            }),
         )
         block = json.loads(result.split("```data-vault-form\n", 1)[1].rsplit("\n```", 1)[0])
         assert "_connector_id" not in block

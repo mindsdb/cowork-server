@@ -17,6 +17,16 @@ producer and its pods are never handed one, so a value set here would be one
 tenant's credential answering for every tenant. The setter refuses in org mode
 rather than trusting the route guard to be the only thing standing there.
 
+The desktop app's own browser is handed over the same way (LocalBrowserHost):
+the app runs it inside its window and serves anton's browser API on loopback
+with a key it makes at each launch, then hands this process the address and
+the key. Both stay in memory, like the credential, and reach anton only as the
+in-process turn's browser config (cowork.services.browser.desktop_browser_config).
+The holder refuses wherever more than one person may share this process: in
+org tenancy, and on a local deployment that trusts identity headers
+(cowork.db.scoped.tenant_scope_required), so one person's browser can never
+answer another person's turn.
+
 Held in a module global with no lock. Uvicorn runs sync endpoints on a thread
 pool, so the write and the reads land on different threads, but rebinding a
 single name is atomic under the GIL and there is no read-modify-write here to
@@ -24,6 +34,8 @@ tear.
 """
 
 from __future__ import annotations
+
+from pydantic import BaseModel, ConfigDict, SecretStr
 
 from cowork.common.settings.app_settings import get_app_settings
 
@@ -59,3 +71,47 @@ def get_minds_credential() -> str | None:
     if _org_mode():
         return None
     return _minds_credential
+
+
+class LocalBrowserHost(BaseModel):
+    """The desktop app's own browser for this launch: where it listens, and
+    the key that opens it. Built only from the checked hand-over body
+    (cowork.api.v1.endpoints.runtime_credential.BrowserHostBody)."""
+
+    model_config = ConfigDict(frozen=True, hide_input_in_errors=True)
+
+    #: ``http://127.0.0.1:<port>``, exactly.
+    url: str
+    token: SecretStr
+
+
+_browser_host: LocalBrowserHost | None = None
+
+
+def _shared_process() -> bool:
+    from cowork.db.scoped import tenant_scope_required
+
+    return tenant_scope_required()
+
+
+def set_browser_host(host: LocalBrowserHost) -> None:
+    """Hold ``host`` as the desktop app's browser for the life of this process.
+    Ignored where more than one person may share this process."""
+    global _browser_host
+    if _shared_process():
+        return
+    _browser_host = host
+
+
+def clear_browser_host() -> None:
+    """Drop the held browser. The app sends a blank hand-over when it quits its browser."""
+    global _browser_host
+    _browser_host = None
+
+
+def get_browser_host() -> LocalBrowserHost | None:
+    """The held browser, or ``None`` when the app has registered none or more
+    than one person may share this process."""
+    if _shared_process():
+        return None
+    return _browser_host

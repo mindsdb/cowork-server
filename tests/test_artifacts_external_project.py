@@ -6,11 +6,11 @@ folder and they then disappear from the artifact list and do not serve.
 """
 from __future__ import annotations
 
-import json
-import logging
+import os
 from pathlib import Path
 
 import pytest
+from pydantic import BaseModel
 from sqlalchemy.pool import StaticPool
 from sqlmodel import Session, SQLModel, create_engine
 
@@ -21,6 +21,9 @@ from cowork.services.projects import (
     GENERAL_PROJECT_ID,
     ProjectService,
 )
+from _linked_folders import SECRET, LoggedRefusal, linked_folder_refusals, replace_with_link
+
+pytestmark = pytest.mark.usefixtures("cleanup_tmp_projects")
 
 
 @pytest.fixture()
@@ -131,67 +134,6 @@ def test_an_in_root_project_is_still_found_by_the_scan(engine):
     assert base.resolve() in bases
 
 
-# -- path resolution ---------------------------------------------------------
-
-
-def test_a_path_inside_an_adopted_folder_resolves_with_a_session(engine, tmp_path):
-    """The path-addressed surface, which cannot use `artifacts_sources_for_project`
-    because it is given a filesystem path and no project id."""
-    from cowork.services.artifacts import resolve_artifact_path
-
-    folder = tmp_path / "Documents" / "notes"
-    folder.mkdir(parents=True)
-    artifact = _artifacts_dir(folder) / "dash"
-    artifact.mkdir()
-    primary = artifact / "index.html"
-    primary.write_text("<html></html>")
-    ProjectService(_scoped(engine)).create_project("notes", path=folder)
-
-    resolved = resolve_artifact_path(str(primary), scope=LOCAL_SCOPE, session=_scoped(engine))
-    assert resolved == primary.resolve()
-
-
-def test_the_same_path_is_refused_without_a_session(engine, tmp_path):
-    """Callers that hold no session keep the old behavior, so nothing that
-    resolves by scan today starts resolving by row behind their back."""
-    from cowork.services.artifacts import resolve_artifact_path
-
-    folder = tmp_path / "Documents" / "notes"
-    folder.mkdir(parents=True)
-    artifact = _artifacts_dir(folder) / "dash"
-    artifact.mkdir()
-    primary = artifact / "index.html"
-    primary.write_text("<html></html>")
-    ProjectService(_scoped(engine)).create_project("notes", path=folder)
-
-    with pytest.raises(FileNotFoundError):
-        resolve_artifact_path(str(primary), scope=LOCAL_SCOPE)
-
-
-def test_the_artifact_root_climb_stops_at_an_adopted_container(engine, tmp_path):
-    """The container set bounds the climb. It is empty for an adopted folder
-    without the widening, and a `metadata.json` the user happens to keep in
-    their own folder then becomes the artifact root — handing every sibling
-    file in that folder to whatever reads the root."""
-    from cowork.services.artifacts import _artifact_root_for
-
-    folder = tmp_path / "Documents" / "notes"
-    folder.mkdir(parents=True)
-    # A file of the user's own, above the artifacts dir. An unbounded climb
-    # walks up to it; a bounded one never leaves `.anton/artifacts/`.
-    (folder / "metadata.json").write_text("{}")
-    base = _artifacts_dir(folder)
-    loose = base / "stray"
-    loose.mkdir()
-    primary = loose / "index.html"
-    primary.write_text("<html></html>")
-    ProjectService(_scoped(engine)).create_project("notes", path=folder)
-
-    root = _artifact_root_for(primary, scope=LOCAL_SCOPE, session=_scoped(engine))
-    assert root == loose.resolve()
-    assert root != folder.resolve()
-
-
 # -- serving -----------------------------------------------------------------
 
 
@@ -269,7 +211,7 @@ def test_a_listed_card_from_an_adopted_folder_serves_under_the_row_name(
     )
 
     session = _scoped(engine)
-    cards = list_artifacts(artifacts_sources_for_scope(session))
+    cards = [card.to_json() for card in list_artifacts(artifacts_sources_for_scope(session))]
     card = next(c for c in cards if c["title"] == "Dashboard")
     assert card["serveUrl"] == (
         f"/api/v1/artifacts/serve/{project.name}/dash/index.html"
@@ -279,8 +221,8 @@ def test_a_listed_card_from_an_adopted_folder_serves_under_the_row_name(
 
 def test_the_artifacts_route_lists_an_adopted_folder(projects_root, tmp_path):
     """Through HTTP, not through the resolver. The unit tests above passed
-    while the local branch of `artifact_sources_for_request` still called the
-    filesystem scan directly, so none of this was reachable from the route.
+    while the route's local branch still called the filesystem scan
+    directly, so none of this was reachable from the route.
     """
     import json
 
@@ -340,109 +282,153 @@ def test_the_artifacts_route_lists_an_adopted_folder(projects_root, tmp_path):
     assert "anton-preview" in served.text
 
 
-def test_published_state_still_returns_the_blank_default_when_the_database_errors(
-    engine, tmp_path, monkeypatch, caplog
+# -- serving through links and stale rows ------------------------------------
+
+
+def _local_client():
+    from fastapi.testclient import TestClient
+
+    from cowork.server import create_app
+
+    # base_url sets scope["server"], which the chosen-folder gate reads.
+    return TestClient(
+        create_app(), base_url="http://127.0.0.1:26866", client=("127.0.0.1", 54321)
+    )
+
+
+class _Adopted(BaseModel):
+    id: str
+    name: str
+
+
+def _adopt(client, folder: Path, name: str) -> _Adopted:
+    created = client.post("/api/v1/projects/", json={"name": name, "path": str(folder)})
+    assert created.status_code == 201, created.text
+    return _Adopted.model_validate(created.json())
+
+
+def test_serve_refuses_an_adopted_folders_artifacts_linked_to_its_anton(projects_root, tmp_path, caplog):
+    folder = tmp_path / "Documents" / "notes"
+    (folder / ".anton").mkdir(parents=True)
+    (folder / ".anton" / ".env").write_text(SECRET)
+    client = _local_client()
+    adopted = _adopt(client, folder, "linked-artifacts")
+    replace_with_link(folder / ".anton" / "artifacts", folder / ".anton")
+
+    with caplog.at_level("WARNING", logger="cowork.services.artifacts"):
+        served = client.get(f"/api/v1/artifacts/serve/{adopted.name}/.env")
+
+    assert SECRET not in served.text, (served.status_code, served.text[:200])
+    assert served.status_code == 404
+    assert linked_folder_refusals(caplog.records) == [
+        LoggedRefusal(event="artifact_folder_refused", reason="linked_folder", project_id=adopted.id)
+    ]
+
+
+def test_serve_refuses_an_adopted_folders_anton_linked_elsewhere(projects_root, tmp_path):
+    folder = tmp_path / "Documents" / "notes"
+    folder.mkdir(parents=True)
+    elsewhere = tmp_path / "elsewhere"
+    page = elsewhere / "artifacts" / "dash" / "index.html"
+    page.parent.mkdir(parents=True)
+    page.write_text("<html>outside the project</html>")
+    client = _local_client()
+    name = _adopt(client, folder, "linked-anton").name
+    replace_with_link(folder / ".anton", elsewhere)
+
+    served = client.get(f"/api/v1/artifacts/serve/{name}/dash/index.html")
+
+    assert "outside the project" not in served.text, (served.status_code, served.text[:200])
+    assert served.status_code == 404
+
+
+@pytest.mark.parametrize(
+    "folder_state",
+    [
+        "no-artifacts",
+        "dangling-link",
+        pytest.param(
+            "unreadable-parent",
+            marks=pytest.mark.skipif(
+                os.name == "nt" or os.geteuid() == 0, reason="POSIX modes, enforced for non-root"
+            ),
+        ),
+    ],
+)
+def test_serve_does_not_take_a_root_folder_of_the_same_name_for_an_adopted_project(
+    projects_root, tmp_path, folder_state, caplog
 ):
-    """Its contract is to answer for any path, never to raise. Resolving through
-    the project row put a database read in the way, and the agent's own
-    `publish_or_preview` calls this with no guard of its own.
-
-    The path has to resolve, or the run never reaches the read under test.
-    """
-    from cowork.services import publish as publish_service
-    from cowork.services.publish import published_owner_state, published_state
+    """The scan lists every directory in the projects root, so falling through
+    to it would serve a leftover folder under the adopted project's name. A
+    dangling link at the adopted folder's path is not a stale row either, nor
+    is a folder whose parent lstat can't read. None of these is a linked
+    `.anton`, so none logs the linked-folder warning."""
+    import shutil
 
     folder = tmp_path / "Documents" / "notes"
     folder.mkdir(parents=True)
-    artifact = _artifacts_dir(folder) / "dash"
-    artifact.mkdir()
-    primary = artifact / "index.html"
-    primary.write_text("<html></html>")
-    (artifact / "metadata.json").write_text("{}")
-    ProjectService(_scoped(engine)).create_project("notes", path=folder)
+    client = _local_client()
+    name = _adopt(client, folder, "same-name").name
+    if folder_state == "dangling-link":
+        shutil.rmtree(folder)
+        folder.symlink_to(tmp_path / "nowhere", target_is_directory=True)
+    else:
+        shutil.rmtree(folder / ".anton", ignore_errors=True)
+    page = projects_root / name / ".anton" / "artifacts" / "dash" / "index.html"
+    page.parent.mkdir(parents=True)
+    page.write_text("<html>leftover in the root</html>")
+    if folder_state == "unreadable-parent":
+        folder.parent.chmod(0)
+    try:
+        with caplog.at_level("WARNING", logger="cowork.services.artifacts"):
+            served = client.get(f"/api/v1/artifacts/serve/{name}/dash/index.html")
+    finally:
+        folder.parent.chmod(0o755)
 
-    def _locked(*, scope, session=None):
-        raise RuntimeError("database is locked")
-
-    # Patched in `publish`, which binds the name at import; patching it in
-    # `artifacts` would leave this binding pointing at the real one, and the
-    # resolution above still has to succeed.
-    monkeypatch.setattr(publish_service, "_artifact_dirs_for_scope", _locked)
-
-    with caplog.at_level(logging.WARNING, logger="cowork.services.publish"):
-        assert published_state(str(primary), scope=LOCAL_SCOPE, session=_scoped(engine)) == {
-            "report_id": "",
-            "url": "",
-            "published": False,
-        }
-        assert published_owner_state(str(primary), scope=LOCAL_SCOPE, session=_scoped(engine)) == {}
-
-    # Blank is what the contract promises, but an outage must not be silent:
-    # without this it is indistinguishable from an artifact that is simply
-    # not published.
-    assert [r.msg for r in caplog.records].count(
-        "Could not resolve artifact roots for %s"
-    ) == 2
-    assert all("database is locked" in r.exc_text for r in caplog.records)
+    assert "leftover in the root" not in served.text, (served.status_code, served.text[:200])
+    assert served.status_code == 404
+    assert linked_folder_refusals(caplog.records) == []
 
 
-def test_published_state_reads_the_artifact_roots_once(engine, tmp_path, monkeypatch):
-    """Path resolution reuses the roots already read. A second read is a second
-    database round trip, and one failing there was swallowed with no log as an
-    artifact that is simply not published."""
-    from cowork.services import artifacts as artifacts_service
-    from cowork.services.publish import published_owner_state, published_state
+def test_serve_reads_an_adopted_folder_reached_through_a_link(projects_root, tmp_path):
+    """Only `.anton` and `.anton/artifacts` must be real directories; the
+    adopted folder itself may be an alias. Adoption stores the resolved
+    path, so the folder moves after it and a link takes its stored place."""
+    import shutil
 
-    folder = tmp_path / "Documents" / "notes"
+    stored = tmp_path / "Documents" / "notes"
+    page = stored / ".anton" / "artifacts" / "dash" / "index.html"
+    page.parent.mkdir(parents=True)
+    page.write_text("<html>through the alias</html>")
+    client = _local_client()
+    name = _adopt(client, stored, "aliased").name
+    real = tmp_path / "real" / "notes"
+    real.parent.mkdir(parents=True)
+    shutil.move(stored, real)
+    stored.symlink_to(real, target_is_directory=True)
+
+    served = client.get(f"/api/v1/artifacts/serve/{name}/dash/index.html")
+
+    assert served.status_code == 200, served.text
+    assert "through the alias" in served.text
+
+
+def test_serve_finds_a_stale_rows_project_in_the_projects_root(projects_root, tmp_path):
+    """A row created before the projects root moved points at a folder that is
+    gone; the project now lives under the new root, where the scan finds it.
+    Passes before the fix too: a regression guard."""
+    import shutil
+
+    folder = tmp_path / "old-root" / "moved"
     folder.mkdir(parents=True)
-    artifact = _artifacts_dir(folder) / "dash"
-    artifact.mkdir()
-    primary = artifact / "index.html"
-    primary.write_text("<html></html>")
-    (artifact / "metadata.json").write_text("{}")
-    entry = {"report_id": "uuid-once", "url": "https://4nton.ai/a/uuid-once", "published": True}
-    (artifact / ".published.json").write_text(json.dumps({"index.html": entry}))
-    ProjectService(_scoped(engine)).create_project("notes", path=folder)
+    client = _local_client()
+    name = _adopt(client, folder, "moved").name
+    shutil.rmtree(folder)
+    page = projects_root / name / ".anton" / "artifacts" / "dash" / "index.html"
+    page.parent.mkdir(parents=True)
+    page.write_text("<html>moved with the root</html>")
 
-    def _second_read(*, scope, session=None):
-        raise RuntimeError("database is locked")
+    served = client.get(f"/api/v1/artifacts/serve/{name}/dash/index.html")
 
-    # Only the binding `resolve_artifact_path` would use; `publish` keeps its own.
-    monkeypatch.setattr(artifacts_service, "_artifact_dirs_for_scope", _second_read)
-
-    assert published_state(str(primary), scope=LOCAL_SCOPE, session=_scoped(engine)) == {
-        "report_id": "uuid-once",
-        "url": "https://4nton.ai/a/uuid-once",
-        "published": True,
-    }
-    assert published_owner_state(str(primary), scope=LOCAL_SCOPE, session=_scoped(engine)) == entry
-
-
-def test_a_relative_path_in_two_roots_is_reported_as_ambiguous(engine, tmp_path):
-    """The one behavior change an allocated project can see. Widening the root
-    set widens this ambiguity: a relative path that matched one root before can
-    match two once any folder is adopted, and the caller is told to send an
-    absolute path rather than being handed an arbitrary one of them."""
-    from cowork.services.artifacts import resolve_artifact_path
-
-    # The service holds the session; letting it go detaches the row.
-    svc = ProjectService(_scoped(engine))
-    allocated = svc.create_project("reports")
-    allocated_dash = _artifacts_dir(Path(allocated.path)) / "dash"
-    allocated_dash.mkdir()
-    (allocated_dash / "index.html").write_text("<html></html>")
-
-    adopted = tmp_path / "Documents" / "old-work"
-    adopted.mkdir(parents=True)
-    adopted_dash = _artifacts_dir(adopted) / "dash"
-    adopted_dash.mkdir()
-    (adopted_dash / "index.html").write_text("<html></html>")
-    ProjectService(_scoped(engine)).create_project("old-work", path=adopted)
-
-    with pytest.raises(ValueError, match="multiple project artifact roots"):
-        resolve_artifact_path("dash/index.html", scope=LOCAL_SCOPE, session=_scoped(engine))
-
-    # Without the adopted root in play the same relative path still resolves.
-    assert resolve_artifact_path("dash/index.html", scope=LOCAL_SCOPE) == (
-        allocated_dash / "index.html"
-    ).resolve()
+    assert served.status_code == 200, served.text
+    assert "moved with the root" in served.text

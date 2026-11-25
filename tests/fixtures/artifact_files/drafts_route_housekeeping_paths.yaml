@@ -1,0 +1,12 @@
+# Store-owned names below the artifact folder that the drafts route answers
+# 404 for at any depth, in any case. `rel_path` is the path in the request.
+# A plain file in the same subfolder still serves.
+
+- id: metadata-at-depth
+  rel_path: sub/metadata.json
+- id: metadata-at-depth-casefolded
+  rel_path: sub/Metadata.JSON
+- id: revisions-directory-at-depth
+  rel_path: sub/.revisions/r1.md
+- id: publish-state-at-depth
+  rel_path: sub/.published.json

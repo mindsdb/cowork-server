@@ -1,6 +1,7 @@
 import asyncio
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from functools import partial
 import inspect
 import os
@@ -16,6 +17,7 @@ from cowork.build_info import account_kwargs, supported_kwargs, surface_kwarg
 from cowork.code_sandbox import (
     build_cell_sandbox,
     code_sandbox_on,
+    live_apps_on,
     refuse_a_linked_project,
     refuse_planted_links,
     shared_files_dir,
@@ -25,13 +27,14 @@ from cowork.common.history_scrub import scrub_credentials, scrubbed_openai_dump
 from cowork.common.logger import get_logger, log_context
 from cowork.common.paths import cowork_home, makedirs_below_nofollow, pod_local_only
 from cowork.common.settings.app_settings import get_app_settings
-from cowork.common.settings.user_settings import current_settings_scope
+from cowork.common.settings.user_settings import current_settings_scope, effective_turn_limits
 from cowork.deployment_identity import identity_for_turn, learned_memory_scope
 from cowork.db.personal_resources import PersonalResource
 from cowork.db.scoped import LOCAL_SCOPE, ScopedSession, TenantScope, tenant_scope_required
-from cowork.db.units import run_db, run_to_completion, unit_session
+from cowork.db.units import run_db, run_efs, run_on_unit_threads, run_to_completion, unit_session
 from cowork.harnesses.base import ChannelContext, FileInputBlock, TextInputBlock, prompt_text, register
 from cowork.harnesses.anton_harness.agent_files import AgentFiles, read_conversation_attachments
+from cowork.harnesses.anton_harness.preview_checker import build_preview_checker, preview_checker_kwargs
 from cowork.harnesses.memory.policy import memory_policy
 from cowork.harnesses.memory.turn_layout import (
     TurnMemoryLayout,
@@ -48,24 +51,47 @@ from cowork.harnesses.anton_harness.stream_formatter import (
 )
 from cowork.managed import managed_folder
 from cowork.models.conversation import Conversation
-from cowork.models.skill import Skill
 from cowork.harnesses.anton_harness.scratchpad_cell_replay import SCRATCHPAD_REPLAY_ROLES, extract_scratchpad_cells
 from cowork.harnesses.anton_harness.settings import AntonHarnessSettings
 from cowork.services.connectors.connections import service
-from cowork.services.connectors.specs._registry import registry
+from cowork.services.connectors.notion_pages import describe_project_pages
+from cowork.services.conversation_folders import ConversationFolderService, folder_refusal
 from cowork.services.conversations import read_earlier_answers
-from cowork.services.projects import display_label
+from cowork.services.live_apps import (
+    TurnLiveApps,
+    current_live_app_launcher,
+    live_app_host_for_turn,
+    prompt_email,
+    release_stop_notices,
+    stop_time_text,
+    turn_live_apps,
+)
+from cowork.services.projects import display_label, is_comparison_sandbox
 from cowork.services.skill_links import links_apply_to, sync_turn_skill_links
-from cowork.services.skills import link_turn_skills, reads_shared_skills
+from cowork.services.skills import artifact_skill_dirs, link_turn_skills, reads_shared_skills
+from cowork.streaming.addons import AddonChannel, addons
 from cowork.streaming.liveness import ModelWaitTicker
+from cowork.streaming.preview_checks import preview_checks
 
 if TYPE_CHECKING:
+    from anton.core.browser.config import BrowserConfig
     from anton.core.session import ChatSession
 
+    from cowork.schemas.artifact_card import ArtifactCard
     from cowork.services.conversations import ReplayHistory
 
 
 logger = get_logger(__name__)
+
+# Anton stamps live input in UTC but older versions omit its offset. Keep this
+# interpretation cache-stable and shared by live turns and persisted history.
+_MESSAGE_TIME_CONTEXT = (
+    "\n\nMESSAGE TIMES: Message send-time prefixes are UTC, including live and "
+    "historical prefixes formatted as [YYYY-MM-DD HH:MM] without a timezone label. "
+    "Use the latest message timestamp as the current time, and convert that instant "
+    "to the user's timezone before reasoning about local dates or scheduling. "
+    "Never attach a local UTC offset to the unchanged UTC clock reading."
+)
 
 
 def _anton_mcp_wiring():
@@ -133,6 +159,9 @@ class BuiltChatSession(NamedTuple):
     # The turn's TurnMemoryLayout.learns: False when its tiers are two empty
     # scratch folders, so it reads and writes nobody's learned memory.
     learns: bool
+    # The launch records whose stop the turn's prompt tells, which the turn
+    # claimed (turn_live_apps) and hands back unless it finishes.
+    live_app_notices: tuple[UUID, ...] = ()
 
 
 def _turn_cortex(*, layout: TurnMemoryLayout, mode: str, llm_client):
@@ -164,10 +193,8 @@ def _turn_cortex(*, layout: TurnMemoryLayout, mode: str, llm_client):
 #: Settings copied from the Cowork DB onto anton's own settings object, in
 #: order. The last three are non-nullable ints with defaults — unlike the
 #: entries above them, ``db_val`` is never None, so they ALWAYS override anton's
-#: own 25/3 defaults (and any ANTON_* env value) for Cowork sessions.
-#: ``max_turn_tokens`` is the per-turn spend ceiling (ENG-1286); it overlays the
-#: SAME value anton defaults to rather than a looser one, because the
-#: distribution that sized it was measured on this traffic.
+#: own defaults (and any ANTON_* env value) for Cowork sessions.
+#: ``max_turn_tokens`` is the per-turn spend ceiling.
 _OVERLAID_SETTINGS: tuple[str, ...] = (
     "planning_provider", "planning_model",
     "coding_provider", "coding_model",
@@ -188,6 +215,9 @@ def _overlay_user_settings(anton_settings, user) -> list[str]:
 
     Returns the attrs actually applied, so a caller or test can assert on it.
 
+    The three budgets come from ``effective_turn_limits``, so the
+    ``limits_enabled`` switch decides them.
+
     **The skew guard is the load-bearing part.** uv.lock pins anton to a
     release, and a PyPI-channel install takes any release at or above the
     floor in ``pyproject.toml``, so cowork-server can ship a setting whose
@@ -199,8 +229,20 @@ def _overlay_user_settings(anton_settings, user) -> list[str]:
     missing setting.
     """
     applied: list[str] = []
-    for attr in _OVERLAID_SETTINGS:
-        db_val = getattr(user, attr, None)
+    limits = effective_turn_limits(user)._asdict()
+    values = [
+        (attr, limits[attr] if attr in limits else getattr(user, attr, None))
+        for attr in _OVERLAID_SETTINGS
+    ]
+    # anton's `image_model` (ANTON_IMAGE_MODEL), which its generate_image tool
+    # and scratchpad helper draw with. Resolved rather than raw: the planning and
+    # coding pins are corrected afterwards from the built client
+    # (_apply_client_models), and nothing corrects this one, so a pin MindsHub no
+    # longer serves or the wallet cannot pay for is swapped here (ENG-1632).
+    # None where no image model can be served, so anton offers no image tool
+    # (UserSettings.image_model_for_agent).
+    values.append(("image_model", getattr(user, "image_model_for_agent", None)))
+    for attr, db_val in values:
         if db_val is None:
             continue
         if not hasattr(anton_settings, attr):
@@ -217,7 +259,67 @@ def _overlay_user_settings(anton_settings, user) -> list[str]:
             db_val = db_val.value.replace("_", "-")
         setattr(anton_settings, attr, db_val)
         applied.append(attr)
+    # The Jev opt-out covers anton's completion check too, so an organization
+    # that turns Jev off sends it nothing. Only ever turns it off: on leaves
+    # anton's own setting alone. An organization MindsHub refuses Jev to needs
+    # no switch: anton stops asking after the first refusal.
+    if getattr(user, "jev_decisions_enabled", True) is False and hasattr(anton_settings, "verifier_jev"):
+        anton_settings.verifier_jev = "off"
+        applied.append("verifier_jev")
+    # The same pattern for classify(): only ever turns it off. An anton that
+    # predates the setting has no classify() to turn off.
+    if getattr(user, "jev_classify_enabled", True) is False and hasattr(anton_settings, "classify_jev"):
+        anton_settings.classify_jev = "off"
+        applied.append("classify_jev")
     return applied
+
+
+def _apply_user_credentials(anton_settings, user) -> None:
+    """Copy the caller's provider keys, URLs and router role onto anton's
+    settings, as every in-process turn does after ``_overlay_user_settings``.
+    Shared with the quick edit (``anton_settings_for_user``)."""
+    from pydantic import SecretStr
+
+    # API keys: UserSettings stores SecretStr, AntonSettings uses plain str
+    for attr in ("anthropic_api_key", "openai_api_key", "minds_api_key"):
+        db_val = getattr(user, attr, None)
+        if db_val is not None:
+            setattr(anton_settings, attr, db_val.get_secret_value() if isinstance(db_val, SecretStr) else db_val)
+
+    # URLs (skip empty strings so AntonSettings.model_post_init derivations
+    # and AntonSettings' own publish_url default are preserved)
+    for attr in ("minds_url", "openai_base_url", "publish_url"):
+        db_val = getattr(user, attr, None)
+        if db_val:
+            setattr(anton_settings, attr, db_val)
+
+    # Routing & summarization role → anton's router_* fields. The LLM
+    # client is actually built by build_llm_client (which reads the
+    # resolved router model directly), so this only keeps AntonSettings
+    # consistent for any path that reads it. Guarded so an anton build
+    # predating ENG-648 (no router_* fields) doesn't raise.
+    router_provider = getattr(user, "router_provider", None)
+    if router_provider is not None and hasattr(anton_settings, "router_provider"):
+        anton_settings.router_provider = (
+            router_provider.value.replace("_", "-")
+            if hasattr(router_provider, "value") else router_provider
+        )
+    router_model = getattr(user, "router_model", None)
+    if router_model is not None and hasattr(anton_settings, "router_model"):
+        anton_settings.router_model = router_model
+
+
+def anton_settings_for_user(user):
+    """``AntonSettings`` for *user* (their ``UserSettings``) the way a turn of
+    theirs builds them, minus the workspace paths: the DB overlay, then the
+    keys and URLs. For callers outside a turn that need anton's view of the
+    person's providers, such as the quick edit's decisions-model check."""
+    from anton.config.settings import AntonSettings
+
+    anton_settings = AntonSettings()
+    _overlay_user_settings(anton_settings, user)
+    _apply_user_credentials(anton_settings, user)
+    return anton_settings
 
 
 def _apply_client_models(anton_settings, llm_client) -> list[str]:
@@ -337,8 +439,12 @@ def _inside_project(base: Path, *, folder: Path) -> Path:
 settings = AntonHarnessSettings()
 
 
-def build_elicitor(conversation_id: str):
-    """The question strategy for this conversation, or None when disabled.
+def build_elicitor(conversation_id: str, *, interactive: bool = True):
+    """The question strategy for this conversation, or None when disabled or
+    when nobody watches the turn (``interactive`` False: a scheduled run).
+    Unattended, a question or a browser hand-over would only wait out its
+    timeout; without an elicitor the agent learns at once that nobody can
+    answer, as a pod turn without ``interactive`` does.
 
     Returning None is the kill switch: anton only registers `ask_user` when
     an elicitor supports "choice", so the model reverts to asking in plain
@@ -348,7 +454,7 @@ def build_elicitor(conversation_id: str):
     CLIElicitor (which does support "choice"), silently reopening the
     switch. See tests/test_ask_user_flag.py for the guard.
     """
-    if not get_app_settings().ask_user_enabled:
+    if not interactive or not get_app_settings().ask_user_enabled:
         return None
     from cowork.harnesses.anton_harness.elicitor import CoworkElicitor
     from cowork.streaming.answers import broker
@@ -382,6 +488,64 @@ def _split_turn_into_rows(history_slice: list) -> list[dict]:
     from anton.cloud_turn.history_rows import split_turn_into_rows
 
     return split_turn_into_rows(history_slice)
+
+
+def _narration(message: dict) -> list[str]:
+    content = message.get("content")
+    if message.get("role") != "assistant" or not isinstance(content, list):
+        return []
+    return [b["text"] for b in content if isinstance(b, dict) and b.get("type") == "text" and isinstance(b.get("text"), str)]
+
+
+def _joined_rounds(texts: list[str]) -> str:
+    """The rounds' text as the stream formatter joins it into the answer."""
+    joined = ""
+    for text in texts:
+        if joined and not joined.endswith("\n\n"):
+            joined += "\n\n"
+        joined += text
+    return joined
+
+
+def _without_repeated_narration(history: list[dict]) -> list[dict]:
+    """Replay each turn as the model saw it live.
+
+    A turn's tool rows keep the text written beside each tool call, and its
+    answer row repeats all of that text before the final reply. When the answer
+    starts with exactly those rounds, only the final reply is replayed, which
+    makes the history byte-identical to the live one and keeps the prompt cache
+    valid across turns. Otherwise the text is dropped from the tool rows, so
+    they replay like rows saved before this change.
+    """
+    out: list[dict] = []
+    narrated_at: list[int] = []
+    for message in history:
+        content = message.get("content")
+        if isinstance(content, list) and any(
+            isinstance(b, dict) and b.get("type") in ("tool_use", "tool_result") for b in content
+        ):
+            if _narration(message):
+                narrated_at.append(len(out))
+            out.append(message)
+            continue
+        if message.get("role") == "assistant" and isinstance(content, str) and narrated_at:
+            lead = _joined_rounds([t for i in narrated_at for t in _narration(out[i])])
+            rest = content[len(lead):] if content.startswith(lead) else None
+            if rest is not None and lead and not lead.endswith("\n\n") and rest:
+                rest = rest[2:] if rest.startswith("\n\n") else None
+            # Live anton appends no empty reply, so an empty one cannot match.
+            if not rest:
+                for i in narrated_at:
+                    out[i] = {**out[i], "content": [
+                        b for b in out[i]["content"] if not (isinstance(b, dict) and b.get("type") == "text")
+                    ]}
+            else:
+                message = {**message, "content": rest}
+            narrated_at = []
+        elif message.get("role") == "user":
+            narrated_at = []
+        out.append(message)
+    return out
 
 
 def _captured_turn_history(*, session: "ChatSession", seed_len: int | None, compacted: bool) -> TurnHistory | None:
@@ -421,6 +585,36 @@ def _captured_turn_history(*, session: "ChatSession", seed_len: int | None, comp
     if not rows:
         return None
     return TurnHistory(rows=[], read=rows) if compacted else TurnHistory(rows=rows)
+
+
+def _turn_revision_summaries(session, seed_len: int | None, request: str):
+    """What this turn says about the artifacts it changed, for their revision
+    labels (revision_summaries): the editor's summaries and the final reply
+    from the turn's part of session.history, and the request. None when the
+    history can't be read; the revisions then keep the generic label."""
+    from cowork.services.revision_summaries import summaries_from_messages
+
+    try:
+        history = list(getattr(session, "history", None) or [])
+        # A compaction mid-turn replaces the list; its tail is then the turn.
+        turn = history[seed_len:] if seed_len is not None and seed_len <= len(history) else history[-40:]
+        return summaries_from_messages(turn, request=request)
+    except Exception:
+        logger.warning("Could not read this turn's edits for the revision labels", exc_info=True)
+        return None
+
+
+def _turn_progress(*, session: "ChatSession", seed_len: int | None) -> list[str]:
+    """The running turn's last steps as Jev reads them when it decides where
+    a message sent mid-turn goes. Read from the same messages
+    `_captured_turn_history` stores."""
+    from cowork.handlers.response_routing import progress_lines
+
+    if hasattr(session, "turn_messages"):
+        return progress_lines(session.turn_messages())
+    if seed_len is not None:
+        return progress_lines(session.history[seed_len:])
+    return []
 
 
 def _turn_memory_read(*, session: "ChatSession", learns: bool) -> TurnMemoryRead | None:
@@ -479,6 +673,15 @@ def _picked_files_guidance(picked_by_connection: dict[str, list[dict]]) -> str:
         "'X-Goog-Drive-Resource-Keys: <id>/<resourceKey>' to the request, or pass "
         "resourceKey=<resourceKey> as a query parameter."
     )
+
+
+def _learns_this_turn(conversation, learns: bool) -> bool:
+    """Whether the turn may write memory: its layout's say, except on a
+    model-comparison side, which reads memory like any task but never writes
+    it, since two agents on the same task would each record the same lessons."""
+    if is_comparison_sandbox(getattr(getattr(conversation, "project", None), "name", None)):
+        return False
+    return learns
 
 
 def _turn_style_context(channel: ChannelContext | None) -> str:
@@ -639,8 +842,51 @@ def _other_files_rule(*, sandboxed: bool) -> str:
 # there.
 _SANDBOXED_BACKENDS_RULE = (
     "App backends are off on this deployment because your code runs in a sandbox, so never "
-    "build a full-stack artifact or call `launch_backend`; build static artifacts instead."
+    "build a full-stack artifact or call `launch_backend`; build static artifacts instead. "
+    "Never give the person a runtime-local address such as `127.0.0.1:<port>` or "
+    "`localhost:<port>`, which their browser can't open: point them to the artifact in Cowork, "
+    "or to the link `publish_or_preview` returns, even when that link is on a `.localhost` name."
 )
+
+# What the agent hears about long-running services with live apps on
+# (cowork.code_sandbox.live_apps_on): a full-stack artifact runs as a live app
+# in an app slot outside this server, which anton launches.
+_LIVE_APPS_RULE = (
+    "Live apps are on: a full-stack artifact runs as a live app in an app slot outside this server, "
+    "at its own address, and only the person who launched it can open it. Build a full-stack app "
+    "with `generate_artifact`, which launches it; start one you built by hand with `launch_backend`, "
+    "and call it again to relaunch a stopped app. A cell that changes a running app's files "
+    "relaunches it by itself. The person approves an app's first launch, and each relaunch after "
+    "its backend, its requirements or its connections change. Give the address from "
+    "the launch result as visible text in backticks, never a `127.0.0.1` or `localhost:<port>` "
+    "address. When a launch names a connection that is missing or not approved, ask the person to "
+    "add it or rename theirs to match, or their operator to approve it. When a launch is refused "
+    "because every app slot is taken, tell the person who holds each slot and since when, and that "
+    "they can wait or ask their operator for more slots. Before the first launch of an app someone "
+    "let the person duplicate, read its `backend.py` and tell the person what it reads and what it "
+    "writes. When the relay refuses a call that writes, say the connection is approved for reads "
+    "only, and that the operator can approve it for writes. "
+)
+
+
+def _live_apps_rule(apps: TurnLiveApps | None) -> str:
+    """_LIVE_APPS_RULE, then the turn's own live apps: the copies in its
+    project, the person's running apps, and each stop they haven't heard of."""
+    rule = _LIVE_APPS_RULE
+    if apps is None:
+        return rule
+    if apps.received:
+        copies = "; ".join(f"`{app.slug}`, from {prompt_email(app.owner_email)}" for app in apps.received)
+        rule += f"Apps someone let the person duplicate, copied into this project and not launched yet: {copies}. "
+    for app in apps.running:
+        rule += f"The person's live app `{app.slug}` is running at `{app.address}`. "
+    for app in apps.stopped:
+        stopped_at = stop_time_text(app.stopped_at or app.started_at)
+        rule += (
+            f"The person's live app `{app.slug}` stopped at {stopped_at} since their last "
+            f"message: {app.stop_text}. Tell them once, and offer to relaunch it. "
+        )
+    return rule
 
 
 def _units_scope() -> TenantScope:
@@ -677,6 +923,30 @@ def _archived_messages(session: ScopedSession, *, conversation_id: UUID) -> list
     from cowork.services.conversations import ConversationService
 
     return ConversationService(session).archived_messages(conversation_id)
+
+
+async def _turn_skills_off_for_me(scope: TenantScope | None) -> frozenset[str]:
+    """The skills the turn's person turned off for themselves
+    (cowork.services.skill_user_settings.off_for_me), in one database unit.
+
+    No scope on a partitioned deployment names no person, so nothing; the
+    desktop's no scope is LOCAL_SCOPE's one person. A failed read logs and
+    turns nothing off, rather than failing the turn over a preference. A wait
+    for a connection that runs out is the turn's failure, so it propagates.
+    """
+    from cowork.services.skill_user_settings import off_for_me
+
+    if scope is None:
+        if tenant_scope_required():
+            return frozenset()
+        scope = LOCAL_SCOPE
+    try:
+        return await run_db(off_for_me, scope=scope)
+    except PoolTimeoutError:
+        raise
+    except Exception:
+        logger.exception("turn skills: couldn't read the person's skill settings")
+        return frozenset()
 
 
 async def _read_attachments(conversation, *, scope: TenantScope | None) -> list[_AttachedFile] | None:
@@ -793,6 +1063,91 @@ def _attachment_context_for(rows: list[_AttachedFile] | None, *, conversation) -
     )
 
 
+def _stored_folder_paths(session: ScopedSession, *, conversation_id: UUID) -> list[str]:
+    _conversation, rows = ConversationFolderService(session).list_folders(conversation_id)
+    return [row.path for row in rows]
+
+
+_FOLDER_CHECK_TIMEOUT_S = 5.0
+
+
+def _usable_folder_paths(paths: list[str], project_path: str | None) -> list[str]:
+    """The stored folder paths that still pass the working-folder rules. Touches the filesystem."""
+    return [path for path in paths if folder_refusal(path, project_path) is None]
+
+
+async def _working_folder_paths(conversation, channel_context: ChannelContext | None) -> list[str]:
+    """The chat's working folders the agent may use this turn, as absolute paths.
+
+    Read in a database unit of its own, since the harness gets the conversation
+    detached. Empty for a channel turn: the people in a Slack or Telegram chat
+    are not the desktop user who added the folders. Each folder is checked
+    again, so one that vanished or now resolves into Cowork's own data is left
+    out. Fails closed: an error offers no folders and is logged. A wait for a
+    connection that runs out is the turn's failure, so it propagates.
+    """
+    if channel_context is not None:
+        return []
+    try:
+        scope = _units_scope()
+        if scope.org_mode:
+            return []
+        paths = await run_db(
+            partial(_stored_folder_paths, conversation_id=conversation.id), scope=scope,
+        )
+        project_path = conversation.project.path if conversation.project else None
+        # Each check stats the folder, which can hang on a network share that stopped
+        # answering; a timeout offers no folders, through the handler below.
+        return await asyncio.wait_for(
+            asyncio.to_thread(_usable_folder_paths, paths, project_path),
+            timeout=_FOLDER_CHECK_TIMEOUT_S,
+        )
+    except PoolTimeoutError:
+        raise
+    except Exception:
+        logger.warning(
+            "Failed to load working folders for conversation %s; none are offered this turn",
+            getattr(conversation, "id", "<unknown>"),
+            exc_info=True,
+        )
+        return []
+
+
+def _file_access_rules(folder_paths: list[str], *, sandboxed: bool) -> str:
+    """The prompt sentences that say which files outside the project are allowed.
+
+    Without working folders this is _other_files_rule's text, so a chat that
+    never adds one sends an unchanged prompt.
+    """
+    if not folder_paths:
+        return _other_files_rule(sandboxed=sandboxed)
+    return (
+        "The only other files that you are allowed to access are any items that are attached to the conversation "
+        "and the files in the working folders below. "
+        "Access to any files not attached to the conversation and located outside both the project and the "
+        "working folders is strictly forbidden. "
+    )
+
+
+def _working_folders_context(paths: list[str]) -> str:
+    """Prompt fragment granting the agent the chat's working folders, or "" for none."""
+    if not paths:
+        return ""
+    listed = "\n".join(f"  - {path}" for path in paths)
+    return (
+        " The user has also added these working folders to THIS conversation:\n"
+        + listed
+        + "\nYou may read and write files in them through the scratchpad, using these absolute paths."
+        " Before you change, move or delete any file in a working folder, ask the user for permission first."
+        " Keep creating artifacts in the project as usual."
+        " Leave any .anton/ directory inside a working folder alone."
+        " To find or read a file in a working folder, list, search and read it in the scratchpad;"
+        " do not use read_text_file or select_path for it, because they cannot open working-folder files."
+        " When the user names a file without saying which folder, search the project and every working folder"
+        " before saying it is missing. If it is not found, say so and ask; never answer about a different file instead."
+    )
+
+
 @register
 class AntonHarness:
     id: str = "anton"
@@ -822,6 +1177,11 @@ class AntonHarness:
         tool_messages: bool = False,
         # Keeps the turn alive while a model call is quiet (see HarnessProvider).
         model_wait: ModelWaitTicker | None = None,
+        interactive: bool = True,
+        ui_locale: str | None = None,
+        # The scheduler's own turn (see HarnessProvider).
+        schedule_id: str | None = None,
+        docs: bool = False,
     ) -> AsyncIterator[str]:
         if get_app_settings().tenancy_mode == "org":
             # Org-mode turns must run on the remote worker, never in this
@@ -865,7 +1225,9 @@ class AntonHarness:
         artifacts_base = project_path / ".anton" / "artifacts"
         # Names AND content mtimes: a name diff only reveals artifacts the turn
         # CREATED, and the reconciler must also see the ones it EDITED.
-        before_slugs, before_mtimes = snapshot_artifact_state(artifacts_base)
+        before_slugs, before_mtimes = await run_efs(
+            partial(snapshot_artifact_state, artifacts_base), scope=_units_scope(), deadline=False
+        )
         # Capture ids while the conversation is unambiguously attached — the
         # end-of-turn finally must not depend on the session still being live.
         conv_id = conversation.id
@@ -886,7 +1248,7 @@ class AntonHarness:
         skill_drafts_base = project_path / ".anton" / "skill_drafts"
         before_drafts = snapshot_skill_drafts(skill_drafts_base)
         before_strays = snapshot_stray_skills(project_path / "skills")
-        cards: list[dict] = []
+        cards: list[ArtifactCard] = []
         skill_drafts: list[dict] = []
         new_slugs: list[str] = []
         touched_slugs: set[str] = set()
@@ -895,9 +1257,31 @@ class AntonHarness:
         memory_read: TurnMemoryRead | None = None
         session = None
         seed_info: dict | None = None
+        # Messages the person adds while the turn runs (ENG-4194); None when
+        # the installed anton can't take them.
+        addon_channel: AddonChannel | None = None
+        # The live-app stops this turn's prompt tells (built.live_app_notices)
+        # go back unless the turn finishes, so the person's next turn tells them.
+        built: BuiltChatSession | None = None
+        turn_finished = False
+        # Where this turn's part of session.history starts, once known: the
+        # turn end reads its edits and reply there for the revision labels.
+        turn_seed_len: int | None = None
 
         async def record_turn_cleanup():
             nonlocal new_slugs, touched_slugs, turn_scope, skill_drafts
+            # The live-app stops the turn's prompt told go back unless the
+            # turn finished, so the person's next turn tells them. Here, so
+            # the same shield covers it and its failure skips nothing.
+            if built is not None and built.live_app_notices and not turn_finished:
+                try:
+                    await release_stop_notices(built.live_app_notices)
+                except Exception:
+                    logger.warning(
+                        "Could not hand back this turn's live-app stop notices",
+                        exc_info=True,
+                        extra={"event": "live_app_notices_unreleased", **log_context(conversation_id=conv_id)},
+                    )
             if session is not None and seed_info is not None and getattr(session, "last_compaction", None) is not None:
                 # Best-effort: a missing compaction does not lose the answer.
                 try:
@@ -913,13 +1297,24 @@ class AntonHarness:
                         extra=log_context(conversation_id=conv_id),
                     )
             try:
-                changes = turn_artifact_changes(
-                    conversation_id=conv_id,
-                    artifacts_base=artifacts_base,
-                    before=before_slugs,
-                    before_mtimes=before_mtimes,
-                    tracked_new=getattr(session, "artifacts_touched", None),
-                    tracked_edits=getattr(session, "artifacts_touched", None),
+                summaries = _turn_revision_summaries(session, turn_seed_len, prompt_text(input))
+                # It waits on each touched artifact's lock and parses its
+                # journal, so it runs off the event loop the server shares.
+                changes = await run_efs(
+                    partial(
+                        turn_artifact_changes,
+                        conversation_id=conv_id,
+                        artifacts_base=artifacts_base,
+                        before=before_slugs,
+                        before_mtimes=before_mtimes,
+                        tracked_new=getattr(session, "artifacts_touched", None),
+                        tracked_edits=getattr(session, "artifacts_touched", None),
+                        schedule_id=schedule_id,
+                        scope=_units_scope(),
+                        summaries=summaries,
+                    ),
+                    scope=_units_scope(),
+                    deadline=False,
                 )
                 new_slugs, touched_slugs, turn_scope = changes.created, changes.touched, _units_scope()
                 if new_slugs:
@@ -930,6 +1325,7 @@ class AntonHarness:
                             project_id=conv_project_id,
                             slugs=new_slugs,
                             creator=getattr(conversation, "created_by", None),
+                            artifact_ids=changes.created_ids,
                         ),
                         scope=turn_scope,
                     )
@@ -951,6 +1347,9 @@ class AntonHarness:
                 disabled_connections=disabled_connections or [],
                 channel_context=channel_context,
                 tool_messages=tool_messages,
+                interactive=interactive,
+                ui_locale=ui_locale,
+                docs=docs,
             )
             session, turn_scratch_dir, seed_info = built.session, built.turn_scratch_dir, built.seed_info
             if model_wait is not None:
@@ -963,7 +1362,13 @@ class AntonHarness:
             # with neither `turn_messages` nor `.history` skips capture and
             # falls back to text-only replay.
             seed_len = len(session.history) if hasattr(session, "history") else None
+            turn_seed_len = seed_len
             compacted = False  # set if anton compacts or hard-truncates history mid-turn
+            addon_channel = addons.open(
+                str(conv_id), session,
+                task=prompt_text(input),
+                progress=partial(_turn_progress, session=session, seed_len=seed_len),
+            )
             # Forward trace annotations only if the installed anton's
             # turn_stream accepts them. Every anton this server can start with
             # does (anton #218 predates the anton.core.artifacts.internal_files
@@ -1004,6 +1409,9 @@ class AntonHarness:
                         memory_read = _turn_memory_read(session=session, learns=built.learns)
                         if memory_read is not None:
                             yield memory_read
+                    if addon_channel is not None:
+                        for addon_event in addon_channel.drain():
+                            yield addon_event
             except (Exception, asyncio.CancelledError):
                 # A turn that fails or is stopped after anton builds its prompt,
                 # before any event after it: the stop usually lands on the first
@@ -1015,19 +1423,33 @@ class AntonHarness:
                     memory_read = _turn_memory_read(session=session, learns=built.learns)
                     if memory_read is not None:
                         yield memory_read
+                # Added messages the model never saw go back to the app, which
+                # runs them next, however the turn ended.
+                if addon_channel is not None:
+                    for addon_event in addon_channel.take_returned():
+                        yield addon_event
                 raise
             # A turn that built its prompt and sent no event after it.
             if memory_read is None:
                 memory_read = _turn_memory_read(session=session, learns=built.learns)
                 if memory_read is not None:
                     yield memory_read
+            if addon_channel is not None:
+                for addon_event in addon_channel.take_returned():
+                    yield addon_event
             # Turn completed cleanly: capture its tool block-rows. Skipped on
             # cancel/error (this line never runs), so a partial turn falls
             # back to text-only replay and anton's own dangling-tool_use
             # sealing keeps its in-memory history valid. A turn that compacted
             # hands its rows to the formatter and stores none.
             turn_history = _captured_turn_history(session=session, seed_len=seed_len, compacted=compacted)
+            turn_finished = True
         finally:
+            if addon_channel is not None:
+                addons.close(str(conv_id), addon_channel)
+            # A preview check still open when the turn ends resolves to "no
+            # answer", and a late answer from the app is a 404.
+            preview_checks.close_conversation(str(conv_id))
             if model_wait is not None:
                 model_wait.detach()
             if turn_scratch_dir:
@@ -1089,7 +1511,15 @@ class AntonHarness:
         directly against fake messages, same reasoning as _seed_history.
         """
         om = scrubbed_openai_dump(m)
-        ts = m.created_at.strftime("%Y-%m-%d %H:%M") if getattr(m, "created_at", None) else None
+        created_at = getattr(m, "created_at", None)
+        # Naive database timestamps are UTC; aware timestamps must be converted.
+        if created_at is not None:
+            created_at = (
+                created_at.replace(tzinfo=timezone.utc)
+                if created_at.tzinfo is None else created_at.astimezone(timezone.utc)
+            )
+        # Same bytes as anton's live stamp, so the replayed message keeps the prompt cache.
+        ts = created_at.strftime("%Y-%m-%d %H:%M") if created_at else None
         if m.role == "user" and ts and isinstance(om.get("content"), str) and om["content"]:
             om["content"] = f"[{ts}] {om['content']}"
         return om
@@ -1118,7 +1548,7 @@ class AntonHarness:
             else:
                 history_summary = None  # cutoff message is gone — stale
 
-        tail = [stamp(m) for m in ordered_messages[tail_start:]]
+        tail = _without_repeated_narration([stamp(m) for m in ordered_messages[tail_start:]])
         if history_summary:
             summary_msg = {"role": "user", "content": scrub_credentials(history_summary)}
             if tail and tail[0].get("role") == "user":
@@ -1243,6 +1673,13 @@ class AntonHarness:
                     "type": "text",
                     "text": f"[Attached file '{block['filename']}' is at: {block['path']}]",
                 })
+        # Anton stamps plain strings, but leaves image/file block lists alone.
+        # Put the clock on this turn too, so a resumed chat cannot mistake the
+        # last historical message's timestamp for now. Keep it out of the
+        # system prompt so the settled prompt prefix remains cache-stable.
+        if anton_blocks:
+            stamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+            anton_blocks.insert(0, {"type": "text", "text": f"[{stamp}]"})
         return anton_blocks
         
     async def _build_chat_session(
@@ -1253,8 +1690,66 @@ class AntonHarness:
         disabled_connections: list[dict] | None = None,
         channel_context: ChannelContext | None = None,
         tool_messages: bool = False,
+        interactive: bool = True,
+        ui_locale: str | None = None,
+        docs: bool = False,
     ) -> BuiltChatSession:
-        """Build the same core runtime the Anton CLI uses, scoped to one project."""
+        """Build the same core runtime the Anton CLI uses, scoped to one project
+        (_build_turn_session). The live-app stops its prompt tells ride on the
+        result; a build that fails hands them back (release_stop_notices).
+
+        ``docs``: the client shows docs, so the doc tools are registered, with
+        the short docs section of the prompt (DOC_PROMPT, on ``list_docs``) and
+        the ``doc-tools`` skill that unlocks the rest. Without it the agent never
+        hears of docs and writes none the client can't show.
+        """
+        notices: list[UUID] = []
+        try:
+            built = await self._build_turn_session(
+                conversation,
+                model=model,
+                reasoning_effort=reasoning_effort,
+                disabled_connections=disabled_connections,
+                channel_context=channel_context,
+                tool_messages=tool_messages,
+                interactive=interactive,
+                ui_locale=ui_locale,
+                live_app_notices=notices,
+                docs=docs,
+            )
+        except BaseException:
+            if notices:
+                try:
+                    await run_to_completion(release_stop_notices(notices))
+                except Exception:
+                    logger.warning(
+                        "Could not hand back this turn's live-app stop notices",
+                        exc_info=True,
+                        extra={
+                            "event": "live_app_notices_unreleased",
+                            **log_context(conversation_id=getattr(conversation, "id", None)),
+                        },
+                    )
+            raise
+        return built._replace(live_app_notices=tuple(notices))
+
+    async def _build_turn_session(
+        self,
+        conversation: Conversation,
+        *,
+        model: str | None,
+        reasoning_effort: str | None,
+        disabled_connections: list[dict] | None,
+        channel_context: ChannelContext | None,
+        tool_messages: bool,
+        interactive: bool,
+        live_app_notices: list[UUID],
+        ui_locale: str | None = None,
+        docs: bool,
+    ) -> BuiltChatSession:
+        """_build_chat_session's work. ``live_app_notices`` gets the launch
+        records whose stop the turn's prompt tells, which the turn claimed
+        (turn_live_apps)."""
         from anton.chat_session import build_runtime_context
         from anton.config.settings import AntonSettings
         from anton.context.self_awareness import SelfAwarenessContext
@@ -1273,13 +1768,24 @@ class AntonHarness:
             build_cowork_label_connection_tool,
             build_cowork_request_credentials_tool,
             build_cowork_create_skill_draft_tool,
+            scope_usage_notes,
         )
+        from .schedule_tools import build_schedule_tools
         CONNECT_DATASOURCE_TOOL = build_cowork_connect_datasource_tool()
         PUBLISH_TOOL = build_cowork_publish_tool()
         LOOKUP_CONNECTOR_TOOL = build_cowork_lookup_connector_tool()
         REQUEST_CREDENTIALS_TOOL = build_cowork_request_credentials_tool()
         LABEL_CONNECTION_TOOL = build_cowork_label_connection_tool()
         CREATE_SKILL_DRAFT_TOOL = build_cowork_create_skill_draft_tool()
+        from .doc_tools import DocToolContext, build_doc_tools
+        doc_tool_ctx = DocToolContext(
+            artifacts_base=Path(conversation.project.path) / ".anton" / "artifacts",
+            conversation_id=str(conversation.id),
+            project_id=str(conversation.project_id) if conversation.project_id else None,
+            project_name=conversation.project.name,
+            project_label=display_label(conversation.project),
+        ) if docs else None
+        DOC_TOOLS = build_doc_tools(doc_tool_ctx) if doc_tool_ctx is not None else []
 
         try:
             from anton.core.datasources.data_vault import LocalDataVault
@@ -1320,39 +1826,37 @@ class AntonHarness:
         # skills others share with them after those (both linked into the
         # turn's scratch folder below).
         anton_settings.skills_extra_roots = [HOST_SKILLS_DIR]
+        if docs:
+            # The `doc-tools` skill unlocks the doc tools and holds the writing guide;
+            # a client without docs never hears of it.
+            from cowork.docs.prompt import DOC_SKILLS_ROOT
 
-        user = get_user_settings()
+            anton_settings.skills_extra_roots.append(DOC_SKILLS_ROOT)
+
+        user = await run_on_unit_threads(get_user_settings)
         _overlay_user_settings(anton_settings, user)
 
         RECALL_HISTORY_TOOL = self._recall_history_tool(conversation, user)
+        elicitor = build_elicitor(str(conversation.id), interactive=interactive)
+        # Asks the user's open preview whether an edited artifact runs. Only
+        # where the cowork app tails the turn: a scheduled run or a channel
+        # bot has no preview to answer, and would only wait out the timeout.
+        preview_checker = (
+            build_preview_checker(str(conversation.id))
+            if interactive and channel_context is None
+            else None
+        )
+        # Every change to a scheduled task waits on a card the user confirms,
+        # so the tools exist only where someone can: not in a scheduled run
+        # (a task must not rewrite itself unattended), a channel bot, or a
+        # deployment with questions off.
+        schedule_tools = (
+            build_schedule_tools(project_id=conversation.project_id)
+            if interactive and elicitor is not None and channel_context is None
+            else []
+        )
 
-        # API keys: UserSettings stores SecretStr, AntonSettings uses plain str
-        for attr in ("anthropic_api_key", "openai_api_key", "minds_api_key"):
-            db_val = getattr(user, attr, None)
-            if db_val is not None:
-                setattr(anton_settings, attr, db_val.get_secret_value() if isinstance(db_val, SecretStr) else db_val)
-
-        # URLs (skip empty strings so AntonSettings.model_post_init derivations
-        # and AntonSettings' own publish_url default are preserved)
-        for attr in ("minds_url", "openai_base_url", "publish_url"):
-            db_val = getattr(user, attr, None)
-            if db_val:
-                setattr(anton_settings, attr, db_val)
-
-        # Routing & summarization role → anton's router_* fields. The LLM
-        # client is actually built by build_llm_client (which reads the
-        # resolved router model directly), so this only keeps AntonSettings
-        # consistent for any path that reads it. Guarded so an anton build
-        # predating ENG-648 (no router_* fields) doesn't raise.
-        router_provider = getattr(user, "router_provider", None)
-        if router_provider is not None and hasattr(anton_settings, "router_provider"):
-            anton_settings.router_provider = (
-                router_provider.value.replace("_", "-")
-                if hasattr(router_provider, "value") else router_provider
-            )
-        router_model = getattr(user, "router_model", None)
-        if router_model is not None and hasattr(anton_settings, "router_model"):
-            anton_settings.router_model = router_model
+        _apply_user_credentials(anton_settings, user)
 
         workspace = Workspace(base)
         if sandboxed:
@@ -1417,6 +1921,9 @@ class AntonHarness:
         # Read once: the prompt lists them, and the code sandbox grants their
         # folders read-only.
         attachment_rows = await _read_attachments(conversation, scope=current_settings_scope())
+        if doc_tool_ctx is not None:
+            # An attached image may go in a doc (copied beside it).
+            doc_tool_ctx.attached_files = frozenset(Path(a.path) for a in attachment_rows or [] if a.path)
         attachment_context = _attachment_context_for(attachment_rows, conversation=conversation)
         # Canonical order (ConversationService._MESSAGE_ORDER: seq, role, id);
         # the bare `conversation.messages` relationship is unordered and would
@@ -1427,9 +1934,38 @@ class AntonHarness:
             partial(_replay_history, conversation_id=conversation.id), scope=_units_scope(),
         )
         ordered_messages = history.messages
+        # Landlock grants agent code no working folder, so a sandboxed turn offers none.
+        folder_paths = [] if sandboxed else await _working_folder_paths(conversation, channel_context)
 
         # App backends are refused under the code sandbox (`sandboxed`), so
-        # the agent is never told to build one.
+        # the agent is never told to build one, unless live apps run them in
+        # app slots outside this server for a turn with a launcher, the only
+        # turn that gets a host (live_app_host_for_turn). A model-comparison
+        # side gets neither: a live app is shareable and holds a capped slot,
+        # and nothing leaves a comparison until the user continues with a side.
+        comparison_side = is_comparison_sandbox(conversation.project.name)
+        launcher = current_live_app_launcher() if live_apps_on() and not comparison_side else None
+        offers_live_apps = launcher is not None
+        turn_apps = (
+            await turn_live_apps(
+                launcher, project_id=conversation.project.id, artifacts_dir=artifacts_dir, claimed_into=live_app_notices
+            )
+            if launcher is not None
+            else None
+        )
+        if offers_live_apps:
+            backends_rule = _live_apps_rule(turn_apps)
+        elif sandboxed:
+            backends_rule = _SANDBOXED_BACKENDS_RULE
+        else:
+            backends_rule = "For a service that must keep running, build a full-stack artifact and start it with `launch_backend`."
+        # The desktop app's own browser, when it registered one and the
+        # person turned the browser on: anton registers its `browser` tool
+        # only then. Never for a channel turn.
+        turn_browser = await _browser_config(
+            user, channel_context=channel_context,
+            conversation_id=str(conversation.id), project_id=conversation.project_id,
+        )
         project_context = (
             # Conversational only. The next line hands the agent the real path,
             # so the name here never has to resolve to anything (ENG-1676).
@@ -1440,19 +1976,25 @@ class AntonHarness:
             "Everything else in .anton/ is off limits. Do not mention the .anton/ directory in your responses. "
             "You can perform operations on these files via the scratchpad. "
             + _project_file_actions_rule(anton_settings.act_first)
-            + _other_files_rule(sandboxed=sandboxed)
-            + "You can read text files with `read_text_file`, or in the scratchpad when that is more efficient (for example, when the data goes straight into scratchpad code or the file needs special parsing). Use the scratchpad for everything else you do with files. "
+            + _file_access_rules(folder_paths, sandboxed=sandboxed)
+            + "Read text files with `read_text_file` (`end_line=-1` returns the whole file), several in one step. Read in the scratchpad only data that goes straight into scratchpad code or a file that needs special parsing: printed scratchpad output stops at 10,000 characters. Use the scratchpad for everything else you do with files. "
             f"Your scratchpad's working directory is {str(base)} — bare relative paths like `open('data.csv')` resolve from the project root."
             # Each turn's scratchpad processes are killed when the turn ends
             # (close_session_scratchpads), with their whole process group.
             " Processes and threads a scratchpad cell starts are stopped when your reply ends: "
             "variables carry over to the next turn, running servers do not. "
+            + backends_rule
+            # Only a turn with a browser hears about it. Where no listed
+            # element fits, a step by position is the way in; whether a step
+            # waits for the person is the browser tool's own prompt's to say.
             + (
-                _SANDBOXED_BACKENDS_RULE
-                if sandboxed
-                else "For a service that must keep running, build a full-stack artifact and start it with `launch_backend`."
+                " In the browser, when no listed element fits (a slider, a map, a date grid, a canvas, a drag "
+                "handle), click or drag by position (x, y) right away instead of reading the page again."
+                if turn_browser is not None
+                else ""
             )
             + attachment_context
+            + _working_folders_context(folder_paths)
         )
         output_context = (
             # Artifacts live under `<base>/.anton/artifacts/<slug>/`, one
@@ -1462,7 +2004,7 @@ class AntonHarness:
             # (which conversation, which turns) is tracked server-side
             # and stamped into each folder's metadata.json + README.md
             # automatically.
-            f"User-facing artifacts (HTML dashboards, CSVs, PDFs, datasets, {'' if sandboxed else 'fullstack apps, '}etc.) live under `{str(artifacts_dir)}/`. "
+            f"User-facing artifacts (HTML dashboards, CSVs, PDFs, datasets, {'' if sandboxed and not offers_live_apps else 'fullstack apps, '}etc.) live under `{str(artifacts_dir)}/`. "
             "Workflow:\n"
             "  1. Call `create_artifact(name, description, type)` BEFORE writing any output. "
             "It returns `{slug, path, ...}` — write your files into the returned `path`.\n"
@@ -1496,8 +2038,9 @@ class AntonHarness:
         data_vault = None
         turn_scratch_dir: Path | None = None
         if LocalDataVault is not None:
+            from cowork.services.connectors import app_held
             from cowork.services.connectors.layered_vault import FilteredDataVault
-            from cowork.services.connectors.persist import turn_vault_for_scope
+            from cowork.services.connectors.persist import own_vault_root, turn_vault_for_scope
 
             # The asker's own connections, with the operator's managed ones
             # over them and the ones others share with the asker after them,
@@ -1514,6 +2057,32 @@ class AntonHarness:
                 )
             else:
                 data_vault = source_vault
+            data_vault = app_held.turn_vault(
+                data_vault, source_vault=source_vault, root=own_vault_root(current_settings_scope())
+            )
+            # anton builds the cell's DS_* environment one connection at a
+            # time and leaves out one that fails, so a sealed connection that
+            # won't open stops the turn here, naming it, instead.
+            from cowork.common.encryption import sealing_keys
+
+            if sealing_keys() is not None:
+                from cowork.services.connectors.sealed_vault import (
+                    SealedRecordError,
+                    refuse_unopenable_connections,
+                )
+
+                try:
+                    refuse_unopenable_connections(vault=data_vault)
+                except SealedRecordError as error:
+                    logger.error(
+                        "A saved connection can't be opened, so the turn stops",
+                        extra={
+                            "event": "sealed_connection_unopenable",
+                            "connection": error.connection,
+                            "reason": error.cause,
+                        },
+                    )
+                    raise
             # Registers this turn's DS_* names and values for scrubbing, and
             # touches no process state, so a concurrent turn's are left alone.
             from anton.utils.datasources import restore_namespaced_env
@@ -1558,8 +2127,12 @@ class AntonHarness:
                 )
                 # Agent-facing API notes for this turn's connected engines.
                 # `data_vault` is already filtered by `disabled_connections`.
-                connector_usage_notes = registry.usage_notes_for(
+                connector_usage_notes = await scope_usage_notes(
                     c["engine"] for c in vault_connections
+                )
+
+                integration_guidance += describe_project_pages(
+                    service.picked_files_by_project(data_vault, conversation.project.name, engine="notion")
                 )
 
             cells = extract_scratchpad_cells(history.events)
@@ -1577,7 +2150,7 @@ class AntonHarness:
                     self._stamp_message,
                 )
             else:
-                initial_history = [self._stamp_message(m) for m in replayable]
+                initial_history = _without_repeated_narration([self._stamp_message(m) for m in replayable])
                 seed_info = None
 
             # The memory of the person who asked: their own tiers, or the
@@ -1620,7 +2193,8 @@ class AntonHarness:
                 layout=memory_layout,
                 mode=(
                     anton_settings.memory_mode
-                    if anton_settings.memory_enabled and memory_layout.learns
+                    if anton_settings.memory_enabled
+                    and _learns_this_turn(conversation, memory_layout.learns)
                     else "off"
                 ),
                 llm_client=llm_client,
@@ -1637,13 +2211,21 @@ class AntonHarness:
             # read-only root, never links a slug the managed folder reserves
             # (linked_turn_skills), and neither do the fan-outs into projects
             # (reconcile_skill_links, reconcile_project).
+            # The skills the asker turned off for themselves, read once for
+            # the whole turn: none of them is linked or followed by an
+            # artifact build, whichever root holds it.
+            off_for_me = await _turn_skills_off_for_me(current_settings_scope())
             managed = managed_folder()
             managed_skill_dirs: dict[str, Path] = {}
             if managed is not None:
                 if turn_scratch_dir is None:
                     turn_scratch_dir = _new_turn_scratch_dir()
                 managed_skills_dir = turn_scratch_dir / "managed-skills"
-                managed_skill_dirs = managed.skill_dirs()
+                managed_skill_dirs = {
+                    slug: path
+                    for slug, path in managed.skill_dirs().items()
+                    if slug not in off_for_me
+                }
                 sync_turn_skill_links(skills_dir=managed_skills_dir, wanted=managed_skill_dirs)
                 anton_settings.skills_extra_roots = [
                     *anton_settings.skills_extra_roots,
@@ -1690,10 +2272,24 @@ class AntonHarness:
                     project_name=conversation.project.name,
                     skills_dir=turn_skills_dir,
                     shared_skills_dir=shared_skills_dir,
+                    off_for_me=off_for_me,
                 )
                 if turn_skills_dir != project_skills_dir:
                     read_only_dirs.append(turn_skills_dir)
                 anton_settings.skills_root = turn_skills_dir
+            # The skills an artifact build follows without a recall (anton's
+            # SkillStore.list_for_artifacts): the host's, the managed folder's
+            # and the asker's own, never one another person shares, whose text
+            # would otherwise steer every build the asker runs.
+            anton_settings.skills_artifact_roots = [
+                HOST_SKILLS_DIR,
+                *managed_skill_dirs.values(),
+                *artifact_skill_dirs(
+                    scope=turn_scope,
+                    project_name=conversation.project.name,
+                    off_for_me=off_for_me,
+                ),
+            ]
             read_only_dirs += anton_settings.skills_extra_roots
             read_only_dirs += [Path(row.path).parent for row in attachment_rows or () if row.path]
             # None with the sandbox off, and then not passed at all. Built in a
@@ -1703,6 +2299,11 @@ class AntonHarness:
             # the settings scope still applies there.
             cell_sandbox = await asyncio.to_thread(
                 build_cell_sandbox, scope=turn_scope, project_dir=base, read_only_dirs=read_only_dirs,
+            )
+            # None with live apps off, for a turn that names nobody with an
+            # email, or on a comparison side, and then not passed at all.
+            live_app_host = (
+                None if comparison_side else live_app_host_for_turn(project_id=conversation.project.id)
             )
 
             deployment = identity_for_turn()
@@ -1725,12 +2326,13 @@ class AntonHarness:
                 # either. Passed directly, as _turn_cortex passes managed_hc:
                 # every anton the floor admits has the field, and a dropped
                 # one would silently bring the memory passes back.
-                background_memory=memory_layout.learns,
+                background_memory=_learns_this_turn(conversation, memory_layout.learns),
                 # episodic=episodic,
                 system_prompt_context=SystemPromptContext(
                     runtime_context=build_runtime_context(anton_settings),
                     suffix=(
                         _turn_style_context(channel_context)
+                        + _MESSAGE_TIME_CONTEXT
                         + f"{project_context}"
                         + f"{output_context}"
                         + f"{skill_output_context}"
@@ -1747,7 +2349,7 @@ class AntonHarness:
                 initial_history=initial_history,
                 # history_store=history_store,
                 session_id=str(conversation.id),
-                elicitor=build_elicitor(str(conversation.id)),
+                elicitor=elicitor,
                 # Surfaced on langfuse traces (Langfuse-Tags / metadata) so calls
                 # are attributed to the active harness. self.id == "anton".
                 harness=self.id,
@@ -1768,6 +2370,17 @@ class AntonHarness:
                 # brief when the agent acts first); without it the tool hands
                 # the content to the agent. Dropped by an anton without the field.
                 **supported_kwargs(ChatSessionConfig, tool_messages=tool_messages),
+                # The app's language (ENG-4149): one line in anton's prompt.
+                # Dropped by an anton without the field, which then answers
+                # in the user's language as it always has.
+                **supported_kwargs(ChatSessionConfig, ui_locale=ui_locale),
+                # The artifact editor's "does it run in the open preview?"
+                # check (ENG-4207). Dropped by an anton without the field,
+                # whose editor then has no preview check at all.
+                **preview_checker_kwargs(ChatSessionConfig, preview_checker),
+                # Read above, with the prompt line it brings. Passed directly:
+                # every anton the floor admits has the field.
+                browser=turn_browser,
                 proactive_dashboards=anton_settings.proactive_dashboards,
                 act_first=anton_settings.act_first,
                 # Hosted web search stays off when COWORK_OPENAI_COMPATIBLE_API
@@ -1785,9 +2398,11 @@ class AntonHarness:
                     REQUEST_CREDENTIALS_TOOL,
                     LABEL_CONNECTION_TOOL,
                     CREATE_SKILL_DRAFT_TOOL,
+                    *DOC_TOOLS,
                     # FETCH_SUBMISSION_TOOL,
                     # UPDATE_FORM_TOOL,
                     *([RECALL_HISTORY_TOOL] if RECALL_HISTORY_TOOL else []),
+                    *schedule_tools,
                     *mcp_tool_defs,
                 ],
                 # Same gate as the discovery call above, not a second one:
@@ -1800,6 +2415,9 @@ class AntonHarness:
                 # refuses the sandbox on an anton without the field, and a
                 # dropped policy would run every cell unlocked.
                 **({"cell_sandbox": cell_sandbox} if cell_sandbox is not None else {}),
+                # Passed directly as well: create_app refuses live apps on an
+                # anton whose ChatSessionConfig takes no live_app_host.
+                **({"live_app_host": live_app_host} if live_app_host is not None else {}),
                 cells=cells
             )
             # Not `ChatSession(config)` directly: every construction of anton's
@@ -1837,3 +2455,40 @@ class AntonHarness:
     def _build_llm_client(effort: str | None = None, *, model: str | None = None, settings=None):
         from cowork.services.providers import build_llm_client
         return build_llm_client(effort_override=effort, model_override=model, settings=settings)
+
+
+async def _browser_config(
+    user, *, channel_context: ChannelContext | None, conversation_id: str, project_id,
+) -> "BrowserConfig | None":
+    """anton's browser for an in-process turn: the desktop app's own browser,
+    with the task's own session, or None.
+
+    None for a channel turn: it comes from a chat where people other than the
+    desktop's owner can write, and the browser holds the owner's sign-ins.
+    None when the person turned the browser off or there is no decisions
+    model to pick its steps (cowork.services.browser.browser_runs), when the
+    app registered no browser, which is always the case where more than one
+    person shares this process
+    (cowork.common.settings.runtime_credential.get_browser_host), and when a
+    signed-in desktop's organization turned the browser off, read before each
+    turn (cowork.services.browser.desktop_organization_off).
+    The web's browser never reaches an in-process turn: web turns run
+    remotely, and the producer gives them the router.
+
+    The organization's own decision model, when it set one up, goes with the
+    config: anton then asks it for the browser's steps rather than Jev on
+    MindsHub, as the route gate does (jev_route.gate_mode).
+    """
+    from cowork.services.browser import browser_runs, desktop_browser_config, desktop_organization_off
+
+    if channel_context is not None or not browser_runs(user):
+        return None
+    from cowork.common.settings.app_settings import TurnQueueSettings
+    from cowork.handlers.jev_route import own_decision_target
+
+    target = own_decision_target(user)
+    decisions = (target, user.decision_model or TurnQueueSettings().jev_route_model) if target else None
+    config = desktop_browser_config(conversation_id=conversation_id, project_id=project_id, decisions=decisions)
+    if config is None or await desktop_organization_off():
+        return None
+    return config

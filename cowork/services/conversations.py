@@ -5,7 +5,7 @@ import json
 import logging
 import os
 import stat
-from collections.abc import Iterable
+from collections.abc import Collection, Iterable
 from dataclasses import dataclass
 from datetime import datetime
 from functools import partial
@@ -15,6 +15,7 @@ from uuid import UUID
 from pydantic import ValidationError
 from sqlalchemy import Text, case, cast, func, or_, tuple_
 from sqlalchemy import select as sa_select
+from sqlalchemy.orm import Bundle, selectinload
 
 from cowork.common.logger import log_context
 from cowork.common.paths import (
@@ -26,12 +27,13 @@ from cowork.common.paths import (
 from cowork.db.scoped import ScopedSelect, ScopedSession, TenantScope
 from cowork.db.units import run_db
 from cowork.models.conversation import Conversation
+from cowork.models.conversation_folder import ConversationFolder
 from cowork.models.message import Message
 from cowork.models.message_event import MessageEvent
 from cowork.models.project import Project
 from cowork.schemas.conversations import ConversationItemsPage
 from cowork.schemas.figure_sources import EarlierAnswer
-from cowork.schemas.responses import Role
+from cowork.schemas.responses import Role, TurnPick
 from cowork.services.channel_bindings import ChannelBindingService
 from cowork.services.schedules import ScheduleService
 from cowork.services.scratchpad_sessions import remove_conversation_sessions
@@ -96,6 +98,18 @@ _MESSAGE_ORDER = (
 _MESSAGE_ORDER_NEWEST_FIRST = tuple(column.desc() for column in _MESSAGE_ORDER)
 
 
+def _last_message_at():
+    """Each conversation's newest message time, as a subquery correlated to
+    the Conversation row. Without a GROUP BY, Postgres and SQLite answer each
+    row with one seek on `ix_messages_conversation_created`."""
+    return (
+        sa_select(func.max(Message.created_at))
+        .where(Message.conversation_id == Conversation.id)
+        .correlate(Conversation)
+        .scalar_subquery()
+    )
+
+
 def _message_cursor_key(message: Message) -> tuple[int, int, UUID]:
     """The runtime value of each _MESSAGE_ORDER column for one row, in the
     same order — used to build a keyset pagination cursor from it."""
@@ -154,14 +168,15 @@ class ConversationDeleteStage:
 
 
 def _is_tool_row(content) -> bool:
-    """True for a history-only tool block-row (all blocks are tool_use /
-    tool_result). These carry prior tool calls for LLM-history replay and are
-    hidden from the UI, which renders tool activity from message events."""
+    """True for a history-only tool block-row: tool_use / tool_result blocks,
+    plus the text the assistant wrote beside its tool calls. These carry prior
+    tool calls for LLM-history replay and are hidden from the UI, which renders
+    tool activity from message events."""
     return (
         isinstance(content, list)
-        and len(content) > 0
+        and any(isinstance(block, dict) and block.get("type") in ("tool_use", "tool_result") for block in content)
         and all(
-            isinstance(block, dict) and block.get("type") in ("tool_use", "tool_result")
+            isinstance(block, dict) and block.get("type") in ("tool_use", "tool_result", "text")
             for block in content
         )
     )
@@ -457,13 +472,7 @@ class ConversationService:
         clean Conversation rows. Empty conversations coalesce to their own
         `created_at` so a NULL max can't sort them to the end.
         """
-        last_activity = func.coalesce(
-            sa_select(func.max(Message.created_at))
-            .where(Message.conversation_id == Conversation.id)
-            .correlate(Conversation)
-            .scalar_subquery(),
-            Conversation.created_at,
-        )
+        last_activity = func.coalesce(_last_message_at(), Conversation.created_at)
         stmt = self.session.select(Conversation)
         # Conversations are personal: the scoped session enforces the org, but
         # user_id has no automatic scoping (see PinService), so without this
@@ -474,11 +483,28 @@ class ConversationService:
             stmt = stmt.where(
                 Conversation.project_id == (project_id or self._default_project_id())
             )
+        else:
+            # A cross-project list is what a person browses, so it leaves out
+            # the model-comparison sides; their own project's list still has
+            # them. autoescape: `_` is a LIKE wildcard, and the prefix starts
+            # with one.
+            from cowork.services.projects import COMPARISON_SANDBOX_PREFIX
+
+            stmt = stmt.where(
+                Conversation.project_id.not_in(
+                    sa_select(Project.id).where(
+                        Project.name.startswith(COMPARISON_SANDBOX_PREFIX, autoescape=True)
+                    )
+                )
+            )
         # created_at then id break ties deterministically so equal-activity rows
         # (e.g. two empty conversations) keep a stable order across polls.
         stmt = stmt.order_by(
             last_activity.desc(), Conversation.created_at.desc(), Conversation.id
         ).limit(limit)
+        # Every caller shows each row's project: loaded in one query for the
+        # page, not one lazy load per row.
+        stmt = stmt.options(selectinload(Conversation.project))
         return list(self.session.exec(stmt).all())
 
     def list_conversations_with_activity(
@@ -488,16 +514,37 @@ class ConversationService:
         all_projects: bool = False,
     ) -> list[tuple[Conversation, datetime]]:
         """`list_conversations` paired with each row's last-activity timestamp
-        for serialization. The value reuses `last_message_at` (an index seek on
-        the ENG-961 composite index); callers that don't need the value (e.g.
-        search indexing) use `list_conversations` and skip the per-row lookup.
+        for serialization: `last_message_at` for the whole page in one query
+        (`last_messages_at`). Callers that don't need the value (e.g. search
+        indexing) use `list_conversations` and skip it.
         """
         convs = self.list_conversations(
             project_id=project_id, limit=limit, all_projects=all_projects
         )
-        return [
-            (conv, self.last_message_at(conv.id) or conv.created_at) for conv in convs
-        ]
+        last = self.last_messages_at([conv.id for conv in convs])
+        return [(conv, last.get(conv.id) or conv.created_at) for conv in convs]
+
+    def last_messages_at(self, conversation_ids: list[UUID]) -> dict[UUID, datetime]:
+        """`last_message_at` for many conversations in one query; a
+        conversation with no message has no entry.
+
+        One row per conversation, from the same correlated MAX that
+        `list_conversations` orders by. A join back to `messages` on the max
+        `created_at` would return every row of a turn's commit, since a
+        turn's tool rows and answer share one `created_at`
+        (`save_assistant_turn`). The Bundle keeps both columns through the
+        scoped select, which runs as scalars.
+        """
+        if not conversation_ids:
+            return {}
+        rows = self.session.exec(
+            self.session.select(Conversation)
+            .with_only_columns(
+                Bundle("last", Conversation.id, _last_message_at().label("created_at"))
+            )
+            .where(Conversation.id.in_(conversation_ids))
+        ).all()
+        return {row.id: row.created_at for row in rows if row.created_at is not None}
 
     def _owned(self, conversation_id: UUID) -> Conversation | None:
         """Fetch a conversation only if it belongs to the caller.
@@ -516,20 +563,28 @@ class ConversationService:
             stmt = stmt.where(Conversation.created_by == self.session.scope.user_id)
         return self.session.exec(stmt).first()
 
-    def owned_ids(self, conversation_ids: Iterable[UUID]) -> set[UUID]:
-        """The subset of `conversation_ids` the caller owns, in one query.
+    def owned_ids(self) -> set[UUID]:
+        """Every conversation the caller owns, in one query that reads only
+        the ids.
 
-        Same rule as `_owned`, batched. The artifact roots resolver walks one
-        directory per conversation and holds every id at once, so without this
-        a plain list request would issue a SELECT per directory.
+        Same rule as `_owned`, batched. The artifact roots resolver reads it
+        once per request, before it walks the file store, so a listing over
+        every project runs one query, not one per project. The query can name
+        neither the directories it will find nor their project: a task moved
+        to another project keeps its workspace directory under the old one.
         """
-        ids = list(conversation_ids)
-        if not ids:
-            return set()
-        stmt = self.session.select(Conversation).where(Conversation.id.in_(ids))
+        return set(self.session.exec(self.owned_ids_query()).all())
+
+    def owned_ids_query(self) -> ScopedSelect:
+        """The query `owned_ids` runs, for a query that filters by the
+        caller's conversations in the database
+        (held_artifact_roots.held_root_rows). Same rule as `_owned`: in org mode
+        the conversations the scope's user created, and for a scope with no
+        user the ones no member created."""
+        stmt = self.session.select(Conversation).with_only_columns(Conversation.id)
         if self.session.scope.org_mode:
             stmt = stmt.where(Conversation.created_by == self.session.scope.user_id)
-        return {row.id for row in self.session.exec(stmt).all()}
+        return stmt
 
     def get_conversation(self, conversation_id: UUID) -> Conversation:
         conversation = self._owned(conversation_id)
@@ -545,10 +600,12 @@ class ConversationService:
         harness: str | None = None,
         model: str | None = None,
         reasoning_effort: str | None = None,
+        channel_type: str | None = None,
     ) -> Conversation:
         """`conversation_id` lets the caller adopt a client-allocated id —
         the composer allocates one up front so attachments can be uploaded
-        against it before the first stream creates the conversation."""
+        against it before the first stream creates the conversation.
+        `channel_type` is set only by the channel runtime, never from a request."""
         # Anchor the parent: the target project must be visible in scope —
         # otherwise org A could link a conversation to org B's project and
         # leak its name/path through serialization.
@@ -561,6 +618,7 @@ class ConversationService:
             harness=harness,
             model=model,
             reasoning_effort=reasoning_effort,
+            channel_type=channel_type,
         )
         if conversation_id is not None:
             conversation.id = conversation_id
@@ -598,6 +656,36 @@ class ConversationService:
         self.session.commit()
         self.session.refresh(conversation)
         return conversation
+
+    def record_turn_picks(
+        self,
+        *,
+        conversation: Conversation,
+        model: str | None,
+        reasoning_effort: str | None,
+        reset: Collection[TurnPick] = (),
+    ) -> None:
+        """Save a turn's model and reasoning-effort picks as the conversation's
+        own, so a reopened chat comes back on the latest ones.
+
+        A pick the turn leaves out keeps the saved value. Cowork's renderer
+        sends no model for a pinned model its picker no longer offers
+        (`offeredModelId`, e.g. one the wallet locks), and that turn must not
+        wipe the pin a top-up brings back. A pick named in `reset` that the
+        turn leaves out is cleared instead: the user went back to Model Router
+        or the default effort. A pick the turn sends wins over its reset.
+        Commits only on a change.
+        """
+        picks = (
+            model or (None if "model" in reset else conversation.model),
+            reasoning_effort or (None if "reasoning_effort" in reset else conversation.reasoning_effort),
+        )
+        if picks == (conversation.model, conversation.reasoning_effort):
+            return
+        conversation.model, conversation.reasoning_effort = picks
+        self.session.add(conversation)
+        self.session.commit()
+        self.session.refresh(conversation)
 
     def update_history_compaction(
         self,
@@ -645,13 +733,18 @@ class ConversationService:
                 return archived
         return []
 
-    def delete_conversation(self, conversation_id: UUID) -> bool:
+    def delete_conversation(self, conversation_id: UUID, *, cleanup_project_files: bool = True) -> bool:
         """Owner-scoped delete for the request path: a member can only delete
-        their own conversation."""
+        their own conversation.
+
+        ``cleanup_project_files=False`` deletes the rows and the attachments'
+        files but leaves the conversation's folders in its project alone, for
+        a caller that knows none were made and runs off the file store's
+        threads, such as the scheduler's discard of a run that never started."""
         conversation = self._owned(conversation_id)
         if conversation is None:
             return False
-        return self._delete_conversation(conversation)
+        return self._delete_conversation(conversation, cleanup_project_files=cleanup_project_files)
 
     def stage_delete_conversation_row(
         self,
@@ -687,6 +780,12 @@ class ConversationService:
         # outlive the conversation as orphans pointing at artifacts no
         # task owns anymore.
         TaskObjectService(self.session).delete_for_conversation(conversation)
+        for folder in self.session.exec(
+            self.session.select(ConversationFolder).where(
+                ConversationFolder.conversation_id == conversation_id
+            )
+        ).all():
+            self.session.delete(folder)
         # Drop the conversation's uploaded attachments (rows + bytes) — they're
         # keyed by conversation id and would otherwise orphan in the file store
         # forever, invisible in any UI (ENG-701). Stage the row deletes into
@@ -758,7 +857,7 @@ class ConversationService:
                 stage.conversation_id,
             )
 
-    def _delete_conversation(self, conversation: Conversation) -> bool:
+    def _delete_conversation(self, conversation: Conversation, *, cleanup_project_files: bool = True) -> bool:
         try:
             # A direct delete is the actor's own: never reach past their file
             # rows into a peer's attachment on the same conversation.
@@ -770,7 +869,7 @@ class ConversationService:
         except Exception:
             self.session.rollback()
             raise
-        self.finalize_staged_conversation_delete(stage)
+        self.finalize_staged_conversation_delete(stage, cleanup_project_files=cleanup_project_files)
         return True
 
     def delete_turn(self, conversation_id: UUID, message_id: UUID) -> int:
@@ -996,7 +1095,10 @@ class ConversationService:
                 self.session.select(MessageEvent)
                 .where(MessageEvent.message_id == reply.id)
             ).all()
-            if any(e.event_data.get("type") in {"response.completed", "response.failed"} for e in events):
+            if any(
+                e.event_data.get("type") in {"response.completed", "response.failed", "response.cancelled"}
+                for e in events
+            ):
                 return False
             self.session.add(MessageEvent(
                 message_id=reply.id,

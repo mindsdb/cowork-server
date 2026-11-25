@@ -4,7 +4,7 @@ import subprocess
 from pathlib import Path
 
 import pytest
-from coding_service_fakes import CREDS, FakeEngine, service_with, wait_for_status
+from tests.support.coding.service_fakes import CREDS, FakeEngine, service_with, wait_for_status
 
 from cowork.coding.contracts import SessionCreateRequest, SessionStatus
 from cowork.coding.control_errors import StateConflict
@@ -41,6 +41,9 @@ def repository(root: Path, name: str) -> Path:
     git(repo, "init")
     git(repo, "config", "user.email", "cowork@example.invalid")
     git(repo, "config", "user.name", "Cowork Test")
+    # A commit starts a detached `git maintenance`, which since git 2.55 holds
+    # .git/objects/maintenance.lock after the commit returns.
+    git(repo, "config", "maintenance.auto", "false")
     (repo / "README.md").write_text(f"{name}\n", encoding="utf-8")
     git(repo, "add", ".")
     git(repo, "commit", "-m", "base")

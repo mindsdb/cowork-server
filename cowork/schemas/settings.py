@@ -23,6 +23,9 @@ class SettingResponse(BaseModel):
     is_set: bool
     value: str | None
     options: list[str] | None = None
+    # The value in force when nothing is stored; set for the turn budgets only,
+    # so Settings can show the safety limits while the limits switch is off.
+    default: str | None = None
 
 
 class ProviderProbeCard(CamelRequest):
@@ -53,7 +56,10 @@ class ProviderProbeCard(CamelRequest):
 ProbeDenialCode = Literal[
     "wallet_empty",
     "included_allowance_exhausted",
+    "window_allowance_exhausted",
+    "model_not_in_tier",
     "free_air_daily_spend_fuse_exceeded",
+    "budget_exceeded",
     "rate_limited",
     "policy_unavailable",
 ]
@@ -64,7 +70,7 @@ class ProviderProbeDenial(CamelResponse):
 
     code: ProbeDenialCode
     # The gate's X-MindsHub-Reset-At instant, as the opaque ISO string it sent.
-    # Set on the allowance and free-Air fuse denials; the renderer formats it.
+    # Set on the allowance, plan-window and free-Air fuse denials; the renderer formats it.
     reset_at: str | None = None
 
 

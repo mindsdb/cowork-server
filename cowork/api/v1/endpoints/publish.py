@@ -6,18 +6,26 @@ from __future__ import annotations
 
 from typing import Annotated, Literal
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
-from pydantic import BaseModel
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
+from fastapi.responses import JSONResponse, Response
+from pydantic import BaseModel, StrictBool, model_validator
 
+from cowork.api.v1.endpoints.connectors.connections import require_app_secret
 from cowork.api.v1.permissions import DesktopOnly, require
-from cowork.db.scoped import ScopedSessionDep, TenantScope, get_tenant_scope
+from cowork.db.scoped import TenantScope, get_tenant_scope
+from cowork.schemas.artifact_access import ArtifactAccessRequest
+from cowork.services.datasource_approval import DatasourceApprovalUnavailable, DatasourceKey
 
+from cowork.services import artifact_stats as _stats
 from cowork.services.publish import (
     PublisherUnavailable,
+    ShareOrgRequired,
     activate_version as _activate_version,
     desktop_publish_context as _desktop_context,
+    desktop_publish_credential as _desktop_credential,
     list_publishable,
     list_versions as _list_versions,
+    pending_datasources as _pending,
     publish_artifact as _publish,
     unpublish_artifact as _unpublish,
     update_artifact as _update,
@@ -47,6 +55,21 @@ class _AccessBody(BaseModel):
     owner_only: bool = False
 
 
+class _ApprovedDatasource(BaseModel):
+    engine: str
+    name: str
+
+
+def _approved(items: list[_ApprovedDatasource], request: Request) -> frozenset[DatasourceKey] | None:
+    """The connections this request approves sending credentials for. An
+    approval carries the desktop app's secret: agent code on the same machine
+    can call this route too."""
+    if not items:
+        return None
+    require_app_secret(request)
+    return frozenset(DatasourceKey(item.engine, item.name) for item in items)
+
+
 class _PublishBody(BaseModel):
     path: str
     # Back-compat: a bare top-level password still publishes password-protected.
@@ -55,10 +78,12 @@ class _PublishBody(BaseModel):
     # .published.json for the in-app reveal.
     password: str | None = None
     access: _AccessBody | None = None
+    approved_datasources: list[_ApprovedDatasource] = []
 
 
 class _UpdateBody(BaseModel):
     path: str
+    approved_datasources: list[_ApprovedDatasource] = []
 
 
 class _ActivateBody(BaseModel):
@@ -66,17 +91,48 @@ class _ActivateBody(BaseModel):
     md5: str
 
 
+class _StatsTrackingBody(BaseModel):
+    """At least one setting; an omitted one stays as it is."""
+
+    path: str
+    enabled: StrictBool | None = None
+    require_email: StrictBool | None = None
+
+    @model_validator(mode="after")
+    def _one_setting(self):
+        if self.enabled is None and self.require_email is None:
+            raise ValueError("Send enabled, require_email or both")
+        return self
+
+
 @router.get("/")
-async def list_publishable_endpoint(scope: ScopeDep, session: ScopedSessionDep):
-    return list_publishable(scope=scope, session=session)
+async def list_publishable_endpoint(scope: ScopeDep):
+    return list_publishable(scope=scope)
 
 
-@router.post("/")
-async def publish_artifact(req: _PublishBody, scope: ScopeDep, session: ScopedSessionDep):
+# Plain `def`: it reads the approval table and the vault.
+@router.get("/datasources")
+def pending_datasources_endpoint(scope: ScopeDep, path: str = Query(...)):
     try:
-        artifact, artifacts_base, api_key, publish_url = _desktop_context(
-            req.path, scope=scope, session=session
-        )
+        return {"pending": _pending(path, scope=scope)}
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
+    except ValueError as e:
+        # ensure_full_id: metadata.json can't be read.
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+    except DatasourceApprovalUnavailable as e:
+        raise HTTPException(status_code=503, detail=str(e))
+
+
+# Plain `def`: publishing renders a Markdown page in the conversion process
+# and uploads the bundle, both blocking, so FastAPI runs it in its threadpool,
+# off the event loop. A typed refusal (an HTTPException) answers with its own
+# status: 413, 429 or 500 for a Markdown page, 413 for a bundle too large.
+@router.post("/")
+def publish_artifact(req: _PublishBody, request: Request, scope: ScopeDep):
+    try:
+        approved = _approved(req.approved_datasources, request)
+        artifact, artifacts_base, api_key, publish_url = _desktop_context(req.path, scope=scope)
         # The publisher resolves datasource secrets from the connector vault,
         # which is keyed by the scope wherever connections are partitioned;
         # without it the publisher would look in the shared root. This router
@@ -88,46 +144,55 @@ async def publish_artifact(req: _PublishBody, scope: ScopeDep, session: ScopedSe
             api_key=api_key,
             publish_url=publish_url,
             password=req.password,
-            access=req.access.model_dump() if req.access else None,
+            access=ArtifactAccessRequest.of_publisher(req.access.model_dump()) if req.access else None,
             scope=scope,
+            approved_datasources=approved,
         )
     except FileNotFoundError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
-    except PublisherUnavailable as e:
+    except (PublisherUnavailable, DatasourceApprovalUnavailable) as e:
         raise HTTPException(status_code=503, detail=str(e))
+    except ShareOrgRequired as e:
+        # MindsHub refused the share with everyone and nothing was published.
+        return JSONResponse(e.refusal().model_dump(), status_code=e.status_code)
     except RuntimeError as e:
         raise HTTPException(status_code=502, detail=str(e))
 
 
 @router.post("/update")
-async def update_artifact(req: _UpdateBody, scope: ScopeDep, session: ScopedSessionDep):
+def update_artifact(req: _UpdateBody, request: Request, scope: ScopeDep):
     try:
-        return _update(req.path, scope=scope, session=session)
+        return _update(
+            req.path, scope=scope,
+            approved_datasources=_approved(req.approved_datasources, request),
+        )
     except FileNotFoundError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
-    except PublisherUnavailable as e:
+    except (PublisherUnavailable, DatasourceApprovalUnavailable) as e:
         raise HTTPException(status_code=503, detail=str(e))
+    except ShareOrgRequired as e:
+        # MindsHub refused the share with everyone and nothing was published.
+        return JSONResponse(e.refusal().model_dump(), status_code=e.status_code)
     except RuntimeError as e:
         raise HTTPException(status_code=502, detail=str(e))
 
 
+# Plain `def`: it waits for the folder's publish lock, which a publish
+# running in the threadpool may hold.
 @router.delete("/")
-async def unpublish_artifact(
+def unpublish_artifact(
     scope: ScopeDep,
-    session: ScopedSessionDep,
     path: str = Query(..., description="Absolute path to the published HTML artifact"),
 ):
     try:
-        artifact, artifacts_base, api_key, publish_url = _desktop_context(
-            path, scope=scope, session=session
-        )
+        artifact, artifacts_base, api_key, publish_url = _desktop_context(path, scope=scope)
         return _unpublish(
             artifact, artifacts_base=artifacts_base,
-            api_key=api_key, publish_url=publish_url,
+            api_key=api_key, publish_url=publish_url, scope=scope,
         )
     except FileNotFoundError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
@@ -142,11 +207,10 @@ async def unpublish_artifact(
 @router.get("/versions")
 async def list_versions_endpoint(
     scope: ScopeDep,
-    session: ScopedSessionDep,
     path: str = Query(..., description="Absolute path to the published artifact"),
 ):
     try:
-        return _list_versions(path, scope=scope, session=session)
+        return _list_versions(path, scope=scope)
     except FileNotFoundError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
     except ValueError as e:
@@ -157,12 +221,12 @@ async def list_versions_endpoint(
         raise HTTPException(status_code=502, detail=str(e))
 
 
+# A plain `def`: the rollback waits for its folder's publish lock and calls
+# the publishing service, both off the event loop.
 @router.post("/activate")
-async def activate_version_endpoint(
-    req: _ActivateBody, scope: ScopeDep, session: ScopedSessionDep
-):
+def activate_version_endpoint(req: _ActivateBody, scope: ScopeDep):
     try:
-        return _activate_version(req.path, req.md5, scope=scope, session=session)
+        return _activate_version(req.path, req.md5, scope=scope)
     except FileNotFoundError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
     except ValueError as e:
@@ -171,3 +235,78 @@ async def activate_version_endpoint(
         raise HTTPException(status_code=503, detail=str(e))
     except RuntimeError as e:
         raise HTTPException(status_code=502, detail=str(e))
+
+
+def _stats_credential() -> tuple[str, str]:
+    """(api_key, publish_url), or the code the stats panel shows as "Reconnect".
+
+    Only the credential lookup's ValueError gets the code; a ValueError from
+    path resolution stays an ordinary 400.
+    """
+    try:
+        return _desktop_credential()
+    except ValueError as e:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={"code": _stats.PUBLISH_CREDENTIAL_MISSING_CODE, "message": str(e)},
+        ) from e
+
+
+# Plain `def` routes: FastAPI runs them in its threadpool, so the call to the
+# publishing service does not block the event loop.
+@router.get("/stats")
+def artifact_stats_endpoint(
+    scope: ScopeDep,
+    path: str = Query(..., description="Absolute path to the published artifact"),
+):
+    api_key, publish_url = _stats_credential()
+    try:
+        report_id = _stats.report_id_for_path(path, scope=scope)
+        return _stats.fetch_stats(publish_url=publish_url, key=api_key, report_id=report_id)
+    except _stats.STATS_ROUTE_ERRORS as e:
+        raise _stats.stats_http_exception(e, desktop=True) from e
+
+
+@router.put("/stats/tracking")
+def set_stats_tracking_endpoint(req: _StatsTrackingBody, scope: ScopeDep):
+    api_key, publish_url = _stats_credential()
+    try:
+        report_id = _stats.report_id_for_path(req.path, scope=scope)
+        return _stats.set_tracking(
+            publish_url=publish_url, key=api_key, report_id=report_id,
+            enabled=req.enabled, require_email=req.require_email,
+        )
+    except _stats.STATS_ROUTE_ERRORS as e:
+        raise _stats.stats_http_exception(e, desktop=True) from e
+
+
+@router.get("/stats/viewers/{viewer_id}")
+def artifact_stats_viewer_endpoint(
+    viewer_id: str,
+    scope: ScopeDep,
+    path: str = Query(..., description="Absolute path to the published artifact"),
+):
+    """One viewer's visits and per-section times, as the publishing service returns them."""
+    api_key, publish_url = _stats_credential()
+    try:
+        report_id = _stats.report_id_for_path(path, scope=scope)
+        return _stats.fetch_viewer(
+            publish_url=publish_url, key=api_key, report_id=report_id, viewer_id=viewer_id,
+        )
+    except _stats.STATS_ROUTE_ERRORS as e:
+        raise _stats.stats_http_exception(e, desktop=True) from e
+
+
+@router.delete("/stats", status_code=status.HTTP_204_NO_CONTENT)
+def delete_artifact_stats_endpoint(
+    scope: ScopeDep,
+    path: str = Query(..., description="Absolute path to the published artifact"),
+):
+    """Delete the artifact's viewer analytics: views, visits and viewers."""
+    api_key, publish_url = _stats_credential()
+    try:
+        report_id = _stats.report_id_for_path(path, scope=scope)
+        _stats.delete_stats(publish_url=publish_url, key=api_key, report_id=report_id)
+    except _stats.STATS_ROUTE_ERRORS as e:
+        raise _stats.stats_http_exception(e, desktop=True) from e
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
