@@ -5,17 +5,23 @@ import importlib
 import json
 import os
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 
 import httpx
 import pytest
 import sqlalchemy as sa
 from alembic.migration import MigrationContext
 from alembic.operations import Operations
+from fastapi import HTTPException, Request
 
 from cowork.harnesses.anton_harness.harness import _left_out_connections_guidance
+from cowork.api.v1.endpoints import schedules as schedules_api
+from cowork.db.scoped import TenantScope
 from cowork.harnesses.anton_harness.schedule_connector_reporting import build_blocked_connector_tool
 from cowork.harnesses.anton_harness.schedule_tools import _list_unit
 from cowork.models.schedule import Schedule
+from cowork.schemas.connectors import DisabledConnection
+from cowork.turnqueue.producer import _datasource_connection_refs
 from tests import test_schedule_model_fallback as fallback
 from tests.integration.prereq import missing_prerequisite
 
@@ -27,6 +33,13 @@ turns = fallback.turns
 COMPLETED, _run_due_slot, _scoped = fallback.COMPLETED, fallback._run_due_slot, fallback._scoped
 
 GMAIL = {"engine": "gmail", "name": "Work mail"}
+
+
+@pytest.fixture(autouse=True)
+def visible_local_connections(monkeypatch):
+    monkeypatch.setattr(schedules_api, "turn_vault_for_scope", lambda _: SimpleNamespace(
+        list_connections=lambda: [GMAIL],
+    ))
 
 
 def _client() -> httpx.AsyncClient:
@@ -92,8 +105,51 @@ async def test_the_api_saves_keeps_and_clears_a_tasks_left_out_connections(sched
         # An edit that doesn't name them keeps them.
         kept = (await client.patch(url, json={"title": "Renamed"})).json()
         assert kept["disabledConnections"] == [GMAIL]
+        unknown = await client.patch(url, json={"disabledConnections": [{"engine": "gmail", "name": "Typo"}]})
+        assert unknown.status_code == 422
         cleared = (await client.patch(url, json={"disabledConnections": []})).json()
         assert not cleared["disabledConnections"]
+
+
+async def test_a_hosted_datasource_exclusion_binds_the_visible_id(monkeypatch):
+    datasource = {"id": 12, "connector_id": "postgres", "name": "Primary"}
+
+    async def catalogue(*_):
+        return {"items": []}
+
+    async def datasources(*_):
+        return [datasource]
+
+    async def custom(*_):
+        return []
+
+    monkeypatch.setattr(schedules_api.auth_proxy, "proxy_catalogue", catalogue)
+    monkeypatch.setattr(schedules_api.auth_proxy, "proxy_datasource_list", datasources)
+    monkeypatch.setattr(schedules_api.auth_proxy, "proxy_custom_connection_list", custom)
+    scope = TenantScope(org_mode=True)
+    request = Request({"type": "http"})
+    assert await schedules_api._resolve_exclusions(
+        [DisabledConnection(engine="postgres", name="Primary")], scope, request,
+    ) == [{"engine": "postgres", "name": "Primary", "datasource_id": 12}]
+    datasource["name"] = "Renamed"
+    assert await schedules_api._resolve_exclusions(
+        [DisabledConnection(engine="postgres", name="Primary", datasource_id=12)], scope, request,
+    ) == [{"engine": "postgres", "name": "Renamed", "datasource_id": 12}]
+    with pytest.raises(HTTPException, match="could not be found"):
+        await schedules_api._resolve_exclusions(
+            [DisabledConnection(engine="postgres", name="Renamed", datasource_id=13)], scope, request,
+        )
+
+
+def test_hosted_grants_keep_the_renamed_datasource_excluded_and_allow_its_peer():
+    connections = [
+        {"id": 12, "connector_id": "postgres", "name": "Renamed", "status": "verified", "credential_version": 1},
+        {"id": 13, "connector_id": "postgres", "name": "Other", "status": "verified", "credential_version": 1},
+    ]
+    assert _datasource_connection_refs(
+        connections, [{"engine": "postgres", "name": "Primary", "datasource_id": 12}], scheduled=True,
+    ) == [{"connection_id": 13, "credential_version": 1}]
+    assert _datasource_connection_refs(connections, [{"engine": "postgres", "name": "Primary"}], scheduled=True) == []
 
 
 def test_a_scheduled_run_is_told_which_connections_its_task_leaves_out():
