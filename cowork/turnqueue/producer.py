@@ -1176,6 +1176,7 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
                                 disabled: list[dict] | None = None,
                                 started_at: str | None = None,
                                 interactive: bool = False,
+                                scheduled: bool = False,
                                 tool_messages: bool = False,
                                 connector_drafts: bool = False,
                                 preview_checks: bool = False,
@@ -1402,6 +1403,11 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
               # Web UI turns only: the pod then registers ask_user and takes
               # answers on stdin, which /answer feeds through Redis.
               "interactive": interactive,
+              # The runner owns this reporting tool. Only an actual scheduled
+              # turn gets excluded labels. Its connector blocks stay filtered.
+              **({"scheduled_excluded_connectors": [
+                  {"engine": connection["engine"], "name": connection["name"]} for connection in disabled
+              ]} if scheduled and disabled and not interactive else {}),
               # The cowork UI renders a tool's message to the user as an
               # agent message; without this the pod hands it to the agent.
               "tool_messages": tool_messages,
