@@ -23,6 +23,13 @@ def _questions(monkeypatch, *, enabled: bool) -> None:
     )
 
 
+def _write_approval(monkeypatch, *, on: bool) -> None:
+    """Set ANTON_WRITE_APPROVAL as the harness's settings read it."""
+    from cowork.harnesses.anton_harness import harness
+
+    monkeypatch.setattr(harness.settings, "write_approval", on)
+
+
 def test_flag_defaults_to_on(monkeypatch):
     monkeypatch.delenv("COWORK_ASK_USER_ENABLED", raising=False)
     from cowork.common.settings.app_settings import AppSettings
@@ -51,6 +58,7 @@ def test_harness_injects_no_elicitor_when_the_flag_is_off(monkeypatch, interacti
     from cowork.harnesses.anton_harness.harness import build_elicitor
 
     _questions(monkeypatch, enabled=False)
+    _write_approval(monkeypatch, on=True)
     assert build_elicitor("conv-1", interactive=interactive) is None
 
 
@@ -72,11 +80,26 @@ def test_a_scheduled_run_gets_an_elicitor_that_takes_only_approval_cards(monkeyp
     from cowork.harnesses.anton_harness.harness import build_elicitor
 
     _questions(monkeypatch, enabled=True)
+    _write_approval(monkeypatch, on=True)
     elicitor = build_elicitor("conv-1", interactive=False)
     assert elicitor is not None
     assert elicitor.supported_kinds == ("approval",)
     assert "choice" not in elicitor.supported_kinds
     assert elicitor.timeout_s == 300
+
+
+def test_a_scheduled_run_without_write_approval_gets_no_elicitor(monkeypatch):
+    """With ANTON_WRITE_APPROVAL off there is no write gate to remember an
+    unanswered card, so an approval card a scheduled run raises, such as a
+    live app's launch or a browser step, would wait out its timeout with
+    nobody watching. The run gets no elicitor, and every card comes back at
+    once."""
+    from cowork.harnesses.anton_harness.harness import build_elicitor
+
+    _questions(monkeypatch, enabled=True)
+    _write_approval(monkeypatch, on=False)
+    assert build_elicitor("conv-1", interactive=False) is None
+    assert build_elicitor("conv-1").supported_kinds == ("choice",)
 
 
 def test_the_approval_kind_is_antons():
@@ -97,6 +120,7 @@ async def test_a_scheduled_run_refuses_a_tools_confirmation_card(monkeypatch):
     from cowork.harnesses.anton_harness.harness import build_elicitor
 
     _questions(monkeypatch, enabled=True)
+    _write_approval(monkeypatch, on=True)
     published = []
 
     class _Session:
@@ -182,6 +206,7 @@ def test_a_scheduled_runs_session_has_no_ask_user_tool(monkeypatch):
     from cowork.harnesses.anton_harness.harness import build_elicitor
 
     _questions(monkeypatch, enabled=True)
+    _write_approval(monkeypatch, on=True)
     elicitor = build_elicitor("conv-1", interactive=False)
     session = ChatSession(ChatSessionConfig(llm_client=_mock_llm(), elicitor=elicitor))
     session._build_tools()
