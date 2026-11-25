@@ -35,7 +35,7 @@ from cowork.db.units import run_db, run_efs, run_on_unit_threads, run_to_complet
 from cowork.harnesses.base import ChannelContext, FileInputBlock, TextInputBlock, prompt_text, register
 from cowork.harnesses.anton_harness.agent_files import AgentFiles, read_conversation_attachments
 from cowork.harnesses.anton_harness.preview_checker import build_preview_checker, preview_checker_kwargs
-from cowork.harnesses.memory.policy import memory_policy
+from cowork.harnesses.memory.policy import memory_policy, memory_reads_off
 from cowork.harnesses.memory.turn_layout import (
     TurnMemoryLayout,
     empty_turn_memory,
@@ -2127,12 +2127,17 @@ class AntonHarness:
             # The memory of the person who asked: their own tiers, or the
             # deployment's shared ones, read through the same resolvers as the
             # /memory API. A turn with no person on a trusted-identity
-            # deployment, and every turn there while memory is off, gets two
-            # empty tiers in its scratch folder, memory off and no background
-            # passes, so it reads and writes nobody's memory. The layout is
-            # picked before any real tier's folder is made or read.
+            # deployment, every turn there while memory is off, and a turn
+            # whose own settings (desktop, hosted org mode) say memory is
+            # off, gets two empty tiers in its scratch folder, memory off and
+            # no background passes, so it reads and writes nobody's memory.
+            # The layout is picked before any real tier's folder is made or
+            # read.
             memory_state = memory_policy(memory_enabled=anton_settings.memory_enabled)
-            memory_off = memory_state.off
+            memory_off = memory_state.off or memory_reads_off(
+                memory_enabled=anton_settings.memory_enabled,
+                memory_mode=anton_settings.memory_mode,
+            )
             memory_layout: TurnMemoryLayout | None = None
             if not memory_off:
                 memory_layout = person_turn_memory(
@@ -2281,7 +2286,7 @@ class AntonHarness:
             deployment_kwargs = {} if deployment is None else {
                 "deployment_identity": deployment,
                 "learned_memory_scope": learned_memory_scope(
-                    off=memory_state.off,
+                    off=memory_off,
                     learns=memory_layout.learns,
                     shared=memory_state.shared,
                 ),
