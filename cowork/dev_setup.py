@@ -55,18 +55,27 @@ def _distribute_skill_links() -> None:
     reconcile_all(SkillService(LOCAL_SCOPE).list_skills())
 
 
-def run_dev_setup() -> None:
-    """Create local schema, seed required base rows, and run migrations."""
-    settings = get_app_settings()
-    db_uri = settings.database.uri
-
+def sqlite_database_file(*, db_uri: str) -> Path | None:
+    """The file a SQLite ``db_uri`` names, or None for an in-memory SQLite
+    database or another kind of database."""
     parsed = make_url(db_uri)
     if (
         parsed.drivername.startswith("sqlite")
         and parsed.database
         and parsed.database != ":memory:"
     ):
-        Path(parsed.database).parent.mkdir(parents=True, exist_ok=True)
+        return Path(parsed.database)
+    return None
+
+
+def run_dev_setup() -> None:
+    """Create local schema, seed required base rows, and run migrations."""
+    settings = get_app_settings()
+    db_uri = settings.database.uri
+
+    database_file = sqlite_database_file(db_uri=db_uri)
+    if database_file is not None:
+        database_file.parent.mkdir(parents=True, exist_ok=True)
 
     engine = get_engine(db_uri)
     run_schema_migrations(engine, db_uri)

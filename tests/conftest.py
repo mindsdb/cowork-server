@@ -29,6 +29,16 @@ os.environ["DATABASE_URI"] = f"sqlite:///{TMP / 'test.db'}"
 # whichever test decrypts first after get_fernet's cache clears. Hosted pods
 # take the key from COWORK_MASTER_KEY and read no file.
 os.environ["MASTER_KEY_PATH"] = str(Path(tempfile.mkdtemp(prefix="cowork-test-key-")) / "master.key")
+# The key exists before any test, as on a deployment that has encrypted
+# before. Making it on first use checks the database and the vaults for sealed
+# data (cowork.services.sealing.refuse_sealed_state_without_key_file), which an
+# async route would then run on the event loop. The tests that make one point
+# MASTER_KEY_PATH at a path of their own (the legacy_key fixture in
+# tests/test_sealing_start.py).
+if not Path(os.environ["MASTER_KEY_PATH"]).exists():
+    from cryptography.fernet import Fernet
+
+    Path(os.environ["MASTER_KEY_PATH"]).write_bytes(Fernet.generate_key())
 # Org mode's pod-local stores (publish state.json, probe env files, the
 # harness's temporary vault) default to <system temp>/cowork, which every test
 # process shares; per process, and outside COWORK_HOME for the same reason as the key.
@@ -743,3 +753,41 @@ def without_gc_pauses():
         yield
     finally:
         gc.enable()
+
+
+@pytest.fixture
+def key_file(monkeypatch, tmp_path):
+    """COWORK_KEY_FILE naming a new one-key file, as the host's key unit
+    writes it, with the server's cached keys read again on each side."""
+    from cryptography.fernet import Fernet
+
+    from cowork.common.encryption import get_fernet, sealing_keys
+
+    path = tmp_path / "run" / "key"
+    path.parent.mkdir()
+    path.write_bytes(Fernet.generate_key() + b"\n")
+    monkeypatch.setenv("COWORK_KEY_FILE", str(path))
+    sealing_keys.cache_clear()
+    get_fernet.cache_clear()
+    yield path
+    sealing_keys.cache_clear()
+    get_fernet.cache_clear()
+
+
+@pytest.fixture(params=["no key file", "key file"])
+def with_and_without_key_file(request, monkeypatch):
+    """Runs a test twice: once on a deployment without COWORK_KEY_FILE, whose
+    vaults are anton's plain ones, and once with a key file (key_file), whose
+    vaults seal every value. A test that uses it saves through the server's
+    own vault builder (cowork.services.connectors.persist.data_vault_at)."""
+    from cowork.common.encryption import get_fernet, sealing_keys
+
+    if request.param == "key file":
+        request.getfixturevalue("key_file")
+    else:
+        monkeypatch.delenv("COWORK_KEY_FILE", raising=False)
+        sealing_keys.cache_clear()
+        get_fernet.cache_clear()
+    yield request.param
+    sealing_keys.cache_clear()
+    get_fernet.cache_clear()
