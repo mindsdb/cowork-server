@@ -31,6 +31,25 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
-    """Downgrade schema. Tasks go back to using every connection."""
-    if "disabled_connections" in {c["name"] for c in sa.inspect(op.get_bind()).get_columns("schedules")}:
-        op.drop_column("schedules", "disabled_connections")
+    """Pause tasks whose connector exclusions the older server cannot enforce."""
+    connection = op.get_bind()
+    if "disabled_connections" not in {c["name"] for c in sa.inspect(connection).get_columns("schedules")}:
+        return
+    schedules = sa.table(
+        "schedules",
+        sa.column("disabled_connections", sa.JSON()),
+        sa.column("enabled", sa.Boolean()),
+        sa.column("paused_at", sa.DateTime(timezone=True)),
+    )
+    disabled = schedules.c.disabled_connections
+    json_type = sa.func.json_type if connection.dialect.name == "sqlite" else sa.func.json_typeof
+    has_exclusions = sa.case(
+        (json_type(disabled) == "array", sa.func.json_array_length(disabled) > 0),
+        else_=False,
+    )
+    op.execute(
+        schedules.update()
+        .where(has_exclusions)
+        .values(enabled=False, paused_at=sa.func.coalesce(schedules.c.paused_at, sa.func.current_timestamp()))
+    )
+    op.drop_column("schedules", "disabled_connections")
