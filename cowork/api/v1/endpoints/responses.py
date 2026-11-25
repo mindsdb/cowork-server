@@ -267,7 +267,7 @@ async def _refuse_while_answering(*, conversation: str | None, scope: TenantScop
     raise claim_held_refusal(conversation_id=conversation_id, holder=holder)
 
 
-@router.post("/", dependencies=[Depends(require(AuthenticatedInOrgMode))])
+@router.post("/", dependencies=[Depends(require(AuthenticatedInOrgMode)), Depends(require(WindowProof))])
 async def responses(
     responses_request: ResponsesRequest,
     request: Request,
@@ -633,7 +633,7 @@ class AddonRequest(BaseModel):
     local_key: str | None = None
 
 
-@router.post("/addon", dependencies=[Depends(require(AuthenticatedInOrgMode))])
+@router.post("/addon", dependencies=[Depends(require(AuthenticatedInOrgMode)), Depends(require(WindowProof))])
 async def add_to_running_turn(req: AddonRequest, scope: TenantScopeDep):
     """A message sent while the conversation's turn runs: add it to that turn
     or tell the app to queue it as the next one (ENG-4194).

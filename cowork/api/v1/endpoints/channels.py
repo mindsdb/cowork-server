@@ -244,7 +244,10 @@ def list_bindings(scoped: ScopedSessionDep, channel_type: str | None = None) -> 
     return ChannelBindingService(scoped).list(channel_type=channel_type)
 
 
-@router.post("/bindings", response_model=BindingResponse, status_code=status.HTTP_201_CREATED)
+@router.post(
+    "/bindings", response_model=BindingResponse, status_code=status.HTTP_201_CREATED,
+    dependencies=[Depends(require(WindowProof))],
+)
 def create_binding(body: BindingCreateRequest, scoped: ScopedSessionDep) -> BindingResponse:
     try:
         return ChannelBindingService(scoped).create(body)
@@ -254,7 +257,7 @@ def create_binding(body: BindingCreateRequest, scoped: ScopedSessionDep) -> Bind
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
 
 
-@router.patch("/bindings/{binding_id}", response_model=BindingResponse)
+@router.patch("/bindings/{binding_id}", response_model=BindingResponse, dependencies=[Depends(require(WindowProof))])
 def update_binding(binding_id: UUID, body: BindingUpdateRequest, scoped: ScopedSessionDep) -> BindingResponse:
     try:
         return ChannelBindingService(scoped).update(binding_id, body)

@@ -5,9 +5,11 @@ HTTP route (the app has no websocket route), with a placeholder for each path
 parameter and no body, from a loopback client in local tenancy. Every guard in
 front of WindowProof therefore passes for real, with no dependency override:
 ``require_local`` sees a loopback peer, socket and host, and the tenancy
-guards see local tenancy. Each request also carries the app secret, so
-``require_app_secret``, which runs before WindowProof on the custom MCP
-routes, lets it through too.
+guards see local tenancy. A route that declares ``require_app_secret`` as
+well declares it after WindowProof, so a request holding the bearer token
+alone meets the proof's refusal first; the bearer-only case runs both with
+and without the app secret to show it. Every other request carries the app
+secret, so that ``require_app_secret`` lets it through.
 
 No endpoint runs. Each route gets one more dependency after every dependency
 its router and the route itself declare, which answers 418 with the route's
@@ -22,9 +24,9 @@ the source for that instead.
 The cases:
 
 - A server the desktop app launched with the hand-off, called with the bearer
-  token alone: exactly the routes that declare WindowProof answer 403
-  ``window_proof_required`` with the ``X-Cowork-Reason`` header, and no other
-  route gives that refusal.
+  token and no proof, once with the app secret and once without: exactly the
+  routes that declare WindowProof answer 403 ``window_proof_required`` with
+  the ``X-Cowork-Reason`` header, and no other route gives that refusal.
 - The same server, called with the proof: no route gives the refusal, and
   every declared route reaches its endpoint. A wrong proof is refused on each
   declared route.
@@ -58,9 +60,11 @@ from tests._launch_handoff import PROOF, SECRET, TOKEN
 
 REFUSAL = "window_proof_required"
 REACHED = status.HTTP_418_IM_A_TEAPOT
-#: What every request carries: the bearer token, and the app secret so that
-#: require_app_secret is never the check that answers.
-BEARER_AND_APP_SECRET = {"Authorization": f"Bearer {TOKEN}", app_secret.HEADER: SECRET}
+#: What agent code on the same machine can send: the bearer token alone.
+BEARER_ONLY = {"Authorization": f"Bearer {TOKEN}"}
+#: The bearer token and the app secret, so that require_app_secret is never
+#: the check that answers.
+BEARER_AND_APP_SECRET = {**BEARER_ONLY, app_secret.HEADER: SECRET}
 WRONG_PROOF = "12" * 32
 _PATH_PARAMETER = re.compile(r"\{[^}]+\}")
 
@@ -166,10 +170,15 @@ def _not_reached(answers: dict[Call, Answer], calls: set[Call]) -> dict[Call, An
     }
 
 
-def test_with_a_hand_off_exactly_the_declared_routes_refuse_the_bearer_alone(handoff_held, monkeypatch, tmp_path):
+@pytest.mark.parametrize(
+    "headers", [BEARER_ONLY, BEARER_AND_APP_SECRET], ids=["bearer-only", "bearer-and-app-secret"]
+)
+def test_with_a_hand_off_exactly_the_declared_routes_refuse_a_call_without_the_proof(
+    handoff_held, monkeypatch, tmp_path, headers
+):
     app = _app(monkeypatch=monkeypatch, tmp_path=tmp_path)
     declared = _declared(app)
-    answers = _ask(app, calls=_calls(app), headers=BEARER_AND_APP_SECRET)
+    answers = _ask(app, calls=_calls(app), headers=headers)
     refused = _refused(answers)
 
     assert declared, "no route declares WindowProof"

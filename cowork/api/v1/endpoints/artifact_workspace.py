@@ -813,7 +813,7 @@ async def artifact_source(
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
 
-@router.put("/workspace/{project_ref}/{artifact_id}")
+@router.put("/workspace/{project_ref}/{artifact_id}", dependencies=[Depends(require(WindowProof))])
 async def update_artifact_source(
     project_ref: str,
     artifact_id: ArtifactIdDep,
@@ -1639,11 +1639,12 @@ router.add_api_route(
     "/workspace/{project_ref}/{artifact_id}/access",
     set_artifact_access,
     methods=["PUT"],
+    dependencies=[Depends(require(WindowProof))],
     route_class_override=_AccessSaveRoute,
 )
 
 
-@router.post("/workspace/{project_ref}/{artifact_id}/republish")
+@router.post("/workspace/{project_ref}/{artifact_id}/republish", dependencies=[Depends(require(WindowProof))])
 async def republish_artifact(
     project_ref: str,
     artifact_id: ArtifactIdDep,
@@ -2001,7 +2002,10 @@ def _restore_revision(
     )
 
 
-@router.post("/workspace/{project_ref}/{artifact_id}/revisions/{revision_id}/restore")
+@router.post(
+    "/workspace/{project_ref}/{artifact_id}/revisions/{revision_id}/restore",
+    dependencies=[Depends(require(WindowProof))],
+)
 async def restore_artifact_revision(
     project_ref: str,
     artifact_id: ArtifactIdDep,

@@ -98,7 +98,7 @@ def save_connector_draft(
     return connector_metadata(custom_connector_spec(row))
 
 
-@router.patch("/{connector_id}", response_model=ConnectorMetadataResponse)
+@router.patch("/{connector_id}", response_model=ConnectorMetadataResponse, dependencies=[Depends(require(WindowProof))])
 def update_custom_connector(
     connector_id: str, body: CustomConnectorUpdate, session: ScopedSessionDep,
 ) -> ConnectorMetadataResponse:
@@ -127,7 +127,7 @@ def update_custom_connector(
     return connector_metadata(custom_connector_spec(row))
 
 
-@router.delete("/{connector_id}", status_code=status.HTTP_204_NO_CONTENT)
+@router.delete("/{connector_id}", status_code=status.HTTP_204_NO_CONTENT, dependencies=[Depends(require(WindowProof))])
 def delete_custom_connector(connector_id: str, session: ScopedSessionDep) -> Response:
     """Delete a custom connector's definition; saved connections stay and can be disconnected.
 

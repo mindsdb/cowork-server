@@ -378,7 +378,9 @@ class WindowProof:
     than GET, except the routes whose callers hold a credential of their own
     and never the proof (the inference proxies and the remote runtime's
     routes), which CODE_MODE_WRITES_WITHOUT_THE_PROOF in
-    tests/test_window_proof_pin.py names.
+    tests/test_window_proof_pin.py names. Every other route that takes a
+    method other than GET and doesn't declare this says why there, in
+    WRITES_WITHOUT_THE_PROOF, or is open by design.
 
     The check runs only while the server holds a launch hand-off
     (``app_secret.held_handoff()``), which only ``cowork-server`` started with
@@ -396,7 +398,9 @@ class WindowProof:
     Declare it at the route, with ``Depends(require(WindowProof))`` in the
     route's ``dependencies``, after the class the route or its router
     declares. That class keeps saying who the route admits where no hand-off
-    is held. A route that is open by design where no hand-off is held, such
+    is held. A check the route adds beside it, such as the app secret, comes
+    after it, so a caller holding the bearer token alone is told the proof is
+    what it lacks. A route that is open by design where no hand-off is held, such
     as ``POST /settings/logout``, declares WindowProof alone, because
     ``route_walker.contradictory_routes`` refuses ``OpenByDesign`` beside
     another class, and tests/test_open_by_design_pin.py pins it with the open

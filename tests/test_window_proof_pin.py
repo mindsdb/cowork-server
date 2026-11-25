@@ -21,11 +21,17 @@ declaring the class are the routes that refuse, and no other route does.
 Neither file knows which routes are privileged. The matrix proves that the
 routes that refuse are the routes that declare WindowProof, not that every
 privileged route declares it: a privileged route that never declares the
-proof passes the pin and the matrix alike. So check a new route against the
-criterion above when you review it. Only one test proves coverage of a whole
-surface: ``test_every_code_mode_write_route_asks_for_the_proof`` fails on any
-write route under /api/v1/coding/ that neither declares the proof nor names
-its caller in CODE_MODE_WRITES_WITHOUT_THE_PROOF.
+proof passes the pin and the matrix alike. Two walkers cover the write
+routes, those that take any method but GET and HEAD.
+``test_every_code_mode_write_route_asks_for_the_proof`` fails on any write
+route under /api/v1/coding/ that neither declares the proof nor names its
+caller in CODE_MODE_WRITES_WITHOUT_THE_PROOF.
+``test_every_write_route_asks_for_the_proof_or_says_why`` fails on any write
+route in the app that neither declares the proof nor appears with its reason
+in WRITES_WITHOUT_THE_PROOF, CODE_MODE_WRITES_WITHOUT_THE_PROOF or the
+open-by-design pin, so a new one has to be decided against the criterion
+above. GET routes stay outside both walkers: a new privileged read, such as
+one that reveals a credential, still depends on review.
 """
 from __future__ import annotations
 
@@ -36,6 +42,7 @@ from fastapi.routing import APIRoute, APIWebSocketRoute
 from cowork.api.v1.permissions import WindowProof
 from cowork.api.v1.route_walker import declared_permissions, route_key
 from cowork.server import create_app
+from tests.test_open_by_design_pin import OPEN_BY_DESIGN_REASONS
 
 CODE_MODE_PREFIX = "/api/v1/coding/"
 READ_METHODS = frozenset({"GET", "HEAD"})
@@ -78,6 +85,49 @@ ORGANIZE_A_CODE_TASK = (
     "task's workspace from disk"
 )
 END_A_REPAIR_REVIEW = "end the person's review of the agent's repair with the agent's edit kept"
+#: Anton's twins of the Code mode prompt routes. A chat's turn runs with the
+#: person's files and connections.
+PROMPT_AN_ANTON_CHAT = (
+    "start a turn in a chat, or add a message to the one running there, so the agent runs work the "
+    "person never asked for, with the person's files and connections"
+)
+#: A scheduled task's prompt runs as an Anton turn at the time the task names.
+RUN_AN_ANTON_TASK = (
+    "create, change, turn back on or run a scheduled task, whose prompt then runs as an Anton turn "
+    "without the confirmation card Anton's own scheduling tool shows"
+)
+#: Skills are instructions Anton loads with its prompt, as Code mode's are.
+CHANGE_ANTON_INSTRUCTIONS = (
+    "add, change or remove the skills Anton loads as instructions, or turn one on or off for the "
+    "person, so the agent writes its own instructions"
+)
+#: The memory's rules slot holds the person's behavioral gates.
+CHANGE_ANTON_MEMORY = (
+    "write or remove the memory every Anton turn reads, the rules of what the agent may do included, "
+    "so the agent rewrites its own gates"
+)
+CHANGE_A_PROJECTS_FILES = (
+    "write or delete any file in a project folder, its instructions (.anton/anton.md) and, on the "
+    "desktop, its memory rules included, which the agent reads every turn"
+)
+CHANGE_A_CUSTOM_CONNECTOR = (
+    "change or remove a custom connector's spec and usage notes, which the agent reads to call it"
+)
+OPEN_A_FOLDER_TO_ANTON = (
+    "attach any folder on this computer to a chat, or make one a project, so the agent's turns there "
+    "read and write it"
+)
+#: The desktop publishes with the person's own publishing key. Saving a
+#: published artifact's source, or restoring a revision of it, publishes it
+#: again.
+PUBLISH_IN_THE_PERSONS_NAME = (
+    "publish an artifact, or change what a published one shows or who may open it, with the person's "
+    "publishing key, so the agent makes its own content public in the person's name"
+)
+ROUTE_OUTSIDE_MESSAGES = (
+    "bind a messaging channel's outside group or thread to a project or chat, with the instructions and "
+    "trigger rule the caller wrote, so outside messages prompt the agent there"
+)
 
 #: (path, methods) -> what an agent holding the bearer token could do with
 #: the route if it did not ask for the window proof.
@@ -314,6 +364,51 @@ WINDOW_PROOF_REASONS: dict[tuple[str, tuple[str, ...]], str] = {
         "start a messaging channel, so people outside the app can message the agent"
     ),
     ("/api/v1/channels/{channel_type}/teardown", ("POST",)): "stop a messaging channel",
+    ("/api/v1/channels/bindings", ("POST",)): ROUTE_OUTSIDE_MESSAGES,
+    ("/api/v1/channels/bindings/{binding_id}", ("PATCH",)): ROUTE_OUTSIDE_MESSAGES,
+    # Anton: start or steer a chat's work, as the Code mode prompt routes do.
+    ("/api/v1/responses/", ("POST",)): PROMPT_AN_ANTON_CHAT,
+    ("/api/v1/responses/addon", ("POST",)): PROMPT_AN_ANTON_CHAT,
+    ("/api/v1/schedules/", ("POST",)): RUN_AN_ANTON_TASK,
+    ("/api/v1/schedules/{schedule_id}", ("PUT",)): RUN_AN_ANTON_TASK,
+    ("/api/v1/schedules/{schedule_id}", ("PATCH",)): RUN_AN_ANTON_TASK,
+    ("/api/v1/schedules/{schedule_id}/resume", ("POST",)): RUN_AN_ANTON_TASK,
+    ("/api/v1/schedules/{schedule_id}/run-now", ("POST",)): RUN_AN_ANTON_TASK,
+    # Anton: change the instructions, memory and connector notes a turn reads.
+    ("/api/v1/skills/", ("POST",)): CHANGE_ANTON_INSTRUCTIONS,
+    ("/api/v1/skills/upload", ("POST",)): CHANGE_ANTON_INSTRUCTIONS,
+    ("/api/v1/skills/{skill_id}", ("PUT",)): CHANGE_ANTON_INSTRUCTIONS,
+    ("/api/v1/skills/{skill_id}", ("DELETE",)): CHANGE_ANTON_INSTRUCTIONS,
+    ("/api/v1/skills/{skill_id}/me", ("PUT",)): CHANGE_ANTON_INSTRUCTIONS,
+    ("/api/v1/memory/", ("PUT",)): CHANGE_ANTON_MEMORY,
+    ("/api/v1/memory/", ("DELETE",)): CHANGE_ANTON_MEMORY,
+    ("/api/v1/memory/all", ("DELETE",)): CHANGE_ANTON_MEMORY,
+    ("/api/v1/projects/{project_name}/files/{path:path}", ("PUT",)): CHANGE_A_PROJECTS_FILES,
+    ("/api/v1/projects/{project_name}/files/{path:path}", ("DELETE",)): CHANGE_A_PROJECTS_FILES,
+    ("/api/v1/connectors/custom/{connector_id}", ("PATCH",)): CHANGE_A_CUSTOM_CONNECTOR,
+    ("/api/v1/connectors/custom/{connector_id}", ("DELETE",)): CHANGE_A_CUSTOM_CONNECTOR,
+    # Anton: open a folder on this computer to a chat's turns.
+    ("/api/v1/conversations/{conversation_id}/folders", ("POST",)): OPEN_A_FOLDER_TO_ANTON,
+    ("/api/v1/tasks/{conversation_id}/folders", ("POST",)): OPEN_A_FOLDER_TO_ANTON,
+    ("/api/v1/projects/", ("POST",)): OPEN_A_FOLDER_TO_ANTON,
+    # Anton: publish in the person's name.
+    ("/api/v1/publish/", ("POST",)): PUBLISH_IN_THE_PERSONS_NAME,
+    ("/api/v1/publish/update", ("POST",)): PUBLISH_IN_THE_PERSONS_NAME,
+    ("/api/v1/publish/activate", ("POST",)): PUBLISH_IN_THE_PERSONS_NAME,
+    ("/api/v1/artifacts/workspace/{project_ref}/{artifact_id}", ("PUT",)): PUBLISH_IN_THE_PERSONS_NAME,
+    ("/api/v1/artifacts/workspace/{project_ref}/{artifact_id}/access", ("PUT",)): PUBLISH_IN_THE_PERSONS_NAME,
+    ("/api/v1/artifacts/workspace/{project_ref}/{artifact_id}/republish", ("POST",)): PUBLISH_IN_THE_PERSONS_NAME,
+    ("/api/v1/artifacts/workspace/{project_ref}/{artifact_id}/revisions/{revision_id}/restore", ("POST",)): (
+        PUBLISH_IN_THE_PERSONS_NAME
+    ),
+    # Anton: run a program on this computer.
+    ("/api/v1/artifacts/preview-mount", ("POST",)): (
+        "start a full-stack artifact's backend, a program that runs on this computer outside any sandbox"
+    ),
+    ("/api/v1/artifacts/open", ("POST",)): (
+        "open an artifact file with this computer's default app for it, which runs the file outside any "
+        "sandbox when it is an app or a script"
+    ),
 }
 
 #: (path, methods) -> the caller of a Code mode write route that doesn't ask
@@ -354,6 +449,189 @@ CODE_MODE_WRITES_WITHOUT_THE_PROOF: dict[tuple[str, tuple[str, ...]], str] = {
     ),
 }
 
+# Why a write route outside Code mode doesn't ask for the proof. Each reason
+# says why the criterion at the top of this file doesn't cover the route.
+
+CHANGES_THE_PERSONS_OWN_WORK = (
+    "creates, edits, organizes or deletes the person's own chats, tasks, projects, files, artifacts, "
+    "comments, pins, comparisons or analytics; it approves no agent action, reveals or writes no "
+    "credential, and widens no gate on what the agent may do"
+)
+STOPS_OR_NARROWS = (
+    "only stops, pauses, withdraws or narrows something (a turn, an added message, a scheduled task, a "
+    "publication, an attached folder, a channel binding, a picked file), so it can't make the agent do more"
+)
+CHANGES_NOTHING = (
+    "reads, checks, tests, searches, shows or reloads what is already there, or gives a fixed answer; "
+    "it stores and approves nothing, and a stored key goes only to the address saved with it"
+)
+ASKS_A_MODEL = (
+    "asks a model, with the MindsHub credential the caller sends, for an answer only (a voice call, or "
+    "the app actions a voice request maps to), with no agent turn; the app takes any action through its "
+    "own routes"
+)
+CHANGES_A_PREFERENCE = (
+    "changes a preference of the person or their organization (the active MindsHub workspace, the "
+    "app's look, the harness channel chats run on, a published artifact's analytics) that approves "
+    "nothing, holds no credential and widens no gate"
+)
+RECORDS_A_PROVIDER_GRANT = (
+    "records the files the person picked in a provider's own picker; the provider's grant, not this "
+    "record, decides what the connection reaches"
+)
+ORG_TENANCY_ONLY = (
+    "acts only in org tenancy, which create_app refuses to start while it holds the launch hand-off, "
+    "so the proof would never apply"
+)
+SIGNED_IN_ONLY = (
+    "acts only for a signed-in person, whom a local server names only from identity headers it was "
+    "set to trust, which the desktop app never sets"
+)
+CALLER_WITHOUT_THE_PROOF = (
+    "its caller is a messaging platform, which signs the body, or a cloud pod, with its turn's key, "
+    "and neither ever holds the proof"
+)
+
+#: (path, methods) -> why a write route outside Code mode doesn't declare
+#: WindowProof. Every other write route outside CODE_MODE_PREFIX declares
+#: it, or is open by design (tests/test_open_by_design_pin.py).
+WRITES_WITHOUT_THE_PROOF: dict[tuple[str, tuple[str, ...]], str] = {
+    # Artifacts.
+    ("/api/v1/artifacts/checks/{check_id}", ("POST",)): CHANGES_NOTHING,
+    ("/api/v1/artifacts/workspace/{project_ref}/{artifact_id}/comment-images", ("POST",)): (
+        CHANGES_THE_PERSONS_OWN_WORK
+    ),
+    ("/api/v1/artifacts/workspace/{project_ref}/{artifact_id}/quick-edits", ("POST",)): (
+        CHANGES_THE_PERSONS_OWN_WORK
+    ),
+    ("/api/v1/artifacts/workspace/{project_ref}/{artifact_id}/quick-edits/{edit_id}/undo", ("POST",)): (
+        CHANGES_THE_PERSONS_OWN_WORK
+    ),
+    ("/api/v1/artifacts/workspace/{project_ref}/{artifact_id}/export", ("POST",)): CHANGES_THE_PERSONS_OWN_WORK,
+    ("/api/v1/artifacts/workspace/{project_ref}/{artifact_id}/stats/tracking", ("PUT",)): CHANGES_A_PREFERENCE,
+    ("/api/v1/artifacts/workspace/{project_ref}/{artifact_id}/stats", ("DELETE",)): CHANGES_THE_PERSONS_OWN_WORK,
+    ("/api/v1/artifacts/workspace/{project_ref}/{artifact_id}/comments-access", ("POST",)): ORG_TENANCY_ONLY,
+    ("/api/v1/artifacts/shared-preview", ("POST",)): ORG_TENANCY_ONLY,
+    ("/api/v1/artifacts/workspace/{project_ref}/{artifact_id}/agent-repairs", ("POST",)): (
+        CHANGES_THE_PERSONS_OWN_WORK
+    ),
+    ("/api/v1/artifacts/drafts/{project_ref}/{artifact_id}/link", ("POST",)): SIGNED_IN_ONLY,
+    ("/api/v1/artifacts/{slug}", ("DELETE",)): CHANGES_THE_PERSONS_OWN_WORK,
+    ("/api/v1/artifacts/reveal", ("POST",)): CHANGES_NOTHING,
+    ("/api/v1/artifacts/", ("DELETE",)): CHANGES_THE_PERSONS_OWN_WORK,
+    ("/api/v1/artifacts/live-app-share", ("POST",)): SIGNED_IN_ONLY,
+    ("/api/v1/artifacts/live-app-share/{share_id}", ("DELETE",)): SIGNED_IN_ONLY,
+    ("/api/v1/artifacts/live-app-duplicate", ("POST",)): SIGNED_IN_ONLY,
+    (
+        "/api/v1/artifact-comments/{user_dir}/{report_id}/{subpath:path}",
+        ("DELETE", "GET", "OPTIONS", "PATCH", "POST"),
+    ): CHANGES_THE_PERSONS_OWN_WORK,
+    ("/api/v1/publish/", ("DELETE",)): STOPS_OR_NARROWS,
+    ("/api/v1/publish/stats/tracking", ("PUT",)): CHANGES_A_PREFERENCE,
+    ("/api/v1/publish/stats", ("DELETE",)): CHANGES_THE_PERSONS_OWN_WORK,
+    ("/api/v1/content-reports/", ("POST",)): ORG_TENANCY_ONLY,
+    ("/api/v1/content-reports/artifact", ("POST",)): ORG_TENANCY_ONLY,
+    # The browser: on the web only, where it is the browser router's.
+    ("/api/v1/browse/provision", ("POST",)): ORG_TENANCY_ONLY,
+    ("/api/v1/browse/embed", ("POST",)): ORG_TENANCY_ONLY,
+    ("/api/v1/browse/open", ("POST",)): ORG_TENANCY_ONLY,
+    ("/api/v1/browse/logins", ("DELETE",)): ORG_TENANCY_ONLY,
+    ("/api/v1/browse/browsers", ("POST",)): ORG_TENANCY_ONLY,
+    ("/api/v1/browse/tabs/switch", ("POST",)): ORG_TENANCY_ONLY,
+    ("/api/v1/browse/tabs/close", ("POST",)): ORG_TENANCY_ONLY,
+    ("/api/v1/browse/close", ("POST",)): ORG_TENANCY_ONLY,
+    ("/api/v1/browse/decisions", ("POST",)): CALLER_WITHOUT_THE_PROOF,
+    # Messaging channels.
+    ("/api/v1/channels/agent", ("PUT",)): CHANGES_A_PREFERENCE,
+    ("/api/v1/channels/{channel_type}/reload", ("POST",)): CHANGES_NOTHING,
+    ("/api/v1/channels/{channel_type}/test-connection", ("POST",)): CHANGES_NOTHING,
+    ("/api/v1/channels/bindings/{binding_id}", ("DELETE",)): STOPS_OR_NARROWS,
+    ("/api/v1/channels/discord/interactions", ("POST",)): CALLER_WITHOUT_THE_PROOF,
+    ("/api/v1/channels/slack/events", ("POST",)): CALLER_WITHOUT_THE_PROOF,
+    ("/api/v1/channels/telegram/webhook", ("POST",)): CALLER_WITHOUT_THE_PROOF,
+    ("/api/v1/channels/whatsapp/webhook", ("GET", "POST")): CALLER_WITHOUT_THE_PROOF,
+    # Chats, their turns, files and attachments.
+    ("/api/v1/conversations/", ("POST",)): CHANGES_THE_PERSONS_OWN_WORK,
+    ("/api/v1/tasks/", ("POST",)): CHANGES_THE_PERSONS_OWN_WORK,
+    ("/api/v1/conversations/{conversation_id}", ("PATCH",)): CHANGES_THE_PERSONS_OWN_WORK,
+    ("/api/v1/tasks/{conversation_id}", ("PATCH",)): CHANGES_THE_PERSONS_OWN_WORK,
+    ("/api/v1/conversations/{conversation_id}/move", ("POST",)): CHANGES_THE_PERSONS_OWN_WORK,
+    ("/api/v1/tasks/{conversation_id}/move", ("POST",)): CHANGES_THE_PERSONS_OWN_WORK,
+    ("/api/v1/conversations/{conversation_id}", ("DELETE",)): CHANGES_THE_PERSONS_OWN_WORK,
+    ("/api/v1/tasks/{conversation_id}", ("DELETE",)): CHANGES_THE_PERSONS_OWN_WORK,
+    ("/api/v1/conversations/{conversation_id}/turns/{message_id}", ("DELETE",)): CHANGES_THE_PERSONS_OWN_WORK,
+    ("/api/v1/tasks/{conversation_id}/turns/{message_id}", ("DELETE",)): CHANGES_THE_PERSONS_OWN_WORK,
+    ("/api/v1/conversations/{conversation_id}/folders/{folder_id}", ("DELETE",)): STOPS_OR_NARROWS,
+    ("/api/v1/tasks/{conversation_id}/folders/{folder_id}", ("DELETE",)): STOPS_OR_NARROWS,
+    ("/api/v1/responses/cancel", ("POST",)): STOPS_OR_NARROWS,
+    ("/api/v1/responses/addon/withdraw", ("POST",)): STOPS_OR_NARROWS,
+    ("/api/v1/comparisons/", ("POST",)): CHANGES_THE_PERSONS_OWN_WORK,
+    ("/api/v1/comparisons/{comparison_id}", ("DELETE",)): CHANGES_THE_PERSONS_OWN_WORK,
+    ("/api/v1/comparisons/{comparison_id}/verdicts/{turn_index}", ("PUT",)): CHANGES_THE_PERSONS_OWN_WORK,
+    ("/api/v1/comparisons/{comparison_id}/sides/{label}/continue", ("POST",)): CHANGES_THE_PERSONS_OWN_WORK,
+    ("/api/v1/files/", ("POST",)): CHANGES_THE_PERSONS_OWN_WORK,
+    ("/api/v1/files/{file_id}", ("DELETE",)): CHANGES_THE_PERSONS_OWN_WORK,
+    ("/api/v1/attachments/{project_name}/{session_id}/upload", ("POST",)): CHANGES_THE_PERSONS_OWN_WORK,
+    ("/api/v1/attachments/{attachment_id}", ("DELETE",)): CHANGES_THE_PERSONS_OWN_WORK,
+    ("/api/v1/attachments/{project_name}/{session_id}/{attachment_id}", ("DELETE",)): CHANGES_THE_PERSONS_OWN_WORK,
+    ("/api/v1/attachments/{project_name}/{session_id}/{attachment_id}/move-to-project", ("POST",)): (
+        CHANGES_THE_PERSONS_OWN_WORK
+    ),
+    ("/api/v1/pins/", ("POST",)): CHANGES_THE_PERSONS_OWN_WORK,
+    ("/api/v1/pins/{item_id}/visit", ("POST",)): CHANGES_THE_PERSONS_OWN_WORK,
+    ("/api/v1/pins/{item_id}", ("DELETE",)): CHANGES_THE_PERSONS_OWN_WORK,
+    # Projects and their files. Upload writes only top-level names that don't
+    # start with a dot, so it can't reach .anton/.
+    ("/api/v1/projects/{project_id}", ("PATCH",)): CHANGES_THE_PERSONS_OWN_WORK,
+    ("/api/v1/projects/{project_id}", ("DELETE",)): CHANGES_THE_PERSONS_OWN_WORK,
+    ("/api/v1/projects/{project_name}/files/upload", ("POST",)): CHANGES_THE_PERSONS_OWN_WORK,
+    ("/api/v1/projects/{project_name}/files/import/sharepoint", ("POST",)): CHANGES_THE_PERSONS_OWN_WORK,
+    ("/api/v1/projects/{project_name}/skill_drafts/{slug}", ("DELETE",)): CHANGES_THE_PERSONS_OWN_WORK,
+    ("/api/v1/projects/preview-mount-file", ("POST",)): CHANGES_NOTHING,
+    # Schedules: these two only stop work. The rest ask for the proof.
+    ("/api/v1/schedules/{schedule_id}", ("DELETE",)): STOPS_OR_NARROWS,
+    ("/api/v1/schedules/{schedule_id}/pause", ("POST",)): STOPS_OR_NARROWS,
+    # Connectors.
+    ("/api/v1/connectors/connections/{engine}/{name}/picked-files", ("PATCH",)): RECORDS_A_PROVIDER_GRANT,
+    ("/api/v1/connectors/connections/{engine}/{name}/picked-files/{file_id}", ("DELETE",)): STOPS_OR_NARROWS,
+    ("/api/v1/connectors/custom", ("POST",)): ORG_TENANCY_ONLY,
+    ("/api/v1/connectors/custom-connections/{connection_id}", ("DELETE",)): ORG_TENANCY_ONLY,
+    ("/api/v1/connectors/connections/custom_mcp/check-url", ("POST",)): CHANGES_NOTHING,
+    ("/api/v1/connectors/datasources/", ("POST",)): ORG_TENANCY_ONLY,
+    ("/api/v1/connectors/datasources/{connection_id}", ("PATCH",)): ORG_TENANCY_ONLY,
+    ("/api/v1/connectors/datasources/{connection_id}", ("DELETE",)): ORG_TENANCY_ONLY,
+    ("/api/v1/connectors/datasources/{connection_id}/validation-retry", ("POST",)): ORG_TENANCY_ONLY,
+    ("/api/v1/connectors/notion/search", ("POST",)): CHANGES_NOTHING,
+    ("/api/v1/connectors/notion/fetch", ("POST",)): CHANGES_NOTHING,
+    ("/api/v1/connectors/oauth/{engine}/picker/session", ("POST",)): CHANGES_NOTHING,
+    ("/api/v1/connectors/oauth/{engine}/picker/token", ("POST",)): ORG_TENANCY_ONLY,
+    ("/api/v1/connectors/posthog/projects", ("POST",)): CHANGES_NOTHING,
+    ("/api/v1/connectors/specs/match", ("POST",)): CHANGES_NOTHING,
+    ("/api/v1/connectors/submissions/replaces", ("POST",)): CHANGES_NOTHING,
+    # Settings checks: each sends a stored key only to the address saved with it.
+    ("/api/v1/settings/validate", ("POST",)): CHANGES_NOTHING,
+    ("/api/v1/settings/test-providers", ("POST",)): CHANGES_NOTHING,
+    ("/api/v1/settings/test-decision-model", ("POST",)): CHANGES_NOTHING,
+    ("/api/v1/settings/validate-provider", ("POST",)): CHANGES_NOTHING,
+    # Skills: sharing needs a signed-in person. The rest ask for the proof.
+    ("/api/v1/skills/{skill_id}/sharing", ("PUT",)): SIGNED_IN_ONLY,
+    # The person's account and devices.
+    ("/api/v1/hub/deletion-request/", ("POST",)): ORG_TENANCY_ONLY,
+    ("/api/v1/hub/workspaces/active", ("PUT",)): CHANGES_A_PREFERENCE,
+    ("/api/v1/org-branding/appearance", ("PUT",)): CHANGES_A_PREFERENCE,
+    ("/api/v1/push/devices", ("POST",)): ORG_TENANCY_ONLY,
+    ("/api/v1/push/devices", ("DELETE",)): ORG_TENANCY_ONLY,
+    # Live apps: each needs a signed-in person with an email.
+    ("/api/v1/live-apps/availability/{notice_id}/ack", ("POST",)): SIGNED_IN_ONLY,
+    ("/api/v1/live-apps/previews", ("POST",)): SIGNED_IN_ONLY,
+    ("/api/v1/live-apps/previews/{record_id}/keepalive", ("POST",)): SIGNED_IN_ONLY,
+    ("/api/v1/live-apps/previews", ("DELETE",)): SIGNED_IN_ONLY,
+    ("/api/v1/live-apps/previews/{record_id}", ("DELETE",)): SIGNED_IN_ONLY,
+    # Voice.
+    ("/api/v1/voice/session", ("POST",)): ASKS_A_MODEL,
+    ("/api/v1/voice/operate", ("POST",)): ASKS_A_MODEL,
+}
+
 
 @pytest.fixture(scope="module")
 def app() -> FastAPI:
@@ -392,20 +670,25 @@ def test_no_reason_outlives_its_route(proof_routes):
     )
 
 
+def _write_routes(app: FastAPI) -> dict[tuple[str, tuple[str, ...]], bool]:
+    """Each route that takes a method other than GET and HEAD, an
+    ``api_route`` with GET among its methods included, and whether it
+    declares WindowProof."""
+    return {
+        _key(route=route): WindowProof in declared_permissions(route)
+        for route in app.routes
+        if isinstance(route, APIRoute) and route.methods - READ_METHODS
+    }
+
+
 def test_every_code_mode_write_route_asks_for_the_proof(app):
     """Code mode runs a Full access task's work and every terminal with no
     sandbox, and delivers in the person's name, so every route under
-    CODE_MODE_PREFIX that takes anything but GET declares WindowProof, an
-    ``api_route`` with GET among its methods included. The exceptions name a
-    caller that holds its own credential and never the proof. A new write
-    route lands in WINDOW_PROOF_REASONS, or here with its caller."""
-    writes = {
-        _key(route=route): WindowProof in declared_permissions(route)
-        for route in app.routes
-        if isinstance(route, APIRoute)
-        and route.path.startswith(CODE_MODE_PREFIX)
-        and route.methods - READ_METHODS
-    }
+    CODE_MODE_PREFIX that takes anything but GET declares WindowProof. The
+    exceptions name a caller that holds its own credential and never the
+    proof. A new write route lands in WINDOW_PROOF_REASONS, or here with its
+    caller."""
+    writes = {key: asks for key, asks in _write_routes(app).items() if key[0].startswith(CODE_MODE_PREFIX)}
     unasked = sorted(
         key for key, asks in writes.items() if not asks and key not in CODE_MODE_WRITES_WITHOUT_THE_PROOF
     )
@@ -421,12 +704,45 @@ def test_every_code_mode_write_route_asks_for_the_proof(app):
     )
 
 
+def test_every_write_route_asks_for_the_proof_or_says_why(app):
+    """Every write route in the app declares WindowProof or appears with its
+    reason in WRITES_WITHOUT_THE_PROOF, CODE_MODE_WRITES_WITHOUT_THE_PROOF or
+    the open-by-design pin. A new write route lands in WINDOW_PROOF_REASONS
+    when the criterion at the top of this file covers it, and otherwise in
+    WRITES_WITHOUT_THE_PROOF with the reason it doesn't."""
+    explained = set(WRITES_WITHOUT_THE_PROOF) | set(CODE_MODE_WRITES_WITHOUT_THE_PROOF) | set(OPEN_BY_DESIGN_REASONS)
+    unasked = sorted(key for key, asks in _write_routes(app).items() if not asks and key not in explained)
+    assert unasked == [], (
+        "these write routes neither declare WindowProof nor say why. Declare the "
+        "proof and pin a reason in WINDOW_PROOF_REASONS, or add the route to "
+        f"WRITES_WITHOUT_THE_PROOF with the reason it needs none: {unasked}"
+    )
+
+
+def test_no_write_without_the_proof_outlives_its_route(app):
+    """Each entry names a write route outside Code mode that exists, doesn't
+    declare WindowProof and isn't open by design, so a route has one answer."""
+    writes = _write_routes(app)
+    stale = sorted(
+        key
+        for key in WRITES_WITHOUT_THE_PROOF
+        if writes.get(key, True) or key[0].startswith(CODE_MODE_PREFIX) or key in OPEN_BY_DESIGN_REASONS
+    )
+    assert stale == [], (
+        "these entries name a route that no longer exists, takes only GET, now "
+        "declares WindowProof, sits under Code mode or is open by design. Delete "
+        f"the entry: {stale}"
+    )
+
+
 def test_the_proof_set_is_small_enough_to_read(proof_routes):
     """A number someone notices moving, as the open-by-design pin keeps one.
     The bound is loose on purpose: it is a tripwire for a bulk change, not a
-    budget to spend down. Code mode's write routes are most of the set, and
-    the Code mode walker above puts each new one in it."""
-    assert len(proof_routes) <= 128, (
+    budget to spend down. Code mode's write routes are most of the set;
+    Anton's twins of them (its turns, scheduled tasks, skills, memory and
+    publishing) and the other writes the criterion covers are the rest. Both
+    walkers put each new write route in it unless the route says why not."""
+    assert len(proof_routes) <= 160, (
         f"{len(proof_routes)} routes now ask for the window proof. If that is "
         "right, raise the bound in the same commit that explains why."
     )
