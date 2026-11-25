@@ -61,7 +61,7 @@ from cowork.handlers.response_routing import (
 )
 from cowork.harnesses.anton_harness.agent_files import AgentFiles
 from cowork.harnesses.anton_harness.figure_sources import has_figures
-from cowork.harnesses.memory.policy import memory_policy, memory_reads_off
+from cowork.harnesses.memory.policy import memory_reads_off
 from cowork.schemas.figure_sources import EarlierAnswer, FigureSources
 from cowork.harnesses.anton_harness.stream_formatter import (
     ConnectorDrafted,
@@ -883,18 +883,6 @@ class ResponsesHandler:
         from cowork.services.content_safety import check_request
         await check_request(request, scope=self.scope)
 
-        # "memory": "off" runs the turn as MEMORY_ENABLED=false would. On a
-        # deployment where that still reads stored memory (memory_policy: the
-        # desktop), the question is refused rather than answered from memory.
-        if request.memory == "off" and not memory_policy(memory_enabled=False).off:
-            raise HTTPException(
-                status_code=501,
-                detail=(
-                    "This deployment can't keep one question from reading memory. "
-                    'Retry the request without "memory": "off".'
-                ),
-            )
-
         # Identity + the running build into the run's trace metadata;
         # server-derived keys win. The build stamp (ENG-1279) is what lets a
         # metric be attributed to a release instead of to a date on which
@@ -978,6 +966,12 @@ class ResponsesHandler:
         if request.browser == "off":
             off["browser_enabled"] = False
         turn_settings = start.settings.model_copy(update=off) if off else start.settings
+        # Read here, once, from the resolved snapshot above, not re-read from
+        # the scope inside the remote producer: a direct call to that
+        # producer (tests included) carries no ambient settings to read.
+        memory_off = memory_reads_off(
+            memory_enabled=turn_settings.memory_enabled, memory_mode=turn_settings.memory_mode,
+        )
         with use_turn_settings(self.scope, turn_settings):
             try:
                 route, turn_llm = await self._route_request(
@@ -1138,6 +1132,7 @@ class ResponsesHandler:
                         trace_metadata=metadata,
                         turn_llm=turn_llm,
                         first_take=first_take,
+                        memory_off=memory_off,
                     )
 
                 def produce(buffer: StreamBuffer):
@@ -2375,6 +2370,7 @@ class ResponsesHandler:
         lifecycle: TurnLifecycle | None = None,
         turn_llm: dict | None = None,
         first_take: FirstTake | None = None,
+        memory_off: bool = False,
     ):
         """Choose the streaming producer coroutine.
 
@@ -2387,6 +2383,10 @@ class ResponsesHandler:
         either producer from persisting into truncated history; it defaults to
         a fresh one so a directly-called producer (tests) still has a flag to
         read.
+
+        `memory_off` is handle()'s own read of this turn's settings
+        (memory_reads_off), not re-read inside the remote producer: a direct
+        call to it, in tests among others, carries no ambient settings.
         """
         lifecycle = lifecycle if lifecycle is not None else TurnLifecycle(identity=RunIdentity(
             correlation_id=(turn_llm or {}).get("correlation_id") or str(uuid4()),
@@ -2406,6 +2406,7 @@ class ResponsesHandler:
                 turn_llm=turn_llm,
                 disabled=disabled,
                 first_take=first_take,
+                memory_off=memory_off,
             )
         return self._produce(
             lifecycle=lifecycle,
@@ -2834,6 +2835,7 @@ class ResponsesHandler:
         disabled: list[dict] | None = None,
         reasoning_effort: str | None = None,
         first_take: FirstTake | None = None,
+        memory_off: bool = False,
     ) -> None:
         """Remote-backend counterpart of _run_turn: pipe the pod's replies
         through the same SSE formatter as the in-process path (full step /
@@ -3231,7 +3233,7 @@ class ResponsesHandler:
             # The project's memory it reads lives on the file store, so the
             # seed is read in a unit on the file store's threads.
             seed = await run_efs_unit(
-                partial(self._read_remote_turn_inputs, conv_id=conv_id, with_memory=True), scope=scope
+                partial(self._read_remote_turn_inputs, conv_id=conv_id, with_memory=not memory_off), scope=scope
             )
             # The skills the caller sees, the pod's whole recallable set
             # (remote_turn_skills); empty when they see none. It seeds the
@@ -3291,6 +3293,7 @@ class ResponsesHandler:
                 # a bounded, sheddable wire block. Skills travel as the
                 # caller's whole recallable set (remote_turn_skills).
                 memory=seed.memory,
+                memory_off=memory_off,
                 skills=skills,
                 workspace=seed.workspace,
                 started_at=seed.started_at,

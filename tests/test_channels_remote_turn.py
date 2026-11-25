@@ -10,6 +10,7 @@ import pytest
 import cowork.channels.runtime as runtime_mod
 import cowork.handlers.responses as responses_mod
 from cowork.channels.runtime import AntonChannelRuntime
+from cowork.common.settings.user_settings import UserSettings
 from cowork.db.scoped import ScopedSession, TenantScope
 from cowork.db.session import get_open_session
 from _fakes import inline_run_db
@@ -40,7 +41,7 @@ def test_turn_stream_uses_the_harness_when_backend_is_not_remote(monkeypatch):
             conversation = type("C", (), {"id": uuid4()})()
             stream = await runtime._turn_stream(
                 harness, "anton", scoped, conversation, [{"type": "text", "text": "hi"}],
-                "hi", None, [],
+                "hi", None, [], UserSettings(_env_file=None),
             )
             chunk = await stream.__anext__()
             assert chunk == "local-sentinel"
@@ -95,7 +96,7 @@ def test_turn_stream_uses_the_remote_worker_when_backend_is_remote(monkeypatch):
         conversation = type("C", (), {"id": conv_id})()
         stream = await runtime._turn_stream(
             harness, "anton", scope, conversation, [{"type": "text", "text": "hi"}],
-            "hi", None, turn_rows,
+            "hi", None, turn_rows, UserSettings(_env_file=None),
         )
         with pytest.raises(StopAsyncIteration):
             await stream.__anext__()
@@ -138,6 +139,7 @@ async def _stream_one_turn(conv_id) -> None:
     stream = await runtime._turn_stream(
         _FakeHarnessLocal(), "anton", TenantScope(org_mode=True, org_id="org-a"),
         type("C", (), {"id": conv_id})(), [{"type": "text", "text": "hi"}], "hi", None, [],
+        UserSettings(_env_file=None),
     )
     with pytest.raises(StopAsyncIteration):
         await stream.__anext__()

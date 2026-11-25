@@ -66,6 +66,7 @@ async def remote_turn_events(
     turn_rows: list,
     turn_id: int = 0,
     correlation_id: str | None = None,
+    memory_off: bool = False,
 ):
     """Yields the same stream format_responses_stream renders for local turns.
     Mutates turn_rows in place; raises RemoteTurnFailed on a worker failure.
@@ -84,7 +85,14 @@ async def remote_turn_events(
     snapshot each would check out a second connection while its unit holds
     the first. It is not bound in here, since a context variable this
     generator set across its yields would be reset in the wrong context when
-    a reader that abandoned it leaves the close to another task."""
+    a reader that abandoned it leaves the close to another task. For the same
+    reason `memory_off` is the caller's own read of that snapshot
+    (_turn_stream), not a read made in here.
+
+    `memory_off` tells the controller this turn's settings say memory reads
+    are off; a channel turn never sends project memory either way
+    (_read_channel_turn_inputs), but the controller still needs this to
+    decide the global memory mount."""
     from anton.core.llm.provider import StreamTaskProgress, StreamTextDelta
     from cowork.handlers._turn_history import remote_turn_history
     from cowork.harnesses.anton_harness.stream_formatter import ArtifactCreated, SkillCreated, TurnContext
@@ -151,6 +159,7 @@ async def remote_turn_events(
             started_at=inputs.started_at,
             skills=skills,
             correlation_id=correlation_id,
+            memory_off=memory_off,
         ):
             if kind == "progress" and data.get("phase") == "workspace_authorized":
                 artifact_writes_allowed = data.get("workspace_mode") == "persistent"
