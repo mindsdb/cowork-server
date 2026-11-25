@@ -390,6 +390,7 @@ class _TurnEvidence:
     handed_over: str | None = None
     # Whether a change the agent asked approval for went unapproved.
     writes_refused: bool = False
+    blocked_connector: str | None = None
 
 
 @dataclass(frozen=True)
@@ -460,6 +461,12 @@ def _classify(evidence: _TurnEvidence) -> _AttemptEnd:
         if evidence.writes_refused:
             # Ranked above a limit: a lost write is the bigger surprise.
             return _AttemptEnd(outcome=AttemptOutcome.writes_refused, error=_WRITES_REFUSED_ERROR)
+        if evidence.blocked_connector is not None:
+            return _AttemptEnd(
+                outcome=AttemptOutcome.connector_blocked,
+                error=f"This task needed an excluded connector: {evidence.blocked_connector}. "
+                "Change the task's connector settings to allow it.",
+            )
         limit_error = _LIMIT_ERRORS.get(evidence.stopped_by or "")
         if limit_error:
             return _AttemptEnd(outcome=AttemptOutcome.stopped_at_limit, error=limit_error)
@@ -1153,6 +1160,7 @@ async def _execute_schedule(
                             AttemptOutcome.interrupted,
                             AttemptOutcome.stopped_at_limit,
                             AttemptOutcome.writes_refused,
+                            AttemptOutcome.connector_blocked,
                         }
                         and not shutdown_interrupted
                     ),
@@ -1473,7 +1481,43 @@ async def _turn_evidence(conversation_id: str) -> _TurnEvidence:
         stopped_by=await _turn_stopped_by(conversation_id) if reason == "completed" else None,
         handed_over=await _turn_handed_over(conversation_id) if reason == "completed" else None,
         writes_refused=reason == "completed" and await _turn_refused_writes(conversation_id),
+        blocked_connector=await _turn_blocked_connector(conversation_id) if reason == "completed" else None,
     )
+
+
+async def _turn_blocked_connector(conversation_id: str) -> str | None:
+    """Read a successful report tool result from the finished turn's event buffer."""
+    from cowork.harnesses.anton_harness.schedule_connector_reporting import REPORT_BLOCKED_CONNECTOR
+
+    handle = registry.get(conversation_id)
+    if handle is None:
+        return None
+    blocked_connector = None
+    try:
+        async with asyncio.timeout(_EVIDENCE_READ_TIMEOUT_SECONDS):
+            async for record in handle.buffer.tail(0):
+                if record.is_terminal:
+                    break
+                for event, data in _sse_frames(record):
+                    if event != "response.in_progress" or not data.get("tool_use_id"):
+                        continue
+                    tool = data.get("tool_name")
+                    if tool and tool != REPORT_BLOCKED_CONNECTOR:
+                        # The run continued using other tools after the report.
+                        blocked_connector = None
+                    if tool != REPORT_BLOCKED_CONNECTOR:
+                        continue
+                    try:
+                        report = json.loads(data.get("content", ""))
+                    except (ValueError, TypeError):
+                        continue
+                    name = report.get("blocked_connector") if isinstance(report, dict) else None
+                    if isinstance(name, str) and name:
+                        blocked_connector = name
+    except Exception:
+        logger.exception("Could not read the scheduled turn's connector report", extra=log_context(conversation_id=conversation_id))
+        return None
+    return blocked_connector
 
 
 async def _turn_stopped_by(conversation_id: str) -> str | None:

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import importlib
+import json
 import os
 from datetime import datetime, timedelta, timezone
 
@@ -12,6 +13,8 @@ from alembic.migration import MigrationContext
 from alembic.operations import Operations
 
 from cowork.harnesses.anton_harness.harness import _left_out_connections_guidance
+from cowork.harnesses.anton_harness.schedule_connector_reporting import build_blocked_connector_tool
+from cowork.harnesses.anton_harness.schedule_tools import _list_unit
 from cowork.models.schedule import Schedule
 from tests import test_schedule_model_fallback as fallback
 from tests.integration.prereq import missing_prerequisite
@@ -51,6 +54,25 @@ async def test_a_run_leaves_out_the_connections_its_task_does(schedule_id, turns
 
     (request,) = turns.requests
     assert [c.model_dump() for c in request.disabled_connections] == [GMAIL]
+
+
+async def test_only_a_connector_excluded_from_this_run_can_be_reported():
+    tool = build_blocked_connector_tool([GMAIL])
+    accepted = await tool.handler(None, GMAIL)
+    assert json.loads(accepted) == {"blocked_connector": "Work mail (gmail)"}
+    assert await tool.handler(None, {"engine": "gmail", "name": "Personal mail"}) == (
+        "Choose a connector that this task excludes."
+    )
+
+
+def test_chat_lists_the_task_exclusions(schedule_id):
+    _set(schedule_id, [GMAIL])
+    session, scoped = _scoped()
+    try:
+        (summary,) = [item for item in _list_unit(scoped) if item["schedule_id"] == str(schedule_id)]
+        assert summary["disabled_connections"] == [GMAIL]
+    finally:
+        session.close()
 
 
 async def test_a_task_with_none_left_out_runs_with_every_connection(schedule_id, turns):

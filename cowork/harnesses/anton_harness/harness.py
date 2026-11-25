@@ -1362,6 +1362,7 @@ class AntonHarness:
                 interactive=interactive,
                 ui_locale=ui_locale,
                 docs=docs,
+                **({"scheduled": True} if schedule_id is not None else {}),
             )
             session, turn_scratch_dir, seed_info = built.session, built.turn_scratch_dir, built.seed_info
             if model_wait is not None:
@@ -1705,6 +1706,7 @@ class AntonHarness:
         interactive: bool = True,
         ui_locale: str | None = None,
         docs: bool = False,
+        scheduled: bool = False,
     ) -> BuiltChatSession:
         """Build the same core runtime the Anton CLI uses, scoped to one project
         (_build_turn_session). The live-app stops its prompt tells ride on the
@@ -1728,6 +1730,7 @@ class AntonHarness:
                 ui_locale=ui_locale,
                 live_app_notices=notices,
                 docs=docs,
+                scheduled=scheduled,
             )
         except BaseException:
             if notices:
@@ -1758,6 +1761,7 @@ class AntonHarness:
         live_app_notices: list[UUID],
         ui_locale: str | None = None,
         docs: bool,
+        scheduled: bool = False,
     ) -> BuiltChatSession:
         """_build_chat_session's work. ``live_app_notices`` gets the launch
         records whose stop the turn's prompt tells, which the turn claimed
@@ -1782,6 +1786,7 @@ class AntonHarness:
             build_cowork_create_skill_draft_tool,
             scope_usage_notes,
         )
+        from .schedule_connector_reporting import build_blocked_connector_tool
         from .schedule_tools import build_schedule_tools
         CONNECT_DATASOURCE_TOOL = build_cowork_connect_datasource_tool()
         PUBLISH_TOOL = build_cowork_publish_tool()
@@ -1867,6 +1872,8 @@ class AntonHarness:
             if interactive and elicitor is not None and channel_context is None
             else []
         )
+        if scheduled and not interactive and disabled_connections:
+            schedule_tools.append(build_blocked_connector_tool(disabled_connections))
 
         _apply_user_credentials(anton_settings, user)
 

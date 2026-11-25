@@ -722,6 +722,31 @@ def test_a_refused_write_stops_a_finished_turn_short_and_outranks_a_limit():
     assert failed.outcome == AttemptOutcome.failed_during_execution
 
 
+@pytest.mark.parametrize("continued", [False, True])
+async def test_an_excluded_connector_is_a_blocked_outcome_when_the_run_stops(tmp_path, monkeypatch, continued):
+    from cowork.harnesses.anton_harness.schedule_connector_reporting import REPORT_BLOCKED_CONNECTOR
+
+    buffer = FileStreamBuffer(tmp_path / "turn.jsonl")
+    report = _sse("response.in_progress", {
+        "tool_use_id": "report", "tool_name": REPORT_BLOCKED_CONNECTOR,
+        "content": '{"blocked_connector": "Work mail (gmail)"}',
+    })
+    await buffer.append("sse", {"sse": report})
+    if continued:
+        await buffer.append("sse", {"sse": _sse("response.in_progress", {
+            "tool_use_id": "alternate", "tool_name": "some_other_tool", "content": "Done",
+        })})
+    await buffer.close("completed")
+    monkeypatch.setattr(scheduler, "registry", SimpleNamespace(get=lambda _cid: SimpleNamespace(buffer=buffer)))
+
+    end = scheduler._classify(await scheduler._turn_evidence("c1"))
+    if continued:
+        assert end.outcome == AttemptOutcome.completed
+    else:
+        assert end.outcome == AttemptOutcome.connector_blocked
+        assert "Work mail (gmail)" in end.error
+
+
 def test_a_turn_with_no_buffer_counts_as_having_acted(monkeypatch):
     monkeypatch.setattr(scheduler, "registry", SimpleNamespace(get=lambda _cid: None))
     assert asyncio.run(scheduler._turn_activity("c1")) == (True, None)
