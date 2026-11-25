@@ -89,7 +89,8 @@ from anton.publish_access import access_from_owner_side
 from anton.publish_access import resolve_access as _resolve_access
 from anton.publish_access import resolve_publish_target as _anton_resolve_publish_target
 from cowork.docs.store import DOC_HTML, is_doc_folder, is_doc_primary
-from cowork.schemas.export_child import PublishMarkdownRequest
+from cowork.schemas.export_child import PublishFileRequest, PublishMarkdownRequest
+from cowork.services.file_page import PUBLISHABLE_FILE_SUFFIXES, published_file_name
 from cowork.services.artifacts import (
     _content_mtime,
     _load_published_map,
@@ -243,11 +244,16 @@ MARKDOWN_CONVERSION_FAILED_CODE = "markdown_conversion_failed"
 MARKDOWN_CONVERSION_FAILED_MESSAGE = "This Markdown file couldn't be converted for publishing."
 
 
-class MarkdownNotPublishable(_CodedRefusal):
+class PageNotPublishable(_CodedRefusal):
+    """A file that publishes as a page rendered from it can't be rendered:
+    Markdown (MarkdownNotPublishable) or a file that isn't a web page
+    (FileNotPublishable, ENG-4687). Nothing was published, and the same file
+    is refused again, so callers report it instead of retrying."""
+
+
+class MarkdownNotPublishable(PageNotPublishable):
     """The file is past publish's Markdown bound, or rendering it passed the
-    conversion's time or memory limit or failed on the file's content.
-    Nothing was published, and the same file is refused again, so callers
-    report it instead of retrying."""
+    conversion's time or memory limit or failed on the file's content."""
 
     def __init__(self, message: str) -> None:
         super().__init__(413, MARKDOWN_NOT_PUBLISHABLE_CODE, message)
@@ -265,6 +271,33 @@ class MarkdownConversionFailed(_CodedRefusal):
 
     def __init__(self) -> None:
         super().__init__(500, MARKDOWN_CONVERSION_FAILED_CODE, MARKDOWN_CONVERSION_FAILED_MESSAGE)
+
+
+# A file that isn't a web page publishes as a page rendered in the conversion
+# process too (ENG-4687, _publish_file_body), refused the same way.
+FILE_NOT_PUBLISHABLE_CODE = "file_not_publishable"
+FILE_TOO_LARGE_MESSAGE = "This file is too large to share as a page. Share a file under 25 MiB."
+FILE_NOT_CONVERTED_MESSAGE = (
+    "This file can't be shared as a page. "
+    "Reading it took too long, used too much memory, or failed on something in the file."
+)
+FILE_CONVERSION_FAILED_CODE = "file_conversion_failed"
+FILE_CONVERSION_FAILED_MESSAGE = "This file couldn't be converted for sharing."
+
+
+class FileNotPublishable(PageNotPublishable):
+    """The file is past publish's bound for a file page, or rendering it passed
+    the conversion's time or memory limit or failed on the file's content."""
+
+    def __init__(self, message: str) -> None:
+        super().__init__(413, FILE_NOT_PUBLISHABLE_CODE, message)
+
+
+class FileConversionFailed(_CodedRefusal):
+    """The conversion process failed on a file page without passing a limit: a fault on this server."""
+
+    def __init__(self) -> None:
+        super().__init__(500, FILE_CONVERSION_FAILED_CODE, FILE_CONVERSION_FAILED_MESSAGE)
 
 
 # Sharing an artifact with everyone takes MindsHub's artifacts.share_org,
@@ -835,11 +868,27 @@ def list_publishable(*, scope: TenantScope | None) -> dict:
 
 
 def is_publishable_static(target: Path, artifacts_base: Path) -> bool:
-    """A non-fullstack target publishes only when it is an HTML/Markdown file
-    that is artifact content (not README, a generation input or a revision copy)."""
-    return target.suffix.lower() in PUBLISHABLE_STATIC_SUFFIXES and not is_non_content_path(
-        target, artifacts_base
-    )
+    """A non-fullstack target publishes only when it is artifact content (not
+    README, a generation input or a revision copy) of a kind that becomes a
+    page: HTML, Markdown, or a file shown as a page of its own (ENG-4687)."""
+    suffix = target.suffix.lower()
+    return (
+        suffix in PUBLISHABLE_STATIC_SUFFIXES or suffix in PUBLISHABLE_FILE_SUFFIXES
+    ) and not is_non_content_path(target, artifacts_base)
+
+
+def _renders_to_page(target: Path) -> bool:
+    """Whether *target* publishes as a page rendered from it, not as itself:
+    Markdown, and a file that isn't a web page (ENG-4687)."""
+    suffix = target.suffix.lower()
+    return suffix == ".md" or suffix in PUBLISHABLE_FILE_SUFFIXES
+
+
+def _render_to_page(target: Path, out_dir: Path, *, background: bool = False) -> Path:
+    """The page *target* publishes as, written to ``out_dir/index.html``."""
+    if target.suffix.lower() == ".md":
+        return _render_markdown_to_html(target, out_dir, background=background)
+    return _render_file_to_html(target, out_dir, background=background)
 
 # What Share and the agent's publish tool report for a full-stack artifact when
 # the publish URL is not MindsHub's service (`is_mindshub_publish_url`).
@@ -1038,6 +1087,70 @@ def _render_markdown_to_html(md_path: Path, out_dir: Path, *, background: bool =
     # As text, so the file's line endings stay the platform's, as before.
     out_path.write_text(page.decode("utf-8"), encoding="utf-8")
     return out_path
+
+
+PUBLISH_FILE_MAX_BYTES = 25 * 1024 * 1024
+
+
+def _render_file_to_html(path: Path, out_dir: Path, *, background: bool = False) -> Path:
+    """Render a file that isn't a web page to a standalone ``index.html`` in ``out_dir`` (ENG-4687).
+
+    The page shows what the file says and links to the file, which is copied
+    beside it under ``published_file_name``, so the publisher bundles it and
+    the link downloads it. Like ``_render_markdown_to_html``: the original is
+    never modified, the page renders in the conversion process
+    (``cowork.services.file_page``), and one render per version of the file
+    serves every "changed since publish" check. Raises ``FileNotPublishable``
+    for a file past the bound or one the conversion refused or stopped,
+    ``MarkdownRenderBusy`` while another conversion runs, and
+    ``FileConversionFailed`` for one that failed.
+    """
+    with path.open("rb") as source:
+        data = source.read(PUBLISH_FILE_MAX_BYTES + 1)
+    if len(data) > PUBLISH_FILE_MAX_BYTES:
+        raise FileNotPublishable(FILE_TOO_LARGE_MESSAGE)
+    suffix = path.suffix.lower()
+    key = hashlib.sha256(b"file\0" + f"{suffix}\0{path.name}\0".encode() + data).hexdigest()
+    page = _RENDERED_PAGES.page(key)
+    if page is None:
+        if background and _RENDERED_PAGES.was_refused(key):
+            raise FileNotPublishable(FILE_NOT_CONVERTED_MESSAGE)
+        try:
+            body = _publish_file_body(data, suffix=suffix, name=path.name)
+        except FileNotPublishable:
+            _RENDERED_PAGES.refuse(key)
+            raise
+        page = _MD_HTML_TEMPLATE.format(title=_html.escape(path.stem), body=body).encode("utf-8")
+        _RENDERED_PAGES.keep(key, page)
+    out_path = out_dir / "index.html"
+    out_path.write_text(page.decode("utf-8"), encoding="utf-8")
+    (out_dir / published_file_name(path.name)).write_bytes(data)
+    return out_path
+
+
+def _publish_file_body(data: bytes, *, suffix: str, name: str) -> str:
+    """The page body ``file_page`` renders for a file, in a conversion process."""
+    from cowork.services.artifact_export import conversion_limits
+    from cowork.services.export_runner import (
+        ConversionBusy,
+        ConversionError,
+        ConversionOverrun,
+        convert_in_child,
+    )
+
+    try:
+        conversion = convert_in_child(
+            request=PublishFileRequest(suffix=suffix, name=name[:255]),
+            source=data,
+            limits=conversion_limits(org_mode=_org_mode()),
+        )
+    except ConversionBusy as exc:
+        raise MarkdownRenderBusy() from exc
+    except ConversionOverrun as exc:
+        raise FileNotPublishable(FILE_NOT_CONVERTED_MESSAGE) from exc
+    except ConversionError as exc:
+        raise FileConversionFailed() from exc
+    return conversion.data.decode("utf-8")
 
 
 def _publish_markdown_body(md_text: str) -> str:
@@ -1708,7 +1821,9 @@ def publish_artifact(
         artifact, container_dirs=[artifacts_base]
     )
     if not is_fullstack and not is_publishable_static(publish_target, artifacts_base):
-        raise ValueError("Only HTML and Markdown artifact content can be published")
+        raise ValueError(
+            "Only web pages, Markdown, PDF, Word, Excel, PowerPoint, CSV and text artifact content can be published"
+        )
     # anton bundles files from this folder by path. A file there with a second
     # name, such as a hard link a cell made to the project's `.anton/.env`,
     # would publish that file's current content on every publish.
@@ -1859,16 +1974,17 @@ def publish_artifact(
                     },
                 )
                 raise AccessModeChanged()
-        # Markdown is rendered to a throwaway index.html that we hand to the
-        # publisher; `.html` and fullstack publish their real target directly.
+        # Markdown, and a file that isn't a web page (ENG-4687), render to a
+        # throwaway index.html that we hand to the publisher; `.html` and
+        # fullstack publish their real target directly.
         # `publish_target` stays the original artifact so the registry, history,
         # and unpublish all key off the file the user actually sees.
         publish_source = publish_target
         md_tmp_dir: tempfile.TemporaryDirectory | None = None
         try:
-            if not is_fullstack and publish_target.suffix.lower() == ".md":
+            if not is_fullstack and _renders_to_page(publish_target):
                 md_tmp_dir = tempfile.TemporaryDirectory(prefix="cowork-md-publish-")
-                publish_source = _render_markdown_to_html(
+                publish_source = _render_to_page(
                     publish_target, Path(md_tmp_dir.name), background=background
                 )
 
@@ -2135,9 +2251,9 @@ def compute_publish_md5(artifact: Path, *, artifacts_base: Path) -> str | None:
     md_tmp_dir: tempfile.TemporaryDirectory | None = None
     try:
         publish_source = publish_target
-        if not is_fullstack and publish_target.suffix.lower() == ".md":
+        if not is_fullstack and _renders_to_page(publish_target):
             md_tmp_dir = tempfile.TemporaryDirectory(prefix="cowork-md-md5-")
-            publish_source = _render_markdown_to_html(
+            publish_source = _render_to_page(
                 publish_target, Path(md_tmp_dir.name), background=True
             )
         if is_fullstack:
