@@ -54,7 +54,7 @@ def credential(monkeypatch):
 def published(monkeypatch):
     seen = []
 
-    def resolve(raw_path, *, scope):
+    def resolve(raw_path, *, scope, adopted=()):
         seen.append(raw_path)
         return "rid-1"
 
@@ -136,7 +136,7 @@ def test_rejected_publish_key_is_502_with_the_reconnect_code(monkeypatch, creden
 
 
 def test_unpublished_artifact_is_404(monkeypatch, credential):
-    def not_published(raw_path, *, scope):
+    def not_published(raw_path, *, scope, adopted=()):
         raise FileNotFoundError("Artifact is not published")
 
     monkeypatch.setattr(artifact_stats, "report_id_for_path", not_published)

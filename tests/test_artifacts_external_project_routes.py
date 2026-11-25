@@ -29,7 +29,7 @@ from cowork.db.scoped import LOCAL_SCOPE, ScopedSession
 from cowork.db.session import get_open_session
 from cowork.models.project import Project
 from cowork.server import create_app
-from cowork.services import artifact_revisions
+from cowork.services import artifact_revisions, artifact_stats
 from cowork.services import artifacts as artifacts_service
 from cowork.services import published_page_ownership
 from cowork.services import publish as publish_service
@@ -442,3 +442,50 @@ def test_a_refresh_keeps_revisions_whose_comments_live_in_the_cloud_in_a_chosen_
     )
 
     assert artifact_revisions._comments_live_in_the_cloud(artifact, LOCAL_SCOPE) is True
+
+
+# -- viewer stats and the datasource check -----------------------------------
+
+
+@pytest.mark.parametrize(
+    ("method", "url", "service_call", "body"),
+    [
+        ("GET", "/api/v1/publish/stats", "fetch_stats", None),
+        ("PUT", "/api/v1/publish/stats/tracking", "set_tracking", {"enabled": True}),
+        ("GET", "/api/v1/publish/stats/viewers/viewer-1", "fetch_viewer", None),
+        ("DELETE", "/api/v1/publish/stats", "delete_stats", None),
+    ],
+    ids=["stats", "tracking", "viewer", "delete"],
+)
+def test_viewer_stats_reach_the_report_of_an_artifact_in_a_chosen_folder(
+    projects_root, tmp_path, monkeypatch, method, url, service_call, body
+):
+    """The service call is stubbed and records the report id it was asked
+    for: before, the path never resolved, so the panel showed no numbers."""
+    asked = []
+    monkeypatch.setattr(publish_ep, "_desktop_credential", lambda: ("key", "https://4nton.ai"))
+    monkeypatch.setattr(
+        artifact_stats, service_call, lambda *, report_id, **kwargs: asked.append(report_id) or {}
+    )
+    client = _client()
+    _project, _folder, artifact = _adopted(client, tmp_path, f"routes-stats-{service_call}")
+    _published_record(artifact, "uuid-stats")
+    path = str(artifact / "index.html")
+
+    if body is None:
+        res = client.request(method, url, params={"path": path})
+    else:
+        res = client.request(method, url, json={"path": path, **body})
+
+    assert res.status_code in (200, 204), res.text
+    assert asked == ["uuid-stats"]
+
+
+def test_the_datasource_check_answers_for_an_artifact_in_a_chosen_folder(projects_root, tmp_path):
+    client = _client()
+    _project, _folder, artifact = _adopted(client, tmp_path, "routes-datasources")
+
+    res = client.get("/api/v1/publish/datasources", params={"path": str(artifact / "index.html")})
+
+    assert res.status_code == 200, res.text
+    assert res.json() == {"pending": []}

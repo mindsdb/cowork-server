@@ -195,7 +195,7 @@ def test_an_unsaved_connection_is_neither_pending_nor_approved(artifacts_base, u
     folder = _app(artifacts_base, [{"engine": "pg", "name": "ghost"}], slug="ghosted")
     monkeypatch.setattr(
         publish, "desktop_artifact_and_base",
-        lambda raw, *, scope: SimpleNamespace(artifact=folder, artifacts_base=artifacts_base),
+        lambda raw, *, scope, adopted=(): SimpleNamespace(artifact=folder, artifacts_base=artifacts_base),
     )
 
     assert publish.pending_datasources(str(folder), scope=None) == []
@@ -241,7 +241,7 @@ def test_the_pending_list_for_the_dialog(app, artifacts_base, monkeypatch):
     monkeypatch.setattr(publish, "vault_for_scope", lambda scope: FakeVault())
     monkeypatch.setattr(
         publish, "desktop_artifact_and_base",
-        lambda raw, *, scope: SimpleNamespace(artifact=app, artifacts_base=artifacts_base),
+        lambda raw, *, scope, adopted=(): SimpleNamespace(artifact=app, artifacts_base=artifacts_base),
     )
     assert publish.pending_datasources(str(app), scope=None) == [
         {"engine": "postgres", "name": "scm", "label": "Sales DB (postgres)"}
@@ -317,7 +317,7 @@ def test_a_page_published_before_approvals_keeps_its_connections(app, artifacts_
     _touch_metadata(app, published_at - 60)
     monkeypatch.setattr(
         publish, "desktop_artifact_and_base",
-        lambda raw, *, scope: SimpleNamespace(artifact=app, artifacts_base=artifacts_base),
+        lambda raw, *, scope, adopted=(): SimpleNamespace(artifact=app, artifacts_base=artifacts_base),
     )
     assert publish.pending_datasources(str(app), scope=None) == []
     # The dialog's read records nothing; the publish does.

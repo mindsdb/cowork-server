@@ -1564,11 +1564,13 @@ def _datasource_vault(
     return AllowedDataVault(source=source, allowed=found.sendable)
 
 
-def pending_datasources(raw_path: str, *, scope: TenantScope | None) -> list[dict[str, str]]:
+def pending_datasources(
+    raw_path: str, *, scope: TenantScope | None, adopted: Collection[ProjectRow] = ()
+) -> list[dict[str, str]]:
     """The connections a publish of this artifact would send credentials for
     without the person's approval yet, for the publish dialog. Empty for
     anything but a full-stack app."""
-    found = desktop_artifact_and_base(raw_path, scope=scope)
+    found = desktop_artifact_and_base(raw_path, scope=scope, adopted=adopted)
     publish_target, published_dir, published_key, is_fullstack = _resolve_publish_target(
         found.artifact, container_dirs=[found.artifacts_base]
     )

@@ -113,9 +113,9 @@ async def list_publishable_endpoint(scope: ScopeDep):
 
 # Plain `def`: it reads the approval table and the vault.
 @router.get("/datasources")
-def pending_datasources_endpoint(scope: ScopeDep, path: str = Query(...)):
+def pending_datasources_endpoint(scope: ScopeDep, adopted: AdoptedRowsDep, path: str = Query(...)):
     try:
-        return {"pending": _pending(path, scope=scope)}
+        return {"pending": _pending(path, scope=scope, adopted=adopted)}
     except FileNotFoundError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
     except ValueError as e:
@@ -265,21 +265,22 @@ def _stats_credential() -> tuple[str, str]:
 @router.get("/stats")
 def artifact_stats_endpoint(
     scope: ScopeDep,
+    adopted: AdoptedRowsDep,
     path: str = Query(..., description="Absolute path to the published artifact"),
 ):
     api_key, publish_url = _stats_credential()
     try:
-        report_id = _stats.report_id_for_path(path, scope=scope)
+        report_id = _stats.report_id_for_path(path, scope=scope, adopted=adopted)
         return _stats.fetch_stats(publish_url=publish_url, key=api_key, report_id=report_id)
     except _stats.STATS_ROUTE_ERRORS as e:
         raise _stats.stats_http_exception(e, desktop=True) from e
 
 
 @router.put("/stats/tracking")
-def set_stats_tracking_endpoint(req: _StatsTrackingBody, scope: ScopeDep):
+def set_stats_tracking_endpoint(req: _StatsTrackingBody, scope: ScopeDep, adopted: AdoptedRowsDep):
     api_key, publish_url = _stats_credential()
     try:
-        report_id = _stats.report_id_for_path(req.path, scope=scope)
+        report_id = _stats.report_id_for_path(req.path, scope=scope, adopted=adopted)
         return _stats.set_tracking(
             publish_url=publish_url, key=api_key, report_id=report_id,
             enabled=req.enabled, require_email=req.require_email,
@@ -292,12 +293,13 @@ def set_stats_tracking_endpoint(req: _StatsTrackingBody, scope: ScopeDep):
 def artifact_stats_viewer_endpoint(
     viewer_id: str,
     scope: ScopeDep,
+    adopted: AdoptedRowsDep,
     path: str = Query(..., description="Absolute path to the published artifact"),
 ):
     """One viewer's visits and per-section times, as the publishing service returns them."""
     api_key, publish_url = _stats_credential()
     try:
-        report_id = _stats.report_id_for_path(path, scope=scope)
+        report_id = _stats.report_id_for_path(path, scope=scope, adopted=adopted)
         return _stats.fetch_viewer(
             publish_url=publish_url, key=api_key, report_id=report_id, viewer_id=viewer_id,
         )
@@ -308,12 +310,13 @@ def artifact_stats_viewer_endpoint(
 @router.delete("/stats", status_code=status.HTTP_204_NO_CONTENT)
 def delete_artifact_stats_endpoint(
     scope: ScopeDep,
+    adopted: AdoptedRowsDep,
     path: str = Query(..., description="Absolute path to the published artifact"),
 ):
     """Delete the artifact's viewer analytics: views, visits and viewers."""
     api_key, publish_url = _stats_credential()
     try:
-        report_id = _stats.report_id_for_path(path, scope=scope)
+        report_id = _stats.report_id_for_path(path, scope=scope, adopted=adopted)
         _stats.delete_stats(publish_url=publish_url, key=api_key, report_id=report_id)
     except _stats.STATS_ROUTE_ERRORS as e:
         raise _stats.stats_http_exception(e, desktop=True) from e
