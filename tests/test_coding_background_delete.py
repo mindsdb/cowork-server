@@ -6,9 +6,18 @@ import shutil
 import subprocess
 import threading
 from pathlib import Path
+from unittest.mock import Mock
 
 import pytest
-from tests.support.coding.service_fakes import CREDS, FakeEngine, copy_folders_without_git, repository, service_with, wait_for_status
+from tests.support.coding.service_fakes import (
+    CREDS,
+    FakeEngine,
+    assert_usage_refreshes_after_cleanup,
+    copy_folders_without_git,
+    repository,
+    service_with,
+    wait_for_status,
+)
 
 from cowork.coding import pending_removals as pending_module
 from cowork.coding.contracts import SessionCreateRequest, SessionStatus, WorkspaceKind, WorkspaceMode
@@ -87,6 +96,31 @@ def test_deleting_a_worktree_task_drops_its_git_registration(tmp_path: Path, blo
     assert service.workspaces.pending_removals.wait(30)
     assert not any(service.workspaces.pending_removals.root.iterdir())
     assert (repo / "README.md").read_text(encoding="utf-8") == "base\n"
+
+
+def test_storage_usage_refreshes_once_a_deleted_task_is_removed(tmp_path: Path, blocked_remover) -> None:
+    _started, release = blocked_remover
+    repo = repository(tmp_path)
+    service = service_with(tmp_path, FakeEngine())
+    session = create(service, repo)
+    service.delete_session(session.id)
+    assert service.workspace_usage.measure().removed_task_bytes > 0
+
+    release.set()
+    assert_usage_refreshes_after_cleanup(service)
+
+
+def test_a_failing_drained_callback_does_not_stop_later_removals(tmp_path: Path) -> None:
+    pending = PendingRemovals(tmp_path / "pending")
+    pending.on_drained = Mock(side_effect=RuntimeError("listener failed"))
+    for name in ("first", "second"):
+        folder = tmp_path / name
+        folder.mkdir()
+        assert pending.discard(folder)
+        assert pending.wait(30)
+
+    assert pending.on_drained.call_count == 2
+    assert not any(pending.root.iterdir())
 
 
 def test_deleting_an_in_place_task_moves_nothing(tmp_path: Path) -> None:

@@ -1,6 +1,7 @@
 from cowork.models.artifact_location import ArtifactLocation  # noqa: F401
 from cowork.models.artifact_sort_time import ArtifactSortTime  # noqa: F401
 from cowork.models.artifact_owner_choice import ArtifactOwnerChoice  # noqa: F401
+from cowork.models.artifact_datasource_approval import ArtifactDatasourceApproval  # noqa: F401
 from cowork.models.channel import (  # noqa: F401
     ChannelBinding,
     ChannelEvent,
@@ -8,6 +9,7 @@ from cowork.models.channel import (  # noqa: F401
     ChannelSession,
 )
 from cowork.models.code_control import CodeControlRecord  # noqa: F401
+from cowork.models.conversation_folder import ConversationFolder  # noqa: F401
 from cowork.models.held_artifact_root import HeldArtifactRoot  # noqa: F401
 from cowork.models.custom_connector import CustomConnector  # noqa: F401
 from cowork.models.published_page import PublishedPageOwner  # noqa: F401
@@ -29,3 +31,5 @@ from cowork.models.shared_resource import (  # noqa: F401
 from cowork.models.task_object import TaskObject  # noqa: F401
 
 from cowork.models.live_app_preview import LiveAppPreview  # noqa: F401
+
+from cowork.models.content_report import ContentReport  # noqa: F401

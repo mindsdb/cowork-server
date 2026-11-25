@@ -1,6 +1,7 @@
 from __future__ import annotations
 from tests._logging_assertions import assert_log_fields
 
+import logging
 from datetime import datetime, timedelta, timezone
 from uuid import UUID
 
@@ -232,9 +233,6 @@ def test_has_running_run_ignores_manual_run_in_progress():
     assert run_service.has_running_run(schedule.id) is False
 
 
-# --- ENG-688: freshness guard — a due cron slot is skipped when a successful
-# run (typically a manual "run now") finished within the cadence window.
-
 def _finish_at(session: Session, run_id, when: datetime) -> None:
     from cowork.models.schedule import ScheduleRun
 
@@ -244,56 +242,69 @@ def _finish_at(session: Session, run_id, when: datetime) -> None:
     session.commit()
 
 
-def test_last_successful_finish_ignores_failures_and_running():
+def _cron_success(session, run_service, schedule, slot_at, finished_at):
+    run = run_service.create_run(schedule.id, is_manual=False, slot_at=slot_at)
+    run_service.finish_run(run.id)
+    _finish_at(session, run.id, finished_at)
+
+
+@pytest.mark.parametrize(("old_cadence", "new_cadence", "manual", "slot_age"), [
+    ("hourly", "hourly", False, 5),   # Move the minute of an hourly task.
+    ("daily", "daily", False, 35),
+    ("daily", "hourly", False, 60),   # The new time aligns with the new cadence.
+    ("daily", "once", False, 5),
+    ("daily", "daily", True, 5),
+])
+def test_edit_after_success_dispatches_new_slot_and_other_due_tasks(
+    old_cadence, new_cadence, manual, slot_age, monkeypatch,
+):
+    from unittest.mock import Mock
+
+    from cowork.schedule_timing import advance_occurrence
+
     session = _session()
-    schedule = _schedule(session)
-    run_service = ScheduleRunService(ScopedSession(session, SYSTEM_SCOPE))
+    scoped = ScopedSession(session, SYSTEM_SCOPE)
+    due = datetime.now(timezone.utc) + timedelta(minutes=1)
+    previous_slot = due - timedelta(minutes=slot_age)
+    original_next = advance_occurrence(old_cadence, previous_slot, "UTC")
+    task = _schedule(session, cadence=old_cadence, next_run_at=original_next)
+    runs = ScheduleRunService(scoped)
+    run = runs.create_run(task.id, is_manual=manual, slot_at=None if manual else previous_slot)
+    runs.finish_run(run.id)
 
-    assert run_service.last_successful_finish(schedule.id) is None
-
-    failed = run_service.create_run(schedule.id, is_manual=True)
-    run_service.finish_run(failed.id, error="boom")
-    running = run_service.create_run(schedule.id, is_manual=False)
-    assert run_service.last_successful_finish(schedule.id) is None
-    # A schedule holds one running run at a time.
-    run_service.finish_run(running.id, error="ended")
-
-    ok = run_service.create_run(schedule.id, is_manual=True)
-    run_service.finish_run(ok.id)
-    finished = run_service.last_successful_finish(schedule.id)
-    assert finished is not None and finished.tzinfo is not None
+    ScheduleService(scoped).update_schedule(task.id, cadence=new_cadence, next_run_at=due)
+    other = _schedule(session, next_run_at=due)
+    clock = Mock(wraps=datetime)
+    clock.now.return_value = due + timedelta(seconds=5)
+    monkeypatch.setattr(scheduler, "datetime", clock)
+    assert {(slot.schedule_id, slot.slot_at) for slot in scheduler._poll(scoped)} == {
+        (task.id, due), (other.id, due),
+    }
 
 
-def test_due_slot_skipped_and_advanced_after_recent_manual_success():
+@pytest.mark.parametrize("change", [{"cadence": "weekly"}, {"timezone": "Europe/Skopje"}])
+def test_timing_change_with_same_next_run_honors_due_slot(change):
+    session = _session()
+    scoped = ScopedSession(session, SYSTEM_SCOPE)
+    due = datetime.now(timezone.utc) + timedelta(minutes=2)
+    task = _schedule(session, next_run_at=due)
+    runs = ScheduleRunService(scoped)
+    run = runs.create_run(task.id, is_manual=True)
+    runs.finish_run(run.id)
+    ScheduleService(scoped).update_schedule(task.id, **change)
+    assert [s.id for s in scheduler._due_schedules(scoped, due)] == [task.id]
+
+
+def test_the_slot_after_a_late_cron_run_is_still_due():
     from cowork.scheduler import _due_schedules
 
     session = _session()
-    schedule = _schedule(session)  # daily, due at 2026-06-25 09:00 UTC
+    slot = datetime(2026, 6, 25, 9, 0, tzinfo=timezone.utc)
+    schedule = _schedule(session, cadence="hourly", next_run_at=slot + timedelta(hours=1))
     run_service = ScheduleRunService(ScopedSession(session, SYSTEM_SCOPE))
+    _cron_success(session, run_service, schedule, slot, slot + timedelta(minutes=50))
 
-    now = datetime(2026, 6, 25, 9, 0, 30, tzinfo=timezone.utc)
-    run = run_service.create_run(schedule.id, is_manual=True)
-    run_service.finish_run(run.id)
-    _finish_at(session, run.id, now - timedelta(minutes=50))
-
-    assert _due_schedules(ScopedSession(session, SYSTEM_SCOPE), now) == []
-    session.refresh(schedule)
-    # Slot consumed: advanced past the skipped occurrence to the next day.
-    assert schedule.next_run_at.replace(tzinfo=timezone.utc) > now
-
-
-def test_due_slot_runs_when_last_success_is_old():
-    from cowork.scheduler import _due_schedules
-
-    session = _session()
-    schedule = _schedule(session)
-    run_service = ScheduleRunService(ScopedSession(session, SYSTEM_SCOPE))
-
-    now = datetime(2026, 6, 25, 9, 0, 30, tzinfo=timezone.utc)
-    run = run_service.create_run(schedule.id, is_manual=True)
-    run_service.finish_run(run.id)
-    _finish_at(session, run.id, now - timedelta(hours=2))
-
+    now = slot + timedelta(hours=1, seconds=30)
     assert [s.id for s in _due_schedules(ScopedSession(session, SYSTEM_SCOPE), now)] == [schedule.id]
 
 
@@ -301,7 +312,7 @@ def test_due_slot_deferred_while_manual_run_in_flight():
     """PR #181 review issue 3: a manual run still executing when the cron
     slot comes due must block the slot — otherwise both publish the same
     output. Deferred, not consumed: the slot stays due, and once the manual
-    run finishes the freshness guard decides whether it still fires."""
+    run finishes the slot can fire."""
     from cowork.scheduler import _due_schedules
 
     session = _session()
@@ -319,8 +330,6 @@ def test_due_slot_deferred_while_manual_run_in_flight():
 
 @pytest.mark.parametrize("cadence", ["every_15_minutes", "every_30_minutes"])
 def test_a_short_cadence_runs_the_slot_right_after_a_manual_run(cadence):
-    # A freshness window would skip every other slot after a Run now at
-    # these cadences, so they have none.
     from cowork.scheduler import _due_schedules
 
     session = _session()
@@ -386,9 +395,6 @@ def test_finish_run_status_override_records_cancelled():
     finished = run_service.finish_run(run.id, status=RunStatus.cancelled)
     assert finished.status == RunStatus.cancelled
     assert finished.error is None
-    # A cancelled run is not a success: it neither blocks via the freshness
-    # guard nor counts as the last successful finish.
-    assert run_service.last_successful_finish(schedule.id) is None
 
 
 def test_has_active_run_counts_manual_runs():
@@ -947,8 +953,7 @@ def test_execute_schedule_records_cancelled_and_consumes_slot(monkeypatch):
     assert state["last_error"] is None
     assert state["last_run_at"] is None
     # The slot is consumed — otherwise the next tick restarts the run the
-    # user just killed (a cancelled run isn't a success, so the freshness
-    # guard wouldn't block it).
+    # user just killed.
     assert state["next_advanced"] is True
 
 
@@ -1130,6 +1135,26 @@ def test_auth_outage_before_the_turn_keeps_the_slot_due(monkeypatch):
     assert state["run_status"] == RunStatus.failed
     # The outage clears on its own; the next poll runs the occurrence.
     assert state["next_advanced"] is False
+
+
+def test_an_auth_outage_before_the_turn_logs_why_once(monkeypatch, caplog, owned_logger):
+    """The run's error is the answer, so the line saying why is logged with it."""
+    import cowork.services.product_permissions as permissions_mod
+
+    owned_logger("cowork.services.product_permissions", level=logging.WARNING)
+
+    async def _check(*_args, **_kwargs):
+        raise permissions_mod.permission_unavailable(route=permissions_mod.AUTHORIZE_ROUTE, cause="not_configured")
+
+    monkeypatch.setattr(permissions_mod, "require_product_permission", _check)
+    state = _execute_with_terminal(monkeypatch, None)
+
+    assert state["run_status"] == RunStatus.failed
+    [record] = [
+        r for r in caplog.records
+        if r.name == "cowork.services.product_permissions" and getattr(r, "event", None) == "permission_unavailable"
+    ]
+    assert (record.route, record.reason) == (permissions_mod.AUTHORIZE_ROUTE, "not_configured")
 
 
 def test_revoked_permission_consumes_the_slot(monkeypatch):

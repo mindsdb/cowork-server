@@ -55,6 +55,7 @@ from cowork.harnesses.anton_harness.scratchpad_cell_replay import SCRATCHPAD_REP
 from cowork.harnesses.anton_harness.settings import AntonHarnessSettings
 from cowork.services.connectors.connections import service
 from cowork.services.connectors.notion_pages import describe_project_pages
+from cowork.services.conversation_folders import ConversationFolderService, folder_refusal
 from cowork.services.conversations import read_earlier_answers
 from cowork.services.live_apps import (
     TurnLiveApps,
@@ -1062,6 +1063,91 @@ def _attachment_context_for(rows: list[_AttachedFile] | None, *, conversation) -
     )
 
 
+def _stored_folder_paths(session: ScopedSession, *, conversation_id: UUID) -> list[str]:
+    _conversation, rows = ConversationFolderService(session).list_folders(conversation_id)
+    return [row.path for row in rows]
+
+
+_FOLDER_CHECK_TIMEOUT_S = 5.0
+
+
+def _usable_folder_paths(paths: list[str], project_path: str | None) -> list[str]:
+    """The stored folder paths that still pass the working-folder rules. Touches the filesystem."""
+    return [path for path in paths if folder_refusal(path, project_path) is None]
+
+
+async def _working_folder_paths(conversation, channel_context: ChannelContext | None) -> list[str]:
+    """The chat's working folders the agent may use this turn, as absolute paths.
+
+    Read in a database unit of its own, since the harness gets the conversation
+    detached. Empty for a channel turn: the people in a Slack or Telegram chat
+    are not the desktop user who added the folders. Each folder is checked
+    again, so one that vanished or now resolves into Cowork's own data is left
+    out. Fails closed: an error offers no folders and is logged. A wait for a
+    connection that runs out is the turn's failure, so it propagates.
+    """
+    if channel_context is not None:
+        return []
+    try:
+        scope = _units_scope()
+        if scope.org_mode:
+            return []
+        paths = await run_db(
+            partial(_stored_folder_paths, conversation_id=conversation.id), scope=scope,
+        )
+        project_path = conversation.project.path if conversation.project else None
+        # Each check stats the folder, which can hang on a network share that stopped
+        # answering; a timeout offers no folders, through the handler below.
+        return await asyncio.wait_for(
+            asyncio.to_thread(_usable_folder_paths, paths, project_path),
+            timeout=_FOLDER_CHECK_TIMEOUT_S,
+        )
+    except PoolTimeoutError:
+        raise
+    except Exception:
+        logger.warning(
+            "Failed to load working folders for conversation %s; none are offered this turn",
+            getattr(conversation, "id", "<unknown>"),
+            exc_info=True,
+        )
+        return []
+
+
+def _file_access_rules(folder_paths: list[str], *, sandboxed: bool) -> str:
+    """The prompt sentences that say which files outside the project are allowed.
+
+    Without working folders this is _other_files_rule's text, so a chat that
+    never adds one sends an unchanged prompt.
+    """
+    if not folder_paths:
+        return _other_files_rule(sandboxed=sandboxed)
+    return (
+        "The only other files that you are allowed to access are any items that are attached to the conversation "
+        "and the files in the working folders below. "
+        "Access to any files not attached to the conversation and located outside both the project and the "
+        "working folders is strictly forbidden. "
+    )
+
+
+def _working_folders_context(paths: list[str]) -> str:
+    """Prompt fragment granting the agent the chat's working folders, or "" for none."""
+    if not paths:
+        return ""
+    listed = "\n".join(f"  - {path}" for path in paths)
+    return (
+        " The user has also added these working folders to THIS conversation:\n"
+        + listed
+        + "\nYou may read and write files in them through the scratchpad, using these absolute paths."
+        " Before you change, move or delete any file in a working folder, ask the user for permission first."
+        " Keep creating artifacts in the project as usual."
+        " Leave any .anton/ directory inside a working folder alone."
+        " To find or read a file in a working folder, list, search and read it in the scratchpad;"
+        " do not use read_text_file or select_path for it, because they cannot open working-folder files."
+        " When the user names a file without saying which folder, search the project and every working folder"
+        " before saying it is missing. If it is not found, say so and ask; never answer about a different file instead."
+    )
+
+
 @register
 class AntonHarness:
     id: str = "anton"
@@ -1430,7 +1516,8 @@ class AntonHarness:
                 created_at.replace(tzinfo=timezone.utc)
                 if created_at.tzinfo is None else created_at.astimezone(timezone.utc)
             )
-        ts = created_at.strftime("%Y-%m-%d %H:%M UTC") if created_at else None
+        # Same bytes as anton's live stamp, so the replayed message keeps the prompt cache.
+        ts = created_at.strftime("%Y-%m-%d %H:%M") if created_at else None
         if m.role == "user" and ts and isinstance(om.get("content"), str) and om["content"]:
             om["content"] = f"[{ts}] {om['content']}"
         return om
@@ -1818,6 +1905,8 @@ class AntonHarness:
             partial(_replay_history, conversation_id=conversation.id), scope=_units_scope(),
         )
         ordered_messages = history.messages
+        # Landlock grants agent code no working folder, so a sandboxed turn offers none.
+        folder_paths = [] if sandboxed else await _working_folder_paths(conversation, channel_context)
 
         # App backends are refused under the code sandbox (`sandboxed`), so
         # the agent is never told to build one, unless live apps run them in
@@ -1858,7 +1947,7 @@ class AntonHarness:
             "Everything else in .anton/ is off limits. Do not mention the .anton/ directory in your responses. "
             "You can perform operations on these files via the scratchpad. "
             + _project_file_actions_rule(anton_settings.act_first)
-            + _other_files_rule(sandboxed=sandboxed)
+            + _file_access_rules(folder_paths, sandboxed=sandboxed)
             + "Read text files with `read_text_file` (`end_line=-1` returns the whole file), several in one step. Read in the scratchpad only data that goes straight into scratchpad code or a file that needs special parsing: printed scratchpad output stops at 10,000 characters. Use the scratchpad for everything else you do with files. "
             f"Your scratchpad's working directory is {str(base)} — bare relative paths like `open('data.csv')` resolve from the project root."
             # Each turn's scratchpad processes are killed when the turn ends
@@ -1876,6 +1965,7 @@ class AntonHarness:
                 else ""
             )
             + attachment_context
+            + _working_folders_context(folder_paths)
         )
         output_context = (
             # Artifacts live under `<base>/.anton/artifacts/<slug>/`, one
@@ -1941,6 +2031,29 @@ class AntonHarness:
             data_vault = app_held.turn_vault(
                 data_vault, source_vault=source_vault, root=own_vault_root(current_settings_scope())
             )
+            # anton builds the cell's DS_* environment one connection at a
+            # time and leaves out one that fails, so a sealed connection that
+            # won't open stops the turn here, naming it, instead.
+            from cowork.common.encryption import sealing_keys
+
+            if sealing_keys() is not None:
+                from cowork.services.connectors.sealed_vault import (
+                    SealedRecordError,
+                    refuse_unopenable_connections,
+                )
+
+                try:
+                    refuse_unopenable_connections(vault=data_vault)
+                except SealedRecordError as error:
+                    logger.error(
+                        "A saved connection can't be opened, so the turn stops",
+                        extra={
+                            "event": "sealed_connection_unopenable",
+                            "connection": error.connection,
+                            "reason": error.cause,
+                        },
+                    )
+                    raise
             # Registers this turn's DS_* names and values for scrubbing, and
             # touches no process state, so a concurrent turn's are left alone.
             from anton.utils.datasources import restore_namespaced_env

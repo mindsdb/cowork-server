@@ -85,6 +85,7 @@ from cowork.turnqueue.addons import ADDON_STEP, relay_addon_step
 from cowork.turnqueue.preview_checks import ARTIFACT_CHECK_STEP, register_remote_check
 from cowork.turnqueue.producer import (
     RemoteWorkspace,
+    TurnLlm,
     revoke_turn_key_quietly,
     step_stream_events,
     stream_remote_replies,
@@ -117,6 +118,7 @@ from cowork.handlers.turn_errors import (
     GENERIC_TURN_ERROR_CODE,
     GENERIC_TURN_ERROR_MESSAGE,
     INTERRUPTED_TURN_MESSAGE,
+    MODEL_NOT_IN_TIER_CODE,
     MODEL_UNAVAILABLE_CODES,
     PROVIDER_OVERLOADED_CODE,
     RATE_LIMITED_CODE,
@@ -128,12 +130,15 @@ from cowork.handlers.turn_errors import (
     STALLED_TURN_MESSAGE,
     TURN_LOST_CODE,
     TURN_LOST_MESSAGE,
+    WINDOW_ALLOWANCE_EXHAUSTED_CODE,
     auth_error_detail,
     friendly_turn_error,
     gate_budget_model,
     gate_budget_period,
     gate_budget_scope,
+    gate_required_tier,
     gate_reset_at,
+    gate_window,
     model_unavailable_info,
     provider_overloaded_info,
     remote_error_label,
@@ -765,7 +770,8 @@ def _start_first_take(
     Its trace is its own (tag ``cowork-first-take``), joined to the gate's by
     the correlation id, so its cost is countable apart from the gate's.
     """
-    if not _first_take_enabled():
+    from cowork.services.content_safety import ContentSafetySettings
+    if ContentSafetySettings().required or not _first_take_enabled():
         return None
     binding = _first_take_binding(minted, binding_factory=binding_factory)
     if binding is None:
@@ -804,6 +810,12 @@ async def _drop_gate_key(turn_llm: dict | None) -> None:
     """Revoke the turn key the routing gate minted, for a turn that won't run."""
     if turn_llm and turn_llm.get("correlation_id"):
         await revoke_turn_key_quietly(turn_llm["correlation_id"])
+
+
+def _gate_block(turn_llm: dict | None) -> dict:
+    """The llm block of the turn key the routing gate minted; empty when it minted none."""
+    gate: TurnLlm | None = (turn_llm or {}).get("llm")
+    return gate.block if gate is not None else {}
 
 
 class ResponsesHandler:
@@ -868,6 +880,8 @@ class ResponsesHandler:
         logger.info("[responses] handle() called — conversation=%s, stream=%s", request.conversation, request.stream)
 
         await require_product_permission(self.scope, "product.execute")
+        from cowork.services.content_safety import check_request
+        await check_request(request, scope=self.scope)
 
         # "memory": "off" runs the turn as MEMORY_ENABLED=false would. On a
         # deployment where that still reads stored memory (memory_policy: the
@@ -1681,7 +1695,7 @@ class ResponsesHandler:
             target = jev_route.own_decision_target(settings)
             model = settings.decision_model or queue_settings.jev_route_model
         else:
-            block = (turn_llm or {}).get("llm") or {}
+            block = _gate_block(turn_llm)
             if block.get("base_url") and block.get("api_key"):
                 target = jev_route.JevTarget.mindshub(block["base_url"], block["api_key"])
             else:
@@ -1718,7 +1732,7 @@ class ResponsesHandler:
         if not answer_model:
             return None
         provider_kind = settings.resolved_planning_provider
-        block = (turn_llm or {}).get("llm") or {}
+        block = _gate_block(turn_llm)
         try:
             if provider_kind is Provider.MINDS_CLOUD and block.get("base_url") and block.get("api_key"):
                 from anton.core.llm.openai import OpenAIProvider
@@ -1749,31 +1763,19 @@ class ResponsesHandler:
                 or provider_api_key(settings, Provider.MINDS_CLOUD) is not None):
             return None, None
         from anton.core.llm.openai import OpenAIProvider
-        from cowork.turnqueue.producer import _mint_llm_block_with_turn_key_id, mint_llm_block
+        from cowork.turnqueue.producer import mint_turn_llm
 
         corr = str(uuid4())
-        queue_settings = TurnQueueSettings()
-        turn_key_id = None
-        workspace_id = getattr(settings, "hub_workspace_id", "") or None
-        if queue_settings.needs_turn_key_id:
-            block, turn_key_id = await _mint_llm_block_with_turn_key_id(
-                org_id=self.scope.org_id,
-                user_id=self.scope.user_id,
-                correlation_id=corr,
-                settings=queue_settings,
-                workspace_id=workspace_id,
-            )
-        else:
-            block = await mint_llm_block(
-                org_id=self.scope.org_id,
-                user_id=self.scope.user_id,
-                correlation_id=corr,
-                settings=queue_settings,
-                workspace_id=workspace_id,
-            )
+        gate = await mint_turn_llm(
+            org_id=self.scope.org_id,
+            user_id=self.scope.user_id,
+            correlation_id=corr,
+            settings=TurnQueueSettings(),
+            workspace_id=getattr(settings, "hub_workspace_id", "") or None,
+        )
         provider = OpenAIProvider(
-            api_key=block["api_key"],
-            base_url=block["base_url"],
+            api_key=gate.block["api_key"],
+            base_url=gate.block["base_url"],
             flavor=OpenAIProvider.FLAVOR_MINDS_PASSTHROUGH,
         )
         # Built outside LLMClient, so nothing else names this call's role.
@@ -1783,10 +1785,8 @@ class ResponsesHandler:
             model=settings.resolved_gate_model or MINDS_FREE_MODEL,
             label=Provider.MINDS_CLOUD.value,
         )
-        turn_context = {"correlation_id": corr, "llm": block}
-        if turn_key_id is not None:
-            turn_context["turn_key_id"] = turn_key_id
-        return binding, turn_context
+        # The producer reuses this key, with its prefix and the lifetime auth gave it.
+        return binding, {"correlation_id": corr, "llm": gate}
 
     async def _handle_direct_response(
         self,
@@ -1807,6 +1807,8 @@ class ResponsesHandler:
         # which registry.start records in the turn index on the Redis backend,
         # so there the Reference a user reports resolves in the index too; the
         # non-streaming half leaves only the log line.
+        from cowork.services.content_safety import check_content
+        await check_content(route.text, purpose="output", scope=self.scope)
         corr = f"direct-{uuid4()}"
         if not request.stream:
             text = route.text
@@ -2216,7 +2218,20 @@ class ResponsesHandler:
 
             if first_take is not None:
                 first_take.cancel()
-            parts.append(answer.first_text)
+            from cowork.services.content_safety import ContentSafetySettings, MAX_CONTENT_CHARS, check_content
+            first_text = answer.first_text
+            remaining_text = answer.rest()
+            if ContentSafetySettings().required:
+                held = [first_text]
+                size = len(first_text)
+                async for chunk in remaining_text:
+                    size += len(chunk)
+                    if size > MAX_CONTENT_CHARS:
+                        raise HTTPException(413, "This content is too large for a safety check.")
+                    held.append(chunk)
+                first_text = "".join(held)
+                await check_content(first_text, purpose="output", scope=scope)
+            parts.append(first_text)
             response = Response(status=ResponseStatus.created, model=binding.model)
             await buffer.append("sse", {"sse": sse_frame("response.created", {
                 "type": "response.created",
@@ -2227,8 +2242,8 @@ class ResponsesHandler:
                 "user_message_id": str(question_id),
                 "response": response.model_dump(),
             })})
-            await buffer.append("sse", {"sse": sse_frame("response.output_text.delta", text_delta(answer.first_text))})
-            async for text in answer.rest():
+            await buffer.append("sse", {"sse": sse_frame("response.output_text.delta", text_delta(first_text))})
+            async for text in remaining_text:
                 parts.append(text)
                 await buffer.append("sse", {"sse": sse_frame("response.output_text.delta", text_delta(text))})
 
@@ -3282,7 +3297,6 @@ class ResponsesHandler:
                 correlation_id=corr,
                 run_id=lifecycle.identity.run_id,
                 llm=(turn_llm or {}).get("llm"),
-                turn_key_id=(turn_llm or {}).get("turn_key_id"),
                 disabled=disabled,
                 # Questions need someone to answer them: this path serves
                 # the web UI, which renders the card and posts /answer.
@@ -3521,11 +3535,14 @@ class ResponsesHandler:
             budget_scope = failure.get("budget_scope")
             budget_period = failure.get("budget_period")
             budget_model = failure.get("budget_model")
+            # Kept by the producer for their own ENG-4186 codes only, already validated.
+            window = failure.get("window")
+            required_tier = failure.get("required_tier")
             # The pod never got to retire a question it was blocked on.
             collected_events.extend(cancelled_ask_user_retirements(collected_events))
             collected_events.append(response_failed_payload(
                 message, code, reset_at=reset_at, budget_scope=budget_scope, budget_period=budget_period,
-                budget_model=budget_model, request_id=corr))
+                budget_model=budget_model, window=window, required_tier=required_tier, request_id=corr))
 
             async def fail() -> None:
                 if code in CONTENT_REPAIR_CODES:
@@ -3558,7 +3575,8 @@ class ResponsesHandler:
                         )
                 await end_turn("error", lambda message_id: response_failed_sse(
                     message, code, reset_at=reset_at, budget_scope=budget_scope, budget_period=budget_period,
-                    budget_model=budget_model, request_id=corr, assistant_message_id=message_id,
+                    budget_model=budget_model, window=window, required_tier=required_tier, request_id=corr,
+                    assistant_message_id=message_id,
                 ))
 
             await run_to_completion(fail())
@@ -3962,6 +3980,18 @@ class ResponsesHandler:
                 _reset = gate_reset_at(exc)
                 if _reset is not None:
                     extra = {"reset_at": _reset}
+                # A spent plan window also says which one (ENG-4186), so the
+                # card can tell a five-hour pause from a weekly one.
+                if code == WINDOW_ALLOWANCE_EXHAUSTED_CODE:
+                    _window = gate_window(exc)
+                    if _window is not None:
+                        extra["window"] = _window
+            elif code == MODEL_NOT_IN_TIER_CODE:
+                # The tier that covers the model, so the card can offer that
+                # upgrade beside adding credits.
+                _tier = gate_required_tier(exc)
+                if _tier is not None:
+                    extra["required_tier"] = _tier
             elif code == BUDGET_EXCEEDED_CODE:
                 # Whose budget is spent and its period, so the card can name them.
                 _budget = {
@@ -4247,11 +4277,16 @@ class ResponsesHandler:
                             extra=log_context(request_id=corr, conversation_id=conversation_id),
                         )
                 # The ladder already produced a code; carry it instead of dropping
-                # it here. Same wire shape the streaming twin emits.
+                # it here. Same wire shape the streaming twin emits. The reset
+                # instant, the plan fields and the budget fields ride along for
+                # their own codes, as they do there.
                 raise HTTPException(
                     status_code=400,
                     detail=response_failed_payload(
                         message, code, request_id=corr,
+                        reset_at=gate_reset_at(exc) if code in RESET_AT_CODES else None,
+                        window=gate_window(exc) if code == WINDOW_ALLOWANCE_EXHAUSTED_CODE else None,
+                        required_tier=gate_required_tier(exc) if code == MODEL_NOT_IN_TIER_CODE else None,
                         budget_scope=gate_budget_scope(exc) if code == BUDGET_EXCEEDED_CODE else None,
                         budget_period=gate_budget_period(exc) if code == BUDGET_EXCEEDED_CODE else None,
                         budget_model=gate_budget_model(exc) if code == BUDGET_EXCEEDED_CODE else None,

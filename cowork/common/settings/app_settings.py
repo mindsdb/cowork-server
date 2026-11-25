@@ -22,6 +22,7 @@ from pydantic import (
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 from cowork.common.paths import cowork_home
+from cowork.common.settings.secret_files import SecretFileSettingsSource, require_process_secrets
 from cowork.db.personal_resources import ALL_PERSONAL_RESOURCES, PersonalResource
 from cowork.schemas.artifact_export import ExportPdfSettings
 
@@ -821,7 +822,8 @@ class TurnQueueSettings(Settings):
         default=1200,
         description=(
             "TTL, in seconds, of the minted per-turn MindsHub key for a turn without a "
-            "time limit (20 min; keep within auth's turn_key_max_ttl_seconds). "
+            "time limit, and for a time-limited turn whose longer key auth refused "
+            "(20 min; keep within auth's turn_key_max_ttl_seconds). "
             "scratchpad-controller's MAX_TURN_WALL_CLOCK_SECONDS (1080) is derived from "
             "it (TTL - 120); change both together."
         ),
@@ -840,7 +842,9 @@ class TurnQueueSettings(Settings):
             "none, and the turn keeps today's caps. Turn it on only where auth extends "
             "turn keys and scratchpad-controller raises its backstop for time-limited "
             "turns; a turn key then lives one time-limit window at a time "
-            "(turn_key_lifetime_seconds) and is extended on each \"Keep going\"."
+            "(turn_key_lifetime_seconds) and is extended on each \"Keep going\". "
+            "An auth whose turn-key cap is below that window refuses the key; the "
+            "turn then runs untimed on a turn_key_ttl_seconds key."
         ),
     )  # COWORK_TURN_TIME_LIMIT_SECONDS
     time_limit_key_margin_seconds: int = Field(
@@ -863,8 +867,8 @@ class TurnQueueSettings(Settings):
             raise ValueError(
                 f"COWORK_TURN_TIME_LIMIT_SECONDS + COWORK_TURN_TIME_LIMIT_KEY_MARGIN_SECONDS "
                 f"({self.turn_key_lifetime_seconds}s) must leave {AUTH_TURN_KEY_SKEW_SECONDS}s "
-                f"under auth's turn-key cap ({AUTH_TURN_KEY_MAX_TTL_SECONDS}s), or every web "
-                f"turn's key mint is refused"
+                f"under auth's turn-key cap ({AUTH_TURN_KEY_MAX_TTL_SECONDS}s), or auth refuses "
+                f"every time-limited key and each web turn runs untimed"
             )
         return self
 
@@ -1010,6 +1014,20 @@ class AppSettings(Settings):
     _deployment_identity: DeploymentIdentity | None = PrivateAttr(default=None)
     _deployment_identity_initialized: bool = PrivateAttr(default=False)
 
+    @classmethod
+    def settings_customise_sources(
+        cls, settings_cls, init_settings, env_settings, dotenv_settings, file_secret_settings
+    ):
+        # A credential whose file the process environment names wins over the
+        # environment and every .env (cowork.common.settings.secret_files).
+        return (
+            init_settings,
+            SecretFileSettingsSource(settings_cls),
+            env_settings,
+            dotenv_settings,
+            file_secret_settings,
+        )
+
     deployment_kind: Literal["self-hosted"] | None = Field(
         default=None,
         validation_alias=AliasChoices("COWORK_DEPLOYMENT_KIND"),
@@ -1023,6 +1041,14 @@ class AppSettings(Settings):
             "agent's product name when COWORK_DEPLOYMENT_KIND=self-hosted. Read once at startup."
         ),
     )
+
+    @model_validator(mode="after")
+    def _self_hosted_credentials_come_from_the_process(self) -> "AppSettings":
+        """A self-hosted process stops rather than fall back to SQLite, a generated
+        token or a credential in cowork-home's .env (secret_files.require_process_secrets)."""
+        if self.deployment_kind == "self-hosted":
+            require_process_secrets()
+        return self
 
     env: str = Field(default="local", description="The environment (local, dev, prod, etc.)")  # ENV
 

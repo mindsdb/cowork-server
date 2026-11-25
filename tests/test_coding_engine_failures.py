@@ -39,6 +39,8 @@ def test_a_rewritten_credit_rejection_is_classified_from_its_error_code() -> Non
         ('unexpected status 400 Bad Request: {"error": {"code": "included_allowance_exhausted", "message": "x"}}', "included_allowance_exhausted"),
         ('unexpected status 400 Bad Request: {"error": {"code": "free_air_daily_spend_fuse_exceeded", "message": "x"}}', "free_air_daily_spend_fuse_exceeded"),
         ('unexpected status 400 Bad Request: {"error": {"code": "budget_exceeded", "message": "x"}}', "budget_exceeded"),
+        ('unexpected status 400 Bad Request: {"error": {"code": "window_allowance_exhausted", "message": "x"}}', "window_allowance_exhausted"),
+        ('unexpected status 400 Bad Request: {"error": {"code": "model_not_in_tier", "message": "x"}}', "model_not_in_tier"),
     ],
 )
 def test_status_line_and_embedded_json_shapes_are_classified(message: str, code: str) -> None:

@@ -35,6 +35,16 @@ STATS_BODY = {
     "unique_viewers": 1,
     "viewers": [],
 }
+VIEWER_BODY = {
+    "viewer": {
+        "id": "v_1", "kind": "email", "email": "a@b.com", "visits": 1, "total_seconds": 95,
+        "first_seen": "2026-10-19T10:00:00Z", "last_seen": "2026-10-19T10:00:00Z", "furthest": 5,
+    },
+    "visits": [{
+        "id": "visit-1", "started_at": "2026-10-19T10:00:00Z", "seconds": 95, "device": "desktop",
+        "furthest": 5, "sections": [{"key": "s1", "index": 1, "label": "Intro", "seconds": 12}],
+    }],
+}
 
 
 @pytest.fixture
@@ -138,12 +148,21 @@ def stats_calls(monkeypatch):
         calls.append(("fetch", publish_url, key, report_id))
         return dict(STATS_BODY)
 
-    def fake_set(*, publish_url, key, report_id, enabled):
-        calls.append(("set", publish_url, key, report_id, enabled))
-        return enabled
+    def fake_set(*, publish_url, key, report_id, enabled=None, require_email=None):
+        calls.append(("set", publish_url, key, report_id, enabled, require_email))
+        return {"tracking": bool(enabled), "require_email": bool(require_email)}
+
+    def fake_viewer(*, publish_url, key, report_id, viewer_id):
+        calls.append(("viewer", publish_url, key, report_id, viewer_id))
+        return dict(VIEWER_BODY)
+
+    def fake_delete(*, publish_url, key, report_id):
+        calls.append(("delete", publish_url, key, report_id))
 
     monkeypatch.setattr(artifact_stats, "fetch_stats", fake_fetch)
     monkeypatch.setattr(artifact_stats, "set_tracking", fake_set)
+    monkeypatch.setattr(artifact_stats, "fetch_viewer", fake_viewer)
+    monkeypatch.setattr(artifact_stats, "delete_stats", fake_delete)
     return calls
 
 
@@ -159,6 +178,14 @@ async def _toggle(enabled: bool = False):
     return await aw.set_artifact_stats_tracking(
         "proj", ARTIFACT_ID, aw._StatsTrackingBody(enabled=enabled), ORG_SCOPE,
     )
+
+
+async def _viewer(viewer_id: str = "v_1"):
+    return await aw.read_artifact_stats_viewer("proj", ARTIFACT_ID, viewer_id, ORG_SCOPE)
+
+
+async def _delete():
+    return await aw.delete_artifact_stats("proj", ARTIFACT_ID, ORG_SCOPE)
 
 
 def _lock_is_free(folder) -> bool:
@@ -180,13 +207,13 @@ async def test_owner_reads_stats_with_a_key_minted_for_the_request(as_owner, key
 async def test_owner_toggles_tracking_under_the_publish_lock(as_owner, keys, stats_calls):
     out = await _toggle(enabled=False)
 
-    assert out == {"tracking": False}
-    assert stats_calls == [("set", "https://view.example", "turnkey-1", "rid-1", False)]
+    assert out == {"tracking": False, "require_email": False}
+    assert stats_calls == [("set", "https://view.example", "turnkey-1", "rid-1", False, None)]
     assert keys.minted[0].revoked is True
     assert _lock_is_free(as_owner)
 
 
-@pytest.mark.parametrize("call", [_read, _toggle])
+@pytest.mark.parametrize("call", [_read, _toggle, _viewer, _delete])
 async def test_a_non_owner_cannot_read_or_toggle_stats(monkeypatch, keys, stats_calls, call):
     def refuse(*_args, **_kwargs):
         raise HTTPException(status_code=403, detail="Not the owner")
@@ -201,7 +228,7 @@ async def test_a_non_owner_cannot_read_or_toggle_stats(monkeypatch, keys, stats_
     assert keys.minted == []
 
 
-@pytest.mark.parametrize("call", [_read, _toggle])
+@pytest.mark.parametrize("call", [_read, _toggle, _viewer, _delete])
 async def test_missing_artifact_manage_is_refused_before_resolving_the_artifact(
     monkeypatch, keys, stats_calls, call,
 ):
@@ -223,7 +250,7 @@ async def test_missing_artifact_manage_is_refused_before_resolving_the_artifact(
     assert keys.minted == []
 
 
-@pytest.mark.parametrize("call", [_read, _toggle])
+@pytest.mark.parametrize("call", [_read, _toggle, _viewer, _delete])
 async def test_no_publish_key_is_503(as_owner, keys, stats_calls, call):
     keys.cls.value = None
 
@@ -250,7 +277,7 @@ async def test_key_is_revoked_when_the_stats_service_fails(as_owner, keys, monke
     assert keys.minted[0].revoked is True
 
 
-@pytest.mark.parametrize("call", [_read, _toggle])
+@pytest.mark.parametrize("call", [_read, _toggle, _viewer, _delete])
 async def test_unpublished_artifact_is_404_without_minting_a_key(as_owner, keys, stats_calls, call):
     (as_owner / ".published.json").unlink()
 
@@ -297,10 +324,10 @@ async def test_anyio_cancellation_still_revokes_the_key_and_releases_the_lock(
 ):
     started = []
 
-    def slow_set(*, publish_url, key, report_id, enabled):
+    def slow_set(*, publish_url, key, report_id, enabled=None, require_email=None):
         started.append(report_id)
         time.sleep(0.5)
-        return enabled
+        return {"tracking": enabled, "require_email": False}
 
     monkeypatch.setattr(artifact_stats, "set_tracking", slow_set)
 
@@ -349,3 +376,78 @@ async def test_report_owned_by_another_account_is_409(as_owner, keys, monkeypatc
         "code": "stats_owned_by_other_account",
         "message": "Stats are not available for this account.",
     }
+
+
+# -- viewer analytics (ENG-4455) ----------------------------------------------
+
+
+async def test_owner_sets_the_email_gate_alone_under_the_publish_lock(as_owner, keys, stats_calls):
+    out = await aw.set_artifact_stats_tracking(
+        "proj", ARTIFACT_ID, aw._StatsTrackingBody(require_email=True), ORG_SCOPE,
+    )
+
+    assert out == {"tracking": False, "require_email": True}
+    assert stats_calls == [("set", "https://view.example", "turnkey-1", "rid-1", None, True)]
+    assert keys.minted[0].revoked is True
+    assert _lock_is_free(as_owner)
+
+
+async def test_tracking_body_needs_at_least_one_setting():
+    with pytest.raises(ValueError):
+        aw._StatsTrackingBody()
+
+
+async def test_owner_reads_one_viewer(as_owner, keys, stats_calls):
+    out = await _viewer("v_1")
+
+    assert out == VIEWER_BODY
+    assert stats_calls == [("viewer", "https://view.example", "turnkey-1", "rid-1", "v_1")]
+    assert keys.minted[0].revoked is True
+
+
+async def test_owner_deletes_analytics_without_the_publish_lock(as_owner, keys, stats_calls, monkeypatch):
+    async def no_lock(*_args, **_kwargs):
+        raise AssertionError("delete must not wait for the publish lock")
+
+    monkeypatch.setattr(aw, "_acquire_live_publish_lock", no_lock)
+
+    res = await _delete()
+
+    assert res.status_code == 204
+    assert stats_calls == [("delete", "https://view.example", "turnkey-1", "rid-1")]
+    assert keys.minted[0].revoked is True
+
+
+async def test_credits_required_passes_through_as_402(as_owner, keys, monkeypatch):
+    body = {"code": "credits_required", "message": "Add credits to collect viewer analytics."}
+    _upstream(monkeypatch, 402, body)
+
+    with pytest.raises(HTTPException) as excinfo:
+        await _toggle(enabled=True)
+
+    assert excinfo.value.status_code == 402
+    assert excinfo.value.detail == body
+    assert keys.minted[0].revoked is True
+    assert _lock_is_free(as_owner)
+
+
+async def test_tracking_off_passes_through_as_422(as_owner, keys, monkeypatch):
+    _upstream(monkeypatch, 422, {"code": "tracking_off"})
+
+    with pytest.raises(HTTPException) as excinfo:
+        await aw.set_artifact_stats_tracking(
+            "proj", ARTIFACT_ID, aw._StatsTrackingBody(require_email=True), ORG_SCOPE,
+        )
+
+    assert excinfo.value.status_code == 422
+    assert excinfo.value.detail["code"] == "tracking_off"
+
+
+async def test_unknown_viewer_is_404(as_owner, keys, monkeypatch):
+    _upstream(monkeypatch, 404, {"code": "viewer_not_found", "error": "No such viewer"})
+
+    with pytest.raises(HTTPException) as excinfo:
+        await _viewer("v_nope")
+
+    assert excinfo.value.status_code == 404
+    assert excinfo.value.detail == {"code": "viewer_not_found", "message": "No such viewer"}

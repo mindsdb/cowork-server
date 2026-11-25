@@ -862,6 +862,80 @@
     return !isNaN(when) && when <= Date.now();
   }
 
+  /* The page's own height, for the app to fit a page that is taller than its
+     frame and scrolls nowhere: a deck sized from the frame's width with its
+     overflow hidden is cut off below, out of reach. `content` is the page's
+     full height, `locked` whether the root or body hide their overflow (so
+     nothing scrolls). Sent after load and whenever the page or frame resizes,
+     only when it changed. */
+  try {
+    var lastSize = '', sizeTimer = 0;
+    var hidesOverflow = function (el) {
+      if (!el) return false;
+      var value = window.getComputedStyle(el).overflowY;
+      return value === 'hidden' || value === 'clip';
+    };
+    /* How tall what is on screen runs: the lowest bottom of the visible
+       leaf elements (text, images, media) that start inside the frame. A deck
+       that hides its other slides below the visible one has a page far taller
+       than the frame, but those slides start below it and don't count, so a
+       deck that fits isn't shrunk. Only content that starts on screen and
+       runs past the bottom (the page really is cut off) makes it taller. */
+    var MAX_SCANNED = 4000;
+    var MEDIA = { IMG: 1, SVG: 1, CANVAS: 1, VIDEO: 1, IFRAME: 1, svg: 1 };
+    var visibleBottom = function (frameHeight) {
+      var all = document.body.getElementsByTagName('*');
+      var count = Math.min(all.length, MAX_SCANNED);
+      var lowest = 0;
+      for (var i = 0; i < count; i++) {
+        var el = all[i];
+        if (el.children.length > 0 && !MEDIA[el.tagName]) continue;
+        var box = el.getBoundingClientRect();
+        if (box.width < 2 || box.height < 2) continue;
+        if (box.top >= frameHeight - 1 || box.bottom <= 0) continue;
+        var style = window.getComputedStyle(el);
+        if (style.visibility === 'hidden' || style.display === 'none' || style.opacity === '0') continue;
+        if (box.bottom > lowest) lowest = box.bottom;
+      }
+      return Math.ceil(lowest + (window.scrollY || 0));
+    };
+    var sendSize = function () {
+      var root = document.documentElement, body = document.body;
+      if (!root || !body) return;
+      var height = Math.round(window.innerHeight || 0);
+      var locked = hidesOverflow(root) || hidesOverflow(body);
+      var size = {
+        type: 'size',
+        width: Math.round(window.innerWidth || 0),
+        height: height,
+        // A page that scrolls fits as it is; only a locked one is measured.
+        content: locked
+          ? visibleBottom(height)
+          : Math.ceil(Math.max(root.scrollHeight || 0, body.scrollHeight || 0)),
+        locked: locked
+      };
+      var text = JSON.stringify(size);
+      if (text === lastSize) return;
+      lastSize = text;
+      post(size);
+    };
+    var scheduleSize = function () {
+      clearTimeout(sizeTimer);
+      sizeTimer = setTimeout(function () {
+        try { sendSize(); } catch (inner) { /* never break the page */ }
+      }, 150);
+    };
+    window.addEventListener('load', scheduleSize);
+    window.addEventListener('resize', scheduleSize);
+    if (typeof ResizeObserver === 'function') {
+      var watchBody = function () {
+        if (document.body) new ResizeObserver(scheduleSize).observe(document.body);
+      };
+      if (document.body) watchBody();
+      else document.addEventListener('DOMContentLoaded', watchBody);
+    }
+  } catch (e) { /* size reports are best effort */ }
+
   try {
     Object.defineProperty(document, 'cookie', {
       configurable: true,

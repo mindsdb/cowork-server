@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import sys
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -104,16 +105,30 @@ class FakeAnton:
 
     route: RouteDecision = field(default_factory=lambda: RouteDecision("edit", 0.93))
     edit: object = None
+    # What answer_request does; None: this anton has no quick reply.
+    answer: object = None
     route_calls: list = field(default_factory=list)
     edit_calls: list = field(default_factory=list)
+    answer_calls: list = field(default_factory=list)
 
     async def route_request(self, message, *, files, kind, base_url, api_key, model="jev-1.13.0", timeout_s=3.0,
                             http=None, name="", description="", data="", history=None,
-                            outline="", recent_changes=None, chat=None):
+                            outline="", recent_changes=None, chat=None, allow_reply=False):
         self.route_calls.append(dict(message=message, files=files, kind=kind, base_url=base_url, api_key=api_key,
                                      model=model, name=name, description=description, data=data, history=history,
-                                     outline=outline, recent_changes=recent_changes, chat=chat))
+                                     outline=outline, recent_changes=recent_changes, chat=chat,
+                                     allow_reply=allow_reply))
         return self.route
+
+    async def answer_request(self, message, *, llm, name="", description="", data="", outline="",
+                             recent_changes=None, history=None, chat=None, max_chars=1200,
+                             role="planning", timeout_s=30.0):
+        context = {k: v for k, v in dict(
+            name=name, description=description, data=data, outline=outline,
+            recent_changes=recent_changes, history=history, chat=chat, role=role, timeout_s=timeout_s,
+        ).items() if v is not None}
+        self.answer_calls.append(dict(message=message, llm=llm, **context))
+        return await self.answer(message)
 
     async def run_quick_edit(self, folder, message, *, kind, llm, checker, history=None, on_progress=None, max_fix_rounds=2):
         self.edit_calls.append(dict(folder=folder, message=message, kind=kind, llm=llm, history=history))
@@ -140,6 +155,7 @@ class FakeAnton:
                 ("https://hub.example/v1", settings.minds_api_key, "jev-1.13.0")
                 if settings.planning_provider == "minds-cloud" else None
             ),
+            answer_request=self.answer_request if self.answer is not None else None,
         )
 
 
@@ -1491,3 +1507,128 @@ async def test_a_model_that_takes_no_images_edits_on_the_text_alone():
 
     assert len(inner.calls) == 3
     assert inner.calls[1] == messages and inner.calls[2] == messages
+
+
+# ── a quick reply in the bar (ENG-4455) ──────────────────────────────────
+
+
+def test_a_reply_route_answers_in_the_bar_and_changes_nothing(client, fake_anton, artifact):
+    folder, _metadata, artifact_id = artifact
+    fake_anton.route = RouteDecision("reply", 0.91)
+    fake_anton.edit = None  # would raise if called
+
+    async def answer(message):
+        # A reply holds no lock: the artifact is free for an edit meanwhile.
+        assert not quick_edit_service.quick_edit_locks._held
+        return "  It shows revenue by region.  "
+
+    fake_anton.answer = answer
+    history = [{"role": "user", "text": "hi"}, {"role": "assistant", "text": "Hello!"}]
+
+    events = events_of(post(client, artifact_id, message="What does this show?", history=history, allowReply=True).text)
+
+    assert [name for name, _ in events] == ["route", "done"]
+    assert events[0][1]["route"] == "reply"
+    assert events[1][1] == {
+        "status": "reply", "summary": "It shows revenue by region.", "revisionId": None,
+        "previousRevisionId": None, "changed": [], "check": None, "editId": None, "undoable": False,
+        "ms": events[1][1]["ms"],
+    }
+    assert fake_anton.route_calls[0]["allow_reply"] is True
+    call = fake_anton.answer_calls[0]
+    # The editor's LLM, and the context the router got.
+    assert call["message"] == "What does this show?" and call["llm"] == "the-llm"
+    assert call["name"] == "Sales" and call["outline"] == "h1 Sales; section#unicorns (3 svg unicorns)"
+    assert call["history"] == history and call["recent_changes"] == []
+    assert "model" not in call and "chat" not in call
+    # anton's own time limit; the editor's (default) role.
+    assert call["timeout_s"] == quick_ep.REPLY_TIMEOUT_S and call["role"] == "planning"
+    assert fake_anton.edit_calls == []
+    assert (folder / "index.html").read_text(encoding="utf-8") == ORIGINAL
+    assert len(list_revisions(folder, rel_path="index.html")) <= 1
+
+
+def test_an_app_that_does_not_ask_for_replies_never_gets_one(client, fake_anton, artifact):
+    """An app without the bar's reply would read one as a failure: without
+    ``allowReply`` the router is not offered it, and a stray reply is the agent's."""
+    _folder, _metadata, artifact_id = artifact
+    fake_anton.route = RouteDecision("reply", 0.95)
+
+    events = events_of(post(client, artifact_id, message="hi").text)
+
+    assert fake_anton.route_calls[0]["allow_reply"] is False
+    assert events[0][1]["route"] == "agent"
+    assert events[-1][1]["status"] == "agent"
+    assert fake_anton.answer_calls == []
+
+
+@pytest.mark.parametrize("outcome", ["", "raise"])
+def test_a_reply_that_comes_back_empty_or_fails_goes_to_the_agent(client, fake_anton, artifact, outcome):
+    _folder, _metadata, artifact_id = artifact
+    fake_anton.route = RouteDecision("reply", 0.9)
+
+    async def answer(message):
+        if outcome == "raise":
+            raise RuntimeError("model down")
+        return outcome
+
+    fake_anton.answer = answer
+
+    events = events_of(post(client, artifact_id, message="How many regions?", allowReply=True).text)
+
+    assert [name for name, _ in events] == ["route", "done"]
+    assert events[1][1]["status"] == "agent" and events[1][1]["summary"] == ""
+
+
+def test_an_anton_that_cannot_reply_is_never_asked_to(client, fake_anton, artifact):
+    """No answer_request: no allow_reply, and a stray reply route is the agent's."""
+    _folder, _metadata, artifact_id = artifact
+    fake_anton.route = RouteDecision("reply", 0.9)
+
+    events = events_of(post(client, artifact_id, message="hi").text)
+
+    assert fake_anton.route_calls[0]["allow_reply"] is False
+    assert events[0][1]["route"] == "agent" and events[1][1]["status"] == "agent"
+
+
+def test_an_anton_whose_router_takes_no_allow_reply_is_never_asked_to(client, fake_anton, artifact, monkeypatch):
+    _folder, _metadata, artifact_id = artifact
+
+    async def answer(message):
+        return "Hello!"
+
+    fake_anton.answer = answer
+    api = fake_anton.api()
+    older = AntonQuickEdit(
+        route_request=api.route_request, run_quick_edit=api.run_quick_edit, checkers=api.checkers,
+        workspace_cls=api.workspace_cls, describe_artifact=api.describe_artifact,
+        route_extras=quick_edit_service.ROUTE_EXTRAS - {"allow_reply"},
+        decisions_available=api.decisions_available, decisions_config=api.decisions_config,
+        answer_request=api.answer_request,
+    )
+    monkeypatch.setattr(quick_edit_service, "anton_quick_edit", lambda: older)
+    fake_anton.route = RouteDecision("agent", 0.9)
+
+    events = events_of(post(client, artifact_id, message="hi").text)
+
+    assert fake_anton.route_calls[0]["allow_reply"] is False
+    assert events[-1][1]["status"] == "agent" and fake_anton.answer_calls == []
+
+
+def test_the_quick_reply_is_detected_from_the_installed_anton(monkeypatch):
+    import anton.core.artifact_editor.router as router
+
+    async def answer_request(message, *, llm, **context):
+        return ""
+
+    async def route_request(message, *, files, kind, base_url, api_key, allow_reply=False):
+        return None
+
+    monkeypatch.setitem(sys.modules, "anton.core.artifact_editor.reply", None)
+    api = quick_edit_service.anton_quick_edit()
+    assert api is not None and api.answer_request is None and not api.can_reply
+
+    monkeypatch.setitem(sys.modules, "anton.core.artifact_editor.reply", SimpleNamespace(answer_request=answer_request))
+    monkeypatch.setattr(router, "route_request", route_request)
+    api = quick_edit_service.anton_quick_edit()
+    assert api.answer_request is answer_request and "allow_reply" in api.route_extras and api.can_reply

@@ -6,6 +6,9 @@ so each case seeds MindsHub's bodies and asserts the one view the desktop gets.
 from __future__ import annotations
 
 import asyncio
+import copy
+import json
+from pathlib import Path
 
 import pytest
 from fastapi import FastAPI
@@ -602,3 +605,177 @@ def test_the_wire_sends_a_null_refill_time_for_an_ineligible_org(monkeypatch):
 
     assert body["freeTokens"]["resetsAt"] is None
     assert body["freeTokens"]["limit"] == 0
+
+
+# ── The subscription plan (ENG-4186) ──────────────────────────────────────
+
+# auth's entitlements/me with a Plus plan, in the shape the ENG-4186 contract fixes.
+PLAN_ENTITLEMENTS = json.loads((Path(__file__).parent / "fixtures/entitlements_me.json").read_text())
+
+
+_ABSENT = object()
+
+
+def _with_plan(plan):
+    body = copy.deepcopy(PLAN_ENTITLEMENTS)
+    if plan is _ABSENT:
+        body.pop("plan")
+    else:
+        body["plan"] = plan
+    return body
+
+
+FREE_PLAN = {"tier": "free", "status": "active", "renews_at": None, "cancel_at_period_end": False, "windows": []}
+
+
+def test_the_plan_and_its_windows_land_in_the_view(calls):
+    calls.answers[svc.ENTITLEMENTS_PATH] = PLAN_ENTITLEMENTS
+
+    plan = _fetch().plan
+
+    assert plan.tier == "plus"
+    assert plan.status == "active"
+    assert plan.renews_at == "2026-12-19T00:00:00Z"
+    assert plan.cancel_at_period_end is False
+    assert [(w.window, w.percent_used, w.resets_at) for w in plan.windows] == [
+        ("5h", 42, "2026-11-19T18:00:00Z"),
+        ("7d", 10, "2026-11-24T09:00:00Z"),
+    ]
+
+
+def test_the_plan_wire_shape_is_camel_case_and_carries_no_dollars(monkeypatch):
+    async def _fake(path, bearer_token):
+        return {svc.ENTITLEMENTS_PATH: PLAN_ENTITLEMENTS, svc.WALLET_PATH: WALLET}.get(path)
+
+    monkeypatch.setattr(svc, "get_mindshub_json", _fake)
+
+    body = _client(principal=None).get(PATH, headers={HEADER_HUB_CREDENTIAL: "Bearer jwt-abc"}).json()
+
+    assert body["plan"] == {
+        "tier": "plus",
+        "status": "active",
+        "renewsAt": "2026-12-19T00:00:00Z",
+        "cancelAtPeriodEnd": False,
+        "windows": [
+            {"window": "5h", "percentUsed": 42, "resetsAt": "2026-11-19T18:00:00Z"},
+            {"window": "7d", "percentUsed": 10, "resetsAt": "2026-11-24T09:00:00Z"},
+        ],
+    }
+    # The free allowance still reads beside it.
+    assert body["freeTokens"]["percentRemaining"] == 64.0
+
+
+def test_a_free_org_gets_the_free_plan_with_no_windows(calls):
+    calls.answers[svc.ENTITLEMENTS_PATH] = _with_plan(FREE_PLAN)
+
+    body = _fetch().model_dump(by_alias=True)
+
+    assert body["plan"] == {
+        "tier": "free", "status": "active", "renewsAt": None, "cancelAtPeriodEnd": False, "windows": [],
+    }
+
+
+def test_an_auth_without_the_plan_block_reports_none(calls):
+    calls.answers[svc.ENTITLEMENTS_PATH] = _with_plan(_ABSENT)
+
+    view = _fetch()
+
+    assert view.plan is None
+    assert view.model_dump(by_alias=True)["plan"] is None
+    # The rest of the view is unaffected.
+    assert view.free_tokens.percent_remaining == 64.0
+
+
+def test_a_canceling_plan_and_a_null_reset_pass_through(calls):
+    plan = copy.deepcopy(PLAN_ENTITLEMENTS["plan"])
+    plan.update(tier="pro", status="past_due", cancel_at_period_end=True)
+    plan["windows"][1]["resets_at"] = None
+    calls.answers[svc.ENTITLEMENTS_PATH] = _with_plan(plan)
+
+    view = _fetch().plan
+
+    assert (view.tier, view.status, view.cancel_at_period_end) == ("pro", "past_due", True)
+    assert view.windows[1].resets_at is None
+
+
+def _plan_with(**changes):
+    plan = copy.deepcopy(PLAN_ENTITLEMENTS["plan"])
+    plan.update(changes)
+    return plan
+
+
+def _plan_with_window(**changes):
+    plan = copy.deepcopy(PLAN_ENTITLEMENTS["plan"])
+    plan["windows"][0].update(changes)
+    return plan
+
+
+@pytest.mark.parametrize(
+    "plan",
+    [
+        pytest.param("plus", id="not_an_object"),
+        pytest.param(_plan_with(tier="enterprise"), id="unknown_tier"),
+        pytest.param(_plan_with(tier=None), id="no_tier"),
+        pytest.param(_plan_with(tier=["plus"]), id="tier_a_list"),
+        pytest.param(_plan_with(tier={"name": "plus"}), id="tier_an_object"),
+        pytest.param(_plan_with(status="trialing"), id="unknown_status"),
+        pytest.param(_plan_with(status=["active"]), id="status_a_list"),
+        pytest.param(_plan_with(status={"state": "active"}), id="status_an_object"),
+        pytest.param(_plan_with(renews_at=1790380800), id="renews_at_not_a_string"),
+        pytest.param(_plan_with(cancel_at_period_end="no"), id="cancel_flag_not_a_bool"),
+        pytest.param(_plan_with(windows={"5h": 42}), id="windows_not_a_list"),
+        pytest.param(_plan_with(windows=["5h"]), id="window_not_an_object"),
+        pytest.param(_plan_with_window(percent_used="42"), id="percent_a_string"),
+        pytest.param(_plan_with_window(percent_used=True), id="percent_a_bool"),
+        pytest.param(_plan_with_window(percent_used=None), id="percent_missing"),
+        pytest.param(_plan_with_window(percent_used=float("nan")), id="percent_nan"),
+        pytest.param(_plan_with_window(percent_used=float("inf")), id="percent_inf"),
+        pytest.param(_plan_with_window(percent_used=10**400), id="percent_too_large_for_a_float"),
+        pytest.param(_plan_with_window(resets_at=1790380800), id="resets_at_not_a_string"),
+        pytest.param(_plan_with(windows=[
+            {"window": "5h", "percent_used": 1, "resets_at": None},
+            {"window": "5h", "percent_used": 99, "resets_at": None},
+        ]), id="duplicate_window"),
+    ],
+)
+def test_a_malformed_plan_fails_closed(calls, plan):
+    """Nothing rather than a guess: a misread percentage draws an empty meter for a spent window."""
+    calls.answers[svc.ENTITLEMENTS_PATH] = _with_plan(plan)
+
+    view = _fetch()
+
+    assert view.plan is None
+    assert view.reachable is True
+    assert view.free_tokens.percent_remaining == 64.0
+
+
+def test_an_unknown_window_is_skipped_rather_than_hiding_the_known_ones(calls):
+    plan = copy.deepcopy(PLAN_ENTITLEMENTS["plan"])
+    plan["windows"].append({"window": "30d", "percent_used": 3, "resets_at": None})
+    calls.answers[svc.ENTITLEMENTS_PATH] = _with_plan(plan)
+
+    assert [w.window for w in _fetch().plan.windows] == ["5h", "7d"]
+
+
+@pytest.mark.parametrize("name", [["5h"], {"name": "5h"}, 5, None])
+def test_a_window_name_that_is_not_a_string_is_skipped_not_raised(calls, name):
+    plan = copy.deepcopy(PLAN_ENTITLEMENTS["plan"])
+    plan["windows"].append({"window": name, "percent_used": 3, "resets_at": None})
+    calls.answers[svc.ENTITLEMENTS_PATH] = _with_plan(plan)
+
+    assert [w.window for w in _fetch().plan.windows] == ["5h", "7d"]
+
+
+@pytest.mark.parametrize(("sent", "read"), [(-5, 0), (140, 100), (42.6, 43)])
+def test_a_window_percentage_is_clamped_and_whole(calls, sent, read):
+    calls.answers[svc.ENTITLEMENTS_PATH] = _with_plan(_plan_with_window(percent_used=sent))
+
+    assert _fetch().plan.windows[0].percent_used == read
+
+
+def test_the_plan_is_cached_with_the_rest_of_the_view(calls):
+    calls.answers[svc.ENTITLEMENTS_PATH] = PLAN_ENTITLEMENTS
+    first = _fetch()
+    calls.answers[svc.ENTITLEMENTS_PATH] = _with_plan(FREE_PLAN)
+
+    assert _fetch().plan == first.plan

@@ -15,6 +15,7 @@ from cowork.common.logger import get_logger
 from cowork.db.scoped import LOCAL_SCOPE
 from cowork.db.units import FilesystemBusy, run_efs
 from cowork.services.connectors.persist import vault_for_scope
+from cowork.services.connectors.sealed_vault import SealedRecordError
 
 if TYPE_CHECKING:
     from cowork.db.scoped import TenantScope
@@ -41,7 +42,8 @@ async def register_vault_secrets(scope: TenantScope | None) -> None:
     shape-based regex. A file store with no slot free within POOL_TIMEOUT
     does: ``FilesystemBusy`` propagates, so a web turn answers 503 with
     Retry-After and a channel turn fails, rather than replay a saved secret,
-    such as a DSN password, unredacted.
+    such as a DSN password, unredacted. So does a sealed record that won't
+    open: ``SealedRecordError`` propagates, logged naming the connection.
     """
     # The scope opens here, in the request's context, and the vault reads and
     # rebuild run on the file store's threads, off the event loop. The thread
@@ -51,6 +53,15 @@ async def register_vault_secrets(scope: TenantScope | None) -> None:
     try:
         await run_efs(partial(_restore_from_vault, scope), scope=scope or LOCAL_SCOPE)
     except FilesystemBusy:
+        raise
+    except SealedRecordError as error:
+        # One sealed record that won't open would leave every connection's
+        # values unregistered, so the request stops, naming it (create_app
+        # answers it with 409).
+        logger.error(
+            "A saved connection can't be opened, so this request's history can't be scrubbed by value",
+            extra={"event": "sealed_connection_unopenable", "connection": error.connection, "reason": error.cause},
+        )
         raise
     except Exception:
         logger.warning(

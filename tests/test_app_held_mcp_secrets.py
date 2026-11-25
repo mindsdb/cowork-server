@@ -7,6 +7,7 @@ connection detail.
 """
 from __future__ import annotations
 
+import errno
 import hashlib
 import hmac
 import io
@@ -17,7 +18,7 @@ import sys
 from urllib.parse import parse_qs
 
 import pytest
-from anton.core.datasources.data_vault import withheld_fields
+from anton.core.datasources.data_vault import LocalDataVault, withheld_fields
 from anton.utils.datasources import clear_ds_env, restore_namespaced_env, scrub_credentials
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
@@ -25,6 +26,7 @@ from fastapi.testclient import TestClient
 from cowork import app_secret
 from cowork.api.v1.router import api_router
 from cowork.db.scoped import LOCAL_SCOPE
+from cowork.server import create_app
 from cowork.services.connectors import app_held
 from cowork.services.connectors.connections import ConnectionsService
 from cowork.services.connectors.oauth import google as google_module
@@ -34,6 +36,7 @@ from cowork.services.connectors.persist import (
     persist_connection,
     turn_vault_for_scope,
 )
+from cowork.services.connectors.sealed_vault import SEALED_FIELD
 
 SECRET = "ab" * 32
 WRONG = "cd" * 32
@@ -443,6 +446,79 @@ class TestProtectedWrites:
         assert app_held.held(own_vault_root(LOCAL_SCOPE), "hubspot", CONN) == {
             "access_token": "tok-1", "expires_at": "2027-01-01T00:00:00Z", "access_mode": "read",
         }
+
+    @pytest.mark.parametrize(
+        ("values", "fail_the_write", "status_code"),
+        [
+            ({SEALED_FIELD: "1"}, False, 422),
+            # About 790 KB in plain text seals to over 1 MiB.
+            ({"notes": "A" * 790_000}, False, 422),
+            ({}, True, 500),
+        ],
+        ids=["reserved-field", "too-large", "write-fails"],
+    )
+    def test_with_a_key_file_a_refused_save_holds_nothing_and_a_later_save_holds_its_own(
+        self, protected, key_file, values, fail_the_write, status_code
+    ):
+        """The token and the default mode are held only once the record is written. A save the sealed
+        vault refuses, or whose write fails, leaves memory as it was, so the connection saved at that
+        name next reads no token from memory. A save that succeeds holds its own, as without a key
+        file."""
+
+        def failing_save(*args, **kwargs):
+            raise OSError(errno.ENOSPC, "No space left on device")
+
+        root = own_vault_root(LOCAL_SCOPE)
+        client = TestClient(create_app(), base_url="http://127.0.0.1:26866", client=("127.0.0.1", 54321))
+
+        with pytest.MonkeyPatch.context() as patch:
+            if fail_the_write:
+                patch.setattr(LocalDataVault, "save", failing_save)
+            refused = client.post(
+                f"{BASE}/save",
+                json={"connector_id": "hubspot", "method": "mcp", "name": "",
+                      "values": {"access_token": "tok-refused", "account_email": "acme.hubspot", **values}},
+            )
+
+        assert refused.status_code == status_code, refused.text
+        assert "tok-refused" not in refused.text
+        assert app_held.held(root, "hubspot", CONN) == {}
+
+        later = client.post(
+            f"{BASE}/save",
+            json={"connector_id": "hubspot", "method": "mcp", "name": "", "values": {"account_email": "acme.hubspot"}},
+        )
+
+        assert later.status_code == 200, later.text
+        assert ConnectionsService(LOCAL_SCOPE).mcp_access_token("hubspot", CONN) is None
+        turn = app_held.AppHeldVault(source=turn_vault_for_scope(LOCAL_SCOPE), root=root)
+        assert "access_token" not in turn.load("hubspot", CONN)
+        assert app_held.held(root, "hubspot", CONN) == {"access_mode": "read"}
+
+        saved = client.post(
+            f"{BASE}/save",
+            json={"connector_id": "hubspot", "method": "mcp", "name": "",
+                  "values": {"access_token": "tok-1", "account_email": "acme.hubspot",
+                             "expires_at": "2027-01-01T00:00:00Z"}},
+        )
+
+        assert saved.status_code == 200, saved.text
+        assert "tok-1" not in _raw_file()
+        assert app_held.held(root, "hubspot", CONN) == {
+            "access_token": "tok-1", "expires_at": "2027-01-01T00:00:00Z", "access_mode": "read",
+        }
+        assert ConnectionsService(LOCAL_SCOPE).mcp_access_token("hubspot", CONN) == "tok-1"
+
+    def test_a_save_that_isnt_mcp_writes_its_token_to_the_file_and_holds_nothing(self, protected):
+        """Only an MCP save moves its token into memory. Any other method's save, as every chat save
+        goes through this vault while the app secret is held, writes its fields as given."""
+        root = own_vault_root(LOCAL_SCOPE)
+        turn = app_held.AppHeldVault(source=turn_vault_for_scope(LOCAL_SCOPE), root=root)
+
+        turn.save("hubspot", CONN, {"_method": "oauth", "access_token": "tok-oauth", "account_email": "acme.hubspot"})
+
+        assert _file_fields()["access_token"] == "tok-oauth"
+        assert app_held.held(root, "hubspot", CONN) == {}
 
     def test_reconnect_save_keeps_a_held_write_mode_and_drops_the_legacy_token(self, protected):
         _seed_mcp(mode="read", token="old-token")
