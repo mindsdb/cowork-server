@@ -433,3 +433,13 @@ def test_the_conversion_request_refuses_a_viewer_location_the_page_cant_hold(vie
         PublishFileRequest(suffix=".pptx", name="deck.pptx", viewer_base=viewer_base)
     assert PublishFileRequest(suffix=".pptx", name="deck.pptx", viewer_base=VIEWER).viewer_base == VIEWER
     assert PublishFileRequest(suffix=".pptx", name="deck.pptx").viewer_base == ""
+
+
+def test_a_hostile_publish_host_answers_at_once():
+    """No backtracking blow-up on runs of "-" (CodeQL py/redos)."""
+    import time
+
+    host = "https://api-" + "-" * 5000 + "_.mindshub.ai"
+    started = time.perf_counter()
+    assert publish.document_viewer_base(web_origin="", publish_url=host) == ""
+    assert time.perf_counter() - started < 0.5

@@ -1141,7 +1141,9 @@ def _render_file_to_html(path: Path, out_dir: Path, *, background: bool = False)
 # api.staging.mindshub.ai beside cowork.staging.mindshub.ai, and a PR
 # environment's view-pr-cowork-<n>.dev.mindshub.ai beside
 # cowork-pr-cowork-<n>.dev.mindshub.ai.
-_PUBLISH_HOST_LABEL = re.compile(r"^(?:api|view)((?:[.-][a-z0-9-]+)*)\.mindshub\.ai$")
+# Each segment is one separator then letters and digits, so a host has exactly
+# one way to match (no backtracking over runs of "-").
+_PUBLISH_HOST_LABEL = re.compile(r"^(?:api|view)((?:[.-][a-z0-9]+)*)\.mindshub\.ai$")
 
 
 def document_viewer_base(*, web_origin: str, publish_url: str, override: str = "") -> str:
