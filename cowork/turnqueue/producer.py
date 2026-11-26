@@ -947,8 +947,9 @@ async def _mint_custom_mcp_block(*, scope: TenantScope, conversation_id: str, co
     the reason, no turn key prefix, no producer key, auth's custom MCP switch
     off, a listing that failed or breaks the contract, a block over the
     backstop, or a grant call auth refused. Only the switch being off and the
-    missing prefix log at info: every turn has them. A member with no server, or every server disabled, gets None and
-    no event. The turn then runs without custom MCP tools.
+    missing prefix log at info: every turn has them. A member with no server,
+    or every server disabled, gets None and no event. The turn then runs
+    without custom MCP tools.
 
     Returns:
         The whole ``custom_mcp`` block. Versions are the grants', not the listing's.
