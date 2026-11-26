@@ -165,6 +165,11 @@ def _request_wire_size(params: dict) -> int:
     return len(json.dumps(params, separators=(",", ":")).encode("utf-8"))
 
 
+def _unlock_skills(host_tools: list[dict] | None) -> set[str]:
+    """The skills these host tools wait for (``unlock_skill``)."""
+    return {spec["unlock_skill"] for spec in host_tools or () if spec.get("unlock_skill")}
+
+
 def _shed_skills(params: dict, *, size: int, budget: int, always_on: bool) -> int:
     """Drop the skills block's on-demand skills (or, with ``always_on``, its
     always-on ones) one at a time from the end of the block until the request
@@ -174,14 +179,17 @@ def _shed_skills(params: dict, *, size: int, budget: int, always_on: bool) -> in
     on-demand skills go in reverse slug order, and the always-on ones team
     skills first. The block itself stays, empty at worst: it is the pod's
     whole recallable set, so a turn that sheds skills has fewer, never a
-    fallback to a mounted skills tree."""
+    fallback to a mounted skills tree. A skill one of the request's host tools
+    waits for (``unlock_skill``) is never shed: without it that tool could
+    never be unlocked."""
     skills = params.get("skills")
     if size <= budget or not isinstance(skills, dict):
         return size
     skills = params["skills"] = dict(skills)
+    unlocking = _unlock_skills(params.get("host_tools"))
     ranked = [
         slug for slug, entry in skills.items()
-        if TurnSkillEntry.model_validate(entry).always_on is always_on
+        if slug not in unlocking and TurnSkillEntry.model_validate(entry).always_on is always_on
     ]
     for slug in reversed(ranked):
         if size <= budget:
@@ -1193,6 +1201,7 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
                                 tool_messages: bool = False,
                                 connector_drafts: bool = False,
                                 preview_checks: bool = False,
+                                host_tools: list[dict] | None = None,
                                 ui_locale: str | None = None,
                                 reasoning_effort: str | None = None,
                                 zdr: ZdrState | None = None,
@@ -1216,6 +1225,13 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
     preview whether an edit runs (ENG-4227, turnqueue/preview_checks.py).
     Only with `interactive`: the answer reaches the pod on the stdin an
     interactive turn keeps open. Channel turns never.
+    `host_tools` are tools this server runs for the pod
+    (turnqueue/host_tools.py), sent only with `interactive`: their answers
+    reach the pod on the stdin an interactive turn keeps open, and only for
+    a persistent workspace: the doc tools write into the project's folder from
+    this server whatever the pod mounts, but without artifact.manage the
+    caller may not change artifacts, and the turn end records nothing for a
+    workspace that is not persistent. Channel turns never send them.
     `ui_locale` is the app's language (cowork.common.ui_locale), which the
     pod's anton replies in when the user's message does not say; None for a
     turn with no request behind it.
@@ -1422,6 +1438,7 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
     offer_connector_drafts = bool(
         connector_drafts and settings.connector_drafts_enabled and scope.org_mode and user_id
     )
+    offered_host_tools = host_tools if host_tools and interactive and workspace_mode == "persistent" else None
     params = {"input": input_text, "workspace_path": workspace_rel_path.lstrip("/"),
               "workspace_mode": workspace_mode,
               "model": model, "history": history or [], "llm": llm_block,
@@ -1437,6 +1454,8 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
               # stdin its answer comes back on (scratchpad-controller#134
               # relays it; an older controller drops it and the pod never asks).
               **({"preview_checks": True} if preview_checks and interactive else {}),
+              # Tools this server runs for the pod; their answers come back on stdin.
+              **({"host_tools": host_tools} if offered_host_tools else {}),
               # False when the organization opted out of Jev: the pod's
               # completion check then never asks it. A controller that
               # predates the field drops it, and the pod keeps Jev on.
@@ -1455,7 +1474,9 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
               **({"memory": memory_block} if memory_block else {}),
               # Only the skills the caller sees, and the pod's whole
               # recallable set, so always present, even empty.
-              "skills": turn_skills_wire(skills or {}),
+              # Less any skill only dropped host tools wait for: it would unlock nothing.
+              "skills": turn_skills_wire({slug: entry for slug, entry in (skills or {}).items()
+                                          if slug not in _unlock_skills(host_tools) - _unlock_skills(offered_host_tools)}),
               # Absent entirely (not an empty dict) when there's nothing to
               # offer — see _mint_oauth_block's docstring for why.
               **({"oauth": oauth_block} if oauth_block else {}),

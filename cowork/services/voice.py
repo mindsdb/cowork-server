@@ -44,7 +44,7 @@ MAX_SDP_CHARS = 64_000
 # GPT-Live's voices, by API name. A session's voice is set when it starts and
 # can't change during it, so the app starts a new session to switch voices.
 DEFAULT_VOICE = "cinder"
-#: Each voice and how it sounds, for the call's change_voice tool.
+#: Each voice and how it sounds, for the app's voice picker.
 VOICE_STYLES = {
     "cinder": "masculine, Southern U.S.",
     "delta": "feminine, Southern U.S.",
@@ -73,17 +73,21 @@ VOICE_STYLES = {
 VOICES = frozenset(VOICE_STYLES)
 
 VOICE_PROMPT = (
-    "You are Anton, the user's coworker in MindsHub Cowork, on a voice call with them. Cowork is where they get "
-    "work done with you: you analyze their data, research, write documents, browse websites and work with the "
-    "apps they connected.\n\n"
+    "You are the voice assistant for MindsHub, powered by Anton, in voice mode with the user. MindsHub Cowork is "
+    "where they get work done with Anton: he analyzes their data, researches, writes documents, browses websites "
+    "and works with the apps they connected. You have no name of your own: when they ask who you are, say you "
+    "are the voice assistant for MindsHub, powered by Anton. Don't call yourself Anton.\n\n"
     "Delegate every request for work: anything about their data, files, projects or connected apps, anything "
     "to look up, write, change, send or build. Delegate requests about the app too: creating a project, "
     "moving a task, starting, opening or stopping a task, what a task's steps are, what is in the browser and "
     "doing something in it. When they ask to stop, cancel or pause what is running, delegate it at once, even "
     "while you wait on another result. Say briefly what you are doing, such as \"Let me look into that.\" Never say "
     "something is done before the result arrives. When it does, tell them the gist in two or three plain "
-    "sentences. When they ask you to change your voice or accent, delegate it: the call reconnects in the new "
-    "voice.\n\n"
+    "sentences.\n\n"
+    "You can't change your own voice or accent. When they ask you to, don't delegate it: tell them, with a bit of "
+    "humor, that they can pick one themselves from the voice options in voice mode, and that there are plenty to "
+    "choose from (accents from all over the world, deep ones, bright ones), so they're bound to find one they "
+    "like better than this one.\n\n"
     "When they ask for something new while other work is running, delegate it too: it starts in its own task, "
     "beside that work, so never tell them to wait for it. When they want to go to a task, find one or hear how one "
     "is going, delegate it.\n\n"
@@ -95,6 +99,16 @@ VOICE_PROMPT = (
     "Answer small talk and questions about this call yourself. Keep every reply short and spoken: no lists, "
     "links or code. When you don't know something, say so."
 )
+
+#: Dictation (ENG-4630): the composer's mic fills the message box from the
+#: person's live transcript, which GPT-Live streams as they talk. The session is
+#: only there to listen; the app never plays what it says.
+DICTATION_PROMPT = (
+    "You are a dictation microphone. The user is dictating text to type into a message box. Never speak, never "
+    "answer, never ask anything and never delegate: stay silent the whole session, whatever they say, even when "
+    "it sounds like a question or a request to you."
+)
+MODES = frozenset({"call", "dictation"})
 
 
 class VoiceOption(CamelResponse):
@@ -202,11 +216,15 @@ def voice_context(*, tz_name: str | None, memory: dict[str, str] | None, now: da
     return "\n\n".join(lines)
 
 
-def session_body(sdp: str, voice: str | None = None, context: str = "") -> dict[str, Any]:
+def session_body(sdp: str, voice: str | None = None, context: str = "", mode: str = "call") -> dict[str, Any]:
+    if mode == "dictation":
+        instructions = DICTATION_PROMPT
+    else:
+        instructions = f"{VOICE_PROMPT}\n\n{context}" if context else VOICE_PROMPT
     return {
         "session": {
             "model": MODEL,
-            "instructions": f"{VOICE_PROMPT}\n\n{context}" if context else VOICE_PROMPT,
+            "instructions": instructions,
             "delegation": {"type": "client"},
             "audio": {"output": {"voice": voice if voice in VOICES else DEFAULT_VOICE}},
         },
@@ -238,7 +256,7 @@ def said_by_inference(error: Any) -> str:
     return " ".join(str(error.get("message") or "").split())[:MAX_REFUSAL_CHARS]
 
 
-async def start_session(bearer: str, sdp: str, voice: str | None = None, context: str = "") -> dict:
+async def start_session(bearer: str, sdp: str, voice: str | None = None, context: str = "", mode: str = "call") -> dict:
     """GPT-Live's answer for the browser's SDP offer: ``{session: {id}, transport: {type, sdp}}``."""
     if not bearer:
         raise VoiceError(401, "unauthorized", "Sign in to MindsHub to start a voice call.")
@@ -247,7 +265,7 @@ async def start_session(bearer: str, sdp: str, voice: str | None = None, context
     try:
         async with _client() as client:
             response = await asyncio.wait_for(
-                client.post(live_sessions_url(), json=session_body(sdp, voice, context), headers={"Authorization": f"Bearer {bearer}"}),
+                client.post(live_sessions_url(), json=session_body(sdp, voice, context, mode), headers={"Authorization": f"Bearer {bearer}"}),
                 _TIMEOUT_S,
             )
     except Exception as exc:

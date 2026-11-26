@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import re
+import tempfile
 from collections.abc import Sequence
 from pathlib import Path
 
@@ -11,8 +13,16 @@ from cowork.coding.project_models import (
     DeliveryPlanItem,
     DeliveryRecord,
     DraftPullRequestRequest,
+    DraftPullRequestSpec,
 )
 from cowork.coding.workspace import GitRunner, WorkspaceError
+
+_REVISION = re.compile(r"^[0-9a-f]{40}([0-9a-f]{24})?$")
+_LFS_POINTER = re.compile(
+    r"^[0-9a-f]+ blob [0-9]+\nversion https://(?:git-lfs\.github\.com|hawser\.github\.com)/spec/v1\n"
+    r"(?:ext-[^\n]+\n)*oid sha256:[0-9a-f]{64}\nsize [0-9]+(?:\n|$)",
+    re.MULTILINE,
+)
 
 
 class ProjectDeliveryService:
@@ -60,7 +70,7 @@ class ProjectDeliveryService:
                 "origin",
                 check=False,
             ).stdout.strip() or None
-            branch = state[0] or workspace.task_branch
+            branch = state[0]
             base_branch = workspace.base_branch or self._source_branch(workspace.source_path)
             commits = self._commit_count(workspace.workspace_path, workspace.base_revision)
             existing = published.get(workspace.folder_id)
@@ -77,13 +87,15 @@ class ProjectDeliveryService:
                         )
                     except WorkspaceError as exc:
                         status_error = str(exc)[:2_000]
+            elif not branch:
+                status, detail = "unavailable", "Check out the task branch before creating its draft pull request"
             elif state[1]:
                 status, detail = "needs_commit", "Commit this folder's changes before creating its draft pull request"
             elif commits == 0:
                 status, detail = "no_changes", "No committed task changes"
             elif not remote:
                 status, detail = "unavailable", "Add an origin remote before creating a draft pull request"
-            elif not branch or not base_branch:
+            elif not base_branch:
                 status, detail = "unavailable", "The task or base branch could not be determined"
             else:
                 status, detail = "ready", ""
@@ -95,6 +107,7 @@ class ProjectDeliveryService:
                     remote_url=remote,
                     base_branch=base_branch,
                     task_branch=branch,
+                    head_revision=state[2],
                     status=status,
                     detail=detail,
                     external_url=existing.external_url if existing else None,
@@ -126,18 +139,22 @@ class ProjectDeliveryService:
                 records.append(self._failed(item, item.detail))
                 continue
             draft = requested.get(item.folder_id)
+            changed = confirmation_mismatch(item, draft)
+            if changed:
+                records.append(self._failed(item, changed))
+                continue
             try:
                 push = integrations.git_push_credentials(
                     project,
                     item.remote_url or "",
                     request.connection_name,
                 )
-                self.git.run(
-                    self._path(item.workspace_path),
-                    "push",
+                self.push_commit(
+                    item.workspace_path,
+                    item.head_revision or "",
+                    item.task_branch or "",
                     push.remote_url,
-                    f"{item.task_branch or ''}:{item.task_branch or ''}",
-                    environment=push.environment,
+                    push.environment,
                 )
                 external_url = integrations.create_draft_pull_request(
                     project,
@@ -167,11 +184,94 @@ class ProjectDeliveryService:
                 records.append(self._failed(item, str(exc)[:2_000]))
         return records
 
-    def _state(self, workspace_path: str) -> tuple[str | None, bool]:
+    def push_commit(
+        self,
+        workspace_path: str,
+        revision: str,
+        branch: str,
+        remote_url: str,
+        environment: dict[str, str],
+    ) -> None:
+        """Push one exact commit to one branch from a repository Cowork owns.
+
+        The push carries the GitHub credential, so it runs outside the task's
+        repository: hook managers keep their scripts in the task's files, and
+        repository settings (URL rewrites, proxies, credential helpers) could
+        send the credential elsewhere. A fresh bare repository borrows the
+        task's objects through ``alternates``, so nothing is copied.
+        """
+        if not _REVISION.fullmatch(revision):
+            raise WorkspaceError("The commit to publish could not be determined")
+        root = self._path(workspace_path)
+        if self.git.run(root, "check-ref-format", "--branch", branch, check=False).returncode != 0:
+            raise WorkspaceError("The task branch name is not a valid Git branch")
+        common = self.git.run(root, "rev-parse", "--git-common-dir").stdout.strip()
+        objects = (root / common).resolve() / "objects"
+        with tempfile.TemporaryDirectory(prefix="cowork-publish-", ignore_cleanup_errors=True) as scratch:
+            clean = Path(scratch) / "repository.git"
+            no_hooks = Path(scratch) / "no-hooks"
+            clean.mkdir()
+            no_hooks.mkdir()
+            # An empty template keeps hooks from init.templateDir out too.
+            self.git.run(clean, "init", "--quiet", "--bare", "--template=", ".")
+            (clean / "objects" / "info").mkdir(parents=True, exist_ok=True)
+            (clean / "objects" / "info" / "alternates").write_text(f"{objects}\n", encoding="utf-8")
+            if self.git.run(clean, "cat-file", "-e", f"{revision}^{{commit}}", check=False).returncode != 0:
+                raise WorkspaceError("The commit to publish is no longer in the task's repository")
+            # Without the pre-push hook Git LFS never uploads file contents,
+            # and the branch would land with pointer files in their place.
+            attributes = self.git.run(
+                clean, "grep", "--quiet", "-e", "filter=lfs", revision, "--", ":(glob)**/.gitattributes",
+                check=False,
+            )
+            if attributes.returncode not in (0, 1):
+                raise WorkspaceError("Could not check Git LFS tracking before publishing")
+            if attributes.returncode == 0 or self._outgoing_lfs_pointer(clean, revision, remote_url, environment):
+                raise WorkspaceError(
+                    "This repository uses Git LFS, which Code mode can't publish yet. "
+                    "Push the task branch yourself, then create the pull request."
+                )
+            self.git.run(
+                clean,
+                "-c",
+                f"core.hooksPath={no_hooks}",
+                "push",
+                "--no-verify",
+                remote_url,
+                f"{revision}:refs/heads/{branch}",
+                environment=environment,
+            )
+
+    def _outgoing_lfs_pointer(self, clean: Path, revision: str, remote_url: str, environment: dict[str, str]) -> bool:
+        # Only subtract tips the destination advertises and we can traverse locally.
+        refs = self.git.run(clean, "ls-remote", "--heads", "--", remote_url, environment=environment).stdout
+        tips = {line.split("\t", 1)[0] for line in refs.splitlines()}
+        tips = {tip for tip in tips if _REVISION.fullmatch(tip)}
+        revisions = [revision]
+        if tips:
+            known = self.git.run(
+                clean, "cat-file", "--batch-check=%(objectname) %(objecttype)", input_text="\n".join(tips) + "\n",
+            )
+            revisions.extend("^" + line.split()[0] for line in known.stdout.splitlines() if line.endswith(" commit"))
+
+        # Git LFS pointers fit in 1 KiB. Walk all parents, including merged
+        # branches, and read only small blobs, in bounded batches.
+        blobs = self.git.run(
+            clean, "rev-list", "--objects", "--no-object-names", "--filter-provided-objects", "--filter=object:type=blob",
+            "--filter=blob:limit=1025", "--stdin", input_text="\n".join(revisions) + "\n",
+        ).stdout.splitlines()
+        for start in range(0, len(blobs), 256):
+            batch = self.git.run(clean, "cat-file", "--batch", input_text="\n".join(blobs[start:start + 256]) + "\n")
+            if _LFS_POINTER.search(batch.stdout):
+                return True
+        return False
+
+    def _state(self, workspace_path: str) -> tuple[str | None, bool, str | None]:
         root = self._path(workspace_path)
         branch = self.git.run(root, "branch", "--show-current", check=False).stdout.strip() or None
         dirty = bool(self.git.run(root, "status", "--porcelain=v1", "--untracked-files=all").stdout.strip())
-        return branch, dirty
+        head = self.git.run(root, "rev-parse", "--verify", "--quiet", "HEAD", check=False).stdout.strip()
+        return branch, dirty, head if _REVISION.fullmatch(head) else None
 
     def _source_branch(self, source_path: str) -> str | None:
         branch = self.git.run(
@@ -213,3 +313,18 @@ class ProjectDeliveryService:
             base_branch=item.base_branch,
             task_branch=item.task_branch,
         )
+
+
+def confirmation_mismatch(item: DeliveryPlanItem, confirmed: DraftPullRequestSpec | None) -> str | None:
+    """Why a folder no longer matches what the person confirmed, if it doesn't."""
+    if confirmed is None:
+        return None
+    pinned = (
+        (confirmed.head_revision, item.head_revision),
+        (confirmed.base_branch, item.base_branch),
+        (confirmed.task_branch, item.task_branch),
+        (confirmed.remote_url, item.remote_url),
+    )
+    if any(expected is not None and expected != current for expected, current in pinned):
+        return "This folder changed after you confirmed its draft pull request. Review it and confirm again."
+    return None

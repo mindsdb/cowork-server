@@ -429,3 +429,20 @@ async def test_a_search_tasks_call_comes_back_with_its_query(inference):
 
     assert answered.status_code == 200, answered.text
     assert answered.json()["tool_calls"] == [{"id": "c1", "name": "search_tasks", "arguments": {"query": "pricing"}}]
+
+
+def test_the_call_introduces_itself_as_the_mindshub_voice_assistant():
+    """ENG-4630: "I'm Anton" confused people, more so in a feminine voice."""
+    assert "You are the voice assistant for MindsHub, powered by Anton" in voice.VOICE_PROMPT
+    assert "You are Anton" not in voice.VOICE_PROMPT
+    assert "Don't call yourself Anton" in voice.VOICE_PROMPT
+
+
+def test_asking_for_another_voice_points_to_the_voice_options():
+    """ENG-4630: the call switching its own voice confused people; they pick it in voice mode."""
+    assert "change_voice" not in operator.TOOL_NAMES
+    assert "change_voice" not in operator.OPERATOR_PROMPT
+    assert "voice options in voice mode" in voice.VOICE_PROMPT
+    assert "plenty to choose from" in voice.VOICE_PROMPT
+    assert "voice options in voice mode" in operator.OPERATOR_PROMPT
+    assert "delegate it: the call reconnects" not in voice.VOICE_PROMPT

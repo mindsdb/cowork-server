@@ -502,8 +502,8 @@ async def _sync_live_artifact(
     from cowork.services.publish import (
         AccessModeChanged,
         DatasourceApprovalRequired,
-        MarkdownNotPublishable,
         MarkdownRenderBusy,
+        PageNotPublishable,
         PublishOwnedByOtherUser,
         PublishTooLarge,
         ShareOrgRequired,
@@ -585,10 +585,10 @@ async def _sync_live_artifact(
         # Repeats on every save until the artifact shrinks, so no traceback.
         logger.warning("Could not synchronize live artifact %s: it is too large to publish", folder)
         return False
-    except MarkdownNotPublishable:
-        # Repeats on every save until the Markdown changes, so no traceback.
+    except PageNotPublishable:
+        # Repeats on every save until the file changes, so no traceback.
         logger.warning(
-            "Could not synchronize live artifact %s: its Markdown page can't be rendered", folder
+            "Could not synchronize live artifact %s: its page can't be rendered", folder
         )
         return False
     except MarkdownRenderBusy:

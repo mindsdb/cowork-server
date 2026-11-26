@@ -268,3 +268,26 @@ async def test_only_a_known_zdr_names_zdr_in_the_refusal(inference, zdr, on, say
     message = response.json()["detail"]["message"]
     assert ("zero data retention" in message) is says_zdr
     assert inference.seen == []
+
+
+async def test_dictation_only_listens_and_reads_no_memory(inference, monkeypatch):
+    """ENG-4630: the composer's mic starts a session that only transcribes."""
+    import cowork.api.v1.endpoints.voice as endpoint
+
+    def no_memory(scope):
+        raise AssertionError("dictation reads no memory")
+
+    monkeypatch.setattr(endpoint, "_person_memory", no_memory)
+    started = await _call("POST", "/session", json={"sdp": "offer-sdp", "mode": "dictation", "timezone": "UTC"})
+
+    assert started.status_code == 200, started.text
+    instructions = json.loads(inference.seen[0].content)["session"]["instructions"]
+    assert instructions == voice.DICTATION_PROMPT
+    assert "Never speak" in instructions
+
+
+async def test_an_unknown_session_mode_is_refused(inference):
+    refused = await _call("POST", "/session", json={"sdp": "offer-sdp", "mode": "karaoke"})
+
+    assert refused.status_code == 422
+    assert inference.seen == []

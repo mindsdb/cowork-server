@@ -1,7 +1,7 @@
 """/voice: voice calls with the agent (ENG-4138, prototype).
 
 GET  /voice/status   whether this deployment's MindsHub Inference serves live voice
-POST /voice/session  the browser's SDP offer in, GPT-Live's answer out (cowork.services.voice)
+POST /voice/session  the browser's SDP offer in, GPT-Live's answer out (cowork.services.voice); mode "dictation" for the composer mic
 POST /voice/operate  a request from the call in, the app actions to take out (cowork.services.voice_operator)
 
 All three act as the caller, with their own MindsHub credential. Status
@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import logging
 from functools import partial
+from typing import Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, Field
@@ -65,6 +66,8 @@ class VoiceSessionRequest(BaseModel):
     voice: str | None = Field(default=None, max_length=32)
     # The person's IANA time zone, from their browser, so the call knows their date and time.
     timezone: str | None = Field(default=None, max_length=64)
+    # "dictation": the composer's mic, which only listens (ENG-4630).
+    mode: Literal["call", "dictation"] = "call"
 
 
 def _person_memory(scope: TenantScope) -> dict[str, str]:
@@ -99,16 +102,19 @@ async def voice_session(
 ) -> dict:
     if (zdr := await _zdr_state(request, scope)) is not ZdrState.OFF:
         raise _refuse_under_zdr(zdr)
-    # Memory lives on the shared file store: read it in run_efs's slots and the
-    # person's share of them. A busy store starts the call without memory.
+    context = ""
+    if body.mode == "call":
+        # Memory lives on the shared file store: read it in run_efs's slots and the
+        # person's share of them. A busy store starts the call without memory.
+        # Dictation only transcribes, so it reads none.
+        try:
+            memory = await run_efs(partial(_person_memory, scope), scope=scope)
+        except FilesystemBusy:
+            logger.warning("voice: the file store is busy, so the call starts without memory")
+            memory = {}
+        context = voice.voice_context(tz_name=body.timezone, memory=memory)
     try:
-        memory = await run_efs(partial(_person_memory, scope), scope=scope)
-    except FilesystemBusy:
-        logger.warning("voice: the file store is busy, so the call starts without memory")
-        memory = {}
-    context = voice.voice_context(tz_name=body.timezone, memory=memory)
-    try:
-        return await voice.start_session(mindshub_credential(request), body.sdp, body.voice, context)
+        return await voice.start_session(mindshub_credential(request), body.sdp, body.voice, context, body.mode)
     except voice.VoiceError as exc:
         raise HTTPException(status_code=exc.status, detail={"code": exc.code, "message": exc.message}) from exc
 
