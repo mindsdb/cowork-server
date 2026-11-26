@@ -56,6 +56,8 @@ def test_the_draft_host_serves_the_viewer_files(host):
     assert response.headers["content-type"].startswith("text/javascript")
     assert response.content == pdf_viewer.asset("pdf.min.mjs")[0]
     assert response.headers["access-control-allow-origin"] == "*"
+    # The address carries the draft token, so nothing on this host is cached.
+    assert response.headers["cache-control"] == "private, no-store"
 
 
 @pytest.mark.parametrize("name", ["LICENSE", "fetch_pdfjs.py", "__init__.py", "missing.mjs"])
@@ -120,6 +122,16 @@ async def test_desktop_viewer_files_answer_any_origin(desktop, tmp_path, monkeyp
     assert response.status_code == 200
     assert response.headers["access-control-allow-origin"] == "*"
     assert response.body == pdf_viewer.asset("viewer.mjs")[0]
+
+
+async def test_desktop_viewer_files_may_be_cached(desktop, tmp_path, monkeypatch):
+    response = await _drafts(monkeypatch, tmp_path, "_anton_pdf/pdf.min.mjs", "script")
+    assert response.headers["cache-control"] == "private, max-age=3600"
+
+
+async def test_the_desktop_viewer_page_of_a_pdf_is_not_cached(desktop, tmp_path, monkeypatch):
+    response = await _drafts(monkeypatch, tmp_path, "docs/report.pdf", "iframe")
+    assert response.headers["cache-control"] == "private, no-store"
 
 
 async def test_desktop_pdf_bytes_answer_any_origin(desktop, tmp_path, monkeypatch):

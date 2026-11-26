@@ -122,13 +122,23 @@ def _pdf_headers(cors: bool) -> dict[str, str]:
     return {"Vary": "Sec-Fetch-Dest", **_cors_headers(cors)}
 
 
+# The viewer's files change only with the server, so on the desktop /drafts
+# route, whose addresses carry no credential, the browser may reuse them for
+# every PDF of a page; after a server update it may use the old files for up
+# to an hour. The draft host keeps no-store: its addresses carry the token.
+_PDF_ASSET_CACHE_CONTROL = "private, max-age=3600"
+
+
 def _pdf_asset_response(name: str, *, cors: bool) -> Response:
     """A file of the bundled PDF viewer, never one of the artifact."""
     found = pdf_viewer.asset(name)
     if found is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Artifact file not found")
     body, content_type = found
-    return Response(body, media_type=content_type, headers={**_DRAFT_RESPONSE_HEADERS, **_cors_headers(cors)})
+    headers = {**_DRAFT_RESPONSE_HEADERS, **_cors_headers(cors)}
+    if cors:
+        headers["Cache-Control"] = _PDF_ASSET_CACHE_CONTROL
+    return Response(body, media_type=content_type, headers=headers)
 
 
 def _pdf_viewer_page(rel_path: str, *, cors: bool) -> HTMLResponse:
@@ -391,13 +401,15 @@ def _draft_file_response(
     UTF-8, streams from the pinned descriptor, read on the file store's
     threads in ``scope``.
 
-    PDFs in sandboxed previews: ``_anton_pdf/<file>`` is the bundled pdf.js
-    viewer (pdf_viewer/); a navigation to a PDF (``dest``) gets the viewer page
-    instead of the bytes; ``pdf_assets`` is the viewer's address the shim gets
-    in an HTML document; ``cors`` lets the desktop frame (opaque origin) read
-    the viewer's files and the PDF.
+    PDFs in sandboxed previews, only where ``pdf_assets`` (the viewer's
+    address the shim gets in an HTML document) is set, that is on the draft
+    host and the desktop ``/drafts`` route: ``_anton_pdf/<file>`` is the
+    bundled pdf.js viewer (pdf_viewer/), and a navigation to a PDF (``dest``)
+    gets the viewer page instead of the bytes. ``cors`` lets the desktop frame
+    (opaque origin) read the viewer's files and the PDF.
     """
-    name = pdf_viewer.asset_name(rel_path)
+    viewer = pdf_assets is not None
+    name = pdf_viewer.asset_name(rel_path) if viewer else None
     if name is not None:
         return _pdf_asset_response(name, cors=cors)
     parts = _draft_file_parts(rel_path, artifact.metadata)
@@ -414,7 +426,7 @@ def _draft_file_response(
     try:
         # The draft host serves top-level opens itself, sandboxed, and a popup
         # of the draft frame inherits the sandbox: a document gets the viewer too.
-        if not download and pdf_viewer.wants_viewer_page(media_type, dest, document=True):
+        if viewer and not download and pdf_viewer.wants_viewer_page(media_type, dest, document=True):
             resources.close()
             return _pdf_viewer_page("/".join(parts), cors=cors)
         if not download and media_type == "text/html":
@@ -426,7 +438,7 @@ def _draft_file_response(
             {"Content-Disposition": attachment_disposition(parts[-1])}
             if download else {}
         )
-        if media_type == pdf_viewer.PDF_TYPE:
+        if viewer and media_type == pdf_viewer.PDF_TYPE:
             extra |= _pdf_headers(cors)
         return _draft_stream(resources, fd, file_stat.st_size, media_type, scope=scope, extra_headers=extra)
     except BaseException:
@@ -2354,7 +2366,8 @@ async def serve_private_draft(
     ``Access-Control-Allow-Origin: *`` and gives the shim the viewer's
     address; any desktop draft page can then read the PDFs of the user's other
     drafts, which is accepted. In org mode this route serves only the legacy
-    srcdoc path, where nothing is replaced, so neither is set.
+    srcdoc path, where nothing is replaced: it serves no viewer files and
+    answers a PDF with its bytes, as before.
     """
     project_selector, artifact_selector = _draft_selectors(project_ref, artifact_id)
     desktop = get_app_settings().tenancy_mode != "org"
