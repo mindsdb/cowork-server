@@ -95,7 +95,7 @@
             "type": "password",
             "required": true,
             "secret": true,
-            "description": "Password for the database user above. Stored encrypted and never transmitted to Anton's servers."
+            "description": "Password for the database user above. Never transmitted to Anton's servers."
           },
           {
             "name": "ssl_enabled",

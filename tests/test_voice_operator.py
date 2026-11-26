@@ -9,6 +9,7 @@ from datetime import datetime, timezone
 import httpx
 import pytest
 
+import cowork.services.voice as voice
 import cowork.services.voice_operator as operator
 from cowork.server import create_app
 
@@ -539,3 +540,61 @@ async def test_a_set_widget_state_call_fits_back_in_the_history(inference):
         {"role": "tool", "tool_call_id": "c1", "content": "Set."},
     ], "widgets": [_CHART]})
     assert answered.status_code == 200, answered.text
+
+
+def test_new_work_starts_beside_running_work_instead_of_queueing():
+    """ENG-4631: a request for a new task while Anton worked on the call's last
+    one was queued behind it."""
+    prompt = operator.OPERATOR_PROMPT
+    assert "one thing at a time" not in prompt
+    assert "Anton can work on several tasks at once" in prompt
+    assert "don't queue it" in prompt
+    assert "task_id 'new'" in prompt
+    # Queueing stays for more work in the busy task itself.
+    assert "More work in a task he is busy in for this call: queue it there with queue_for_anton" in prompt
+    assert "When they ask for something new while other work is running, delegate it too" in voice.VOICE_PROMPT
+
+
+def test_a_goodbye_in_any_words_ends_the_call():
+    """ENG-4631: "you're dismissed" was taken for small talk and the call stayed up."""
+    assert "\"you're dismissed\"" in operator.OPERATOR_PROMPT and "call hang_up" in operator.OPERATOR_PROMPT
+    assert "\"you're dismissed\"" in voice.VOICE_PROMPT and "it is not small talk" in voice.VOICE_PROMPT
+
+
+def test_the_call_can_find_a_task_and_open_it():
+    """ENG-4631: voice couldn't move between tasks or find the one being talked about."""
+    tools = {t["function"]["name"]: t["function"] for t in operator.TOOLS}
+    search = tools["search_tasks"]
+    assert search["parameters"]["required"] == ["query"]
+    assert set(search["parameters"]["properties"]) == {"query"}
+    assert "search_tasks" in tools["open_task"]["description"]
+    assert "call search_tasks" in operator.OPERATOR_PROMPT
+    assert "ask which one" in operator.OPERATOR_PROMPT
+
+
+async def test_a_search_tasks_call_comes_back_with_its_query(inference):
+    inference.answer = httpx.Response(200, json={"choices": [{"message": {"content": None, "tool_calls": [
+        {"id": "c1", "type": "function", "function": {"name": "search_tasks", "arguments": '{"query": "pricing", "limit": 99}'}},
+    ]}}]})
+
+    answered = await _operate({"messages": [{"role": "user", "content": "Go to the pricing one."}]})
+
+    assert answered.status_code == 200, answered.text
+    assert answered.json()["tool_calls"] == [{"id": "c1", "name": "search_tasks", "arguments": {"query": "pricing"}}]
+
+
+def test_the_call_introduces_itself_as_the_mindshub_voice_assistant():
+    """ENG-4630: "I'm Anton" confused people, more so in a feminine voice."""
+    assert "You are the voice assistant for MindsHub, powered by Anton" in voice.VOICE_PROMPT
+    assert "You are Anton" not in voice.VOICE_PROMPT
+    assert "Don't call yourself Anton" in voice.VOICE_PROMPT
+
+
+def test_asking_for_another_voice_points_to_the_voice_options():
+    """ENG-4630: the call switching its own voice confused people; they pick it in voice mode."""
+    assert "change_voice" not in operator.TOOL_NAMES
+    assert "change_voice" not in operator.OPERATOR_PROMPT
+    assert "voice options in voice mode" in voice.VOICE_PROMPT
+    assert "plenty to choose from" in voice.VOICE_PROMPT
+    assert "voice options in voice mode" in operator.OPERATOR_PROMPT
+    assert "delegate it: the call reconnects" not in voice.VOICE_PROMPT

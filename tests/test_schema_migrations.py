@@ -1792,3 +1792,37 @@ def test_the_custom_connector_auth_column_upgrades_and_downgrades(tmp_path, monk
         check = connection.execute(text("select connection_check from custom_connectors")).scalar()
     assert "connection_auth" not in columns
     assert json.loads(check) == {"path": "/v1/me"}
+
+
+DATASOURCE_APPROVALS_REVISION = "a8d3f6c1e924"
+
+
+def test_artifact_datasource_approvals_upgrade_and_downgrade(tmp_path, monkeypatch):
+    """One row per artifact folder among rows with no org, and per org; the
+    downgrade drops the table."""
+    monkeypatch.setenv("COWORK_PROJECTS_DIR", str(tmp_path / "projects"))
+    get_app_settings.cache_clear()
+
+    db_path = tmp_path / "artifact-datasource-approvals.db"
+    uri = _sqlite_uri(db_path)
+    engine = create_engine(uri)
+    run_schema_migrations(engine, uri)
+    assert _has_table(db_path, "artifact_datasource_approvals")
+    insert = text(
+        "INSERT INTO artifact_datasource_approvals (id, org_id, artifact_key, artifact_dir, datasources) "
+        "VALUES (:id, :org, 'artifact/1', '/p/.anton/artifacts/app', '[]')"
+    )
+    with engine.begin() as connection:
+        connection.execute(insert, {"id": "a" * 32, "org": None})
+        connection.execute(insert, {"id": "b" * 32, "org": _ORG})
+        connection.execute(insert, {"id": "c" * 32, "org": _OTHER_ORG})
+        for row_id, org in (("d" * 32, None), ("e" * 32, _ORG)):
+            with pytest.raises(IntegrityError):
+                with connection.begin_nested():
+                    connection.execute(insert, {"id": row_id, "org": org})
+
+    down = ScriptDirectory.from_config(_alembic_config(uri)).get_revision(DATASOURCE_APPROVALS_REVISION).down_revision
+    _downgrade_to(engine, uri, down)
+    assert not _has_table(db_path, "artifact_datasource_approvals")
+    _upgrade_to(engine, uri, "head")
+    assert _has_table(db_path, "artifact_datasource_approvals")

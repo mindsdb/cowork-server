@@ -4,9 +4,11 @@ import hashlib
 import re
 import time
 from collections.abc import Callable
+from pathlib import Path
 
 from fastapi.exceptions import RequestValidationError
 from sqlalchemy import create_engine, event
+from sqlalchemy.engine import make_url
 from sqlalchemy.exc import TimeoutError as PoolTimeoutError
 from sqlalchemy.orm import sessionmaker
 from sqlmodel import Session as SQLModelSession
@@ -167,6 +169,19 @@ def get_engine(db_uri: str):
     if db_uri not in _engines:
         _engines[db_uri] = _create_engine(db_uri=db_uri)
     return _engines[db_uri]
+
+
+def sqlite_database_file(*, db_uri: str) -> Path | None:
+    """The file a SQLite ``db_uri`` names, or None for an in-memory SQLite
+    database or another kind of database."""
+    parsed = make_url(db_uri)
+    if (
+        parsed.drivername.startswith("sqlite")
+        and parsed.database
+        and parsed.database != ":memory:"
+    ):
+        return Path(parsed.database)
+    return None
 
 
 def get_session_factory(engine):

@@ -53,6 +53,18 @@ def wait_for_status(service: CodingService, session_id: str, status: SessionStat
     return session
 
 
+def assert_usage_refreshes_after_cleanup(service: CodingService) -> None:
+    assert service.workspaces.pending_removals.wait(30)
+    page = service.workspace_usage_page()
+    assert page.measuring
+    deadline = time.monotonic() + 30
+    while page.measuring and time.monotonic() < deadline:
+        time.sleep(0.01)
+        page = service.workspace_usage_page()
+    assert not page.measuring
+    assert page.removed_task_bytes == 0
+
+
 def wait_for_run_to_follow(service: CodingService, session_id: str) -> CodingSession:
     """Wait for a local task's run status to match its session status, and
     return the task as it is then.

@@ -72,6 +72,9 @@ class ArtifactCard(BaseModel):
     draft_url: str = ""
     capabilities: dict | None = None
     received_from: dict | None = None
+    # A doc (cowork.docs) only: "doc", and the rendered page it is shared as.
+    format: str | None = None
+    html_path: str | None = None
 
     @model_serializer(mode="wrap")
     def _set_fields_only(

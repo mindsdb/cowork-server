@@ -457,12 +457,19 @@ class DraftPullRequestSpec(BaseModel):
     folder_id: str = Field(min_length=1, max_length=120)
     title: str = Field(min_length=1, max_length=256)
     body: str = Field(default="", max_length=100_000)
+    # What the person reviewed and confirmed. When given, publishing refuses a
+    # folder whose commit or destination has moved since, so a later commit or
+    # a changed remote never rides an earlier confirmation.
+    head_revision: str | None = Field(default=None, pattern=r"^[0-9a-f]{40}([0-9a-f]{24})?$")
+    base_branch: str | None = Field(default=None, max_length=512)
+    task_branch: str | None = Field(default=None, max_length=512)
+    remote_url: str | None = Field(default=None, max_length=8_192)
 
 
 class DraftPullRequestRequest(BaseModel):
     title: str = Field(min_length=1, max_length=256)
     body: str = Field(default="", max_length=100_000)
-    drafts: list[DraftPullRequestSpec] = Field(default_factory=list, max_length=24)
+    drafts: list[DraftPullRequestSpec] = Field(default_factory=list, min_length=1, max_length=24)
     connection_name: str | None = Field(default=None, max_length=512)
     confirmed: bool = False
 
@@ -541,6 +548,7 @@ class DeliveryPlanItem(BaseModel):
     remote_url: str | None = None
     base_branch: str | None = None
     task_branch: str | None = None
+    head_revision: str | None = None
     status: Literal["ready", "needs_commit", "no_changes", "unavailable", "published"]
     detail: str = ""
     external_url: str | None = None

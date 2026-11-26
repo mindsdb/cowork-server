@@ -24,7 +24,6 @@ import argparse
 import sys
 from pathlib import Path
 
-from anton.core.datasources.data_vault import LocalDataVault
 
 from cowork.db.personal_resources import PersonalResource
 from cowork.managed import SharedConnection, SharedConnections, managed_folder
@@ -43,7 +42,7 @@ from cowork.ops import (
     run_operator_command,
 )
 from cowork.ops.connection_inventory import connection_inventory
-from cowork.services.connectors.persist import own_vault_for_scope
+from cowork.services.connectors.persist import data_vault_at, own_vault_for_scope
 
 # How the refusal of a name in two engines says to pick one, for this module
 # and for the make target that runs it.
@@ -77,7 +76,7 @@ def share_connection(
         )
     (engine,) = engines
     managed = managed_folder()
-    if managed is not None and LocalDataVault(managed.vault_dir).read_record(engine, name):
+    if managed is not None and data_vault_at(managed.vault_dir).read_record(engine, name):
         # Everyone reads the operator's own entry first, so the share would
         # reach nobody.
         raise OperatorCommandError(

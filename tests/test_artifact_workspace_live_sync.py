@@ -490,7 +490,7 @@ async def test_a_refused_share_with_everyone_stops_live_sync_with_one_warning(ar
 @pytest.mark.parametrize(
     ("refusal", "said"),
     [
-        ("not_publishable", "its Markdown page can't be rendered"),
+        ("not_publishable", "its page can't be rendered"),
         ("busy", "another conversion runs"),
     ],
 )

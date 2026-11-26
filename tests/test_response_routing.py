@@ -12,6 +12,7 @@ from cowork.handlers.response_routing import (
     decide_route,
 )
 from cowork.handlers.responses import ResponsesHandler
+from cowork.turnqueue.producer import TurnLlm
 from tests._logging_assertions import assert_log_fields
 
 
@@ -1067,9 +1068,9 @@ async def test_router_binding_mints_per_turn_key_in_hosted_org_mode(monkeypatch)
     async def fake_mint(*, org_id, user_id, correlation_id, settings, workspace_id=None):
         minted["corr"] = correlation_id
         minted["workspace_id"] = workspace_id
-        return block
+        return producer.TurnLlm(block=block, turn_key_id=None, ttl_seconds=1200)
 
-    monkeypatch.setattr(producer, "mint_llm_block", fake_mint)
+    monkeypatch.setattr(producer, "mint_turn_llm", fake_mint)
 
     trace_token = set_trace_context(TraceContext(session_id="conv-router"))
     try:
@@ -1096,7 +1097,8 @@ async def test_router_binding_mints_per_turn_key_in_hosted_org_mode(monkeypatch)
     # with an older dependency that never reads it when building headers.
     metadata = json.loads(requests[0].headers["Langfuse-Metadata"])
     assert metadata["role"] == "router"
-    assert turn_llm == {"correlation_id": minted["corr"], "llm": block}
+    assert turn_llm == {"correlation_id": minted["corr"],
+                        "llm": producer.TurnLlm(block=block, turn_key_id=None, ttl_seconds=1200)}
     # The routing gate's own pre-mint must carry the caller's picked workspace
     # too — this key is what a delegated remote turn ends up reusing as its
     # `llm` block, so skipping it here would silently exempt every hosted-org
@@ -1129,9 +1131,12 @@ async def test_router_binding_omits_workspace_id_when_none_picked(monkeypatch):
 
     async def fake_mint(*, org_id, user_id, correlation_id, settings, workspace_id=None):
         minted["workspace_id"] = workspace_id
-        return {"provider": "minds-cloud", "api_key": "mdb_test", "base_url": "http://gw/v1"}
+        return producer.TurnLlm(
+            block={"provider": "minds-cloud", "api_key": "mdb_test", "base_url": "http://gw/v1"},
+            turn_key_id=None, ttl_seconds=1200,
+        )
 
-    monkeypatch.setattr(producer, "mint_llm_block", fake_mint)
+    monkeypatch.setattr(producer, "mint_turn_llm", fake_mint)
 
     await handler._router_binding()
 
@@ -1168,15 +1173,17 @@ async def test_router_binding_hands_the_key_prefix_to_the_turn_when_datasources_
 
     async def fake_mint(*, org_id, user_id, correlation_id, settings, workspace_id=None):
         minted["workspace_id"] = workspace_id
-        return block, "mdb_gate"
+        return producer.TurnLlm(block=block, turn_key_id="mdb_gate", ttl_seconds=6000)
 
-    monkeypatch.setattr(producer, "_mint_llm_block_with_turn_key_id", fake_mint)
+    monkeypatch.setattr(producer, "mint_turn_llm", fake_mint)
     monkeypatch.setattr(producer, "mint_llm_block", AsyncMock(side_effect=AssertionError("minted without the prefix")))
 
     _, turn_llm = await handler._router_binding()
 
-    assert turn_llm["llm"] == block
-    assert turn_llm["turn_key_id"] == "mdb_gate"
+    assert turn_llm["llm"].block == block
+    assert turn_llm["llm"].turn_key_id == "mdb_gate"
+    # The producer sizes the job's time limit to the key auth actually minted.
+    assert turn_llm["llm"].ttl_seconds == 6000
     # The workspace a person picked binds the key whether or not datasources are on.
     assert minted["workspace_id"] == "ws-picked"
 
@@ -1200,13 +1207,14 @@ async def test_the_gate_mints_a_prefixed_key_when_either_setting_needs_one(monke
         lambda scope: SimpleNamespace(resolved_router_provider=Provider.MINDS_CLOUD, resolved_router_model="kimi",
                                       resolved_gate_model="mindshub_air", hub_workspace_id=""),
     )
-    block = {"provider": "minds-cloud", "api_key": "mdb_gate.secret", "base_url": "http://gw/v1"}
-    monkeypatch.setattr(producer, "_mint_llm_block_with_turn_key_id", AsyncMock(return_value=(block, "mdb_gate")))
-    monkeypatch.setattr(producer, "mint_llm_block", AsyncMock(return_value=block))
+    from cowork.turnqueue.auth_keys import MintedTurnKey
+
+    monkeypatch.setattr(producer, "mint_turn_key_details", AsyncMock(
+        return_value=MintedTurnKey(key="mdb_gate.secret", prefix="mdb_gate", ttl_seconds=1200)))
 
     _, turn_llm = await handler._router_binding()
 
-    assert turn_llm.get("turn_key_id") == ("mdb_gate" if prefixed else None)
+    assert turn_llm["llm"].turn_key_id == ("mdb_gate" if prefixed else None)
 
 
 @pytest.mark.asyncio
@@ -3046,7 +3054,8 @@ async def test_a_failed_gate_revokes_the_key_it_minted(monkeypatch):
     llm_block = {"provider": "minds-cloud", "api_key": "turn-key", "base_url": "https://minds.example/v1"}
 
     async def fake_binding():
-        return None, {"correlation_id": "corr-gate", "llm": llm_block}
+        return None, {"correlation_id": "corr-gate",
+                      "llm": TurnLlm(block=llm_block, turn_key_id=None, ttl_seconds=1200)}
 
     handler._router_binding = fake_binding
 
@@ -3083,7 +3092,8 @@ async def test_a_failed_gate_cancels_the_first_take_before_revoking_its_key(monk
     llm_block = {"provider": "minds-cloud", "api_key": "turn-key", "base_url": "https://minds.example/v1"}
 
     async def fake_binding():
-        return None, {"correlation_id": "corr-gate", "llm": llm_block}
+        return None, {"correlation_id": "corr-gate",
+                      "llm": TurnLlm(block=llm_block, turn_key_id=None, ttl_seconds=1200)}
 
     handler._router_binding = fake_binding
     events = []
@@ -3125,7 +3135,8 @@ async def test_a_gate_cancelled_after_its_mint_revokes_the_key(monkeypatch):
     llm_block = {"provider": "minds-cloud", "api_key": "turn-key", "base_url": "https://minds.example/v1"}
 
     async def fake_binding():
-        return None, {"correlation_id": "corr-gate", "llm": llm_block}
+        return None, {"correlation_id": "corr-gate",
+                      "llm": TurnLlm(block=llm_block, turn_key_id=None, ttl_seconds=1200)}
 
     handler._router_binding = fake_binding
 
@@ -3306,3 +3317,166 @@ async def test_pinned_scheduled_turn_bypasses_direct_answers(monkeypatch, schedu
     with pytest.raises(Routed):
         await handler.handle(ResponsesRequest(input="Say hi.", model=model, stream=True))
     assert bool(gate_calls) == (expected == DIRECT_CONTEXT)
+
+
+@pytest.mark.parametrize("request_extra", [
+    {"doc_context": {"artifactId": "a" * 32, "title": "Plan", "mode": "edit",
+                     "selection": {"blockIds": ["b_12345678"], "quote": "The checkout change needs a security review."}}},
+    {"doc_context": {"artifactId": "a" * 32, "title": "Plan", "request": "Shorter, please."}},
+    {"output": "doc"},
+])
+@pytest.mark.asyncio
+async def test_a_turn_about_a_doc_goes_to_the_agent_not_the_gate(monkeypatch, request_extra):
+    """"Make this more concise" on a selection must edit the doc. Answered
+    directly, the rewrite landed in the chat and the doc stayed as it was."""
+    from functools import partial
+
+    import cowork.handlers.responses as responses
+    from cowork.db.scoped import LOCAL_SCOPE
+    from cowork.db.units import run_db
+    from cowork.schemas.responses import ResponsesRequest
+    from cowork.services.conversations import ConversationService
+
+    class _NoHistory(ConversationService):
+        def get_ordered_messages(self, *args, **kwargs):
+            raise AssertionError("must not read the gate's history")
+
+        def get_recent_messages(self, *args, **kwargs):
+            raise AssertionError("must not read the gate's history")
+
+    handler = _routing_handler(monkeypatch)
+    monkeypatch.setattr(responses, "ConversationService", _NoHistory)
+    request = ResponsesRequest(input="Make this more concise.", **request_extra)
+
+    start = await run_db(
+        partial(handler._read_turn_start, request=request, has_disabled_connections=False),
+        scope=LOCAL_SCOPE,
+    )
+    decision, turn_llm = await handler._route_request(
+        conversation_id=start.conversation_id,
+        harness_input=start.harness_input,
+        gate_rows=start.gate_rows,
+        has_attachments=False,
+        has_disabled_connections=False,
+        has_doc=responses._turn_needs_doc_agent(request),
+    )
+
+    assert start.gate_rows == []
+    assert decision.route == DELEGATED_AGENTIC
+    assert decision.reason == "doc_context_present"
+    assert turn_llm is None
+
+
+@pytest.mark.parametrize(("doc_context", "needs_agent"), [
+    ({"artifactId": "a" * 32, "title": "Plan"}, False),
+    ({"artifactId": "a" * 32, "selection": {"blockIds": [], "quote": None}}, False),
+    ({"artifactId": "a" * 32, "selection": {"blockIds": ["b_1"]}}, True),
+    ({"artifactId": "a" * 32, "selection": {"quote": "GA slips"}}, True),
+    ({"artifactId": "a" * 32, "request": "Shorter"}, True),
+])
+def test_only_a_selection_or_an_edit_request_on_the_open_doc_skips_the_gate(doc_context, needs_agent):
+    import cowork.handlers.responses as responses
+    from cowork.schemas.responses import ResponsesRequest
+
+    request = ResponsesRequest(input="Thanks!", doc_context=doc_context)
+    assert responses._turn_has_doc(request) is True
+    assert responses._turn_needs_doc_agent(request) is needs_agent
+
+
+@pytest.mark.asyncio
+async def test_with_a_doc_merely_open_the_llm_gate_decides_and_is_told_a_doc_is_open(monkeypatch):
+    """Jev cannot be told about the doc, so the LLM gate decides; it sees one
+    short line, never the doc's ids."""
+    import cowork.handlers.responses as responses
+    from cowork.docs.prompt import doc_context_block
+    from cowork.handlers.response_routing import _SYSTEM_PROMPT, DOC_OPEN_MARKER
+
+    handler = _routing_handler(monkeypatch)
+    handler._jev_gate = lambda _turn_llm: "jev"
+    seen = {}
+
+    async def fake_decide_route(**kwargs):
+        seen.update(kwargs)
+        return RouteDecision(route=DELEGATED_AGENTIC, reason="test")
+
+    monkeypatch.setattr(responses, "decide_route", fake_decide_route)
+    block = doc_context_block({"artifactId": "a" * 32, "title": "Plan"})
+    await handler._route_request(
+        conversation_id=None,
+        gate_rows=[],
+        harness_input=[{"type": "text", "text": block}, {"type": "text", "text": "Thanks!"}],
+        has_attachments=False,
+        has_disabled_connections=False,
+        doc_open=True,
+    )
+
+    assert seen["jev"] is None
+    latest = seen["history"][-1]["content"]
+    assert DOC_OPEN_MARKER in latest and "Thanks!" in latest and "a" * 32 not in latest
+    assert DOC_OPEN_MARKER in _SYSTEM_PROMPT
+
+
+def test_a_message_carries_the_open_doc_and_the_output_choice_ahead_of_the_words_typed():
+    from types import SimpleNamespace
+
+    from cowork.docs.prompt import DOC_OUTPUT_NOTE
+    from cowork.handlers.responses import ResponsesHandler
+    from cowork.schemas.responses import ResponsesRequest
+
+    request = ResponsesRequest(
+        input="Make the risks section shorter",
+        doc_context={"artifactId": "33e65fe7f08743aba742e888db31ae1a", "tab": "t_1", "rev": 7,
+                     "selection": {"blockIds": ["b_1"], "quote": "GA slips"}},
+        output="doc",
+    )
+    texts = [b["text"] for b in ResponsesHandler._build_harness_input(SimpleNamespace(), request, session=None)]
+    assert texts[0].startswith("<doc-view-context>") and '"quote": "GA slips"' in texts[0]
+    assert texts[1] == DOC_OUTPUT_NOTE
+    assert texts[2] == "Make the risks section shorter"
+
+
+@pytest.mark.parametrize("request_extra", [
+    {"doc_context": {"artifactId": "a" * 32, "title": "Plan", "mode": "edit",
+                     "selection": {"blockIds": ["b_12345678"], "quote": "GA slips"}}},
+    {"output": "doc"},
+])
+def test_a_remote_turn_is_answered_without_the_open_doc_or_the_output_choice(monkeypatch, request_extra):
+    """Without remote_docs the worker pod has no doc tools: the blocks would have
+    the model call tools it doesn't have. Dropped, the turn is any other turn,
+    the gate's to answer as well. With remote_docs the pod gets the tools, and
+    the blocks stay."""
+    from types import SimpleNamespace
+
+    import cowork.handlers.responses as responses
+    from cowork.handlers.responses import ResponsesHandler
+    from cowork.schemas.responses import ResponsesRequest
+
+    monkeypatch.setenv("COWORK_TURN_BACKEND", "remote")
+    remote = ResponsesRequest(input="Make the risks section shorter", stream=True, **request_extra)
+    texts = [b["text"] for b in ResponsesHandler._build_harness_input(SimpleNamespace(), remote, session=None)]
+    assert texts == ["Make the risks section shorter"]
+    assert responses._turn_has_doc(remote) is False
+
+    # With the request's remote_docs decision, the pod gets the doc tools and the blocks.
+    kept = ResponsesHandler._build_harness_input(SimpleNamespace(), remote, session=None, remote_docs=True)
+    assert len(kept) == 2 and kept[-1]["text"] == "Make the risks section shorter"
+    assert responses._turn_has_doc(remote, remote_docs=True) is True
+
+    # A non-streaming turn runs in this process whatever the backend, doc tools and all.
+    here = ResponsesRequest(input="Make the risks section shorter", stream=False, **request_extra)
+    assert len(ResponsesHandler._build_harness_input(SimpleNamespace(), here, session=None)) == 2
+    assert responses._turn_has_doc(here) is True
+
+
+def test_a_new_conversation_is_titled_by_what_the_person_typed():
+    from cowork.docs.prompt import DOC_OUTPUT_NOTE, doc_context_block
+    from cowork.handlers.responses import _title_text
+
+    blocks = [
+        {"type": "text", "text": doc_context_block({"artifactId": "a" * 32, "title": "Plan", "mode": "edit"})},
+        {"type": "text", "text": DOC_OUTPUT_NOTE},
+        {"type": "text", "text": "Give me three tips for a good team retro."},
+    ]
+    assert _title_text(blocks) == "Give me three tips for a good team retro."
+    # Nothing typed but the context: still a title, not an empty row.
+    assert _title_text(blocks[:1]).startswith("<doc-view-context>")
