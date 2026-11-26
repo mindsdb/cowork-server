@@ -56,6 +56,7 @@ from anton.core.artifacts.internal_files import (
     is_bytecode_name,
 )
 from anton.core.artifacts.store import iter_content_files
+from cowork.services.artifact_revisions import INLINE_STATE_FILE
 
 if TYPE_CHECKING:
     from cowork.db.scoped import ScopedSession, TenantScope
@@ -355,6 +356,18 @@ def _user_files_with_mtimes(folder: Path) -> list[tuple[Path, int]]:
     return out
 
 
+def _content_clock_ns(folder: Path) -> int:
+    """Newest mtime (ns) across the files that make up the artifact's page.
+
+    An inline html-app's top-level `state.json` is left out: it is the
+    viewer's picks (ENG-4684), saved on every change. Counting it would bump
+    the card's cache-bust token on each save, so every open frame of the
+    artifact reloads, saves its state again and reloads again.
+    """
+    state = folder / INLINE_STATE_FILE
+    return max((ns for path, ns in _user_files_with_mtimes(folder) if path != state), default=0)
+
+
 def _user_files(folder: Path) -> list[Path]:
     """All non-housekeeping files inside an artifact folder, sorted by mtime desc."""
     return [p for p, _ in _user_files_with_mtimes(folder)]
@@ -474,8 +487,7 @@ def _content_mtime(folder: Path) -> int:
     since publish" gate for the `modified` badge.
     """
     try:
-        max_ns = max((ns for _, ns in _user_files_with_mtimes(folder)), default=0)
-        return max_ns // 1_000_000_000
+        return _content_clock_ns(folder) // 1_000_000_000
     except OSError:
         return 0
 
@@ -495,7 +507,7 @@ def content_mtime_ns(folder: Path) -> int:
     to notice two edits that landed in the same second.
     """
     try:
-        return max((ns for _, ns in _user_files_with_mtimes(folder)), default=0)
+        return _content_clock_ns(folder)
     except OSError:
         return 0
 
