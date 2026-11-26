@@ -1,5 +1,5 @@
 version = 1
-revision = 5
+revision = 3
 requires-python = ">=3.12, <3.14"
 resolution-markers = [
     "python_full_version >= '3.13' and platform_machine == 'x86_64' and sys_platform == 'darwin'",
@@ -141,7 +141,7 @@ wheels = [
 
 [[package]]
 name = "anton-agent"
-version = "2.26.11.18.1rc1"
+version = "2.26.11.23.1"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "anthropic" },
@@ -163,9 +163,9 @@ dependencies = [
     { name = "truststore" },
     { name = "typer" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/40/13/c479b956e882629fd59599dbf1de78af28e536731f6dbf0cc6d653463de8/anton_agent-2.26.11.18.1rc1.tar.gz", hash = "sha256:296b427a5d84e3594b68f1a280047b9dd88dc283c7e4e5865f5294431c8715a9", size = 7596727, upload-time = "2026-11-18T16:52:54.219Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/b1/46/5b55359ad4b37f58d8cbf6c488059fffc258dde44cff65467fa93c519933/anton_agent-2.26.11.23.1.tar.gz", hash = "sha256:fad26e2be525ff275aaf5d7a2f065a490e7accbf8ae7ff89816c0fe299ad0fe9", size = 7678092, upload-time = "2026-11-23T02:25:19.774Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/c0/8d/01e720e6215ce819b5e001adc72bed53f5eb86d0b5e8cf4a9b38a5cf3df0/anton_agent-2.26.11.18.1rc1-py3-none-any.whl", hash = "sha256:c634cb234c7fb23672ac39472d255b466dd5f0e5b282ebbad01e9607e8b6bb36", size = 4516724, upload-time = "2026-11-18T16:52:51.906Z" },
+    { url = "https://files.pythonhosted.org/packages/6b/e6/c9b0c3ef1b0e09582d4195af437bd96806c403ca773df917a6d8947c56e1/anton_agent-2.26.11.23.1-py3-none-any.whl", hash = "sha256:fbc38ca3f89bc50878289318e5818a7c5ba95be41e40c28ca1efc5daa5d9f145", size = 4542456, upload-time = "2026-11-23T02:25:17.969Z" },
 ]
 
 [[package]]
@@ -459,7 +459,7 @@ requires-dist = [
     { name = "aiohttp", specifier = ">=3.14" },
     { name = "aiohttp", marker = "extra == 'channels'", specifier = ">=3.9.0" },
     { name = "alembic", specifier = ">=1.17.0" },
-    { name = "anton-agent", specifier = ">=2.26.11.18.1rc1,<3" },
+    { name = "anton-agent", specifier = ">=2.26.11.23.1,<3" },
     { name = "anyio", specifier = ">=4.14.2" },
     { name = "beautifulsoup4", specifier = "==4.15.0" },
     { name = "cryptography", specifier = ">=48.0.0,<51" },
@@ -480,7 +480,7 @@ requires-dist = [
     { name = "pydantic", specifier = ">=2.12.5" },
     { name = "pydantic-settings", specifier = ">=2.14.2" },
     { name = "pyjwt", specifier = ">=2.15.0" },
-    { name = "pypdf", specifier = "==6.21.1" },
+    { name = "pypdf", specifier = "==6.21.4" },
     { name = "python-docx", specifier = "==1.2.0" },
     { name = "python-dotenv", specifier = ">=1.2.2" },
     { name = "python-multipart", specifier = ">=0.0.28" },
@@ -998,14 +998,14 @@ wheels = [
 
 [[package]]
 name = "mako"
-version = "1.3.12"
+version = "1.4.3"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "markupsafe" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/00/62/791b31e69ae182791ec67f04850f2f062716bbd205483d63a215f3e062d3/mako-1.3.12.tar.gz", hash = "sha256:9f778e93289bd410bb35daadeb4fc66d95a746f0b75777b942088b7fd7af550a", size = 400219, upload-time = "2026-04-28T19:01:08.512Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/5a/09/e07c4b5579a79f4b16f8d4f29f6c54514ac787c4ad506b8c4f28a0e6b0bf/mako-1.4.3.tar.gz", hash = "sha256:cd6537fe88d5fec315c55c2f8529bc4ce7a9a352ad7db3eeaa6a66e2dd4ec37a", size = 412799, upload-time = "2026-09-22T20:54:31.509Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/bc/b1/a0ec7a5a9db730a08daef1fdfb8090435b82465abbf758a596f0ea88727e/mako-1.3.12-py3-none-any.whl", hash = "sha256:8f61569480282dbf557145ce441e4ba888be453c30989f879f0d652e39f53ea9", size = 78521, upload-time = "2026-04-28T19:01:10.393Z" },
+    { url = "https://files.pythonhosted.org/packages/6d/a0/053d6af3e8f871e0073b4a36732d9e65be77a72e5434c31b94f6af78a6bb/mako-1.4.3-py3-none-any.whl", hash = "sha256:723296007c870bfd6b3f0c3230dba7198096e5269297ebf5e4eff9e7ffa39d4f", size = 80164, upload-time = "2026-09-22T20:54:33.128Z" },
 ]
 
 [[package]]
@@ -1632,11 +1632,11 @@ crypto = [
 
 [[package]]
 name = "pypdf"
-version = "6.21.1"
+version = "6.21.4"
 source = { registry = "https://pypi.org/simple" }
-sdist = { url = "https://files.pythonhosted.org/packages/51/e1/32a9c4dbd94618145f8bab5c623bdb0a528f23fc8719afd77ba0278fd377/pypdf-6.21.1.tar.gz", hash = "sha256:2d62c383acd6e0dff0a96322ba8b1135229343b084d73c6f6cfd947fd291afcb", size = 7088597, upload-time = "2026-10-17T10:29:52.801Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/1e/e1/ec8f4d155c997c45917153a5521e60d6ee6389d68abdcbc8e44e564caffc/pypdf-6.21.4.tar.gz", hash = "sha256:c8817e3f888d47a087872ded69812c1ef30cacb871d6e053e0c00bbaf0bc2163", size = 7109255, upload-time = "2026-10-28T17:00:54.81Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/85/e6/24c944e473c34e818cf1b98085796fcd780465ecfe17663f2bf8fee1958b/pypdf-6.21.1-py3-none-any.whl", hash = "sha256:553e2d42f5bb3bb2a785a7d3de8ef90bb7df74b5413eff5a7b4388007ea9254b", size = 405134, upload-time = "2026-10-17T10:29:50.687Z" },
+    { url = "https://files.pythonhosted.org/packages/3f/4b/77e8ad4ac42c9d93600f40541a50e9feb3a61d2bbee2d76f659346072051/pypdf-6.21.4-py3-none-any.whl", hash = "sha256:33e4fb41ca352810eb4e9838aa0d82d6888a5f8bf682f43e99cce5faa666255c", size = 410430, upload-time = "2026-10-28T17:00:53.146Z" },
 ]
 
 [[package]]
@@ -1919,11 +1919,11 @@ wheels = [
 
 [[package]]
 name = "soupsieve"
-version = "2.8.4"
+version = "4.1.3"
 source = { registry = "https://pypi.org/simple" }
-sdist = { url = "https://files.pythonhosted.org/packages/47/2c/0a5f6f8ee0d5589e48c7640213ed5175d52cf540a06725b628cc1a45d6ce/soupsieve-2.8.4.tar.gz", hash = "sha256:e121fd02e975c695e4e9e8774a5ee35d74714b59307868dcc5319ad2d9e3328e", size = 121110, upload-time = "2026-05-24T13:55:57.154Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/82/77/d59ca6aa338bdd8d880234d15b7c466cb176e44502899a9df81ba2e13cd0/soupsieve-4.1.3.tar.gz", hash = "sha256:13f70186c8f40bf8d0ff7bbab09a18fb149600b465269207b5e5b588f55fda08", size = 181564, upload-time = "2026-11-20T12:58:27.613Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/5e/f5/0c41cb68dcae6b7de4fac4188a3a9589e21fb31df21ea3a2e888db95e6c9/soupsieve-2.8.4-py3-none-any.whl", hash = "sha256:e7e6b0769c8f51ed59acab6e994b00621096cfb1c640a7509295987388fbaf65", size = 37304, upload-time = "2026-05-24T13:55:55.406Z" },
+    { url = "https://files.pythonhosted.org/packages/f6/f7/be207468cac6ad79389f36cf1fce4f2836960df91659979ec486c727bb2e/soupsieve-4.1.3-py3-none-any.whl", hash = "sha256:7a390d1a57d1ab7bb228531e9b8a750a5ebf87db774e0ef6faeeac057d22a5bf", size = 59792, upload-time = "2026-11-20T12:58:26.459Z" },
 ]
 
 [[package]]

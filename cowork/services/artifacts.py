@@ -34,6 +34,7 @@ from urllib.parse import quote
 
 from cowork.code_sandbox import backends_off_message, build_cell_sandbox, code_sandbox_on
 from cowork.common.minds_tls import minds_ssl_verify
+from cowork.docs.store import DOC_HTML, is_doc_primary
 from cowork.common.paths import (
     O_NOFOLLOW,
     PinnedDir,
@@ -45,6 +46,7 @@ from cowork.common.paths import (
     dir_unlink,
 )
 from cowork.common.settings.app_settings import get_app_settings
+from cowork.services.connectors.sealed_vault import SealedRecordError
 from cowork.db.personal_resources import PersonalResource
 from cowork.models.artifact_owner_choice import AccessMode
 from cowork.schemas.artifact_access import ArtifactAccessView, ArtifactStatusView
@@ -583,9 +585,11 @@ def _modified_state(
     # `folder.parent` IS the artifacts root: artifacts always live at
     # `<base>/<slug>/`. Passing it explicitly is what makes the badge work in org
     # mode, where the module-level FS scan finds no roots at all.
+    # A doc publishes its rendered page, so that page is what changed or not.
+    target = primary if primary.name == DOC_HTML else folder
     try:
         current_md5 = compute_publish_md5(
-            folder, artifacts_base=artifacts_base or folder.parent
+            target, artifacts_base=artifacts_base or folder.parent
         )
     except MarkdownRenderBusy:
         return False, False  # another conversion runs: can't tell yet
@@ -1083,20 +1087,43 @@ def _unpublish_folder(
             )
             continue
         if not (folder / name).is_file():
-            # The path-based unpublish needs the file present, so this record
-            # cannot be cleared upstream — and once the folder is gone there is
-            # nothing left pointing at the remote copy. No metrics backend
-            # exists here, so this log line is the metric; keep the prefix.
-            logger.warning(
-                "orphaned_publish identifier=%s url=%s reason=primary_missing",
-                entry.get("report_id") or entry.get("last_md5"),
-                entry.get("url", ""),
+            # The path-based unpublish needs the file present. Take the page
+            # down by its recorded id instead: once the folder is gone nothing
+            # is left pointing at the remote copy, and its viewers' analytics
+            # go with it upstream.
+            _unpublish_missing_primary(
+                folder, name, entry, api_key=api_key, publish_url=publish_url, scope=scope,
             )
             continue
         unpublish_artifact(
             folder / name, artifacts_base=artifacts_base,
             api_key=api_key, publish_url=publish_url, scope=scope,
         )
+
+
+def _unpublish_missing_primary(
+    folder: Path, name: str, entry: dict, *, api_key: str, publish_url: str,
+    scope: TenantScope | None,
+) -> None:
+    """Take down a recorded page whose primary file is gone, by its recorded
+    id. On a protected publisher only an id the owner record ties to this
+    page is sent (`_unpublish_protected_pages` does the same)."""
+    from cowork.services.published_page_ownership import publication_owner
+
+    with publication_owner(
+        folder / name, published_dir=folder, publish_url=publish_url, scope=scope,
+    ) as ownership:
+        identifier = entry.get("report_id") or entry.get("last_md5")
+        if ownership is not None:
+            identifier = ownership.checked_report_id(entry.get("report_id"), url=entry.get("url", ""))
+        if not identifier:
+            return
+        logger.info(
+            "published_page_take_down identifier=%s url=%s reason=primary_missing",
+            identifier,
+            entry.get("url", ""),
+        )
+        _unpublish_identifier(str(identifier), entry, api_key=api_key, publish_url=publish_url)
 
 
 def _unpublish_identifier(
@@ -1145,9 +1172,10 @@ class _PageToTakeDown(NamedTuple):
 
 
 def _pages_to_take_down(*, folder: PinnedDir, published_map: dict) -> list[_PageToTakeDown]:
-    """The pages ``published_map`` records as live whose primary is still a
-    regular file in ``folder``. A page whose primary name is invalid or whose
-    primary is gone is logged as an orphaned publish and left up."""
+    """The pages ``published_map`` records as live. A page whose primary name
+    is invalid is logged as an orphaned publish and left up. A page whose
+    primary is gone is listed too: it comes down by its recorded id, which
+    needs no file, so deleting the folder leaves no live page behind."""
     pages: list[_PageToTakeDown] = []
     for name, entry in published_map.items():
         if not isinstance(entry, dict) or entry.get("published") is False:
@@ -1167,12 +1195,11 @@ def _pages_to_take_down(*, folder: PinnedDir, published_map: dict) -> list[_Page
         except OSError:
             primary_stat = None
         if primary_stat is None or not stat.S_ISREG(primary_stat.st_mode):
-            logger.warning(
-                "orphaned_publish identifier=%s url=%s reason=primary_missing",
+            logger.info(
+                "published_page_take_down identifier=%s url=%s reason=primary_missing",
                 identifier,
                 entry.get("url", ""),
             )
-            continue
         pages.append(_PageToTakeDown(name, str(identifier), entry))
     return pages
 
@@ -1413,8 +1440,13 @@ async def delete_artifact_from_source(
     publish_url: str,
     scope: TenantScope,
     deadline: bool = True,
+    remove: bool = True,
 ) -> None:
     """Delete one direct artifact child through pinned directory descriptors.
+
+    Without ``remove`` it only takes the folder's pages down, the same way,
+    and leaves the folder: a project delete takes down every artifact's
+    pages before it removes the project's files (`take_down_artifact_pages`).
 
     The older :func:`delete_artifact` remains the desktop/path-oriented public
     helper. HTTP deletion has stronger information: an authorized
@@ -1460,8 +1492,44 @@ async def delete_artifact_from_source(
     finally:
         if pinned:
             await run_efs(
-                partial(_finish_delete, pinned=pinned[0], remove=taken_down), scope=scope, deadline=False,
+                partial(_finish_delete, pinned=pinned[0], remove=taken_down and remove),
+                scope=scope,
+                deadline=False,
             )
+
+
+def has_live_pages(folder: Path) -> bool:
+    """Whether ``folder``'s publish record names a page that is still up.
+    A cheap first look, path-based: the take-down pins the folder itself."""
+    return any(
+        isinstance(entry, dict)
+        and entry.get("published") is not False
+        and bool(entry.get("report_id") or entry.get("last_md5"))
+        for entry in _load_published_map(folder).values()
+    )
+
+
+async def take_down_artifact_pages(
+    *,
+    source: ProjectArtifacts,
+    folder_name: str,
+    api_key: str,
+    publish_url: str,
+    scope: TenantScope,
+) -> None:
+    """Take down every live page of one artifact and keep its folder: the
+    artifact delete's take-down (`delete_artifact_from_source`), recorded in
+    its publish record the same way. Raises as that does when a page fails to
+    come down, with the pages already down recorded."""
+    await delete_artifact_from_source(
+        source=source,
+        folder_name=folder_name,
+        expected_artifact_id=None,
+        api_key=api_key,
+        publish_url=publish_url,
+        scope=scope,
+        remove=False,
+    )
 
 
 def reveal_in_file_manager(path: Path) -> None:
@@ -1547,6 +1615,11 @@ def _prepare_artifact_card(
     primary_ext = logical_primary.suffix.lower() if logical_primary is not None else ""
     artifact_type = meta.type or "mixed"
     kind = KIND_BY_TYPE.get(artifact_type) or KIND_BY_EXT.get(primary_ext, "File")
+    # A doc (cowork.docs) is a document artifact whose primary is the doc file;
+    # the renderer opens it in the doc editor rather than as a JSON file.
+    is_doc = is_doc_primary(logical_primary.name if logical_primary is not None else meta.primary)
+    if is_doc:
+        kind = "Doc"
     is_live = False
     if primary is not None:
         # `primary_hint` can point at a file `_user_files` skipped (e.g. a
@@ -1562,7 +1635,12 @@ def _prepare_artifact_card(
 
     from cowork.services.artifact_identity import artifact_key
 
-    access = published_access_view(io_folder, primary, published_map=published_map)
+    # A doc is shared as its rendered page (doc.html, rewritten on every
+    # write), so its publish state, access and "modified" badge are the page's,
+    # not the JSON's.
+    doc_html = io_folder / DOC_HTML if is_doc else None
+    shared_page = doc_html if doc_html is not None else primary
+    access = published_access_view(io_folder, shared_page, published_map=published_map)
     # Left out here, at the one card builder, so inline chat cards are covered
     # too. In org mode the owner reads the password and the emails from GET
     # .../access, which can tell owner from co-member. `accessMode` stays:
@@ -1609,7 +1687,7 @@ def _prepare_artifact_card(
         # still reachable is the client's call: it already knows its own
         # conversations and can fetch the rest.
         origin_conversation_id=origin_conversation_id(meta),
-        published_url=_published_url_for(io_folder, primary, published_map=published_map),
+        published_url=_published_url_for(io_folder, shared_page, published_map=published_map),
         # Set explicitly so `to_json()` (exclude_unset) keeps the key for a caller
         # that doesn't assign it.
         modified=False,
@@ -1621,6 +1699,11 @@ def _prepare_artifact_card(
             project_name=project_name,
         ),
     )
+    if doc_html is not None:
+        card.format = "doc"
+        card.html_path = str(logical_folder / DOC_HTML)
+        if doc_html.is_file():
+            primary = doc_html
     if primary is not None:
         # macOS commonly exposes the same temporary directory through both
         # ``/var`` and ``/private/var``. Canonicalize both sides before deriving
@@ -2200,6 +2283,9 @@ def preview_mount_for(token: str, *, scope: TenantScope | None) -> Path | None:
 # `.html` is served as-is; `.md` is rendered to a styled HTML page first
 # (see `publish._render_markdown_to_html`). Fullstack artifacts bypass this —
 # they publish their directory regardless of the primary file's suffix.
+# Files that aren't web pages (PDF, Word, ...) publish too, as a page of their
+# own (`file_page.PUBLISHABLE_FILE_SUFFIXES`, ENG-4687), but aren't listed by
+# `html_artifacts`: in a page's folder they are its supporting files.
 PUBLISHABLE_STATIC_SUFFIXES = (".html", ".md")
 _PUBLISHABLE_LIST_LIMIT = 40
 
@@ -2554,6 +2640,14 @@ async def _launch_backend_locked(
                     )
                     continue
                 extra_env.update(env)
+    except SealedRecordError as error:
+        # A sealed connection that won't open keeps the backend down, naming
+        # it, rather than starting it without that connection.
+        logger.error(
+            "A saved connection can't be opened, so the app backend doesn't start",
+            extra={"event": "sealed_connection_unopenable", "connection": error.connection, "reason": error.cause},
+        )
+        return BackendStatus(running=False, detail=str(error), port=0)
     except Exception:
         logger.warning(
             "Could not build datasource env for backend launch of %s", slug, exc_info=True

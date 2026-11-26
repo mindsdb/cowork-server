@@ -55,6 +55,7 @@ from cowork.harnesses.anton_harness.scratchpad_cell_replay import SCRATCHPAD_REP
 from cowork.harnesses.anton_harness.settings import AntonHarnessSettings
 from cowork.services.connectors.connections import service
 from cowork.services.connectors.notion_pages import describe_project_pages
+from cowork.services.conversation_folders import ConversationFolderService, folder_refusal
 from cowork.services.conversations import read_earlier_answers
 from cowork.services.live_apps import (
     TurnLiveApps,
@@ -265,6 +266,11 @@ def _overlay_user_settings(anton_settings, user) -> list[str]:
     if getattr(user, "jev_decisions_enabled", True) is False and hasattr(anton_settings, "verifier_jev"):
         anton_settings.verifier_jev = "off"
         applied.append("verifier_jev")
+    # The same pattern for classify(): only ever turns it off. An anton that
+    # predates the setting has no classify() to turn off.
+    if getattr(user, "jev_classify_enabled", True) is False and hasattr(anton_settings, "classify_jev"):
+        anton_settings.classify_jev = "off"
+        applied.append("classify_jev")
     return applied
 
 
@@ -433,28 +439,75 @@ def _inside_project(base: Path, *, folder: Path) -> Path:
 settings = AntonHarnessSettings()
 
 
-def build_elicitor(conversation_id: str, *, interactive: bool = True):
-    """The question strategy for this conversation, or None when disabled or
-    when nobody watches the turn (``interactive`` False: a scheduled run).
-    Unattended, a question or a browser hand-over would only wait out its
-    timeout; without an elicitor the agent learns at once that nobody can
-    answer, as a pod turn without ``interactive`` does.
+def _anton_approval_kind() -> str | None:
+    """anton's approval capability, or None for an anton that predates it.
+    Such an anton's artifact brief reads any elicitor as someone who can
+    confirm it, so a scheduled run there gets no elicitor. Read with
+    getattr, so the anton floor doesn't move."""
+    from anton.core.interaction import elicit
 
-    Returning None is the kill switch: anton only registers `ask_user` when
-    an elicitor supports "choice", so the model reverts to asking in plain
-    text with no silent-failure window. This holds only as long as the
-    ChatSessionConfig built from this value is not also given a `console`:
-    with elicitor=None and a console present, anton constructs its own
-    CLIElicitor (which does support "choice"), silently reopening the
-    switch. See tests/test_ask_user_flag.py for the guard.
+    return getattr(elicit, "APPROVAL_KIND", None)
+
+
+def build_elicitor(
+    conversation_id: str, *, interactive: bool = True, write_approval: bool = False
+):
+    """The question strategy for this conversation's turn.
+
+    With questions off (COWORK_ASK_USER_ENABLED=false) it is None, the kill
+    switch: anton registers `ask_user` only when an elicitor supports
+    "choice", so the model reverts to asking in plain text with no
+    silent-failure window. No write waits on a card there either, because
+    check_write_approval_startup refuses to start the server with
+    ANTON_WRITE_APPROVAL on and questions off.
+
+    An interactive turn gets an elicitor that takes "choice": the model's
+    questions, the browser hand-over and the confirmation cards reach the
+    person watching the turn.
+
+    ``write_approval`` is the turn's own AntonSettings.write_approval, the
+    value anton's write gate reads, not this server's import-time settings.
+
+    A scheduled run (``interactive`` False) with ``write_approval`` on gets
+    an elicitor that takes only approval cards (anton's APPROVAL_KIND). A
+    person who opens the run can still approve a held write. A question, a
+    browser hand-over or a tool's own confirmation card (confirm_card) still
+    comes back at once, because the elicitor doesn't take "choice": nobody
+    waits to answer them, so they would only wait out their timeout. anton's
+    write gate remembers a card nobody answered (WriteGate.unanswered, which
+    ask_approval_choice sets and reads for every approval card) and refuses
+    the turn's later cards without asking, so the run waits out one card at
+    most.
+
+    On an anton that predates APPROVAL_KIND, a scheduled run gets no
+    elicitor even with ``write_approval`` on. That anton's artifact brief
+    reads any elicitor as someone who can confirm it, so an approvals-only
+    elicitor would stop a changed repeat brief at its confirmation. With no
+    elicitor, that anton refuses the held write at once.
+
+    A scheduled run with ``write_approval`` off gets None. With no write
+    gate, nothing remembers an unanswered card, so each approval card the run
+    raises, such as a browser step, would wait out its timeout with nobody
+    watching.
+
+    The kill switch holds only as long as the ChatSessionConfig built from
+    this value is not also given a `console`: with elicitor=None and a
+    console present, anton constructs its own CLIElicitor (which does
+    support "choice"), silently reopening the switch. See
+    tests/test_ask_user_flag.py for the guard.
     """
-    if not interactive or not get_app_settings().ask_user_enabled:
+    if not get_app_settings().ask_user_enabled:
         return None
     from cowork.harnesses.anton_harness.elicitor import CoworkElicitor
     from cowork.streaming.answers import broker
 
     # timeout_s deliberately not passed: elicitor.DEFAULT_TIMEOUT_S is the one
     # place the number lives, so this call site does not restate it.
+    if not interactive:
+        approval_kind = _anton_approval_kind()
+        if not write_approval or approval_kind is None:
+            return None
+        return CoworkElicitor(conversation_id, broker, supported_kinds=(approval_kind,))
     return CoworkElicitor(conversation_id, broker)
 
 
@@ -1057,6 +1110,91 @@ def _attachment_context_for(rows: list[_AttachedFile] | None, *, conversation) -
     )
 
 
+def _stored_folder_paths(session: ScopedSession, *, conversation_id: UUID) -> list[str]:
+    _conversation, rows = ConversationFolderService(session).list_folders(conversation_id)
+    return [row.path for row in rows]
+
+
+_FOLDER_CHECK_TIMEOUT_S = 5.0
+
+
+def _usable_folder_paths(paths: list[str], project_path: str | None) -> list[str]:
+    """The stored folder paths that still pass the working-folder rules. Touches the filesystem."""
+    return [path for path in paths if folder_refusal(path, project_path) is None]
+
+
+async def _working_folder_paths(conversation, channel_context: ChannelContext | None) -> list[str]:
+    """The chat's working folders the agent may use this turn, as absolute paths.
+
+    Read in a database unit of its own, since the harness gets the conversation
+    detached. Empty for a channel turn: the people in a Slack or Telegram chat
+    are not the desktop user who added the folders. Each folder is checked
+    again, so one that vanished or now resolves into Cowork's own data is left
+    out. Fails closed: an error offers no folders and is logged. A wait for a
+    connection that runs out is the turn's failure, so it propagates.
+    """
+    if channel_context is not None:
+        return []
+    try:
+        scope = _units_scope()
+        if scope.org_mode:
+            return []
+        paths = await run_db(
+            partial(_stored_folder_paths, conversation_id=conversation.id), scope=scope,
+        )
+        project_path = conversation.project.path if conversation.project else None
+        # Each check stats the folder, which can hang on a network share that stopped
+        # answering; a timeout offers no folders, through the handler below.
+        return await asyncio.wait_for(
+            asyncio.to_thread(_usable_folder_paths, paths, project_path),
+            timeout=_FOLDER_CHECK_TIMEOUT_S,
+        )
+    except PoolTimeoutError:
+        raise
+    except Exception:
+        logger.warning(
+            "Failed to load working folders for conversation %s; none are offered this turn",
+            getattr(conversation, "id", "<unknown>"),
+            exc_info=True,
+        )
+        return []
+
+
+def _file_access_rules(folder_paths: list[str], *, sandboxed: bool) -> str:
+    """The prompt sentences that say which files outside the project are allowed.
+
+    Without working folders this is _other_files_rule's text, so a chat that
+    never adds one sends an unchanged prompt.
+    """
+    if not folder_paths:
+        return _other_files_rule(sandboxed=sandboxed)
+    return (
+        "The only other files that you are allowed to access are any items that are attached to the conversation "
+        "and the files in the working folders below. "
+        "Access to any files not attached to the conversation and located outside both the project and the "
+        "working folders is strictly forbidden. "
+    )
+
+
+def _working_folders_context(paths: list[str]) -> str:
+    """Prompt fragment granting the agent the chat's working folders, or "" for none."""
+    if not paths:
+        return ""
+    listed = "\n".join(f"  - {path}" for path in paths)
+    return (
+        " The user has also added these working folders to THIS conversation:\n"
+        + listed
+        + "\nYou may read and write files in them through the scratchpad, using these absolute paths."
+        " Before you change, move or delete any file in a working folder, ask the user for permission first."
+        " Keep creating artifacts in the project as usual."
+        " Leave any .anton/ directory inside a working folder alone."
+        " To find or read a file in a working folder, list, search and read it in the scratchpad;"
+        " do not use read_text_file or select_path for it, because they cannot open working-folder files."
+        " When the user names a file without saying which folder, search the project and every working folder"
+        " before saying it is missing. If it is not found, say so and ask; never answer about a different file instead."
+    )
+
+
 @register
 class AntonHarness:
     id: str = "anton"
@@ -1090,6 +1228,7 @@ class AntonHarness:
         ui_locale: str | None = None,
         # The scheduler's own turn (see HarnessProvider).
         schedule_id: str | None = None,
+        docs: bool = False,
     ) -> AsyncIterator[str]:
         if get_app_settings().tenancy_mode == "org":
             # Org-mode turns must run on the remote worker, never in this
@@ -1257,6 +1396,7 @@ class AntonHarness:
                 tool_messages=tool_messages,
                 interactive=interactive,
                 ui_locale=ui_locale,
+                docs=docs,
             )
             session, turn_scratch_dir, seed_info = built.session, built.turn_scratch_dir, built.seed_info
             if model_wait is not None:
@@ -1425,7 +1565,8 @@ class AntonHarness:
                 created_at.replace(tzinfo=timezone.utc)
                 if created_at.tzinfo is None else created_at.astimezone(timezone.utc)
             )
-        ts = created_at.strftime("%Y-%m-%d %H:%M UTC") if created_at else None
+        # Same bytes as anton's live stamp, so the replayed message keeps the prompt cache.
+        ts = created_at.strftime("%Y-%m-%d %H:%M") if created_at else None
         if m.role == "user" and ts and isinstance(om.get("content"), str) and om["content"]:
             om["content"] = f"[{ts}] {om['content']}"
         return om
@@ -1598,10 +1739,17 @@ class AntonHarness:
         tool_messages: bool = False,
         interactive: bool = True,
         ui_locale: str | None = None,
+        docs: bool = False,
     ) -> BuiltChatSession:
         """Build the same core runtime the Anton CLI uses, scoped to one project
         (_build_turn_session). The live-app stops its prompt tells ride on the
-        result; a build that fails hands them back (release_stop_notices)."""
+        result; a build that fails hands them back (release_stop_notices).
+
+        ``docs``: the client shows docs, so the doc tools are registered, with
+        the short docs section of the prompt (DOC_PROMPT, on ``list_docs``) and
+        the ``doc-tools`` skill that unlocks the rest. Without it the agent never
+        hears of docs and writes none the client can't show.
+        """
         notices: list[UUID] = []
         try:
             built = await self._build_turn_session(
@@ -1614,6 +1762,7 @@ class AntonHarness:
                 interactive=interactive,
                 ui_locale=ui_locale,
                 live_app_notices=notices,
+                docs=docs,
             )
         except BaseException:
             if notices:
@@ -1643,6 +1792,7 @@ class AntonHarness:
         interactive: bool,
         live_app_notices: list[UUID],
         ui_locale: str | None = None,
+        docs: bool,
     ) -> BuiltChatSession:
         """_build_chat_session's work. ``live_app_notices`` gets the launch
         records whose stop the turn's prompt tells, which the turn claimed
@@ -1674,6 +1824,15 @@ class AntonHarness:
         REQUEST_CREDENTIALS_TOOL = build_cowork_request_credentials_tool()
         LABEL_CONNECTION_TOOL = build_cowork_label_connection_tool()
         CREATE_SKILL_DRAFT_TOOL = build_cowork_create_skill_draft_tool()
+        from .doc_tools import DocToolContext, build_doc_tools
+        doc_tool_ctx = DocToolContext(
+            artifacts_base=Path(conversation.project.path) / ".anton" / "artifacts",
+            conversation_id=str(conversation.id),
+            project_id=str(conversation.project_id) if conversation.project_id else None,
+            project_name=conversation.project.name,
+            project_label=display_label(conversation.project),
+        ) if docs else None
+        DOC_TOOLS = build_doc_tools(doc_tool_ctx) if doc_tool_ctx is not None else []
 
         try:
             from anton.core.datasources.data_vault import LocalDataVault
@@ -1714,12 +1873,22 @@ class AntonHarness:
         # skills others share with them after those (both linked into the
         # turn's scratch folder below).
         anton_settings.skills_extra_roots = [HOST_SKILLS_DIR]
+        if docs:
+            # The `doc-tools` skill unlocks the doc tools and holds the writing guide;
+            # a client without docs never hears of it.
+            from cowork.docs.prompt import DOC_SKILLS_ROOT
+
+            anton_settings.skills_extra_roots.append(DOC_SKILLS_ROOT)
 
         user = await run_on_unit_threads(get_user_settings)
         _overlay_user_settings(anton_settings, user)
 
         RECALL_HISTORY_TOOL = self._recall_history_tool(conversation, user)
-        elicitor = build_elicitor(str(conversation.id), interactive=interactive)
+        elicitor = build_elicitor(
+            str(conversation.id),
+            interactive=interactive,
+            write_approval=anton_settings.write_approval is True,
+        )
         # Asks the user's open preview whether an edited artifact runs. Only
         # where the cowork app tails the turn: a scheduled run or a channel
         # bot has no preview to answer, and would only wait out the timeout.
@@ -1803,6 +1972,9 @@ class AntonHarness:
         # Read once: the prompt lists them, and the code sandbox grants their
         # folders read-only.
         attachment_rows = await _read_attachments(conversation, scope=current_settings_scope())
+        if doc_tool_ctx is not None:
+            # An attached image may go in a doc (copied beside it).
+            doc_tool_ctx.attached_files = frozenset(Path(a.path) for a in attachment_rows or [] if a.path)
         attachment_context = _attachment_context_for(attachment_rows, conversation=conversation)
         # Canonical order (ConversationService._MESSAGE_ORDER: seq, role, id);
         # the bare `conversation.messages` relationship is unordered and would
@@ -1813,6 +1985,8 @@ class AntonHarness:
             partial(_replay_history, conversation_id=conversation.id), scope=_units_scope(),
         )
         ordered_messages = history.messages
+        # Landlock grants agent code no working folder, so a sandboxed turn offers none.
+        folder_paths = [] if sandboxed else await _working_folder_paths(conversation, channel_context)
 
         # App backends are refused under the code sandbox (`sandboxed`), so
         # the agent is never told to build one, unless live apps run them in
@@ -1853,7 +2027,7 @@ class AntonHarness:
             "Everything else in .anton/ is off limits. Do not mention the .anton/ directory in your responses. "
             "You can perform operations on these files via the scratchpad. "
             + _project_file_actions_rule(anton_settings.act_first)
-            + _other_files_rule(sandboxed=sandboxed)
+            + _file_access_rules(folder_paths, sandboxed=sandboxed)
             + "Read text files with `read_text_file` (`end_line=-1` returns the whole file), several in one step. Read in the scratchpad only data that goes straight into scratchpad code or a file that needs special parsing: printed scratchpad output stops at 10,000 characters. Use the scratchpad for everything else you do with files. "
             f"Your scratchpad's working directory is {str(base)} — bare relative paths like `open('data.csv')` resolve from the project root."
             # Each turn's scratchpad processes are killed when the turn ends
@@ -1871,6 +2045,7 @@ class AntonHarness:
                 else ""
             )
             + attachment_context
+            + _working_folders_context(folder_paths)
         )
         output_context = (
             # Artifacts live under `<base>/.anton/artifacts/<slug>/`, one
@@ -1936,6 +2111,29 @@ class AntonHarness:
             data_vault = app_held.turn_vault(
                 data_vault, source_vault=source_vault, root=own_vault_root(current_settings_scope())
             )
+            # anton builds the cell's DS_* environment one connection at a
+            # time and leaves out one that fails, so a sealed connection that
+            # won't open stops the turn here, naming it, instead.
+            from cowork.common.encryption import sealing_keys
+
+            if sealing_keys() is not None:
+                from cowork.services.connectors.sealed_vault import (
+                    SealedRecordError,
+                    refuse_unopenable_connections,
+                )
+
+                try:
+                    refuse_unopenable_connections(vault=data_vault)
+                except SealedRecordError as error:
+                    logger.error(
+                        "A saved connection can't be opened, so the turn stops",
+                        extra={
+                            "event": "sealed_connection_unopenable",
+                            "connection": error.connection,
+                            "reason": error.cause,
+                        },
+                    )
+                    raise
             # Registers this turn's DS_* names and values for scrubbing, and
             # touches no process state, so a concurrent turn's are left alone.
             from anton.utils.datasources import restore_namespaced_env
@@ -2251,6 +2449,7 @@ class AntonHarness:
                     REQUEST_CREDENTIALS_TOOL,
                     LABEL_CONNECTION_TOOL,
                     CREATE_SKILL_DRAFT_TOOL,
+                    *DOC_TOOLS,
                     # FETCH_SUBMISSION_TOOL,
                     # UPDATE_FORM_TOOL,
                     *([RECALL_HISTORY_TOOL] if RECALL_HISTORY_TOOL else []),

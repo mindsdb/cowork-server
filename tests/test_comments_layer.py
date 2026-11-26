@@ -272,3 +272,14 @@ def test_layer_saves_an_edit_on_click_away_and_keeps_the_card():
     ]:
         assert token in LAYER_JS, token
     assert "mutate({type:'edit'" not in LAYER_JS
+
+
+def test_keys_typed_in_a_comment_card_stay_in_the_card():
+    # A deck that moves on Space or the arrows (and swallows them) must not
+    # hear keys typed in the card, or a comment can't have spaces. Escape still
+    # reaches the layer, which closes the card with it.
+    for token in [
+        "['keydown', 'keypress', 'keyup'].forEach(function(type){",
+        "pop.addEventListener(type, function(e){ if (e.key !== 'Escape') e.stopPropagation(); });",
+    ]:
+        assert token in LAYER_JS, token

@@ -1569,3 +1569,58 @@ def finalize_agent_repair(
         repair.updated_at = _now()
         _write_repair(folder, repair)
         return repair.to_json()
+
+
+# ── the revision a published page shows (ENG-4595) ───────────────────────
+
+#: How long after a publish's content mtime a revision may be stamped and still
+#: be the one it published: a save writes the file, then its revision.
+_PUBLISHED_AT_SLACK_S = 2.0
+
+
+def published_head_revision_id(folder: Path) -> str | None:
+    """The revision a publish of *folder* is about to put live: its editable
+    source's head, captured first when the file moved without one, as the
+    viewer reads it. None for a folder with no editable source (binary,
+    oversized). Never raises: a publish never fails over it."""
+    try:
+        from cowork.services.artifact_identity import ensure_full_id
+
+        artifact_id, metadata = ensure_full_id(folder)
+        revision = current_source(folder, metadata, artifact_id).get("revision") or {}
+        return revision.get("id") or None
+    except Exception:
+        logger.debug("Could not read the revision a publish puts live", exc_info=True)
+        return None
+
+
+def published_revision(folder: Path, entry: object, rel_path: str | None) -> dict | None:
+    """The revision of *rel_path* the live page was published from, or None.
+
+    *entry* is the artifact's ``.published.json`` entry. A publish since
+    ENG-4595 records ``published_revision_id``; for an older one, the newest
+    revision of *rel_path* stamped no later than the publish's content mtime
+    (``published_mtime``) stands in. None when nothing is published, or no
+    revision can be told apart as the published one.
+    """
+    if not isinstance(entry, dict) or not entry.get("report_id") or entry.get("published") is False:
+        return None
+    if not rel_path:
+        return None
+    with artifact_lock(folder):
+        manifest = _read_manifest(folder)
+    recorded = manifest.revision(entry.get("published_revision_id"))
+    if recorded is not None and recorded.path == rel_path:
+        return recorded.to_json()
+    published_mtime = entry.get("published_mtime")
+    if not isinstance(published_mtime, (int, float)) or isinstance(published_mtime, bool):
+        return None
+    cutoff = datetime.fromtimestamp(published_mtime + _PUBLISHED_AT_SLACK_S, tz=timezone.utc)
+    best = None
+    for revision in manifest.revisions:
+        if revision.path != rel_path:
+            continue
+        created = _parse_timestamp(revision.created_at)
+        if created is not None and created <= cutoff:
+            best = revision
+    return best.to_json() if best is not None else None

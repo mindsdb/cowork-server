@@ -132,9 +132,8 @@ def resume_schedule(schedule_id: UUID, scoped: ScopedSessionDep):
 def run_schedule_now(
     schedule_id: UUID, scoped: ScopedSessionDep, background_tasks: BackgroundTasks, trial: bool = False,
 ):
-    """Start a run now. ``trial=true`` tries the task out: the run leaves a
-    one-off scheduled for its own time, and neither the freshness guard nor
-    the failure streak counts it."""
+    """Start an additional run. Any upcoming occurrence keeps its time.
+    A trial leaves the failure streak unchanged."""
     try:
         schedule = ScheduleService(scoped).get_schedule(schedule_id)
     except ValueError as e:

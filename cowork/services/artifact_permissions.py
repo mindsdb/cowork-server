@@ -5,6 +5,7 @@ from fastapi import HTTPException, status
 
 from cowork.principal import Principal, can_manage_org
 from cowork.services.artifact_export import ExportSource, offered_export_formats
+from cowork.services.product_permissions import has_product_permission
 
 _OWNER_ONLY = "Only the artifact owner can change this draft"
 _OWNER_UNKNOWN = "Artifact owner is unknown"
@@ -25,7 +26,8 @@ def artifact_capabilities(
     by every member of the project (ENG-2056), so the owner is the artifact's
     recorded attribution (legacy per-conversation roots: the conversation's
     creator). Project visibility grants review, never source mutation. An
-    artifact nobody is recorded as owning says so with ``ownerUnknown``.
+    artifact nobody is recorded as owning says so with ``ownerUnknown``; one
+    whose owner is known carries it as ``ownerUserId``.
 
     With ``export_source``, ``exportFormats`` lists the formats the export
     route accepts from this caller, from ``offered_export_formats`` alone:
@@ -59,6 +61,11 @@ def artifact_capabilities(
         }
         if resolution.unknown:
             capabilities["ownerUnknown"] = True
+        elif owner_id:
+            # Lets a member's client name the owner ("Shared by ...") instead
+            # of a generic label. Every caller here is a member of the scope's
+            # org, so the owner's id is theirs to see.
+            capabilities["ownerUserId"] = str(owner_id)
     if export_source is not None:
         capabilities = with_export_formats(scope, capabilities, export_source)
     return capabilities
@@ -114,3 +121,21 @@ def may_delete_ownerless_artifact(
 
         resolution = resolve_artifact_owner(session, source, slug)
     return resolution.unknown
+
+
+async def current_capabilities(scope, capabilities: dict) -> dict:
+    """``capabilities`` narrowed to what the caller's product permissions allow right now."""
+    if not capabilities["canEdit"]:
+        return capabilities
+    can_edit = await has_product_permission(scope, "artifact.manage")
+    can_execute = await has_product_permission(scope, "product.execute")
+    current = {
+        **capabilities,
+        "canEdit": can_edit,
+        "canAddressWithAgent": capabilities["canAddressWithAgent"] and can_edit and can_execute,
+        "canResolveComments": capabilities["canResolveComments"] and can_edit,
+    }
+    # The export route needs `artifact.manage` too, so it offers nothing here.
+    if not can_edit and "exportFormats" in capabilities:
+        current["exportFormats"] = []
+    return current

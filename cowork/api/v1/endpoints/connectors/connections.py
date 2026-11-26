@@ -35,6 +35,7 @@ from cowork.services.connectors.layered_vault import SHARED_CONNECTION_REFUSAL, 
 from cowork.services.connectors.oauth import auth_proxy
 from cowork.services.connectors.oauth.google import oauth_service
 from cowork.services.connectors.persist import own_vault_for_scope, own_vault_root, persist_connection, vault_for_scope
+from cowork.services.connectors.sealed_vault import RecordTooLargeError, ReservedFieldError
 from cowork.services.connectors.sharepoint import ENGINE as SHAREPOINT, generic_setup_refusal
 
 _log = logging.getLogger("cowork.connectors.connections")
@@ -92,6 +93,8 @@ async def list_connections(scope: ScopeDep, request: Request):
                 name=c["name"],
                 user_label=c.get("user_label"),
                 status="needs_reconnect" if c.get("status") == "needs_reconnect" else None,
+                method=c.get("method"),
+                access_mode=c.get("access_mode"),
             )
             for item in catalogue.get("items", [])
             for c in item.get("connections", [])
@@ -195,6 +198,18 @@ def validate_and_save_developer_connection(body: DirectSaveRequest, scope: Scope
     return _persist_direct_connection(body, scope, values)
 
 
+def _refuse_new_slack_mcp(body: DirectSaveRequest, scope: TenantScope) -> None:
+    """While Slack's `mcp` method is switched off, refuse a new connection with
+    it; a reconnect of an existing one still saves."""
+    if body.connector_id != "slack" or body.method != "mcp" or OAuthSettings().slack_connector_enabled:
+        return
+    name = body.name.strip()
+    existing = ConnectionsService(scope).runtime_fields("slack", name) if body.replace_existing and name else None
+    if existing is not None and existing.get("_method") == "mcp":
+        return
+    raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Slack sign-in is not available in this build yet.")
+
+
 def _refuse_sharepoint(connector_id: str, scope: TenantScope) -> None:
     """Refuse SharePoint here: only its own routes save it, after checking the key with Microsoft."""
     if connector_id == SHAREPOINT:
@@ -229,6 +244,7 @@ def _persist_direct_connection(
 ) -> dict[str, object]:
     _refuse_custom_mcp(body.connector_id)
     _refuse_sharepoint(body.connector_id, scope)
+    _refuse_new_slack_mcp(body, scope)
     with unit_session(scope=scope) as session:
         known = ConnectorCatalog(session).get_connector(body.connector_id)
     if known is None:
@@ -269,9 +285,11 @@ def _persist_direct_connection(
             vault=vault,
             scope=scope,
         )
-    except SharedConnectionError:
-        # A derived name that lands on a connection the caller can't change:
-        # create_app's handler answers it with 403, not the 500 below.
+    except (SharedConnectionError, RecordTooLargeError, ReservedFieldError):
+        # A derived name that lands on a connection the caller can't change,
+        # a sealed record too large to read back, or a field named like the
+        # sealed mark: create_app's handlers answer them with 403 and 422,
+        # not the 500 below.
         raise
     except Exception:
         _log.exception("Failed to save connection %s", body.connector_id)

@@ -46,24 +46,102 @@ def test_fetch_sends_the_publish_credential_and_returns_the_body_unchanged(monke
     (call,) = upstream.calls
     assert out == STATS_BODY
     assert call.method == "GET"
-    assert call.url == "https://view.example/stats/rid-1"
+    assert call.url == "https://view.example/a/rid-1/_stats"
     assert call.api_key == "k-1"
     assert call.payload is None
     assert call.timeout == 15
 
 
-def test_set_tracking_puts_the_flag_and_returns_the_stored_value(monkeypatch):
+def test_set_tracking_puts_the_flag_and_returns_the_stored_settings(monkeypatch):
     upstream = StatsUpstream(200, {"tracking": False}).install(monkeypatch)
 
     out = stats.set_tracking(publish_url=PUBLISH_URL, key="k-1", report_id="rid-1", enabled=False)
 
     (call,) = upstream.calls
-    assert out is False
+    # A service that predates the email gate answers without require_email.
+    assert out == {"tracking": False, "require_email": False}
     assert call.method == "PUT"
-    assert call.url == "https://view.example/stats/rid-1/tracking"
+    assert call.url == "https://view.example/a/rid-1/_stats/tracking"
     assert call.api_key == "k-1"
     assert isinstance(call.payload, bytes)
-    assert json.loads(call.payload) == {"enabled": False}
+    assert json.loads(call.payload) == {"tracking": False, "enabled": False}
+
+
+def test_set_tracking_sends_only_the_email_gate_when_the_flag_is_omitted(monkeypatch):
+    upstream = StatsUpstream(200, {"tracking": True, "require_email": True}).install(monkeypatch)
+
+    out = stats.set_tracking(publish_url=PUBLISH_URL, key="k-1", report_id="rid-1", require_email=True)
+
+    assert out == {"tracking": True, "require_email": True}
+    assert json.loads(upstream.calls[0].payload) == {"require_email": True}
+
+
+def test_set_tracking_with_nothing_to_change_sends_nothing(monkeypatch):
+    upstream = StatsUpstream(200, {"tracking": True}).install(monkeypatch)
+    with pytest.raises(ValueError):
+        stats.set_tracking(publish_url=PUBLISH_URL, key="k-1", report_id="rid-1")
+    assert upstream.calls == []
+
+
+def test_fetch_viewer_gets_one_viewer_unchanged(monkeypatch):
+    body = {"viewer": {"id": "v_1", "kind": "anonymous", "email": None}, "visits": []}
+    upstream = StatsUpstream(200, body).install(monkeypatch)
+
+    out = stats.fetch_viewer(publish_url=PUBLISH_URL, key="k-1", report_id="rid-1", viewer_id="v_1")
+
+    assert out == body
+    assert upstream.calls[0].method == "GET"
+    assert upstream.calls[0].url == "https://view.example/a/rid-1/_stats/viewers/v_1"
+
+
+def test_viewer_id_is_escaped_into_one_path_segment(monkeypatch):
+    upstream = StatsUpstream(200, {"viewer": {}, "visits": []}).install(monkeypatch)
+    stats.fetch_viewer(publish_url=PUBLISH_URL, key="k-1", report_id="rid-1", viewer_id="a/b?c")
+    assert upstream.calls[0].url == "https://view.example/a/rid-1/_stats/viewers/a%2Fb%3Fc"
+
+
+@pytest.mark.parametrize("viewer_id", ["", ".", "..", "x" * 129])
+def test_unusable_viewer_id_is_not_found_without_a_request(monkeypatch, viewer_id):
+    upstream = StatsUpstream(200, {}).install(monkeypatch)
+    with pytest.raises(stats.StatsNotFound):
+        stats.fetch_viewer(publish_url=PUBLISH_URL, key="k-1", report_id="rid-1", viewer_id=viewer_id)
+    assert upstream.calls == []
+
+
+def test_unknown_viewer_is_not_found(monkeypatch):
+    StatsUpstream(404, {"code": "viewer_not_found", "error": "No such viewer"}).install(monkeypatch)
+    with pytest.raises(stats.StatsNotFound) as excinfo:
+        stats.fetch_viewer(publish_url=PUBLISH_URL, key="k-1", report_id="rid-1", viewer_id="v_9")
+    assert (excinfo.value.code, excinfo.value.message) == ("viewer_not_found", "No such viewer")
+
+
+def test_delete_stats_sends_a_delete_and_accepts_an_empty_204(monkeypatch):
+    upstream = StatsUpstream(204, None).install(monkeypatch)
+
+    assert stats.delete_stats(publish_url=PUBLISH_URL, key="k-1", report_id="rid-1") is None
+
+    assert upstream.calls[0].method == "DELETE"
+    assert upstream.calls[0].url == "https://view.example/a/rid-1/_stats"
+    assert upstream.calls[0].payload is None
+
+
+def test_credits_required_carries_the_service_body(monkeypatch):
+    body = {"code": "credits_required", "message": "Add credits to collect viewer analytics."}
+    StatsUpstream(402, body).install(monkeypatch)
+    with pytest.raises(stats.StatsUpgradeRequired) as excinfo:
+        _call("set")
+    assert excinfo.value.body == body
+    mapped = stats.stats_http_exception(excinfo.value, desktop=False)
+    assert (mapped.status_code, mapped.detail) == (402, body)
+
+
+def test_tracking_off_is_rejected_with_its_code(monkeypatch):
+    StatsUpstream(422, {"code": "tracking_off"}).install(monkeypatch)
+    with pytest.raises(stats.StatsRejected) as excinfo:
+        stats.set_tracking(publish_url=PUBLISH_URL, key="k-1", report_id="rid-1", require_email=True)
+    mapped = stats.stats_http_exception(excinfo.value, desktop=True)
+    assert mapped.status_code == 422
+    assert mapped.detail == {"code": "tracking_off", "message": "Turn on viewer analytics first."}
 
 
 def test_report_id_is_escaped_into_one_path_segment(monkeypatch):
@@ -71,7 +149,7 @@ def test_report_id_is_escaped_into_one_path_segment(monkeypatch):
 
     stats.fetch_stats(publish_url=PUBLISH_URL, key="k-1", report_id="a/b")
 
-    assert upstream.calls[0].url == "https://view.example/stats/a%2Fb"
+    assert upstream.calls[0].url == "https://view.example/a/a%2Fb/_stats"
 
 
 def test_requests_pass_the_tls_setting_to_the_transport(monkeypatch):
@@ -105,6 +183,11 @@ def test_typed_errors_stay_out_of_the_generic_route_branches():
         (404, {"code": "stats_unavailable"}, stats.StatsUnavailable),
         (404, {"message": "Not Found"}, RuntimeError),
         (404, None, RuntimeError),
+        (404, {"code": "viewer_not_found"}, stats.StatsNotFound),
+        (404, {"error": "No such viewer"}, stats.StatsNotFound),
+        (422, {"code": "tracking_off"}, stats.StatsRejected),
+        (422, {"error": "bad"}, RuntimeError),
+        (402, {"code": "credits_required", "message": "Add credits."}, stats.StatsUpgradeRequired),
         (403, {"code": "permission_denied", "error": "You do not have permission to manage artifacts."}, ProductPermissionDenied),
         (403, {"code": "organization_inactive", "error": "This organization is archived."}, stats.StatsForbidden),
         (403, None, stats.StatsForbidden),
@@ -218,6 +301,12 @@ def test_fetch_reply_that_is_not_an_object_is_a_runtime_error(monkeypatch):
          {"error": "Plan limit", "message": "Upgrade now", "code": "upgrade_required"}),
         (stats.StatsUpgradeRequired(None), True, 402,
          {"code": "upgrade_required", "message": "Upgrade required"}),
+        (stats.StatsUpgradeRequired({"code": "credits_required", "message": "Add credits."}), False, 402,
+         {"code": "credits_required", "message": "Add credits."}),
+        (stats.StatsRejected({"code": "tracking_off", "error": "Analytics are off"}), True, 422,
+         {"code": "tracking_off", "error": "Analytics are off", "message": "Analytics are off"}),
+        (stats.StatsNotFound("viewer_not_found", "Viewer not found."), False, 404,
+         {"code": "viewer_not_found", "message": "Viewer not found."}),
         (stats.TrackingConflict(), True, 409,
          {"code": "tracking_conflict", "message": "The artifact is being updated. Try again in a moment."}),
         (stats.StatsTemporarilyUnavailable(), False, 503,

@@ -847,3 +847,19 @@ def test_hash_and_scroll_are_restored():
     assert out["restored"] == ["ok"]
     probe = next(m for m in out["posted"] if m["type"] == "probe")
     assert probe == {"type": "probe", "hash": "#pricing", "y": 900, "top": 40}
+
+
+def test_the_shim_reports_the_page_height_and_whether_it_scrolls():
+    """The app fits a page taller than its frame that scrolls nowhere (a deck
+    sized from the frame's width, overflow hidden): the shim tells it the
+    page's full height and whether the root or body hide their overflow,
+    after load and on every resize, best effort."""
+    js = SHIM_JS
+    block = js[js.index("type: 'size'") - 2400 : js.index("size reports are best effort")]
+    # A locked page counts only what starts on screen: a deck's hidden
+    # slides stacked below the frame don't make it look cut off.
+    assert "? visibleBottom(height)" in js
+    assert "if (box.top >= frameHeight - 1 || box.bottom <= 0) continue;" in js
+    assert "var locked = hidesOverflow(root) || hidesOverflow(body);" in js
+    assert "window.addEventListener('load', scheduleSize)" in js
+    assert "window.addEventListener('resize', scheduleSize)" in js

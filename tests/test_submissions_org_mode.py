@@ -21,6 +21,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from cowork.server import create_app
+from tests._connector_test_request import with_test_request
 
 PATH = "/api/v1/connectors/submissions/"
 BEARER = "Bearer sentinel-caller-credential"
@@ -39,12 +40,12 @@ MEMBER_HEADERS = {
 AUTH_HEADERS = {**MEMBER_HEADERS, "Authorization": BEARER}
 
 #: A model-written form that passes check_handcrafted_form.
-HANDCRAFTED_FORM = {
+HANDCRAFTED_FORM = with_test_request({
     "form_id": "fm_bbbbbbbbbb",
     "engine": "handcrafted",
     "title": "Connect handcrafted",
     "fields": [{"name": "token", "label": "Token", "type": "password", "secret": True, "required": True}],
-}
+})
 
 #: Shaped like auth's DatasourceConnectionResponseSerializer.
 CONNECTION = {
@@ -477,43 +478,83 @@ def org_client_with_local_flow(monkeypatch, adapter_verified_datasources) -> Tes
     return _org_client(monkeypatch, ENABLED)
 
 
-def test_an_org_handcrafted_form_takes_the_submission_flow_not_the_relay(org_client_with_local_flow, relay, monkeypatch):
+@pytest.fixture()
+def staged_in_org(monkeypatch):
+    """What reaches the submission store, and a probe that must never run."""
     from cowork.api.v1.endpoints.connectors import submissions as submissions_endpoint
     from cowork.services.connectors.submissions import store
 
-    recorded, _ = relay
-    staged: dict = {}
-    real_stage = store.stage
+    staged: list[dict] = []
+    monkeypatch.setattr(store, "stage", lambda **kwargs: staged.append(kwargs) or "sub_x")
 
-    def record_stage(**kwargs):
-        staged.update(kwargs)
-        return real_stage(**kwargs)
-
-    class FakeProbeHandler:
+    class NoProbe:
         def __init__(self, *, scope):
-            pass
+            raise AssertionError("an org-mode custom form must not reach the probe")
 
-        async def run(self, *args):
-            yield "event: response.completed\ndata: {}\n\n"
+    monkeypatch.setattr(submissions_endpoint, "ProbeHandler", NoProbe)
+    return staged
 
-    monkeypatch.setattr(store, "stage", record_stage)
-    monkeypatch.setattr(submissions_endpoint, "ProbeHandler", FakeProbeHandler)
+
+GRANT_FORM = {
+    "form_id": "fm_cccccccccc", "engine": "handcrafted", "title": "Connect handcrafted",
+    "methods": [{
+        "id": "oauth", "label": "Sign in", "submit_action": "oauth_launch",
+        "oauth": {"auth_url": "https://example.com/auth", "token_url": "https://example.com/token"},
+    }],
+}
+
+
+@pytest.mark.parametrize(("form", "values", "method"), [
+    (HANDCRAFTED_FORM, {"token": PASSWORD}, None),
+    (GRANT_FORM, {"access_token": PASSWORD}, "oauth"),
+], ids=["handcrafted", "handcrafted oauth grant"])
+def test_an_org_custom_form_is_refused_before_it_is_staged(org_client_with_local_flow, relay, staged_in_org, form, values, method):
+    """Nothing tests a custom connector in an organization yet, so it is
+    refused before its values are checked or kept; a grant is not saved first."""
+    recorded, _ = relay
 
     res = org_client_with_local_flow.post(
         PATH,
-        json={
-            "form_id": HANDCRAFTED_FORM["form_id"],
-            "name": "handcrafted",
-            "form_spec": HANDCRAFTED_FORM,
-            "values": {"token": PASSWORD},
-            "skipped": [],
-        },
+        json={"form_id": form["form_id"], "name": "handcrafted", "form_spec": form, "values": values,
+              "skipped": [], "method": method},
         headers=AUTH_HEADERS,
     )
 
-    assert res.status_code == 200
-    assert staged["form_spec"]["form_id"] == HANDCRAFTED_FORM["form_id"]
-    assert recorded == []
+    assert res.status_code == 403
+    assert "Custom connectors cannot be connected in an organization yet" in res.json()["detail"]
+    assert PASSWORD not in res.text
+    assert staged_in_org == [] and recorded == []
+
+
+def test_an_org_stored_custom_connector_is_refused_before_it_is_staged(org_client_with_local_flow, relay, staged_in_org, monkeypatch):
+    from cowork.api.v1.endpoints.connectors import submissions as submissions_endpoint
+    from cowork.schemas.connectors import ConnectorSpecResponse
+
+    stored = ConnectorSpecResponse(
+        id="handcrafted", label="Handcrafted", description="", category="other",
+        form={k: v for k, v in HANDCRAFTED_FORM.items() if k != "engine"} | {"form_id": "handcrafted-connector"},
+    )
+
+    class Catalog:
+        def __init__(self, session):
+            pass
+
+        def get_connector(self, connector_id):
+            return stored if connector_id == "handcrafted" else None
+
+    monkeypatch.setattr(submissions_endpoint, "ConnectorCatalog", Catalog)
+    recorded, _ = relay
+
+    res = org_client_with_local_flow.post(
+        PATH,
+        json={"form_id": "handcrafted-connector", "connector_id": "handcrafted", "name": "handcrafted",
+              "form_spec": {"_connector_id": "handcrafted", "form_id": "handcrafted-connector"},
+              "values": {"token": PASSWORD}, "skipped": []},
+        headers=AUTH_HEADERS,
+    )
+
+    assert res.status_code == 403
+    assert staged_in_org == [] and recorded == []
 
 
 def test_an_org_built_in_outside_the_database_category_takes_the_submission_flow(

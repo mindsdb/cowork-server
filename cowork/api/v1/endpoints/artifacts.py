@@ -42,7 +42,9 @@ from cowork.api.v1.artifact_preview import (
     wants_comment_layer,
     wants_html_preview,
 )
-from cowork.api.v1.artifact_scope import scoped_project_id_for_request
+from cowork.api.v1.artifact_scope import (
+    review_artifact_and_read, scoped_project_id_for_request,
+)
 from cowork.db.units import FilesystemBusy, run_db, run_efs, run_on_unit_threads
 from cowork.common.logger import log_context
 from cowork.common.paths import dir_scandir, dir_stat, open_pinned_child
@@ -862,6 +864,48 @@ def _desktop_artifact_status_for_path(path: str, *, scope: TenantScope | None) -
     return ArtifactStatusView()
 
 
+class _SharedArtifactRef(BaseModel):
+    project_id: UUID
+    artifact_id: UUID
+
+
+def _shared_preview_card(found, *, artifact_id: str):
+    from cowork.services.artifact_identity import _opened_child_directory, opened_artifact_root
+    from cowork.services.artifacts import _listed_card_for_pinned_folder
+
+    source = found.source
+    with opened_artifact_root(source) as root, _opened_child_directory(root, found.folder.name) as folder:
+        card = _listed_card_for_pinned_folder(
+            found.folder, 0, project_id=source.project_id, project_name=source.project_name,
+            pinned_folder=folder, pinned_root=root, artifacts_base=source.base,
+        )
+    if card is None or card.id != artifact_id or not card.draft_url:
+        raise HTTPException(404, "Artifact not found")
+    # The notification opens a read-only preview. Owner controls and sharing
+    # settings belong to the ordinary workspace, not this response.
+    return {
+        "id": card.id, "projectId": card.project_id, "path": card.path, "title": card.title,
+        "ext": card.ext, "type": card.type, "draftUrl": card.draft_url, "mtime": card.mtime,
+        "capabilities": {"role": "reviewer", "canEdit": False},
+    }
+
+
+@router.post("/shared-preview", dependencies=[Depends(require(AuthenticatedInOrgMode))])
+async def shared_artifact_preview(body: _SharedArtifactRef, scope: ScopeDep):
+    """Resolve a notification with the same authorization as the draft bytes."""
+    if not scope.org_mode:
+        raise HTTPException(404, "Artifact not found")
+    artifact_id = body.artifact_id.hex
+    try:
+        reviewed = await review_artifact_and_read(
+            scope, str(body.project_id), artifact_id,
+            read=partial(_shared_preview_card, artifact_id=artifact_id),
+        )
+    except FileNotFoundError:
+        raise HTTPException(404, "Artifact not found") from None
+    return reviewed.value
+
+
 # require(AuthenticatedInOrgMode), declared explicitly, refuses a caller with
 # no org in scope in org mode before the route runs. Without it the route
 # still fails closed: the ScopedSession each run_db unit builds (unit_session
@@ -937,15 +981,42 @@ async def delete_artifact_by_slug(
     )
 
 
+async def take_down_credential(scope: TenantScope) -> tuple[str, str]:
+    """The (publish_url, api_key) a delete takes published pages down with.
+
+    In org mode the key is minted for the acting user: unpublish acts on the
+    viewer, and the viewer scopes by the token's owner, so the credential has
+    to be the acting user's - not a stored provider key (org deployments have
+    none). On desktop it is the provider key, "" when there is none.
+    """
+    from cowork.common.settings.user_settings import get_user_settings
+    from cowork.services.artifact_publish_key import PublishKey
+    from cowork.services.publish import _resolve_publish_endpoint
+
+    publish_url, api_key = _resolve_publish_endpoint(await run_on_unit_threads(get_user_settings))
+    if not _org_mode():
+        return publish_url, api_key
+    if not scope or not scope.org_id or not scope.user_id:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="No tenant in scope")
+    from cowork.services.artifact_autopublish import _active_workspace_id
+
+    api_key = await PublishKey(
+        scope.user_id, scope.org_id, min_ttl_s=120.0,
+        workspace_id=await run_on_unit_threads(partial(_active_workspace_id, scope)),
+    ).get()
+    if not api_key:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Could not mint a publish credential",
+        )
+    return publish_url, api_key
+
+
 async def delete_artifact_for_request(
     scope: TenantScope, slug: str | _ArtifactDeleteRef, *, project_id: UUID, principal: Principal | None = None
 ) -> None:
     """Delete one artifact of one project. Unpublishes first; a failed unpublish
     leaves the folder in place and surfaces the error."""
-    from cowork.common.settings.user_settings import get_user_settings
-    from cowork.services.artifact_publish_key import PublishKey
-    from cowork.services.publish import _resolve_publish_endpoint
-
     # This helper is also called directly by internal/test code, so retain the
     # same concrete parsing boundary the HTTP adapter applies above. In
     # particular, no request-derived string can select a project path.
@@ -1009,28 +1080,12 @@ async def delete_artifact_for_request(
 
     admin_delete = await run_db(owner_decision, scope=scope)
     expected_artifact_id = artifact_id if ref.artifact_id is not None else None
-    publish_url, api_key = _resolve_publish_endpoint(await run_on_unit_threads(get_user_settings))
+    publish_url, api_key = await take_down_credential(scope)
     # Set once the draft review rule is gone: the delete step may then no
     # longer refuse a busy file store, which would leave the folder's review
     # marker without its rule.
     revoked = False
     if _org_mode():
-        if not scope or not scope.org_id or not scope.user_id:
-            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="No tenant in scope")
-        # Unpublish acts on the viewer, and the viewer scopes by the token's owner,
-        # so the credential has to be the acting user's - not a stored provider key
-        # (org deployments have none).
-        from cowork.services.artifact_autopublish import _active_workspace_id
-
-        api_key = await PublishKey(
-            scope.user_id, scope.org_id, min_ttl_s=120.0,
-            workspace_id=await run_on_unit_threads(partial(_active_workspace_id, scope)),
-        ).get()
-        if not api_key:
-            raise HTTPException(
-                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                detail="Could not mint a publish credential",
-            )
         from cowork.services.artifact_access import (
             ArtifactAccessUnavailable,
             revoke_draft_review_access,

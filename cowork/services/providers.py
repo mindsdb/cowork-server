@@ -21,6 +21,7 @@ from cowork.coding.inference_trace import SURFACE_TAG_PREFIX
 from cowork.common.settings import runtime_credential
 from cowork.common.settings.app_settings import CATALOG_ROLE_NAMES, IMAGE_ROLE, default_minds_api_host
 from cowork.handlers.turn_errors import GatewayDenial, gateway_denial
+from cowork.schemas.mindshub_usage import PLAN_TIERS, is_one_of
 from cowork.services.mindshub_client import sweep_cache
 
 if TYPE_CHECKING:
@@ -343,6 +344,14 @@ class MindsModelListing(NamedTuple):
     # a row without `kind` is a chat model unless it is an embeddings one.
     # Required for the same reason as ``role_defaults``.
     image_models: dict[str, bool]
+    # Model id -> the cheapest subscription tier whose included allowance
+    # covers it ("free", "plus" or "pro"), from the row's `covered_by_tier`
+    # (ENG-4186). Absent for a row that sends null or nothing, which includes
+    # every MindsHub that predates the field. Display-only: the wallet pays for
+    # any model on any tier, so this never decides whether a model is usable;
+    # ``enabled`` and ``disabled_reasons`` do. Required for the same reason as
+    # ``role_defaults``.
+    covered_by_tier: dict[str, str]
 
 
 def _empty_listing() -> MindsModelListing:
@@ -354,12 +363,11 @@ def _empty_listing() -> MindsModelListing:
     objects means one in-place write downstream would corrupt the cached failure
     of every gateway at once. Nothing mutates them today.
     """
-    return MindsModelListing(None, {}, {}, {}, {}, {}, {}, {}, {})
+    return MindsModelListing(None, {}, {}, {}, {}, {}, {}, {}, {}, {})
 
 
 # The `kind` a `/v1/models` row carries for an image-generation model.
 _IMAGE_KIND = "image"
-
 
 # The listing's ``disabled_reason`` for a model an admin's model rule restricts
 # for the caller. Unlike the billing reasons, it is true for the caller alone
@@ -678,6 +686,7 @@ async def fetch_minds_models(
     role_defaults: dict[str, str] = {}
     disabled_reasons: dict[str, str] = {}
     image_models: dict[str, bool] = {}
+    covered_by_tier: dict[str, str] = {}
 
     def _text(row: dict, key: str) -> Optional[str]:
         """A non-empty string field, or None. Anything else is treated as absent.
@@ -726,6 +735,13 @@ async def fetch_minds_models(
         locked = (image_models if is_image else enabled).get(model_id) is False
         if locked and (reason := _text(row, "disabled_reason")):
             disabled_reasons[model_id] = reason
+        # The tier whose allowance covers the model, whether or not
+        # it is locked: the picker shows it on covered rows and offers it as
+        # the upgrade on locked ones. `is_one_of` checks the type first: a custom
+        # endpoint's row may send a list or an object here, and `in` raises on
+        # an unhashable value.
+        if is_one_of(tier := row.get("covered_by_tier"), PLAN_TIERS):
+            covered_by_tier[model_id] = tier
         levels = row.get("reasoning_efforts")
         if isinstance(levels, list) and levels:
             entry: dict = {"efforts": [str(x) for x in levels]}
@@ -773,7 +789,7 @@ async def fetch_minds_models(
     return _remember(
         MindsModelListing(
             (ids or None), efforts, enabled, labels, providers, families, role_defaults,
-            disabled_reasons, image_models,
+            disabled_reasons, image_models, covered_by_tier,
         )
     )
 

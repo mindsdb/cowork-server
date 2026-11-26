@@ -12,6 +12,7 @@ import logging
 import os
 import threading
 import uuid
+from collections.abc import Callable
 from pathlib import Path
 
 from cowork.coding.local_copy import force_remove
@@ -29,6 +30,9 @@ class PendingRemovals:
         self._failed: set[str] = set()
         self._thread: threading.Thread | None = None
         self._requested = False
+        # Called on the removal thread after a pass that touched any folder,
+        # so storage reporting stops counting what is gone.
+        self.on_drained: Callable[[], None] = lambda: None
         self.root.mkdir(parents=True, exist_ok=True)
         if self._entries():
             self._start()
@@ -116,7 +120,8 @@ class PendingRemovals:
                     self._thread = None
                     return
                 self._requested = False
-            for entry in self._entries():
+            entries = self._entries()
+            for entry in entries:
                 try:
                     if entry.is_symlink() or not entry.is_dir():
                         entry.unlink(missing_ok=True)
@@ -141,3 +146,8 @@ class PendingRemovals:
                         # the failure invisible for the rest of this process.
                         logger.warning("Could not persist cleanup failure for %s", entry, exc_info=True)
                     logger.warning("Could not remove %s: %s", entry, exc)
+            if entries:
+                try:
+                    self.on_drained()
+                except Exception:
+                    logger.warning("Could not report finished folder removal", exc_info=True)

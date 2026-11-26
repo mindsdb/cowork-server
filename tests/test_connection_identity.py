@@ -8,6 +8,7 @@ while the app password is masked.
 from datetime import datetime, timezone
 from pathlib import Path
 
+import pytest
 from anton.core.datasources.data_vault import LocalDataVault
 
 from cowork.common.settings.app_settings import ConnectorSettings, OAuthSettings
@@ -24,6 +25,7 @@ from cowork.services.connectors.identity import (
     spec_secret_fields,
 )
 from cowork.services.connectors.persist import (
+    data_vault_at,
     persist_connection,
     set_connection_label,
 )
@@ -253,8 +255,9 @@ class TestGetMaskingFallback:
     """The detail endpoint must mask secrets even for legacy records saved
     before secure_keys was persisted (via the name heuristic)."""
 
+    @pytest.mark.usefixtures("with_and_without_key_file")
     def test_legacy_record_without_secure_keys_is_masked(self, tmp_path, monkeypatch):
-        vault = LocalDataVault(tmp_path)
+        vault = data_vault_at(tmp_path)
         # Legacy save: no secure_keys written.
         vault.save(
             "gmail", "legacy",
@@ -466,8 +469,9 @@ class TestDisplayName:
         assert by_name["a-x-com"] == "a@x.com"
         assert by_name["b-x-com"] == "b@x.com"
 
+    @pytest.mark.usefixtures("with_and_without_key_file")
     def test_get_surfaces_display_name_and_hides_label_field(self, tmp_path, monkeypatch):
-        vault = LocalDataVault(tmp_path)
+        vault = data_vault_at(tmp_path)
         persist_connection(
             "gmail", "app-password", "", {"email": "a@x.com", "app_password": "p"},
             label="Support", vault=vault,

@@ -30,6 +30,7 @@ from cowork.services.connectors.custom_connectors import CustomConnectorService,
 from cowork.services.connectors.custom_mcp import CUSTOM_MCP_ENGINE, ReservedEngineError, is_connection_id
 from cowork.services.connectors.layered_vault import FilteredDataVault, LayeredDataVault
 from cowork.services.connectors.persist import own_vault_for_scope, own_vault_root, turn_vault_for_scope
+from tests._connector_test_request import with_test_request
 
 SECRET = "ab" * 32
 HEADERS = {app_secret.HEADER: SECRET}
@@ -286,6 +287,18 @@ class TestTurnsReadOnlyHeldSettings:
         assert not {"_server_url", "_allowed_tools", "access_token"} & set(connecting)
 
 
+class TestConnectionList:
+    def test_a_custom_connection_lists_no_access_mode(self, protected):
+        # Its allowed tools, not an access mode, decide what the agent runs,
+        # so the tile must not claim "Read" for it.
+        _write_file(AGENT_WRITTEN)
+        _hold()
+        rows = _client().get(f"{BASE}/").json()
+        row = next(r for r in rows if r["engine"] == CUSTOM_MCP_ENGINE and r["name"] == CONN)
+        assert row["method"] == "mcp"
+        assert row["access_mode"] is None
+
+
 class TestHoldCustom:
     def test_a_new_server_url_drops_the_held_token(self, protected):
         _hold()
@@ -347,13 +360,13 @@ class TestReservedEngine:
             CustomConnectorService(ScopedSession(session, LOCAL_SCOPE)).upsert_from_form(CUSTOM_MCP_ENGINE, form)
 
     def test_a_planted_row_with_the_id_is_never_served(self, db):
-        form = {
+        form = with_test_request({
             "form_id": "fm_aaaaaaaaaa",
             "engine": "httpbin",
             "title": "Connect httpbin",
             "logo_color": "#3a7",
             "fields": [{"name": "token", "label": "Token", "type": "password", "secret": True}],
-        }
+        })
         with Session(db) as session:
             CustomConnectorService(ScopedSession(session, LOCAL_SCOPE)).upsert_from_form("httpbin", form)
             row = session.exec(select(CustomConnector)).one()

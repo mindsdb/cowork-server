@@ -38,9 +38,11 @@ from cowork.schemas.connectors import InvalidConnectorIdError, validate_engine_i
 from cowork.services.connectors.catalog import ConnectorCatalog
 from cowork.services.connectors.connections import ConnectionsService
 from cowork.services.connectors.custom_connectors import (
+    NEEDS_REBUILD_FOR_AGENT,
     UnstorableFormError,
     check_handcrafted_form,
     handcrafted_form_allowed,
+    has_test_requests,
     scope_is_one_persons,
 )
 from cowork.services.connectors.persist import vault_for_scope
@@ -50,6 +52,8 @@ from cowork.services.connectors.specs._registry import ConnectorSpecRegistry, re
 
 if TYPE_CHECKING:
     from cowork.schemas.artifact_access import ArtifactAccessRequest
+    from cowork.services.datasource_approval import DatasourceKey
+    from cowork.services.publish import DatasourceApprovalRequired
 
 logger = logging.getLogger(__name__)
 T = TypeVar("T")
@@ -68,7 +72,11 @@ def _published_state(raw_path: str) -> dict:
     return published_state(raw_path, scope=current_settings_scope())
 
 
-def _publish_artifact(raw_path: str, access: ArtifactAccessRequest | None = None) -> dict:
+def _publish_artifact(
+    raw_path: str,
+    access: ArtifactAccessRequest | None = None,
+    approved_datasources: frozenset[DatasourceKey] | None = None,
+) -> dict:
     """Desktop publish for the agent's own `publish_or_preview` tool.
 
     Resolves the artifact, its root and the credential the same way the HTTP
@@ -84,6 +92,7 @@ def _publish_artifact(raw_path: str, access: ArtifactAccessRequest | None = None
     return publish_artifact(
         artifact, artifacts_base=artifacts_base,
         api_key=api_key, publish_url=publish_url, access=access, scope=scope,
+        approved_datasources=approved_datasources,
     )
 
 
@@ -160,7 +169,13 @@ _PUBLISH_PROMPT = (
     "  owner_only=true and no emails. Leaving emails empty WITHOUT owner_only publishes PUBLICLY.\n"
     "- Exception: when re-publishing an artifact that already has access on record and the user\n"
     "  says nothing new about access, omit these fields to keep its previous access (no need to\n"
-    "  ask again)."
+    "  ask again).\n"
+)
+# Only where full-stack apps publish: the self-hosted publisher refuses them.
+_FULLSTACK_CARD_RULE = (
+    "- Publishing a full-stack app can show the user a card listing the connections whose\n"
+    "  credentials it uploads. If they cancel, don't work around the card by editing\n"
+    "  `.published.json`, `metadata.json` or the artifact's id.\n"
 )
 COWORK_PUBLISH_DESCRIPTION = _PUBLISH_DESCRIPTION.format(
     panel="In the desktop app the user can also publish via the Live Artifacts panel",
@@ -168,7 +183,7 @@ COWORK_PUBLISH_DESCRIPTION = _PUBLISH_DESCRIPTION.format(
 COWORK_PUBLISH_PROMPT = _PUBLISH_PROMPT.format(
     heading="CONTENT SHARING POLICY (desktop chat):",
     from_chat="publishing works straight from chat when MindsHub is configured",
-)
+) + _FULLSTACK_CARD_RULE
 # A self-hosted deployment publishes to its own publisher, which takes HTML
 # and Markdown only: `publish_artifact` refuses a full-stack artifact there
 # (`FULLSTACK_PUBLISH_UNSUPPORTED`). The agent hears it before it builds one.
@@ -184,6 +199,12 @@ SELF_HOSTED_PUBLISH_DESCRIPTION = (
 SELF_HOSTED_PUBLISH_PROMPT = _PUBLISH_PROMPT.format(
     heading="CONTENT SHARING POLICY:",
     from_chat="publishing works straight from chat",
+)
+# Appended where a first publish without access raises AccessChoiceRequired:
+# a shared publish token has no owner to let in.
+FIRST_PUBLISH_ACCESS_RULE = (
+    "- This deployment can't publish a link only the user can open: never set owner_only, and\n"
+    "  on a first publish always pass access_mode, asking the user which access they want first.\n"
 )
 
 
@@ -219,6 +240,47 @@ def _resolve_publish_path(session: Any, raw_path: str) -> Path | None:
     except (OSError, RuntimeError, ValueError):
         # NUL bytes, over-long names and unknown `~user` raise here.
         return None
+
+
+_DATASOURCES_NOT_APPROVED = {
+    "cancelled": (
+        "PUBLISH FAILED: The user didn't approve sending these credentials, so nothing was published. "
+        "Don't publish it another way; ask what they'd like to change."
+    ),
+    "timeout": (
+        "PUBLISH FAILED: The user didn't answer in time, so nothing was published. "
+        "The user can publish it from the Share dialog."
+    ),
+    "unavailable": (
+        "PUBLISH FAILED: Confirmation isn't available in this conversation, so nothing was published. "
+        "The user can publish it from the Share dialog."
+    ),
+    "error": "PUBLISH FAILED: The confirmation card failed, so nothing was published.",
+}
+
+
+def _card_artifact_name(exc: DatasourceApprovalRequired, file_path: Path) -> str:
+    """The artifact the card names: the published folder the server resolved,
+    else the folder of the path the tool resolved, never the agent's `title`.
+    The agent names folders too, so only word characters, `.` and `-` show."""
+    name = exc.artifact_slug or (file_path.name if file_path.is_dir() else file_path.parent.name)
+    return re.sub(r"[^\w.-]+", "-", name)[:80] or "this app"
+
+
+async def _confirm_datasources(session: Any, artifact_name: str, pending: list[dict[str, str]]) -> str:
+    """Show the card listing the connections whose credentials a publish
+    would upload (confirm_card); only "confirmed" lets them leave."""
+    from cowork.harnesses.anton_harness.confirm_card import confirm_card
+
+    names = ", ".join(item["label"] for item in pending)
+    return await confirm_card(
+        session,
+        key="publish",
+        prompt=f'Publishing "{artifact_name}" will upload the credentials of these connections to MindsHub: {names}.',
+        confirm=("publish", "Publish", "Upload these credentials with the app"),
+        cancel_detail="Publish nothing",
+        confirm_style="primary",
+    )
 
 
 async def _cowork_publish_or_preview(session: Any, tc_input: dict):
@@ -285,7 +347,7 @@ async def _cowork_publish_or_preview(session: Any, tc_input: dict):
     if action != "publish":
         return f"publish_or_preview: unknown action '{action}'"
 
-    # Resolve the access spec: explicit tool fields > preserve previous > public.
+    # Resolve the access spec: explicit tool fields > preserve previous > the service's default.
     from pydantic import ValidationError
 
     from cowork.models.artifact_owner_choice import AccessMode
@@ -325,9 +387,10 @@ async def _cowork_publish_or_preview(session: Any, tc_input: dict):
         # mode/access_password, which would silently reset to public.
         prev = _published_owner_state(abs_path)
         try:
-            access = (
-                _access_from_state(prev) if prev.get("report_id") else ArtifactAccessRequest(mode=AccessMode.PUBLIC)
-            )
+            # None on a first publish: publish_artifact applies the default
+            # (owner-only, or a refusal where a shared publish token can't
+            # publish privately).
+            access = _access_from_state(prev) if prev.get("report_id") else None
         except ValidationError as exc:
             # The entry is a file the agent can write, so its access fields can
             # hold any type; publishing without them would change who sees it.
@@ -366,11 +429,13 @@ async def _cowork_publish_or_preview(session: Any, tc_input: dict):
 
     from fastapi import HTTPException
 
+    from cowork.services.datasource_approval import DatasourceKey
     from cowork.services.publish import (
         ARTIFACT_TOO_LARGE_MESSAGE,
-        MARKDOWN_NOT_PUBLISHABLE_CODE,
         OWNED_BY_OTHER_USER_MESSAGE,
-        MarkdownNotPublishable,
+        AccessChoiceRequired,
+        DatasourceApprovalRequired,
+        PageNotPublishable,
         PublishOwnedByOtherUser,
         PublishRejected,
         PublishTooLarge,
@@ -382,7 +447,32 @@ async def _cowork_publish_or_preview(session: Any, tc_input: dict):
         # A thread of its own: a Markdown page renders in the conversion
         # process, for up to its 30 s, and the upload blocks too. This handler
         # runs on the server's event loop.
-        result = await asyncio.to_thread(_publish_artifact, abs_path, access=access)
+        try:
+            result = await asyncio.to_thread(_publish_artifact, abs_path, access=access)
+        except DatasourceApprovalRequired as exc:
+            answer = await _confirm_datasources(session, _card_artifact_name(exc, file_path), exc.pending)
+            if answer != "confirmed":
+                reason = "datasource_approval_declined" if answer == "cancelled" else f"datasource_approval_{answer}"
+                return _fail(_DATASOURCES_NOT_APPROVED[answer], reason=reason)
+            approved = frozenset(DatasourceKey(item["engine"], item["name"]) for item in exc.pending)
+            try:
+                result = await asyncio.to_thread(
+                    _publish_artifact, abs_path, access=access, approved_datasources=approved
+                )
+            except DatasourceApprovalRequired:
+                return _fail(
+                    "PUBLISH FAILED: The app's connections changed while the user was deciding, so "
+                    "nothing was published. Tell the user, and publish again only if they ask.",
+                    reason="datasource_approval_changed",
+                )
+    except AccessChoiceRequired:
+        logger.info("Cowork publish refused: no access chosen on a shared publish token")
+        return _fail(
+            "PUBLISH FAILED: This deployment can't publish a link only the user can open. "
+            "Ask the user which access they want (password, specific people, organization or "
+            "public) and call again with access_mode.",
+            reason="access_choice_required",
+        )
     except PublishOwnedByOtherUser:
         # The model can edit files, so spell out that it must not work around
         # the refusal (e.g. by dropping the stored report_id). Not a ban for the
@@ -405,15 +495,17 @@ async def _cowork_publish_or_preview(session: Any, tc_input: dict):
             "(PDFs, images) and publish again.",
             reason="too_large",
         )
-    except MarkdownNotPublishable as exc:
+    except PageNotPublishable as exc:
         # The same file is refused on every try, and each try can hold the
         # server's one conversion for 30 s; the model can shorten the file.
+        # Markdown, or a file shared as a page of its own (ENG-4687).
         message = exc.detail["message"]
         logger.info("Cowork publish refused: %s", message)
+        what = "the Markdown" if exc.detail["code"] == "markdown_not_publishable" else "the file"
         return _fail(
             f"PUBLISH FAILED: {message} Do not retry with the same file. "
-            "Tell the user, or shorten or simplify the Markdown and publish again.",
-            reason=MARKDOWN_NOT_PUBLISHABLE_CODE,
+            f"Tell the user, or shorten or simplify {what} and publish again.",
+            reason=exc.detail["code"],
         )
     except ShareOrgRequired as exc:
         # The reason is MindsHub's, and classify_upload_error already logged
@@ -457,17 +549,27 @@ async def _cowork_publish_or_preview(session: Any, tc_input: dict):
     view_url = result.get("url", "") if isinstance(result, dict) else ""
     report_id = inner.get("report_id") or None
     md5 = inner.get("md5") or None
+    unapproved = result.get("unapprovedDatasources") if isinstance(result, dict) else None
+    notes = ""
+    if access is None and isinstance(result, dict) and result.get("accessMode") == AccessMode.RESTRICTED:
+        notes += (
+            " Only the user can open the link; they can change who can open it in the Share dialog."
+        )
+    if unapproved:
+        notes += " It was published without the credentials of: " + ", ".join(
+            item["label"] for item in unapproved
+        ) + "."
     if not view_url:
         # Committed (the service returned) but the URL is missing — success is
         # true, external_url stays null so the ambiguity is explicit, not prose.
         return _ok(
-            "Published, but no view URL was returned.",
+            "Published, but no view URL was returned." + notes,
             resource_id=report_id,
             idempotency_key=report_id,
             content_hash=(f"md5:{md5}" if md5 else None),
         )
     return _ok(
-        f"Published successfully! View URL: {view_url}",
+        f"Published successfully! View URL: {view_url}" + notes,
         resource_id=report_id,
         external_url=view_url,
         idempotency_key=report_id,
@@ -486,18 +588,26 @@ def build_cowork_publish_tool():
     these overrides the LLM defaults to CLI-era guidance and refuses
     to call `action: 'publish'` even when the user explicitly asked.
     On a self-hosted deployment the copy names neither the desktop app
-    nor MindsHub publishing.
+    nor MindsHub publishing. Where publishes go through a shared publish
+    token, on either kind of host, the prompt also says a first publish
+    must name its access.
     """
     from anton.tools import PUBLISH_TOOL
     from anton.core.tools.tool_defs import ToolDef
 
+    from cowork.services.publish import uses_shared_publish_token
+
     self_hosted = identity_for_turn() is not None
+    prompt = SELF_HOSTED_PUBLISH_PROMPT if self_hosted else COWORK_PUBLISH_PROMPT
+    # The same scope _publish_artifact publishes in.
+    if uses_shared_publish_token(current_settings_scope()):
+        prompt += FIRST_PUBLISH_ACCESS_RULE
     return ToolDef(
         name=PUBLISH_TOOL.name,
         description=SELF_HOSTED_PUBLISH_DESCRIPTION if self_hosted else COWORK_PUBLISH_DESCRIPTION,
         input_schema=PUBLISH_TOOL.input_schema,
         handler=_cowork_publish_or_preview,
-        prompt=SELF_HOSTED_PUBLISH_PROMPT if self_hosted else COWORK_PUBLISH_PROMPT,
+        prompt=prompt,
     )
 
 
@@ -754,6 +864,16 @@ _DATA_REQUEST_NOTE = (
     "say how to fetch a small sample of data (method, path, body shape, token "
     "flow), because the connection test passes only once data comes back."
 )
+_TEST_REQUEST_NOTE = (
+    "Every handcrafted form needs a `test_request`: the request Cowork sends to "
+    "check that the API returns data, written as data with `{{field}}` "
+    "placeholders. Give it an optional `token` step (method, url, form or "
+    "json_body, basic_auth, token_field) and a `data` step that sends `{{token}}` "
+    "or a secret field and fetches a few rows. Placeholders go only in the path, "
+    "query, header values and bodies, never in the host, so when each customer "
+    "has their own host, ask the user for it first and write it into the url. "
+    "APIs that need signed requests or client certificates can't be tested this way."
+)
 _BUILD_CUSTOM_CONNECTOR = (
     "No built-in or saved connector matches. Build a custom connector: ask the "
     "user how the system is reached (a REST or GraphQL API, a database, or file "
@@ -761,14 +881,14 @@ _BUILD_CUSTOM_CONNECTOR = (
     "handcraft the form with `engine` set to the new connector's id and a "
     "`connector` block (label, description, category, usage_notes), and pass it "
     "to `request_credentials`. Credentials go only through that form, never chat. "
-    f"{_DATA_REQUEST_NOTE} Once its connection test passes it is saved for reuse."
+    f"{_TEST_REQUEST_NOTE} {_DATA_REQUEST_NOTE} Once its connection test passes it is saved for reuse."
 )
 _NO_CUSTOM_CONNECTOR = (
     "No built-in or saved connector matches, and custom connectors can't be "
     "saved for reuse on this deployment. Tell the user so. A handcrafted form "
     "passed to `request_credentials` still saves this connection once its test "
     "passes, but it won't be listed with the connectors. Still give the form a "
-    f"`connector` block with usage_notes. {_DATA_REQUEST_NOTE}"
+    f"`connector` block with usage_notes. {_TEST_REQUEST_NOTE} {_DATA_REQUEST_NOTE}"
 )
 
 
@@ -917,9 +1037,14 @@ async def _cowork_request_credentials(session: Any, tc_input: dict) -> str:
         return f"request_credentials: {_sharepoint_instruction()}"
     known = (await _scope_connectors()).get(connector_id)
     extends_name = spec.get("extends_connection")
+    custom = bool(known and known.get("custom"))
+    stored_test_request = has_test_requests(known.get("form") or {}) if custom else None
     handcrafted = handcrafted_form_allowed(
-        known=known is not None, custom=bool(known and known.get("custom")), extends=extends_name is not None,
+        known=known is not None, custom=custom, extends=extends_name is not None,
+        stored_test_request=stored_test_request,
     )
+    if spec.get("_connector_id") and stored_test_request is False and not tenant_scope_required():
+        return f"request_credentials: {NEEDS_REBUILD_FOR_AGENT.format(connector_id=connector_id)}"
     if not spec.get("_connector_id") and not handcrafted:
         return (
             f"request_credentials: {connector_id!r} is already a connector. Call "
@@ -967,13 +1092,34 @@ async def _cowork_request_credentials(session: Any, tc_input: dict) -> str:
         "fence and AFTER the closing fence. Do not concatenate the fence "
         "onto the end of a sentence — markdown parsers won't recognise it "
         "as a code block if it isn't at the start of a line.\n\n"
-        "After the user submits, the server tests the connection and saves "
-        "the credentials automatically — your job is done. Do not call any "
+        "After the user submits, the server tests the connection, and the "
+        "credentials are saved once it passes (on a custom connector, once the "
+        "user confirms its result) — your job is done. Do not call any "
         "tool to retrieve the submitted values, and do not re-emit the form "
         "unless the user asks for a new one.\n\n"
         f"{block}"
     )
 
+
+_TEST_STEP_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "method": {"type": "string", "enum": ["GET", "POST"]},
+        "url": {"type": "string", "description": "https URL; {{field}} placeholders only in the path and query."},
+        "headers": {"type": "object", "description": "Header values may use {{field}} or {{token}}."},
+        "basic_auth": {"type": "array", "items": {"type": "string"}, "description": "Two placeholders: user, then password."},
+        "form": {"type": "object", "description": "Form-encoded body."},
+        "json_body": {"description": "JSON body; placeholders in its string values."},
+        "token_field": {"type": "string", "description": "Token step only: the JSON key that holds the token."},
+    },
+    "required": ["method", "url"],
+}
+_TEST_REQUEST_SCHEMA = {
+    "type": "object",
+    "description": "REQUIRED on a handcrafted form (on each method of a multi-method form). " + _TEST_REQUEST_NOTE,
+    "properties": {"token": _TEST_STEP_SCHEMA, "data": _TEST_STEP_SCHEMA},
+    "required": ["data"],
+}
 
 _REQUEST_CREDENTIALS_SCHEMA = {
     "type": "object",
@@ -1000,6 +1146,7 @@ _REQUEST_CREDENTIALS_SCHEMA = {
                 "usage_notes": {"type": "string", "description": f"Short notes for using it later: base URL, auth header, key endpoints, quirks. {_DATA_REQUEST_NOTE} Never credential values."},
             },
         },
+        "test_request": _TEST_REQUEST_SCHEMA,
         "_connector_id": {
             "type": "string",
             "description": "Slug of the canonical spec returned by `lookup_connector`. ALWAYS copy it over when the spec came from lookup (routes submissions to the registry-aware save endpoint); omit for handcrafted specs.",
@@ -1094,6 +1241,7 @@ _REQUEST_CREDENTIALS_SCHEMA = {
                         "items": {"type": "object"},
                     },
                     "actions": {"type": "array", "items": {"type": "object"}},
+                    "test_request": _TEST_REQUEST_SCHEMA,
                 },
                 "required": ["id", "label", "fields"],
             },
@@ -1251,19 +1399,41 @@ async def _cowork_connect_datasource(session: Any, tc_input: dict) -> str:
     with connections turned off reads a FilteredDataVault over it, whose
     connecting view lists them by label alone, so a paste never matches or
     relabels one.
+
+    With a key file, a field named SEALED_FIELD is refused by name before
+    anton's handler runs, as the sealed vault refuses it, even for a value
+    anton would drop or an engine whose fields lack it, so the model hears one
+    rule. A save the sealed vault refuses as too large (RecordTooLargeError)
+    answers with its reason. anton has written an engine it doesn't know to
+    ~/.anton/datasources.md by then, with the same field names any connect
+    with them writes, and a retry with a smaller value keeps them, so anton
+    drops none.
     """
     from anton.tools import handle_connect_datasource
 
+    from cowork.common.encryption import sealing_keys
     from cowork.services.connectors.layered_vault import FilteredDataVault, LayeredDataVault
+    from cowork.services.connectors.sealed_vault import SEALED_FIELD, RecordTooLargeError, ReservedFieldError
+
+    known_variables = tc_input.get("known_variables")
+    if sealing_keys() is not None and isinstance(known_variables, dict) and SEALED_FIELD in known_variables:
+        # anton's handler writes an engine it doesn't know to ~/.anton/datasources.md, this field
+        # among its fields, before the sealed vault refuses the save. The model's retry with the
+        # field renamed would then find that engine, and anton would drop the renamed field without
+        # a word. anton names the connection only when it saves, so the refusal names the engine.
+        return str(ReservedFieldError(connection=str(tc_input.get("engine", ""))))
 
     vault = session._data_vault
-    if not isinstance(vault, (LayeredDataVault, FilteredDataVault)):
-        return await handle_connect_datasource(session, tc_input)
     # anton's handler reads the vault off the session, and a session runs its
     # tool calls one at a time, so the swap holds for this call alone.
-    session._data_vault = vault.for_connecting()
+    if isinstance(vault, (LayeredDataVault, FilteredDataVault)):
+        session._data_vault = vault.for_connecting()
     try:
         return await handle_connect_datasource(session, tc_input)
+    except RecordTooLargeError as exc:
+        # A refusal of the person's input, as the pre-check's is: the reason names the connection
+        # and the sizes, never a value, and nothing is logged.
+        return str(exc)
     finally:
         session._data_vault = vault
 

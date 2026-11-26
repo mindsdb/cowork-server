@@ -139,9 +139,11 @@ class ConnectedInChat(NamedTuple):
     session_vault: object
 
 
-async def connect_in_chat(turn: BuiltTurn, monkeypatch, *, known_variables: dict[str, str]) -> ConnectedInChat:
+async def connect_in_chat(
+    turn: BuiltTurn, monkeypatch, *, known_variables: dict[str, str], engine: str = "postgres"
+) -> ConnectedInChat:
     """Run the turn's own connect_new_datasource tool as the agent calls it
-    with postgres credentials pasted in chat, its connection test passing."""
+    with credentials for ``engine`` pasted in chat, its connection test passing."""
 
     async def connection_test_passes(*_args, **_kwargs) -> bool:
         return True
@@ -157,5 +159,5 @@ async def connect_in_chat(turn: BuiltTurn, monkeypatch, *, known_variables: dict
         _scratchpads=None,
         _active_datasource=None,
     )
-    answer = await tool.handler(session, {"engine": "postgres", "known_variables": known_variables})
+    answer = await tool.handler(session, {"engine": engine, "known_variables": known_variables})
     return ConnectedInChat(answer=answer, session_vault=session._data_vault)
