@@ -112,6 +112,8 @@ _PROMPT = """\
 SCHEDULED TASKS:
 - `{list_tool}` shows the user's scheduled tasks. `{manage_tool}` creates, changes, pauses, resumes or \
 deletes one. Use the schedule_id `{list_tool}` returns; never guess one.
+- The task list shows excluded connectors. To change them, direct the user to that task's settings \
+on the Scheduled Tasks page. Changing the task's prompt does not change its connector exclusions.
 - The user approves every change on a confirmation card the tool shows them, and nothing changes \
 unless they confirm it there. So call the tool rather than asking "shall I?" in chat. Ask first only \
 when you don't know what to run, how often, or when. If they cancel, nothing was changed: ask what \
@@ -159,6 +161,7 @@ def _summary(schedule) -> dict:
         "recurrence": recurrence,
         "timezone": schedule.timezone,
         "next_run_at": ensure_utc(schedule.next_run_at).isoformat(),
+        "disabled_connections": [entry.model_dump() for entry in schedule.disabled_connections or []],
         "state": schedule.state.value,
         "paused": schedule.state in {ScheduleState.paused, ScheduleState.auto_paused},
     }
@@ -679,7 +682,10 @@ def build_schedule_tools(*, project_id: UUID | None) -> list:
     return [
         ToolDef(
             name=LIST_TOOL_NAME,
-            description="List the user's scheduled tasks: id, title, prompt, cadence, timezone, next run, and state (active, paused, auto_paused, missed, or done).",
+            description=(
+                "List the user's scheduled tasks with their IDs, prompts, timing, state, "
+                "and excluded connectors."
+            ),
             input_schema=_LIST_SCHEMA,
             handler=_list_tasks,
         ),

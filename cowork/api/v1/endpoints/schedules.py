@@ -1,14 +1,17 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 from functools import partial
 from uuid import UUID
 
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, status
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request, status
 
 from cowork.api.v1.permissions import AuthenticatedInOrgMode, WindowProof, require
-from cowork.db.scoped import ScopedSession, ScopedSessionDep, TenantScopeDep
+from cowork.common.settings.app_settings import OAuthSettings
+from cowork.db.scoped import ScopedSession, ScopedSessionDep, TenantScope, TenantScopeDep
 from cowork.db.units import run_db, run_efs_unit
+from cowork.schemas.connectors import DisabledConnection
 from cowork.schemas.schedules import (
     DEFAULT_MODEL_SENTINEL,
     ScheduleCreateRequest,
@@ -16,6 +19,8 @@ from cowork.schemas.schedules import (
     ScheduleRunResponse,
     ScheduleUpdateRequest,
 )
+from cowork.services.connectors.oauth import auth_proxy
+from cowork.services.connectors.persist import turn_vault_for_scope
 from cowork.services.schedules import InvalidSchedule, ScheduleConflict, ScheduleRunService, ScheduleService
 
 logger = logging.getLogger(__name__)
@@ -56,14 +61,70 @@ def list_schedules(scoped: ScopedSessionDep, project_id: UUID | None = None):
 @router.post(
     "/", status_code=status.HTTP_201_CREATED, response_model=ScheduleResponse, dependencies=[Depends(require(WindowProof))]
 )
-async def create_schedule(body: ScheduleCreateRequest, scope: TenantScopeDep):
+async def create_schedule(body: ScheduleCreateRequest, scope: TenantScopeDep, request: Request):
     # A schedule with no project runs in the caller's default project, which
     # checks the general project's folder on the file store.
     unit = run_db if body.project_id is not None else run_efs_unit
-    return await unit(partial(_create_schedule, body=body), scope=scope)
+    exclusions = await _resolve_exclusions(body.disabled_connections, scope, request)
+    return await unit(partial(_create_schedule, body=body, exclusions=exclusions), scope=scope)
 
 
-def _create_schedule(scoped: ScopedSession, *, body: ScheduleCreateRequest) -> ScheduleResponse:
+async def _resolve_exclusions(
+    exclusions: list[DisabledConnection] | None, scope: TenantScope, request: Request,
+    *, stored: list[dict] | None = None,
+) -> list[dict]:
+    """Validate against this member's visible connections and store stable datasource IDs.
+
+    An entry the task already holds (``stored``) stays as it is when its
+    connection is gone: the editor resends the whole list with every save and
+    shows no box for a missing connection, so refusing it would refuse every
+    later edit. Kept rather than dropped, so a connection that comes back
+    under the same name or id is still left out.
+    """
+    if not exclusions:
+        return []
+    kept = {(e.get("engine"), e.get("name"), e.get("datasource_id")): e for e in stored or [] if isinstance(e, dict)}
+    if scope.org_mode:
+        settings = OAuthSettings()
+        catalogue, datasources, custom = await asyncio.gather(
+            auth_proxy.proxy_catalogue(request, settings),
+            auth_proxy.proxy_datasource_list(request, settings),
+            auth_proxy.proxy_custom_connection_list(request, settings),
+        )
+        known = {(c["engine"], c["name"]) for item in catalogue.get("items", []) for c in item.get("connections", [])}
+        known.update((c["connector_id"], c["name"]) for c in custom)
+        by_id = {(c["connector_id"], c["id"]): c for c in datasources}
+        by_name = {(c["connector_id"], c["name"]): c for c in datasources}
+    else:
+        rows = await run_efs_unit(lambda _: turn_vault_for_scope(scope).list_connections(), scope=scope)
+        known = {(c["engine"], c["name"]) for c in rows}
+        by_id, by_name = {}, {}
+
+    canonical = []
+    for item in exclusions:
+        key = (item.engine, item.name)
+        if item.datasource_id is not None:
+            source = by_id.get((item.engine, item.datasource_id))
+        else:
+            source = by_name.get(key)
+            if key in known:
+                if source is not None:
+                    raise HTTPException(status_code=422, detail="Two connectors match this exclusion. Select it again.")
+                canonical.append(item.model_dump())
+                continue
+        if source is None:
+            already = kept.get((item.engine, item.name, item.datasource_id))
+            if already is not None:
+                canonical.append(already)
+                continue
+            raise HTTPException(status_code=422, detail="An excluded connector could not be found in your connections.")
+        canonical.append(DisabledConnection(
+            engine=item.engine, name=source["name"], datasource_id=source["id"],
+        ).model_dump())
+    return canonical
+
+
+def _create_schedule(scoped: ScopedSession, *, body: ScheduleCreateRequest, exclusions: list[dict]) -> ScheduleResponse:
     try:
         schedule = ScheduleService(scoped).create_schedule(
             title=body.title,
@@ -75,6 +136,7 @@ def _create_schedule(scoped: ScopedSession, *, body: ScheduleCreateRequest) -> S
             timezone=body.timezone,
             project_id=body.project_id,
             enabled=body.enabled,
+            disabled_connections=exclusions,
         )
     except ValueError as e:
         # e.g. a project_id that isn't visible in this scope
@@ -92,11 +154,28 @@ def get_schedule(schedule_id: UUID, scoped: ScopedSessionDep):
 
 @router.put("/{schedule_id}", response_model=ScheduleResponse, dependencies=[Depends(require(WindowProof))])
 @router.patch("/{schedule_id}", response_model=ScheduleResponse, dependencies=[Depends(require(WindowProof))])
-def update_schedule(schedule_id: UUID, body: ScheduleUpdateRequest, scoped: ScopedSessionDep):
+async def update_schedule(schedule_id: UUID, body: ScheduleUpdateRequest, scope: TenantScopeDep, request: Request):
     changes = body.model_dump(exclude_none=True)
     # "No project" arrives as an explicit null, which exclude_none drops.
     if "project_id" in body.model_fields_set and body.project_id is None:
         changes["project_id"] = None
+    if body.disabled_connections is not None:
+        stored = await run_db(partial(_stored_exclusions, schedule_id=schedule_id), scope=scope) if body.disabled_connections else None
+        changes["disabled_connections"] = await _resolve_exclusions(
+            body.disabled_connections, scope, request, stored=stored,
+        )
+    unit = run_efs_unit if "project_id" in changes and changes["project_id"] is None else run_db
+    return await unit(partial(_update_schedule, schedule_id=schedule_id, changes=changes), scope=scope)
+
+
+def _stored_exclusions(scoped: ScopedSession, *, schedule_id: UUID) -> list[dict]:
+    try:
+        return list(ScheduleService(scoped).get_schedule(schedule_id).disabled_connections or [])
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
+
+
+def _update_schedule(scoped: ScopedSession, *, schedule_id: UUID, changes: dict) -> ScheduleResponse:
     try:
         schedule = ScheduleService(scoped).update_schedule(schedule_id, **changes)
     except InvalidSchedule as e:

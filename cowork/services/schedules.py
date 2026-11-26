@@ -169,6 +169,7 @@ class ScheduleService:
         project_id: UUID | None = None,
         enabled: bool = True,
         recurrence: dict | None = None,
+        disabled_connections: list[dict] | None = None,
     ) -> Schedule:
         # Anchor the parent (same as conversations): the target project must be
         # visible in scope, or a foreign org's project id could be attached.
@@ -185,6 +186,7 @@ class ScheduleService:
             timezone=timezone,
             project_id=target_project_id,
             enabled=enabled,
+            disabled_connections=disabled_connections or None,
             # `timezone` is this method's zone-name argument here.
             paused_at=None if enabled else datetime.now(timezone_.utc),
         )
@@ -700,6 +702,7 @@ class ScheduleRunService:
         self,
         error: str = "Run orphaned by a server restart before it completed.",
         started_before: datetime | None = None,
+        executed: list[ScheduleRun] | None = None,
     ) -> int:
         """Mark every run still in ``running`` as ``failed``.
 
@@ -715,6 +718,9 @@ class ScheduleRunService:
 
         A reaped run gives its cron slot back, so the slot it left due fires
         again on the next poll, as it did before runs claimed slots.
+
+        Each reaped run that had claimed execution, other than a trial, goes
+        on ``executed``, so the caller can tell its owner it didn't finish.
         """
         query = self.session.select(ScheduleRun).where(ScheduleRun.status == RunStatus.running)
         if started_before is not None:
@@ -735,6 +741,8 @@ class ScheduleRunService:
             run.lease_expires_at = None
             _record_lost_run(run)
             self.session.add(run)
+            if executed is not None and run.execution_claimed_at is not None and not run.trial:
+                executed.append(run)
         self.session.commit()
         return len(runs)
 
