@@ -362,7 +362,7 @@ class TestAnOldConnectorCanBeBuiltAgain:
             monkeypatch.setattr(module, "run_db", connector_test_flow.run_db)
         staged = []
         monkeypatch.setattr(submissions_endpoint.store, "stage", lambda **kwargs: staged.append(kwargs) or "sub_x")
-        monkeypatch.setattr(submissions_endpoint, "ProbeHandler", lambda *, scope: SimpleNamespace(run=lambda *a: iter(())))
+        monkeypatch.setattr(submissions_endpoint, "ProbeHandler", lambda *, scope, **_: SimpleNamespace(run=lambda *a: iter(())))
         return SimpleNamespace(staged=staged, submissions=submissions_endpoint, tools=tools)
 
     @pytest.mark.asyncio

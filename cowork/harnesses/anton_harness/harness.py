@@ -27,7 +27,7 @@ from cowork.common.history_scrub import scrub_credentials, scrubbed_openai_dump
 from cowork.common.logger import get_logger, log_context
 from cowork.common.paths import cowork_home, makedirs_below_nofollow, pod_local_only
 from cowork.common.settings.app_settings import get_app_settings
-from cowork.common.settings.user_settings import current_settings_scope, effective_turn_limits
+from cowork.common.settings.user_settings import Provider, current_settings_scope, effective_turn_limits
 from cowork.deployment_identity import identity_for_turn, learned_memory_scope
 from cowork.db.personal_resources import PersonalResource
 from cowork.db.scoped import LOCAL_SCOPE, ScopedSession, TenantScope, tenant_scope_required
@@ -273,6 +273,12 @@ def _overlay_user_settings(anton_settings, user, *, zdr_on: bool = False) -> lis
     if classify_off and hasattr(anton_settings, "classify_jev"):
         anton_settings.classify_jev = "off"
         applied.append("classify_jev")
+    # Under ZDR MindsHub drops native web search, so the scratchpad's web_search() goes
+    # when its coding model runs there. An anton that predates the setting keeps it.
+    web_search_off = zdr_on and getattr(user, "resolved_coding_provider", None) is Provider.MINDS_CLOUD
+    if web_search_off and hasattr(anton_settings, "scratchpad_web_search"):
+        anton_settings.scratchpad_web_search = "off"
+        applied.append("scratchpad_web_search")
     return applied
 
 
@@ -1822,7 +1828,8 @@ class AntonHarness:
         anton_settings.skills_extra_roots = [HOST_SKILLS_DIR]
 
         user = await run_on_unit_threads(get_user_settings)
-        _overlay_user_settings(anton_settings, user, zdr_on=await _turn_zdr_on(user))
+        zdr_on = await _turn_zdr_on(user)
+        _overlay_user_settings(anton_settings, user, zdr_on=zdr_on)
 
         RECALL_HISTORY_TOOL = self._recall_history_tool(conversation, user)
         elicitor = build_elicitor(str(conversation.id), interactive=interactive)
@@ -2348,7 +2355,7 @@ class AntonHarness:
                 # Hosted web search stays off when COWORK_OPENAI_COMPATIBLE_API
                 # puts planning on the Responses API. The client above uses
                 # this same settings snapshot, even if settings change mid-build.
-                **web_tool_kwargs_for(user.resolved_planning_provider),
+                **web_tool_kwargs_for(user.resolved_planning_provider, zdr_on=zdr_on),
                 # "Conversation started" stamp for the cache-stable prompt prefix
                 # (anton 2a). The live current time is rendered separately in the
                 # volatile tail, so resuming days later still reports the real "now".

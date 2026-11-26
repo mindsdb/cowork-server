@@ -709,14 +709,14 @@ def _failed_frame_for(exc: Exception, *, request_id: str | None = None) -> str:
     return response_failed_sse(GENERIC_TURN_ERROR_MESSAGE, GENERIC_TURN_ERROR_CODE, request_id=request_id)
 
 
-def _allowed_web_tools(provider_kind: Provider) -> frozenset[str]:
+def _allowed_web_tools(provider_kind: Provider, *, zdr_on: bool = False) -> frozenset[str]:
     """The native web tools a direct answer may use: the same switches the
     agent's turns honor (`web_tool_switches`: the server's ANTON_WEB_* env,
-    and openai_compatible on the Responses flavor, where hosted search would
-    bypass the egress gateway)."""
+    openai_compatible on the Responses flavor, where hosted search would
+    bypass the egress gateway, and MindsHub under ZDR, which drops them)."""
     from cowork.services.providers import web_tool_switches
 
-    switches = web_tool_switches(provider_kind)
+    switches = web_tool_switches(provider_kind, zdr_on=zdr_on)
     if switches.get("internet_research_enabled") is False:
         return frozenset()
     return frozenset(
@@ -1055,6 +1055,8 @@ class ResponsesHandler:
                 answer_binding = self._answer_binding(
                     model=request.model, reasoning_effort=request.reasoning_effort, turn_llm=turn_llm,
                     web=not has_files,
+                    # Under ZDR MindsHub drops native web tools; only a known answer turns them off.
+                    zdr_on=not has_files and await self._zdr_on_quietly(turn_llm) is True,
                 )
                 answer_history = self.routing_history or _routing_history(
                     start.gate_rows or [], start.harness_input,
@@ -1779,7 +1781,7 @@ class ResponsesHandler:
 
     def _answer_binding(
         self, *, model: str | None, reasoning_effort: str | None = None, turn_llm: dict | None,
-        web: bool = True,
+        web: bool = True, zdr_on: bool = False,
     ) -> RouterBinding | None:
         """The model that writes a direct answer the gate routed: the
         composer's pick, else the planning model, on the planning provider,
@@ -1810,7 +1812,7 @@ class ResponsesHandler:
             return None
         return RouterBinding(
             provider=provider, model=answer_model, label=provider_kind.value,
-            reasoning_effort=reasoning_effort, web_tools=_allowed_web_tools(provider_kind) if web else frozenset(),
+            reasoning_effort=reasoning_effort, web_tools=_allowed_web_tools(provider_kind, zdr_on=zdr_on) if web else frozenset(),
         )
 
     async def _router_binding(self) -> tuple[RouterBinding | None, dict | None]:

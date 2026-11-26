@@ -3079,7 +3079,38 @@ async def test_zdr_keeps_the_pods_completion_check_and_classify_off_jev(monkeypa
     params = json.loads(fake.added[0][1]["payload"])["params"]
     assert params["jev_decisions"] is sent
     assert params["jev_classify"] is sent
+    assert params["web_search"] is sent
     assert asked == ([] if handed is not None else ["mdb_turnkey"])
+
+
+@pytest.mark.parametrize(("read", "sent"), [(True, False), (False, True), (RuntimeError("down"), False)])
+@pytest.mark.asyncio
+async def test_zdr_turns_off_the_pods_web_search_even_with_jev_opted_out(monkeypatch, read, sent):
+    # web_search() follows ZDR alone, so ZDR is read even when Jev is already off; unknown counts as on.
+    from cowork.common.settings import user_settings
+    from cowork.services import mindshub_zdr
+
+    monkeypatch.setattr(
+        user_settings, "get_user_settings",
+        lambda scope: SimpleNamespace(limits_enabled=False, resolved_planning_model="m", hub_workspace_id="",
+                                      jev_decisions_enabled=False, jev_classify_enabled=False),
+    )
+
+    async def zdr_on_for(**kwargs):
+        if isinstance(read, Exception):
+            raise read
+        return read
+
+    monkeypatch.setattr(mindshub_zdr, "zdr_on_for", zdr_on_for)
+    fake = FakeRedis(replies=[("scratchpad:reply:conv-1", _reply("turn_completed", {}))])
+    monkeypatch.setattr(prod, "get_redis", lambda: fake)
+    monkeypatch.setattr(prod, "_new_correlation_id", lambda: "r")
+    await _drain(prod.stream_remote_replies(
+        conversation_id="conv-1", org_id=None, user_id=None, input_text="hi", model="m"))
+
+    params = json.loads(fake.added[0][1]["payload"])["params"]
+    assert params["web_search"] is sent
+    assert params["jev_classify"] is False and params["jev_decisions"] is False
 
 
 @pytest.mark.parametrize("enabled", [True, False])

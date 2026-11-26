@@ -488,7 +488,7 @@ def staged_in_org(monkeypatch):
     monkeypatch.setattr(store, "stage", lambda **kwargs: staged.append(kwargs) or "sub_x")
 
     class NoProbe:
-        def __init__(self, *, scope):
+        def __init__(self, *, scope, **_):
             raise AssertionError("an org-mode custom form must not reach the probe")
 
     monkeypatch.setattr(submissions_endpoint, "ProbeHandler", NoProbe)
@@ -572,7 +572,7 @@ def test_an_org_built_in_outside_the_database_category_takes_the_submission_flow
         return real_stage(**kwargs)
 
     class FakeProbeHandler:
-        def __init__(self, *, scope):
+        def __init__(self, *, scope, **_):
             pass
 
         async def run(self, *args):
@@ -734,7 +734,7 @@ def test_a_desktop_submission_still_stages_and_probes(local_client, monkeypatch)
         return staged["submission_id"]
 
     class FakeProbeHandler:
-        def __init__(self, *, scope):
+        def __init__(self, *, scope, **_):
             probed["scope"] = scope
 
         async def run(self, submission_id, connector_id, method, name, conversation_id):
@@ -770,7 +770,7 @@ def test_a_desktop_managed_service_submission_still_stages_and_probes(local_clie
         return staged["submission_id"]
 
     class FakeProbeHandler:
-        def __init__(self, *, scope):
+        def __init__(self, *, scope, **_):
             pass
 
         async def run(self, submission_id, connector_id, method, name, conversation_id):
@@ -805,7 +805,7 @@ def test_a_desktop_handcrafted_submission_still_stages_its_own_form(local_client
         return real_stage(**kwargs)
 
     class FakeProbeHandler:
-        def __init__(self, *, scope):
+        def __init__(self, *, scope, **_):
             pass
 
         async def run(self, *args):

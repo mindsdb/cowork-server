@@ -1029,6 +1029,40 @@ def test_zdr_turns_off_classify_whatever_the_switch():
     assert "classify_jev" in applied
 
 
+@pytest.mark.parametrize(("zdr_on", "coding", "web_search"), [
+    (True, "minds_cloud", "off"),
+    (False, "minds_cloud", "on"),
+    # BYOK coding: MindsHub's ZDR doesn't drop that provider's web search.
+    (True, "anthropic", "on"),
+])
+def test_zdr_turns_off_the_scratchpads_web_search(zdr_on, coding, web_search):
+    from types import SimpleNamespace
+
+    from cowork.common.settings.user_settings import UserSettings
+    from cowork.harnesses.anton_harness.harness import _overlay_user_settings
+
+    anton = SimpleNamespace(scratchpad_web_search="on", classify_jev="on", verifier_jev="on")
+    user = UserSettings.model_validate({"coding_provider": coding, "minds_cloud_api_key": "k"})
+    applied = _overlay_user_settings(anton, user, zdr_on=zdr_on)
+
+    assert anton.scratchpad_web_search == web_search
+    assert ("scratchpad_web_search" in applied) is (web_search == "off")
+
+
+def test_an_anton_without_the_web_search_switch_is_left_alone():
+    from types import SimpleNamespace
+
+    from cowork.common.settings.user_settings import UserSettings
+    from cowork.harnesses.anton_harness.harness import _overlay_user_settings
+
+    anton = SimpleNamespace(classify_jev="on", verifier_jev="on")
+    user = UserSettings.model_validate({"coding_provider": "minds_cloud", "minds_cloud_api_key": "k"})
+    applied = _overlay_user_settings(anton, user, zdr_on=True)
+
+    assert not hasattr(anton, "scratchpad_web_search")
+    assert "scratchpad_web_search" not in applied
+
+
 def test_an_anton_without_classify_is_left_alone():
     from types import SimpleNamespace
 
@@ -1408,6 +1442,16 @@ def test_the_direct_answer_honors_the_servers_web_tool_switches(monkeypatch, env
         monkeypatch.setenv(name, value)
 
     assert _allowed_web_tools(Provider.MINDS_CLOUD) == allowed
+
+
+def test_the_direct_answer_on_mindshub_has_no_web_tools_under_zdr(monkeypatch):
+    from cowork.handlers.responses import _allowed_web_tools
+
+    for name in ("ANTON_WEB_SEARCH_ENABLED", "ANTON_WEB_FETCH_ENABLED", "ANTON_INTERNET_RESEARCH_ENABLED"):
+        monkeypatch.delenv(name, raising=False)
+
+    assert _allowed_web_tools(Provider.MINDS_CLOUD, zdr_on=True) == frozenset()
+    assert _allowed_web_tools(Provider.ANTHROPIC, zdr_on=True) == {"web_search", "web_fetch"}
 
 
 @pytest.mark.asyncio

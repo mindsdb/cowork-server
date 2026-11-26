@@ -1393,19 +1393,19 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
     turn_settings = await run_on_unit_threads(partial(get_user_settings, scope))
     jev_decisions = getattr(turn_settings, "jev_decisions_enabled", True) is not False
     jev_classify = getattr(turn_settings, "jev_classify_enabled", True) is not False
-    # Under ZDR MindsHub refuses Jev, so the pod neither checks completion nor classifies with it.
-    if jev_decisions or jev_classify:
-        if zdr_on is None:
-            from cowork.services.mindshub_zdr import zdr_on_for
+    # Under ZDR MindsHub refuses Jev and drops native web search, so the pod neither checks
+    # completion nor classifies with Jev, and its scratchpad has no web_search(). Read even with Jev off.
+    if zdr_on is None:
+        from cowork.services.mindshub_zdr import zdr_on_for
 
-            try:
-                zdr_on = await zdr_on_for(scope=scope, settings=turn_settings, turn_key=llm_block.get("api_key", ""))
-            except Exception:
-                # Unknown counts as on: it only skips Jev, which MindsHub refuses under ZDR.
-                logger.warning("Could not read ZDR for the remote turn", exc_info=True)
-                zdr_on = True
-        jev_decisions = jev_decisions and not zdr_on
-        jev_classify = jev_classify and not zdr_on
+        try:
+            zdr_on = await zdr_on_for(scope=scope, settings=turn_settings, turn_key=llm_block.get("api_key", ""))
+        except Exception:
+            # Unknown counts as on: it only skips Jev and web_search(), which ZDR drops anyway.
+            logger.warning("Could not read ZDR for the remote turn", exc_info=True)
+            zdr_on = True
+    jev_decisions = jev_decisions and not zdr_on
+    jev_classify = jev_classify and not zdr_on
     # A key shorter than the time-limited window comes from an auth that
     # refused that window (auth_keys._request_turn_key), so the turn runs
     # untimed: no "Keep going" ask the key couldn't outlive.
@@ -1436,6 +1436,9 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
               # Jev: the pod's scratchpad then has no classify(). A controller
               # that predates the field drops it, and the pod keeps it on.
               "jev_classify": jev_classify,
+              # False under ZDR: the pod's scratchpad then has no web_search().
+              # A controller that doesn't relay it yet, or an older pod, keeps the helper.
+              "web_search": not zdr_on,
               # The app's language (ENG-4149), read by anton's TurnRequestV1.
               # Absent without one. scratchpad-controller relays it to the pod
               # (mindsdb/scratchpad-controller#124, which merges first).

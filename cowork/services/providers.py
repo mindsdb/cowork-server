@@ -1792,7 +1792,7 @@ _WEB_TOOL_ENV = {
 _OFF_VALUES = frozenset({"0", "false", "no", "off"})
 
 
-def web_tool_kwargs_for(planning_provider: Provider) -> WebToolKwargs:
+def web_tool_kwargs_for(planning_provider: Provider, *, zdr_on: bool = False) -> WebToolKwargs:
     """ChatSessionConfig web-tool kwargs for a session that plans on ``planning_provider``.
 
     On anton's Responses flavor either web flag becomes OpenAI's hosted
@@ -1806,17 +1806,18 @@ def web_tool_kwargs_for(planning_provider: Provider) -> WebToolKwargs:
     ``ANTON_WEB_SEARCH_ENABLED`` / ``ANTON_WEB_FETCH_ENABLED`` set to a false
     value in the server's env turn that tool off for every session this server
     runs, and ``ANTON_INTERNET_RESEARCH_ENABLED`` turns internet research off;
-    they never turn anything on. Org turns run in a pod through
+    they never turn anything on. Under ZDR (*zdr_on*) MindsHub drops native web
+    tools, so a session planning there runs with both off. Org turns run in a pod through
     ``anton.cloud_turn``, which doesn't read this env. A field the installed
     anton's ChatSessionConfig lacks is dropped (``supported_kwargs``): passing
     it would fail every turn.
     """
     from anton.core.session import ChatSessionConfig
 
-    return WebToolKwargs(**supported_kwargs(ChatSessionConfig, **web_tool_switches(planning_provider)))
+    return WebToolKwargs(**supported_kwargs(ChatSessionConfig, **web_tool_switches(planning_provider, zdr_on=zdr_on)))
 
 
-def web_tool_switches(planning_provider: Provider) -> WebToolKwargs:
+def web_tool_switches(planning_provider: Provider, *, zdr_on: bool = False) -> WebToolKwargs:
     """The web tools this server turns off for a session on `planning_provider`,
     before `web_tool_kwargs_for` drops the fields the installed anton lacks.
     For callers that apply them themselves, such as the direct answer."""
@@ -1825,7 +1826,8 @@ def web_tool_switches(planning_provider: Provider) -> WebToolKwargs:
     if (
         planning_provider is Provider.OPENAI_COMPATIBLE
         and openai_compatible_agent_api() == "responses"
-    ):
+    ) or (zdr_on and planning_provider is Provider.MINDS_CLOUD):
+        # Under ZDR MindsHub drops native web tools, so they would answer from memory.
         kwargs = WebToolKwargs(web_search_enabled=False, web_fetch_enabled=False)
     else:
         kwargs = WebToolKwargs()
