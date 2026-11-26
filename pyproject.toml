@@ -17,7 +17,8 @@ classifiers = [
 dependencies = [
     # Discord Gateway and Slack Socket Mode ingress import it at runtime, and
     # the server image installs no extras, so it cannot live only in `channels`.
-    "aiohttp>=3.14",
+    # Floor for the aiohttp security fixes in 3.14.4.
+    "aiohttp>=3.14.4",
     "alembic>=1.17.0",
     # First release that re-sends the previous password hash
     # (`previous_access`) and raises `ArtifactOwnedByOtherUserError`.
