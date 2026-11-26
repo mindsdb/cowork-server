@@ -729,6 +729,20 @@ def test_managed_project_permissions_stay_with_operator(tmp_path, monkeypatch, s
     from cowork.harnesses.memory.store import ProjectMemoryStore
 
     monkeypatch.setenv("COWORK_PRIVATE_PROJECT_DIRS", "true")
+    monkeypatch.setenv("COWORK_TENANCY_MODE", "local")
+    monkeypatch.setenv("COWORK_TRUST_IDENTITY_HEADERS", "false")
+    monkeypatch.delenv("COWORK_DEPLOYMENT_KIND", raising=False)
+    # The test session supplies DATABASE_URI. Supply the rest of a self-hosted
+    # process's credentials with the same stand-ins as the deployment tests.
+    for name, stand_in in (
+        ("COWORK_AUTH_TOKEN", "self-hosted-test-token"),
+        ("COWORK_PUBLISH_TOKEN", "mdb_self_hosted_test_publish_token"),
+        ("MINDS_API_KEY", "mdb_self_hosted_test_publish_token"),
+    ):
+        monkeypatch.delenv(f"{name}_FILE", raising=False)
+        monkeypatch.setenv(name, stand_in)
+    get_app_settings.cache_clear()
+    assert get_app_settings().protect_desktop_project_dirs
     monkeypatch.setenv(setting, value)
     get_app_settings.cache_clear()
     assert not get_app_settings().protect_desktop_project_dirs
