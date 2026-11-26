@@ -351,40 +351,32 @@ def test_a_page_without_a_usable_viewer_is_text_alone(viewer_base):
 @pytest.mark.parametrize(
     ("web_origin", "publish_url", "override", "expected"),
     [
-        (
-            "https://cowork.staging.mindshub.ai",
-            "https://api.staging.mindshub.ai",
-            "",
-            "https://cowork.staging.mindshub.ai/document-viewer/v1/",
-        ),
-        (
-            "https://cowork.mindshub.ai/",
-            "",
-            "",
-            "https://cowork.mindshub.ai/document-viewer/v1/",
-        ),
-        # A desktop server: the publish host names the Cowork web app.
+        # A MindsHub publish host names its environment's Cowork web app.
+        ("", "https://view.mindshub.ai", "", "https://cowork.mindshub.ai/document-viewer/v1/"),
+        ("", "https://api.staging.mindshub.ai", "", "https://cowork.staging.mindshub.ai/document-viewer/v1/"),
+        ("", "https://api.dev.mindshub.ai", "", "https://cowork.dev.mindshub.ai/document-viewer/v1/"),
+        # A PR environment's hosts, and over a server set to the shared dev app.
         (
             "",
-            "https://view.mindshub.ai",
+            "https://view-pr-cowork-1583.dev.mindshub.ai",
             "",
-            "https://cowork.mindshub.ai/document-viewer/v1/",
+            "https://cowork-pr-cowork-1583.dev.mindshub.ai/document-viewer/v1/",
         ),
         (
+            "https://cowork.dev.mindshub.ai",
+            "https://api-pr-cowork-1583.dev.mindshub.ai/",
             "",
-            "https://api.dev.mindshub.ai",
-            "",
-            "https://cowork.dev.mindshub.ai/document-viewer/v1/",
+            "https://cowork-pr-cowork-1583.dev.mindshub.ai/document-viewer/v1/",
         ),
+        # Another publisher: the server's own Cowork web app, or text alone.
+        ("https://cowork.example.com/", "https://publish.customer.example", "", "https://cowork.example.com/document-viewer/v1/"),
         ("", "https://publish.customer.example", "", ""),
+        ("http://cowork.example.com", "https://publish.customer.example", "", ""),
         ("", "", "", ""),
+        # Not a MindsHub host, whatever its name says.
+        ("", "https://view.mindshub.ai.evil.example", "", ""),
         # An operator's override wins, and must be https.
-        (
-            "https://cowork.mindshub.ai",
-            "",
-            "https://viewer.example/v1",
-            "https://viewer.example/v1/",
-        ),
+        ("https://cowork.mindshub.ai", "", "https://viewer.example/v1", "https://viewer.example/v1/"),
         ("https://cowork.mindshub.ai", "", "http://viewer.example/v1/", ""),
     ],
 )

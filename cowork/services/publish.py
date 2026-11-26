@@ -1143,7 +1143,8 @@ def _document_viewer_base() -> str:
     try:
         publish_url, _api_key = _resolve_publish_endpoint(get_user_settings())
         web_origin = get_app_settings().draft_frame_origin()
-    except Exception:  # noqa: BLE001
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("shared document pages: no viewer, settings unreadable (%s)", type(exc).__name__)
         return ""
     return document_viewer_base(
         web_origin=web_origin,

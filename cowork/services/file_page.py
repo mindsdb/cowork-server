@@ -39,11 +39,12 @@ PUBLISHABLE_FILE_SUFFIXES = (".pdf", ".docx", ".xlsx", ".pptx", ".csv", ".txt")
 # /document-viewer/v1/<type>.js on the Cowork web app.
 VIEWER_TYPES = {".docx": "docx", ".pptx": "pptx", ".xlsx": "xlsx"}
 DOCUMENT_VIEWER_PATH = "/document-viewer/v1/"
-# The Cowork web app a desktop server's pages load the viewer from, by the
-# publish host it publishes to (``providers.publish_url_for_endpoint``).
-PROD_COWORK_WEB_ORIGIN = "https://cowork.mindshub.ai"
-_PROD_PUBLISH_HOST = "view.mindshub.ai"
-_ENV_PUBLISH_HOST = re.compile(r"^api\.([a-z0-9-]+)\.mindshub\.ai$")
+# A MindsHub publish host, and the Cowork web app beside it: the host's first
+# label `api` or `view` becomes `cowork`, so view.mindshub.ai is beside
+# cowork.mindshub.ai, api.staging.mindshub.ai beside cowork.staging.mindshub.ai
+# and a PR environment's view-pr-cowork-<n>.dev.mindshub.ai beside
+# cowork-pr-cowork-<n>.dev.mindshub.ai.
+_MINDSHUB_PUBLISH_HOST = re.compile(r"^(?:api|view)((?:[.-][a-z0-9-]+)*)\.mindshub\.ai$")
 _VIEWER_BASE = re.compile(r"^https://[^\s\"'<>]+/$")
 
 # How much of each kind the page shows.
@@ -117,25 +118,24 @@ def published_file_name(name: str) -> str:
 def document_viewer_base(*, web_origin: str, publish_url: str, override: str = "") -> str:
     """Where a shared page loads the document viewer's scripts from, or "".
 
-    *override* (``COWORK_DOCUMENT_VIEWER_URL``) wins. A cloud server names its
-    Cowork web app in ``COWORK_WEB_ORIGIN`` (*web_origin*). A desktop server has
-    none, so the publish host names it: MindsHub's own (prod) publishes beside
-    cowork.mindshub.ai, and ``api.<env>.mindshub.ai`` beside
-    ``cowork.<env>.mindshub.ai``. Any other publisher gets pages of text alone.
+    *override* (``COWORK_DOCUMENT_VIEWER_URL``) wins. A page published to a
+    MindsHub host loads it from the Cowork web app of that host's environment
+    (``_MINDSHUB_PUBLISH_HOST``): the page and the viewer always come from the
+    same environment, whatever the server's own settings name. Otherwise the
+    server's Cowork web app (``COWORK_WEB_ORIGIN``, *web_origin*), and with
+    neither, pages of text alone.
     """
     if override:
         base = override if override.endswith("/") else override + "/"
         return base if _VIEWER_BASE.match(base) else ""
-    origin = web_origin.rstrip("/")
-    if not origin.startswith("https://"):
-        host = (urlparse(publish_url or "").hostname or "").lower()
-        env = _ENV_PUBLISH_HOST.match(host)
-        if host == _PROD_PUBLISH_HOST:
-            origin = PROD_COWORK_WEB_ORIGIN
-        elif env:
-            origin = f"https://cowork.{env.group(1)}.mindshub.ai"
-        else:
-            return ""
+    host = (urlparse(publish_url or "").hostname or "").lower()
+    beside = _MINDSHUB_PUBLISH_HOST.match(host)
+    if beside:
+        origin = f"https://cowork{beside.group(1)}.mindshub.ai"
+    elif web_origin.startswith("https://"):
+        origin = web_origin.rstrip("/")
+    else:
+        return ""
     base = origin + DOCUMENT_VIEWER_PATH
     return base if _VIEWER_BASE.match(base) else ""
 
