@@ -30,10 +30,6 @@ DEFAULT_TIMEOUT_S = 300
 class CoworkElicitor:
     """Surfaces questions as inline cards in the cowork chat."""
 
-    # No file-browser widget yet, so path questions stay CLI-only and
-    # select_path keeps degrading to picker_unavailable here.
-    supported_kinds = ("choice",)
-
     answer_hint = (
         "The user sees the options as clickable buttons and may also type a "
         "free-form answer, or skip the question entirely."
@@ -45,10 +41,16 @@ class CoworkElicitor:
         broker: AnswerBroker,
         *,
         timeout_s: int = DEFAULT_TIMEOUT_S,
+        supported_kinds: tuple[str, ...] = ("choice",),
     ) -> None:
         self._conversation_id = conversation_id
         self._broker = broker
         self.timeout_s = timeout_s
+        # anton reads this off the instance when it registers the session's
+        # tools and before it shows each card. No file-browser widget yet, so
+        # path questions stay CLI-only and select_path keeps degrading to
+        # picker_unavailable here.
+        self.supported_kinds = supported_kinds
 
     async def begin(self, question_id: str, request: AskRequest) -> None:
         self._broker.open(self._conversation_id, question_id, request)

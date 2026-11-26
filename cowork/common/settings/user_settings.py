@@ -22,6 +22,7 @@ from cowork.common.settings.app_settings import (
     PLANNING_MODEL_DEFAULTS,
     ROLE_MODEL_DEFAULTS,
     ROUTER_MODEL_DEFAULTS,
+    LaunchEnvironmentSource,
     Settings,
     default_minds_url,
     get_app_settings,
@@ -537,16 +538,17 @@ class UserSettings(Settings):
     def settings_customise_sources(
         cls, settings_cls, init_settings, env_settings, dotenv_settings, file_secret_settings
     ):
-        # Only local reads process env; a shared server's injected provider
-        # secrets would otherwise leak into every tenant's settings. Fail closed:
-        # anything not local is DB-only. A credential whose file the process
-        # environment names wins over the environment and every .env
-        # (cowork.common.settings.secret_files).
+        # Only local reads process env (live, then as captured at launch); a
+        # shared server's injected provider secrets would otherwise leak into
+        # every tenant's settings. Fail closed: anything not local is DB-only.
+        # A credential whose file the process environment names wins over the
+        # environment and every .env (cowork.common.settings.secret_files).
         if get_app_settings().tenancy_mode == "local":
             return (
                 init_settings,
                 SecretFileSettingsSource(settings_cls),
                 env_settings,
+                LaunchEnvironmentSource(settings_cls),
                 dotenv_settings,
                 file_secret_settings,
             )

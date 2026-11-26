@@ -17,6 +17,8 @@ from pathlib import Path
 
 from cryptography.fernet import Fernet, MultiFernet
 
+from cowork.common.launch_environment import launch_value
+
 logger = logging.getLogger(__name__)
 
 KEY_FILE_ENV = "COWORK_KEY_FILE"
@@ -41,8 +43,10 @@ class UnopenableSettingError(Exception):
 
 def key_file_path() -> Path | None:
     """The file ``COWORK_KEY_FILE`` names, read from the process environment
-    only, so a line in cowork-home's ``.env`` can't set or move it."""
-    value = os.environ.get(KEY_FILE_ENV, "")
+    only, so a line in cowork-home's ``.env`` can't set or move it. A local
+    launch moves the variable out of ``os.environ`` once its settings load,
+    so it is read through launch_value."""
+    value = launch_value(KEY_FILE_ENV) or ""
     return Path(value) if value else None
 
 

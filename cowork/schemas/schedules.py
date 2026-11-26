@@ -125,7 +125,7 @@ class AttemptOutcome(str, Enum):
     # automatic continuations) with nobody there to say "keep going".
     stopped_at_limit = "stopped_at_limit"
     # The turn ended on its own, but a change it asked approval for was
-    # refused: a scheduled run has nobody to approve it, so it wasn't made.
+    # refused: nobody approved it while the run waited, so it wasn't made.
     writes_refused = "writes_refused"
     # Failed before the agent could act: setup or permission, or a turn whose
     # stream shows nothing but its start, its memory read and its failure.

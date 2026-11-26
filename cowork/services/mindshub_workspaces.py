@@ -15,8 +15,10 @@ shells, and the active-workspace pick has to be stored here anyway.
 **The bearer is the caller's own, and the host is the operator's.** Same rule
 ``fetch_org_model_catalog`` follows: the stored provider key and ``minds_url``
 are both tenant-settable, so using either would let an org admin point a
-member's credential at a host they chose. ``default_minds_auth_host`` derives
-from ENV, which the desktop propagates when it spawns this process.
+member's credential at a host they chose. ``mindshub_client.mindshub_v1`` picks
+it: the deployment's in-cluster auth base, else ``default_minds_auth_host``,
+which a desktop install derives from the ENV it propagates when it spawns this
+process.
 """
 
 from __future__ import annotations
