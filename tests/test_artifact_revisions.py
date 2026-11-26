@@ -1896,3 +1896,120 @@ def test_comment_on_viewer_capture_keeps_its_id_and_content(artifact):
     assert first["id"] not in {r["id"] for r in list_revisions(folder)}
     _refresh(folder, "# Data 3\n")
     assert revision_with_content(folder, observed["id"])["content"] == "# Data 2\n"
+
+
+@pytest.fixture
+def inline_app(tmp_path):
+    folder = tmp_path / "contacts"
+    folder.mkdir()
+    metadata = {"id": "c0ffee00", "slug": "contacts", "type": "html-app", "primary": "index.html", "display": "inline"}
+    (folder / "metadata.json").write_text(json.dumps(metadata), encoding="utf-8")
+    (folder / "index.html").write_text("<ul></ul>", encoding="utf-8")
+    artifact_id, metadata = ensure_full_id(folder, ArtifactMetadata.model_validate(metadata))
+    return folder, metadata, artifact_id
+
+
+def test_an_interrupted_first_state_save_is_finished_on_the_next_read(inline_app, monkeypatch):
+    """ENG-4684: the save that creates state.json recovers like any other."""
+    folder, metadata, artifact_id = inline_app
+    with pytest.raises(FileNotFoundError):
+        current_source(folder, metadata, artifact_id, "state.json")
+    write_manifest = revision_service._write_manifest
+
+    def fail_once(folder_arg, payload):
+        monkeypatch.setattr(revision_service, "_write_manifest", write_manifest)
+        raise OSError("simulated manifest interruption")
+
+    monkeypatch.setattr(revision_service, "_write_manifest", fail_once)
+    with pytest.raises(OSError, match="simulated manifest interruption"):
+        save_source(
+            folder, metadata, artifact_id,
+            content='{"done": true}', expected_revision_id=None,
+            rel_path="state.json", actor_id="user-1", summary="Inline state",
+        )
+
+    recovered = current_source(folder, metadata, artifact_id, "state.json")
+    assert recovered["content"] == '{"done": true}'
+    assert recovered["revision"]["summary"] == "Inline state"
+    assert not (folder / ".revisions" / "pending-source-write.json").exists()
+
+
+def test_the_turn_capture_never_takes_state_json_for_the_page(inline_app):
+    folder, metadata, artifact_id = inline_app
+    save_source(folder, metadata, artifact_id, content="{}", expected_revision_id=None, rel_path="state.json")
+    (folder / "index.html").write_text("<ul><li>Ana</li></ul>", encoding="utf-8")
+
+    captured = capture_agent_revision(folder, conversation_id="conversation-1")
+
+    assert captured["path"] == "index.html"
+    assert current_source(folder, metadata, artifact_id)["path"] == "index.html"
+
+
+def test_inline_state_saves_never_push_out_the_page_revisions(inline_app, monkeypatch):
+    """ENG-4684: a page that saves its state on every click must not prune the
+    page revisions earlier chat cards name. Stale state saves go first, and
+    the newest state save stays."""
+    folder, metadata, artifact_id = inline_app
+    monkeypatch.setattr(revision_service, "MAX_REVISIONS", 5)
+    first_page = capture_agent_revision(folder, conversation_id="conversation-1")
+    (folder / "index.html").write_text("<ul><li>Ana</li></ul>", encoding="utf-8")
+    second_page = capture_agent_revision(folder, conversation_id="conversation-1")
+
+    head = None
+    for n in range(8):
+        saved = save_source(
+            folder, metadata, artifact_id, content=json.dumps({"n": n}),
+            expected_revision_id=head, rel_path="state.json",
+        )
+        head = saved["revision"]["id"]
+
+    kept = list_revisions(folder)
+    assert len(kept) == 5
+    ids = {r["id"] for r in kept}
+    assert {first_page["id"], second_page["id"], head} <= ids
+    assert revision_with_content(folder, first_page["id"])["content"] == "<ul></ul>"
+    assert json.loads(current_source(folder, metadata, artifact_id, "state.json")["content"]) == {"n": 7}
+
+
+def test_without_state_saves_pruning_still_drops_the_oldest(inline_app, monkeypatch):
+    folder, metadata, artifact_id = inline_app
+    monkeypatch.setattr(revision_service, "MAX_REVISIONS", 3)
+    captured = []
+    for n in range(5):
+        (folder / "index.html").write_text(f"<p>{n}</p>", encoding="utf-8")
+        captured.append(capture_agent_revision(folder, conversation_id="conversation-1")["id"])
+
+    assert [r["id"] for r in list_revisions(folder)] == list(reversed(captured[-3:]))
+
+
+def test_snapshot_saves_never_push_out_the_page_revisions(inline_app, monkeypatch):
+    """ENG-4684: snapshot.json, saved on every slider move, prunes like
+    state.json: stale saves of either go first, and the newest of each stays."""
+    folder, metadata, artifact_id = inline_app
+    monkeypatch.setattr(revision_service, "MAX_REVISIONS", 5)
+    first_page = capture_agent_revision(folder, conversation_id="conversation-1")
+    (folder / "index.html").write_text("<ul><li>Ana</li></ul>", encoding="utf-8")
+    second_page = capture_agent_revision(folder, conversation_id="conversation-1")
+
+    state = save_source(
+        folder, metadata, artifact_id, content='{"s": 1}', expected_revision_id=None, rel_path="state.json",
+    )["revision"]["id"]
+    head = None
+    for n in range(8):
+        head = save_source(
+            folder, metadata, artifact_id, content=json.dumps({"controls": [], "text": str(n)}),
+            expected_revision_id=head, rel_path="snapshot.json",
+        )["revision"]["id"]
+
+    kept = {r["id"] for r in list_revisions(folder)}
+    assert len(kept) == 5
+    assert {first_page["id"], second_page["id"], state, head} <= kept
+    assert json.loads(current_source(folder, metadata, artifact_id, "snapshot.json")["content"])["text"] == "7"
+
+
+def test_the_turn_capture_never_takes_snapshot_json_for_the_page(inline_app):
+    folder, metadata, artifact_id = inline_app
+    save_source(folder, metadata, artifact_id, content="{}", expected_revision_id=None, rel_path="snapshot.json")
+    (folder / "index.html").write_text("<ul><li>Ana</li></ul>", encoding="utf-8")
+
+    assert capture_agent_revision(folder, conversation_id="conversation-1")["path"] == "index.html"

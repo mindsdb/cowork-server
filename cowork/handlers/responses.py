@@ -3687,6 +3687,7 @@ class ResponsesHandler:
                     turn_artifacts.directory.base,
                     new_slugs=changes.created,
                     touched_slugs=changes.touched,
+                    revisions=changes.revisions,
                     scope=scope,
                     project_id=turn_artifacts.directory.project_id,
                     project_name=turn_artifacts.directory.project_name,

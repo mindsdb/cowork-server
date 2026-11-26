@@ -47,6 +47,7 @@ from cowork.services.product_permissions import has_product_permission, require_
 from cowork.services.artifact_permissions import (
     artifact_capabilities,
     require_artifact_owner,
+    with_display_limits,
     with_export_formats,
 )
 from cowork.services import artifact_files
@@ -54,7 +55,7 @@ from cowork.services.artifact_autopublish import job_budget_for, lock_ttl_for
 from cowork.services.preview_html import prepare_preview_html
 from cowork.services.quick_edit import direct_edit_available, edits_in_place, quick_edit_available
 from cowork.services.artifact_identity import opened_artifact_folder
-from cowork.services.artifact_metadata import ArtifactMetadata
+from cowork.services.artifact_metadata import WIDGET_PUBLISH_REFUSAL, ArtifactMetadata, is_widget
 from cowork.schemas.artifact_export import ExportRequest, ExportResult
 from cowork.schemas.artifact_access import (
     ArtifactAccessRequest,
@@ -75,6 +76,7 @@ from cowork.services.artifact_export import (
 )
 from cowork.services.render_pdf_client import RenderPdfFailed
 from cowork.services.artifact_revisions import (
+    INLINE_PAGE_FILES,
     JOURNAL_DIRNAME,
     RepairAlreadyPending,
     RevisionConflict,
@@ -188,9 +190,17 @@ def _editable_source_selector(source, folder: Path, requested: str | None) -> st
                 current = open_pinned_child(current, disk_name)
                 resources.callback(current.close)
                 disk_parts.append(disk_name)
-            disk_name = artifact_files.existing_draft_entry_name(
-                current, parts[-1], native_case=True
-            )
+            try:
+                disk_name = artifact_files.existing_draft_entry_name(
+                    current, parts[-1], native_case=True
+                )
+            except FileNotFoundError:
+                # An inline html-app's state.json or snapshot.json before its
+                # first save (ENG-4684): the service answers a read 404, lets
+                # a save create it, and refuses it for any other artifact type.
+                if len(parts) != 1 or parts[0] not in INLINE_PAGE_FILES:
+                    raise
+                return parts[0]
             if not stat.S_ISREG(dir_lstat(current, disk_name).st_mode):
                 raise OSError("draft source is not a regular file")
             disk_parts.append(disk_name)
@@ -425,7 +435,9 @@ def _not_found_detail(exc: FileNotFoundError) -> str:
 
 class _SourceUpdateBody(BaseModel):
     content: str
-    expectedRevisionId: str = Field(min_length=1, max_length=80)
+    # Null only for the save that creates an inline page's state.json or
+    # snapshot.json (ENG-4684); for a file that exists it answers 409 like a stale token.
+    expectedRevisionId: str | None = Field(min_length=1, max_length=80)
     path: str | None = Field(default=None, max_length=1000)
     summary: str = Field(default="Edited artifact", max_length=240)
 
@@ -802,7 +814,9 @@ async def artifact_source(
         )
         capabilities = await _current_capabilities(
             scope,
-            with_export_formats(scope, owner_capabilities, export_source),
+            with_display_limits(
+                with_export_formats(scope, owner_capabilities, export_source), metadata.display
+            ),
             source_path=result.get("path"),
         )
         return {**result, "capabilities": capabilities, "repair": repair}
@@ -841,7 +855,9 @@ async def update_artifact_source(
             ),
             scope=scope,
         )
-        if saved["revision"]["id"] != body.expectedRevisionId:
+        # An inline page's saved state is no part of its published page, so
+        # saving it re-publishes nothing.
+        if saved["revision"]["id"] != body.expectedRevisionId and saved["path"] not in INLINE_PAGE_FILES:
             await _sync_live_artifact(scope, folder, project_id=source.project_id)
         return saved
     except RevisionConflict as exc:
@@ -986,7 +1002,9 @@ async def artifact_review_entry(
     capabilities = await _current_capabilities(
         scope,
         await run_db(
-            lambda unit: artifact_capabilities(unit, artifact.source, artifact.folder.name),
+            lambda unit: artifact_capabilities(
+                unit, artifact.source, artifact.folder.name, display=artifact.metadata.display
+            ),
             scope=scope,
         ),
         source_path=(current_revision or {}).get("path"),
@@ -1246,6 +1264,14 @@ def _owner_publish_context(scope: TenantScope, folder: Path):
     )
 
 
+def _refuse_widget(metadata: ArtifactMetadata | None) -> None:
+    """400 for a widget: it is never published or shared (ENG-4684). Checked
+    before the publish lock and the audience checks; publish_artifact refuses
+    it again for every other path."""
+    if metadata is not None and is_widget(metadata.display):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=WIDGET_PUBLISH_REFUSAL)
+
+
 def _artifact_primary(folder: Path, metadata: ArtifactMetadata | None):
     from cowork.services.artifacts import _pick_primary, _user_files
 
@@ -1470,6 +1496,7 @@ async def set_artifact_access(
     source, folder, metadata, _capabilities = await _owner_workspace(
         scope, project_ref, artifact_id
     )
+    _refuse_widget(metadata)
     if await run_efs(partial(_artifact_primary, folder, metadata), scope=scope) is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -1652,6 +1679,7 @@ async def republish_artifact(
     source, folder, metadata, _capabilities = await _owner_workspace(
         scope, project_ref, artifact_id
     )
+    _refuse_widget(metadata)
     if await run_efs(partial(_artifact_primary, folder, metadata), scope=scope) is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -2025,7 +2053,7 @@ async def restore_artifact_revision(
             ),
             scope=scope,
         )
-        if saved["revision"]["id"] != body.expectedRevisionId:
+        if saved["revision"]["id"] != body.expectedRevisionId and saved["path"] not in INLINE_PAGE_FILES:
             await _sync_live_artifact(scope, folder, project_id=source.project_id)
         return saved
     except RevisionConflict as exc:

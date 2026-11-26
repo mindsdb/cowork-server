@@ -90,6 +90,7 @@ from anton.publish_access import resolve_access as _resolve_access
 from anton.publish_access import resolve_publish_target as _anton_resolve_publish_target
 from cowork.docs.store import DOC_HTML, is_doc_folder, is_doc_primary
 from cowork.schemas.export_child import PublishFileRequest, PublishMarkdownRequest
+from cowork.services.artifact_metadata import WIDGET_PUBLISH_REFUSAL, is_widget
 from cowork.services.file_page import (
     DOCUMENT_VIEWER_PATH,
     PUBLISHABLE_FILE_SUFFIXES,
@@ -98,6 +99,7 @@ from cowork.services.file_page import (
 )
 from cowork.services.artifacts import (
     _content_mtime,
+    _load_metadata,
     _load_published_map,
     _org_mode,
     PUBLISHABLE_STATIC_SUFFIXES,
@@ -124,6 +126,29 @@ class ComparisonPublishRefused(ValueError):
     A ValueError so every caller's existing mapping applies unchanged: 400 on
     the REST paths, a failed tool result for the agent.
     """
+
+
+class WidgetPublishRefused(ValueError):
+    """Publishing or sharing a widget (metadata.json ``display: "widget"``),
+    which is never allowed: a widget collects input in the chat and is no
+    deliverable (ENG-4684).
+
+    A ValueError, as ComparisonPublishRefused, so every caller's existing
+    mapping applies unchanged: 400 on the REST paths, a failed tool result
+    for the agent, a skip for autopublish.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(WIDGET_PUBLISH_REFUSAL)
+
+
+def is_widget_folder(folder: Path) -> bool:
+    """Whether ``folder`` is an artifact folder whose metadata.json makes it a
+    widget. A folder without readable metadata is not one."""
+    if not (folder / "metadata.json").is_file():
+        return False
+    metadata = _load_metadata(folder)
+    return metadata is not None and is_widget(metadata.display)
 
 
 class PublisherUnavailable(RuntimeError):
@@ -1887,6 +1912,10 @@ def publish_artifact(
         raise ValueError(
             "Only web pages, Markdown, PDF, Word, Excel, PowerPoint, CSV and text artifact content can be published"
         )
+    # Every publish path ends here, so this is the one place a widget is kept
+    # from going live or being shared; the routes also refuse it up front.
+    if is_widget_folder(published_dir):
+        raise WidgetPublishRefused()
     # anton bundles files from this folder by path. A file there with a second
     # name, such as a hard link a cell made to the project's `.anton/.env`,
     # would publish that file's current content on every publish.
