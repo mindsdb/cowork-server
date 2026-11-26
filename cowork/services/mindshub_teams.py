@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from collections.abc import Callable
 from enum import StrEnum
 from typing import Any, NamedTuple, TypeVar
@@ -165,6 +166,17 @@ _teams_cache: CallerTtlCache[MindsHubTeamListing] = CallerTtlCache(keep_s=_MAX_T
 _permissions_cache: CallerTtlCache[MindsHubPermissions] = CallerTtlCache(keep_s=_MAX_THROTTLED_AGE_S)
 
 _Read = TypeVar("_Read", MindsHubTeamListing, MindsHubPermissions)
+
+# Each organization's last known ZDR answer and when it was read, for a push that has no credential to ask with.
+_org_zdr_seen: dict[str, tuple[ZdrState, float]] = {}
+
+
+def recent_org_zdr_state(org_id: str, *, max_age_s: float) -> ZdrState:
+    """The org's last ON/OFF answer read in this process within ``max_age_s``, else UNKNOWN."""
+    seen = _org_zdr_seen.get(org_id) if org_id else None
+    if seen is None or time.monotonic() - seen[1] > max_age_s:
+        return ZdrState.UNKNOWN
+    return seen[0]
 
 
 def _parse_teams(payload: Any) -> MindsHubTeamListing:
@@ -320,11 +332,14 @@ async def fetch_mindshub_permissions(*, bearer_token: str, org_id: str, user_id:
     """The caller's ``permissions[]`` from their entitlements."""
     if not bearer_token:
         return MindsHubPermissions()
-    return await _cached_read(
+    permissions = await _cached_read(
         _permissions_cache, path=ENTITLEMENTS_PATH, bearer_token=bearer_token, org_id=org_id,
         user_id=user_id, parse=_parse_permissions, unknown=MindsHubPermissions,
         none_granted=_refused_permissions, failed=MindsHubPermissions.is_outage_answer,
     )
+    if org_id and permissions.zdr_state is not ZdrState.UNKNOWN:
+        _org_zdr_seen[org_id] = (permissions.zdr_state, time.monotonic())
+    return permissions
 
 
 async def fetch_teams_and_permissions(
@@ -356,3 +371,4 @@ async def org_team_ids(*, bearer_token: str) -> frozenset[str] | None:
 def reset_caches_for_tests() -> None:
     _teams_cache.clear()
     _permissions_cache.clear()
+    _org_zdr_seen.clear()

@@ -8,9 +8,12 @@ from __future__ import annotations
 
 import logging
 
-from cowork.services.mindshub_teams import ZdrState, fetch_mindshub_permissions
+from cowork.services.mindshub_teams import ZdrState, fetch_mindshub_permissions, recent_org_zdr_state
 
 logger = logging.getLogger(__name__)
+
+# How long an org's last ZDR answer here stands in for a read a push has no credential to make.
+PUSH_ZDR_ANSWER_MAX_AGE_S = 30 * 60
 
 
 async def zdr_state(*, bearer_token: str, org_id: str, user_id: str) -> ZdrState:
@@ -69,4 +72,14 @@ async def browser_zdr_on(*, scope, settings, org_bearer: str = "", turn_key: str
         return await zdr_on_for(scope=scope, settings=settings, org_bearer=org_bearer, turn_key=turn_key)
     except Exception:
         logger.warning("Could not read ZDR for the browser; keeping it off", exc_info=True)
+        return True
+
+
+def push_zdr_on(org_id: str | None) -> bool:
+    """Whether a push for *org_id* must leave user content out. Never asks MindsHub
+    (a push has no caller credential): the org's last answer read here, and none counts as on."""
+    try:
+        return recent_org_zdr_state(org_id or "", max_age_s=PUSH_ZDR_ANSWER_MAX_AGE_S) is not ZdrState.OFF
+    except Exception:
+        logger.warning("Could not read ZDR for a push; leaving its content out", exc_info=True)
         return True
