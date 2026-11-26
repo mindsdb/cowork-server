@@ -4,7 +4,8 @@ Skills shipped with cowork and seeded into the canonical skills store. Desktop
 uses `COWORK_SKILLS_DIR` (default `~/.cowork/skills`); org mode lazily seeds each
 organization's `<shared>/<org_id>/skills` store on its first read or turn.
 
-Layout — one folder per skill, each holding a `SKILL.md`:
+Layout — one folder per skill, each holding only a `SKILL.md` (a test enforces
+it: an update replaces that one file atomically):
 
     skills_builtin/
       my-skill/
@@ -17,8 +18,30 @@ Seeding is versioned by `BUILTIN_SKILLS_VERSION`:
   so a lost durable volume reseeds instead of being masked by a surviving DB
   row.
 - Seeding runs only when the stored version < `BUILTIN_SKILLS_VERSION`.
-- Existing folders in the store are never overwritten. Add new skills here and
-  bump `BUILTIN_SKILLS_VERSION` to ship them in a later release.
+- A builtin the store lacks is copied only if it is new since the store's
+  version, so a builtin someone deleted stays deleted.
+- A builtin the store has is replaced only when its files are exactly a version
+  we shipped (`shipped.json`; anton's `stats.json` sidecar is ignored and kept).
+  A copy someone edited, or one holding a link, is left as it is. The update
+  writes the new text beside `SKILL.md` and renames it over the old one, so a
+  copy is never missing or half written. A file that can't be replaced (a
+  Windows lock, say) is logged and skipped, and retried at the next version
+  bump; it never stops Desktop from starting.
+- To ship a new or changed builtin, in this order:
+  1. Bump `BUILTIN_SKILLS_VERSION` (`CODE_BUILTIN_SKILLS_VERSION` for a Code
+     skill). A store already at the old version would never see the change.
+  2. Edit or add the skill here.
+  3. Run `python scripts/builtin_skills_shipped.py` in a full clone (it reads
+     git history). It refuses a new or changed builtin until the version is
+     bumped, and records a new one as introduced in the bumped version.
+  `test_every_packaged_builtin_is_in_the_shipped_list` fails if a builtin was
+  edited without running the script, and CI runs the script's `--check`: a
+  pull request against its base branch, a push against the commit before it.
+  For a pull request that changes a builtin or a version constant, the
+  required `migration-freshness` check also runs it, against the tip of the
+  base branch, so a refusal there blocks the merge. If the base already
+  records your version, because another pull request bumped to it first,
+  raise the version above the one the refusal names and run the script again.
 
 On desktop, seeded copies remain ordinary editable/deletable file-backed skills.
 In org mode, packaged slugs are reserved and immutable for members, admins, and

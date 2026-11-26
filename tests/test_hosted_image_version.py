@@ -159,7 +159,7 @@ def test_the_version_is_resolved_before_git_is_deleted() -> None:
     installed dist-info. Deleting earlier would put us back to a fallback
     version -- the same bug, reached from the other side.
     """
-    sync_at = _DOCKERFILE.find("uv sync --frozen --no-dev")
+    sync_at = _DOCKERFILE.find("uv sync --locked --no-dev")
     delete_at = _DOCKERFILE.find("rm -rf /app/.git")
     assert sync_at != -1 and delete_at != -1
     assert sync_at < delete_at, "uv sync must resolve the version before .git is removed"

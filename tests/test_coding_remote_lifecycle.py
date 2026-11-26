@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from coding_service_fakes import CREDS, FakeEngine, repository, service_with
+from tests.support.coding.service_fakes import CREDS, FakeEngine, repository, service_with
 
 from cowork.coding.contracts import SessionCreateRequest, SessionStatus, TaskCapability
 from cowork.coding.control_models import ComputerCapabilities, RuntimeCommand, RuntimeEvent

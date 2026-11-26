@@ -111,8 +111,8 @@ def _bytes_under(folder: Path) -> dict[str, bytes]:
 
 async def _remember(*, engine, scope, project_id, rule: str, lesson: str) -> None:
     service = _service(engine=engine, scope=scope)
-    await service.update_memory(scope=MemoryScope.global_, category=MemorySlot.RULES, content=rule)
-    await service.update_memory(
+    service.update_memory_sync(scope=MemoryScope.global_, category=MemorySlot.RULES, content=rule)
+    service.update_memory_sync(
         scope=MemoryScope.project, category=MemorySlot.LESSONS, content=lesson, project_id=project_id
     )
 
@@ -220,8 +220,9 @@ def _shared_tier(root: Path, project_id: UUID | str) -> Path:
 async def test_the_shared_listing_holds_every_project_tier_by_id_alone(env, monkeypatch):
     """Bob's listing holds the tier of Alice's private project, which he can't
     open, by its id: no project row of hers is read, no name or path reaches
-    the response, and he gets no capability on it. A folder in projects/ that
-    is not a project id, or a link named like one, is no tier."""
+    the response, and he gets no capability on it. Nor on his own project's
+    tier: the one store is everyone's, so no person changes it. A folder in
+    projects/ that is not a project id, or a link named like one, is no tier."""
     engine, root = env
     monkeypatch.setenv("COWORK_PERSONAL_RESOURCES", ",".join(sorted(WITHOUT_MEMORY)))
     get_app_settings.cache_clear()
@@ -264,7 +265,7 @@ async def test_the_shared_listing_holds_every_project_tier_by_id_alone(env, monk
     [bob_lesson] = [
         item for item in items if item.project_id == bobs and item.category == MemorySlot.LESSONS
     ]
-    assert bob_lesson.capabilities.can_edit is True
+    assert bob_lesson.capabilities.can_edit is False and bob_lesson.capabilities.can_delete is False
     dumped = repr([item.model_dump() for item in items])
     assert "secret-plans" not in dumped and str(root) not in dumped
 
@@ -296,9 +297,9 @@ def test_a_project_tier_is_named_by_a_canonical_project_id_alone(tmp_path):
 async def test_the_shared_listing_gives_the_caller_empty_slots_for_its_projects_with_no_tier(
     env, monkeypatch
 ):
-    """The tiers on disk and the caller's own projects together: Bob gets empty,
-    editable slots for a project of his that has no tier yet, and listing them
-    makes no folder."""
+    """The tiers on disk and the caller's own projects together: Bob gets empty
+    slots for a project of his that has no tier yet, which he can't change in
+    the one store, and listing them makes no folder."""
     engine, root = env
     monkeypatch.setenv("COWORK_PERSONAL_RESOURCES", ",".join(sorted(WITHOUT_MEMORY)))
     get_app_settings.cache_clear()
@@ -313,7 +314,10 @@ async def test_the_shared_listing_gives_the_caller_empty_slots_for_its_projects_
 
     mine = [item for item in items if item.project_id == fresh]
     assert sorted(item.category for item in mine) == sorted([MemorySlot.RULES, MemorySlot.LESSONS])
-    assert all(item.content == "" and item.capabilities.can_edit is True for item in mine)
+    assert all(
+        item.content == "" and not item.capabilities.can_edit and not item.capabilities.can_delete
+        for item in mine
+    )
     assert alices in {item.project_id for item in items}
     assert not _shared_tier(root, fresh).exists()
     filtered = _service(engine=engine, scope=bob).list_memory_sync(project_id=fresh)
@@ -413,7 +417,7 @@ async def test_hosted_org_mode_lists_stored_memory_whatever_memory_enabled_says(
     project = _project(engine=engine, scope=member, path=tmp_path / "org-project")
     (tmp_path / "org-project" / ".anton" / "memory").mkdir(parents=True)
     (tmp_path / "org-project" / ".anton" / "memory" / "lessons.md").write_text("team lesson\n")
-    await _service(engine=engine, scope=member).update_memory(
+    _service(engine=engine, scope=member).update_memory_sync(
         scope=MemoryScope.global_, category=MemorySlot.RULES, content="alice's rule"
     )
 
@@ -449,7 +453,7 @@ async def test_the_operator_view_keeps_the_projects_own_folder_where_memory_is_p
     store = project_memory_store(scope=LOCAL_SCOPE, project_path=project_path, project_id=project)
     assert type(store) is ProjectMemoryStore
     assert store.root == project_path / ".anton" / "memory"
-    await _service(engine=engine, scope=LOCAL_SCOPE).update_memory(
+    _service(engine=engine, scope=LOCAL_SCOPE).update_memory_sync(
         scope=MemoryScope.project, category=MemorySlot.LESSONS, content="operator lesson", project_id=project
     )
     assert (project_path / ".anton" / "memory" / "lessons.md").read_text().strip() == "operator lesson"
@@ -474,7 +478,7 @@ async def test_the_operator_view_reads_the_deployment_tier_where_memory_is_share
 
     store = project_memory_store(scope=LOCAL_SCOPE, project_path=project_path, project_id=project)
     assert type(store) is NestedProjectMemoryStore and store.root == _shared_tier(root, project)
-    await _service(engine=engine, scope=LOCAL_SCOPE).update_memory(
+    _service(engine=engine, scope=LOCAL_SCOPE).update_memory_sync(
         scope=MemoryScope.project, category=MemorySlot.LESSONS, content="operator lesson", project_id=project
     )
 
@@ -548,7 +552,7 @@ async def test_reset_in_org_mode_removes_only_the_members_global_tier(env, tmp_p
     project_path = tmp_path / "org-project"
     (project_path / ".anton" / "memory").mkdir(parents=True)
     (project_path / ".anton" / "memory" / "lessons.md").write_text("team lesson\n")
-    await _service(engine=engine, scope=member).update_memory(
+    _service(engine=engine, scope=member).update_memory_sync(
         scope=MemoryScope.global_, category=MemorySlot.RULES, content="alice's rule"
     )
 

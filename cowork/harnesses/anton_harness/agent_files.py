@@ -180,6 +180,40 @@ class AgentFiles:
             )
             return None
 
+    def reported_file(self, literal: str) -> NamedFile | None:
+        """named_file for a path a tool reports in the project's terms, as
+        anton's generate_image does: relative to the agent's working directory,
+        except that ``.anton/artifacts/...`` is the project's artifacts folder.
+
+        On this server the two agree, the working directory being the project
+        root. A cloud pod works in the conversation's folder and sees the
+        project's artifacts folder at its own mount, so such a path is read
+        there, and names nothing when the pod's artifacts are not this
+        project's. The refusals of named_file (a ``..`` out of the folder, a
+        link out of it) apply as they do to any path.
+        """
+        seen = PurePosixPath(literal)
+        artifacts = _PROJECT_ARTIFACTS_FOLDER.parts
+        if self.pod_working_dirs and not seen.is_absolute() and seen.parts[:len(artifacts)] == artifacts:
+            if self.pod_artifacts_dir is None:
+                return None
+            literal = self.pod_artifacts_dir.joinpath(*seen.parts[len(artifacts):]).as_posix()
+        return self.named_file(literal)
+
+    def pod_project_parts(self, literal: str) -> tuple[str, ...] | None:
+        """Where a path the pod names lands in the project, as path parts below
+        ``project_root``, for a server that opens it one component at a time
+        without following links. None for a turn this server runs, for a place
+        where the pod sees nothing of the project, and for a path with a ``..``,
+        which only a link-following walk could place, and for a NUL byte, which no
+        path holds."""
+        if not self.pod_working_dirs or not literal or "\0" in literal:
+            return None
+        place = self._place_in_pod(literal)
+        if place is None or not place.parts or any(part in ("", ".", "..") for part in place.parts):
+            return None
+        return (*place.folder.parts, *place.parts)
+
     def _named_file(self, literal: str) -> NamedFile | None:
         """named_file, letting a failed lookup raise."""
         root = Path(os.path.realpath(self.project_root))

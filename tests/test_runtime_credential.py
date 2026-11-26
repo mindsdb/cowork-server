@@ -164,3 +164,196 @@ def test_org_mode_ignores_a_hand_over(monkeypatch):
         assert runtime_credential.get_minds_credential() is None
     finally:
         get_app_settings.cache_clear()
+
+
+# ── the desktop app's own browser ──────────────────────────────────────────
+
+_LAUNCH_KEY = "Ab3_-" + "x" * 38
+
+
+@pytest.fixture
+def no_browser_host():
+    runtime_credential.clear_browser_host()
+    yield
+    runtime_credential.clear_browser_host()
+
+
+def _loopback_client() -> TestClient:
+    from cowork.server import create_app
+
+    return TestClient(create_app(), client=("127.0.0.1", 40000))
+
+
+def test_the_browser_route_holds_and_clears(no_browser_host):
+    client = _loopback_client()
+
+    response = client.put(
+        "/api/v1/runtime-credential/browser", json={"url": "http://127.0.0.1:51234", "token": _LAUNCH_KEY},
+    )
+    assert response.status_code == 200 and response.json() == {"ok": True}
+    held = runtime_credential.get_browser_host()
+    assert (held.url, held.token.get_secret_value()) == ("http://127.0.0.1:51234", _LAUNCH_KEY)
+
+    response = client.put("/api/v1/runtime-credential/browser", json={"url": "", "token": ""})
+    assert response.status_code == 200
+    assert runtime_credential.get_browser_host() is None
+
+
+@pytest.mark.parametrize("body", [
+    {"url": "http://localhost:51234", "token": _LAUNCH_KEY},
+    {"url": "http://127.0.0.1", "token": _LAUNCH_KEY},
+    {"url": "http://127.0.0.1:0", "token": _LAUNCH_KEY},
+    {"url": "http://127.0.0.1:05123", "token": _LAUNCH_KEY},
+    {"url": "http://127.0.0.1:70000", "token": _LAUNCH_KEY},
+    {"url": "https://127.0.0.1:51234", "token": _LAUNCH_KEY},
+    {"url": "http://127.0.0.1:51234/", "token": _LAUNCH_KEY},
+    {"url": "http://10.0.0.5:51234", "token": _LAUNCH_KEY},
+    {"url": "http://127.0.0.1:51234", "token": _LAUNCH_KEY[:-1]},
+    {"url": "http://127.0.0.1:51234", "token": _LAUNCH_KEY[:-1] + "="},
+    {"url": "http://127.0.0.1:51234", "token": ""},
+    {"url": "", "token": _LAUNCH_KEY},
+    {"url": "http://127.0.0.1:51234", "token": _LAUNCH_KEY, "extra": "x"},
+])
+def test_the_browser_route_refuses_a_malformed_body_without_echoing_the_key(no_browser_host, body):
+    response = _loopback_client().put("/api/v1/runtime-credential/browser", json=body)
+
+    assert response.status_code == 422
+    assert _LAUNCH_KEY[:-1] not in response.text
+    assert runtime_credential.get_browser_host() is None
+
+
+def test_the_browser_route_refuses_a_caller_that_is_not_loopback(no_browser_host):
+    # A remote peer must never choose which browser the agent drives.
+    from cowork.server import create_app
+
+    client = TestClient(create_app(), client=("10.1.2.3", 40000))
+    response = client.put(
+        "/api/v1/runtime-credential/browser", json={"url": "http://127.0.0.1:51234", "token": _LAUNCH_KEY},
+    )
+
+    assert response.status_code == 403
+    assert runtime_credential.get_browser_host() is None
+
+
+def test_the_browser_route_is_refused_in_org_mode(no_browser_host, org_deployment):
+    # A signed-in member on loopback still reaches only the desktop-only refusal.
+    response = _loopback_client().put(
+        "/api/v1/runtime-credential/browser",
+        json={"url": "http://127.0.0.1:51234", "token": _LAUNCH_KEY},
+        headers={
+            "X-User-Id": "11111111-1111-4111-8111-111111111111",
+            "X-Organization-Id": "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
+        },
+    )
+
+    assert response.status_code == 403
+    assert runtime_credential.get_browser_host() is None
+
+
+def test_the_browser_holder_refuses_wherever_people_share_the_process(no_browser_host, monkeypatch):
+    """Org tenancy and a deployment that trusts identity headers serve several
+    people: a browser set there would answer every person's turn. The route
+    guard refuses org mode first; this is the layer under it, and the only
+    layer for identity headers, where the hand-over is a quiet no-op."""
+    host = runtime_credential.LocalBrowserHost(url="http://127.0.0.1:51234", token=_LAUNCH_KEY)
+    for env in ({"COWORK_TENANCY_MODE": "org"}, {"COWORK_TRUST_IDENTITY_HEADERS": "true"}):
+        with monkeypatch.context() as patch:
+            for name, value in env.items():
+                patch.setenv(name, value)
+            get_app_settings.cache_clear()
+            try:
+                runtime_credential.set_browser_host(host)
+                assert runtime_credential.get_browser_host() is None, env
+            finally:
+                get_app_settings.cache_clear()
+        # Nothing was stored, so nothing appears once the process is single-person.
+        assert runtime_credential.get_browser_host() is None, env
+        # Held before, it is still not served there.
+        runtime_credential.set_browser_host(host)
+        with monkeypatch.context() as patch:
+            for name, value in env.items():
+                patch.setenv(name, value)
+            get_app_settings.cache_clear()
+            try:
+                assert runtime_credential.get_browser_host() is None, env
+            finally:
+                get_app_settings.cache_clear()
+        runtime_credential.clear_browser_host()
+
+
+# ── which organization the held credential acts in ─────────────────────────
+
+
+@pytest.fixture
+def entitlements(monkeypatch):
+    """MindsHub's entitlements answer, per credential."""
+    from types import SimpleNamespace
+
+    from cowork.services import mindshub_teams
+    from cowork.services.mindshub_client import MindsHubAnswer, MindsHubReply
+
+    state = SimpleNamespace(asked=[], replies={})
+
+    async def reply(path, bearer):
+        state.asked.append((path, bearer))
+        return state.replies.get(bearer, MindsHubReply(MindsHubAnswer.UNREACHABLE))
+
+    mindshub_teams.reset_caches_for_tests()
+    monkeypatch.setattr(mindshub_teams, "get_mindshub_reply", reply)
+    yield state
+    mindshub_teams.reset_caches_for_tests()
+
+
+def _answer_for(organization_id):
+    from cowork.services.mindshub_client import MindsHubAnswer, MindsHubReply
+
+    browser = {"enabled": True, "daily_bytes": 1, "disabled_reason": None}
+    if organization_id is not None:
+        browser["organization_id"] = organization_id
+    return MindsHubReply(MindsHubAnswer.OK, payload={"permissions": ["browser.use"], "browser": browser})
+
+
+def _organization(client) -> tuple[int, dict]:
+    response = client.get("/api/v1/runtime-credential/minds/organization")
+    return response.status_code, response.json()
+
+
+def test_the_organization_is_the_held_keys_own(entitlements):
+    # A key the person pasted can belong to another organization than the one
+    # they are signed in to. The answer is MindsHub's for the credential the
+    # app handed over, which is the key when there is one.
+    runtime_credential.set_minds_credential("mdb_key_of_org_b")
+    entitlements.replies["mdb_key_of_org_b"] = _answer_for("org-b")
+
+    assert _organization(_loopback_client()) == (200, {"organizationId": "org-b"})
+    assert entitlements.asked == [("/entitlements/me/", "mdb_key_of_org_b")]
+
+
+def test_no_held_credential_has_no_organization_and_asks_nothing(entitlements):
+    assert _organization(_loopback_client()) == (200, {"organizationId": None})
+    assert entitlements.asked == []
+
+
+@pytest.mark.parametrize("reply", ["unreachable", "refused", "no_block", "no_id"])
+def test_an_answer_that_names_no_organization_is_none(entitlements, reply):
+    from cowork.services.mindshub_client import MindsHubAnswer, MindsHubReply
+
+    runtime_credential.set_minds_credential("mdb_key")
+    entitlements.replies["mdb_key"] = {
+        "unreachable": MindsHubReply(MindsHubAnswer.UNREACHABLE),
+        "refused": MindsHubReply(MindsHubAnswer.REFUSED, status_code=401),
+        "no_block": MindsHubReply(MindsHubAnswer.OK, payload={"permissions": []}),
+        "no_id": _answer_for(None),
+    }[reply]
+
+    assert _organization(_loopback_client()) == (200, {"organizationId": None})
+
+
+def test_the_organization_read_refuses_a_caller_that_is_not_loopback(entitlements):
+    from cowork.server import create_app
+
+    runtime_credential.set_minds_credential("mdb_key")
+    client = TestClient(create_app(), client=("10.1.2.3", 40000))
+
+    assert client.get("/api/v1/runtime-credential/minds/organization").status_code == 403
+    assert entitlements.asked == []

@@ -30,6 +30,22 @@ values, source lines, locals, arbitrary extras, HTTP queries and provider bodies
 are excluded. Use the structured fields when querying logs; the previous text
 prefixes are no longer a parsing contract.
 
+Shared-memory startup warnings retain the fixed policy text, including whether
+learning is enabled or the shared store is kept unread. They omit the memory
+store path.
+
+An unreadable managed connection stops startup with an `ERROR` event named
+`managed_connection_unreadable` and `reason=file_unreadable`. The
+`managed_connection_file` field holds only the stored basename, such as
+`postgres-warehouse`. This identifier may differ from the original engine and
+name after the vault sanitizes them for storage; the check does not read those
+fields. A directory failure uses `reason=vault_unreadable` and omits the filename.
+`error_type` holds the exception class. This event omits full paths, credential
+contents and raw exception text. The check opens files read-only and closes them
+without reading their contents. Readable connections add no startup warning.
+Cowork does not repair ownership or permissions; repair them on the host and
+restart Cowork to repeat the check.
+
 Enable extra detail only for an owned troubleshooting session, repeat the failing
 operation, and restore the default afterward. Logging controls do not enable
 framework debug responses. Roll back a release by restoring its previous image

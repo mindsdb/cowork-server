@@ -294,7 +294,7 @@ async def test_real_response_collection_keeps_http_outcome_but_sanitizes_provide
 
     error = ProviderAuthError(PRIVATE) if curated else _sdk_error()
 
-    async def formatter(*args):
+    async def formatter(*args, **_kwargs):
         raise error
         yield
 

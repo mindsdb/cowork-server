@@ -5,6 +5,7 @@ import asyncio
 import inspect
 import json
 import logging
+import os
 import re
 import time
 from collections import OrderedDict
@@ -15,12 +16,13 @@ from urllib.parse import urlparse
 import httpx
 from pydantic import SecretStr
 
-from cowork.build_info import surface
+from cowork.build_info import supported_kwargs, surface
 from cowork.coding.inference_trace import SURFACE_TAG_PREFIX
 from cowork.common.settings import runtime_credential
-from cowork.common.settings.app_settings import AGENT_ROLE_NAMES, default_minds_api_host
+from cowork.common.settings.app_settings import CATALOG_ROLE_NAMES, IMAGE_ROLE, default_minds_api_host
 from cowork.handlers.turn_errors import GatewayDenial, gateway_denial
-from cowork.services.hub_workspaces import sweep_cache
+from cowork.schemas.mindshub_usage import PLAN_TIERS, is_one_of
+from cowork.services.mindshub_client import sweep_cache
 
 if TYPE_CHECKING:
     from cowork.common.settings.app_settings import OpenAICompatibleAPI
@@ -40,8 +42,7 @@ MINDS_PROBE_MODEL = "mindshub_air"
 
 # Marks a request as our own background call on the user's key, not activity
 # they asked for, so the customer's Traces list hides it by default: the
-# connectivity/health-check pings below and the Jev shadow probe
-# (cowork/handlers/jev_shadow.py). Read by mindshub_inference; it is
+# connectivity/health-check pings below. Read by mindshub_inference; it is
 # our own header and means nothing to a non-Minds endpoint, so it is only ever
 # sent to a Minds host.
 MINDS_REQUEST_KIND_HEADER = "X-Minds-Request-Kind"
@@ -255,20 +256,23 @@ def provider_base_url(
 # so this live list is the only source of minds-cloud model names. The
 # deprecated MindsHub sentinel aliases are hidden from this route by design.
 #
-# Cached so a rapid sequence of Settings opens doesn't re-hit the
-# network. Failures are cached too — with a shorter TTL — so a route
-# that isn't deployed yet doesn't add a round-trip to every load.
-_MINDS_MODELS_TTL = 300.0       # successful fetch
+# Short-lived so a top-up (or running out) reaches the picker within seconds.
+# Failures are cached too, so an undeployed route doesn't cost every load a fetch.
+_MINDS_MODELS_TTL = 15.0        # successful MindsHub fetch (``mindshub=True``)
+_CUSTOM_MODELS_TTL = 300.0      # successful fetch from a BYO custom endpoint
 _MINDS_MODELS_FAIL_TTL = 30.0   # negative result (down / not deployed)
-# Expired entries are dropped on every write, and past this many the least
-# recently used goes too. Org mode holds one listing per org member, so without
-# a bound the cache grows with every member a pod has ever served. Meant to sit
-# well above the members one pod serves within one TTL, since only their entries
-# are still fresh, so eviction normally takes an entry nobody is about to read.
+# For MindsHub, force_refresh retries a cached failure once it is this old, so a
+# picker open during an outage can wait up to the fetch budget (_MINDS_MODELS_TIMEOUT_S).
+_MINDS_MODELS_FORCED_RETRY_S = 5.0
+# How long an expired success stays readable through `cached_minds_models`.
+_MINDS_MODELS_RETAIN_S = 300.0
+# Past this many entries the least recently used goes (org mode holds one per
+# member). Sized well above the members one pod serves in the retain window.
 _MINDS_MODELS_CACHE_MAX = 512
-# Derived from the TTLs rather than restated, so raising one cannot start
-# dropping entries that are still fresh.
-_MINDS_MODELS_MAX_TTL_S = max(_MINDS_MODELS_TTL, _MINDS_MODELS_FAIL_TTL)
+# Derived rather than restated, so raising a TTL cannot start dropping fresh entries.
+_MINDS_MODELS_MAX_TTL_S = max(
+    _MINDS_MODELS_TTL, _CUSTOM_MODELS_TTL, _MINDS_MODELS_FAIL_TTL, _MINDS_MODELS_RETAIN_S
+)
 # Hard TOTAL budget for one /v1/models fetch. httpx.Timeout is per-operation, so
 # `follow_redirects` chains and trickled responses (each chunk under the per-op
 # read timeout) can otherwise run far past it — minutes, unbounded. This fetch
@@ -289,6 +293,10 @@ class MindsModelListing(NamedTuple):
     model id and are empty (never None) whenever the gateway doesn't publish that
     field — a plain OpenAI-compatible endpoint publishes none of
     ``labels``/``providers``/``families``.
+
+    ``ids`` and ``enabled`` are the chat models only. The image models are in
+    ``image_models``; the display maps (``labels``, ``providers``, ``families``,
+    ``disabled_reasons``) describe both, keyed by id.
     """
 
     ids: Optional[list[str]]
@@ -318,14 +326,32 @@ class MindsModelListing(NamedTuple):
     # hazard ``_empty_listing`` is a factory to avoid; a default would reintroduce
     # it for the sake of not touching three test fakes.
     role_defaults: dict[str, str]
-    # Why a model the ``enabled`` map marks false is unavailable, in the
-    # gateway's own reason words: "model_restricted" (an admin in the org
-    # restricted it), "wallet_empty" or "included_allowance_exhausted". Keyed
-    # only by ids that ``enabled`` marks false, so the two maps cannot
+    # Why a model the ``enabled`` map (or ``image_models``) marks false is
+    # unavailable, in the gateway's own reason words: "model_restricted" (an
+    # admin in the org restricted it), "wallet_empty",
+    # "included_allowance_exhausted" or "budget_exceeded" (a spending budget
+    # is spent). Keyed only by ids one of those marks false, so the maps cannot
     # disagree. Empty whenever the gateway publishes no reasons, which includes
     # every MindsHub that predates the field and every plain OpenAI-compatible
     # endpoint. Required for the same reason as ``role_defaults``.
     disabled_reasons: dict[str, str]
+    # Every `kind: "image"` row, in the gateway's order -> whether the caller may
+    # use it (True when the row publishes no `enabled`, as for chat). Dense, unlike
+    # ``enabled``, so its keys are the image picker's list. Never in ``ids``: an
+    # image model offered to a chat role errors every turn, and the chat roles'
+    # first-enabled fallback must never land on one. Empty for every gateway that
+    # predates `kind` and every plain OpenAI-compatible endpoint, which is right:
+    # a row without `kind` is a chat model unless it is an embeddings one.
+    # Required for the same reason as ``role_defaults``.
+    image_models: dict[str, bool]
+    # Model id -> the cheapest subscription tier whose included allowance
+    # covers it ("free", "plus" or "pro"), from the row's `covered_by_tier`
+    # (ENG-4186). Absent for a row that sends null or nothing, which includes
+    # every MindsHub that predates the field. Display-only: the wallet pays for
+    # any model on any tier, so this never decides whether a model is usable;
+    # ``enabled`` and ``disabled_reasons`` do. Required for the same reason as
+    # ``role_defaults``.
+    covered_by_tier: dict[str, str]
 
 
 def _empty_listing() -> MindsModelListing:
@@ -337,8 +363,11 @@ def _empty_listing() -> MindsModelListing:
     objects means one in-place write downstream would corrupt the cached failure
     of every gateway at once. Nothing mutates them today.
     """
-    return MindsModelListing(None, {}, {}, {}, {}, {}, {}, {})
+    return MindsModelListing(None, {}, {}, {}, {}, {}, {}, {}, {}, {})
 
+
+# The `kind` a `/v1/models` row carries for an image-generation model.
+_IMAGE_KIND = "image"
 
 # The listing's ``disabled_reason`` for a model an admin's model rule restricts
 # for the caller. Unlike the billing reasons, it is true for the caller alone
@@ -369,29 +398,59 @@ class _ListingCacheKey(NamedTuple):
     # the key never shows it. Nothing is derived from it: the key is the same
     # value the settings object already holds in memory.
     credential: SecretStr | None
+    # A fetch that did not ask for `?kind=image` (not MindsHub): its listing has no
+    # image models, so a MindsHub read must never be served it.
+    chat_only: bool = False
 
 
 def _listing_cache_key(
-    *, base_url: str, api_key: str, tenant_key: str | None, user_id: str | None
+    *, base_url: str, api_key: str, tenant_key: str | None, user_id: str | None, chat_only: bool = False
 ) -> _ListingCacheKey:
     """The entry a fetch writes and a cached read looks up, built in one place."""
     credential = SecretStr(api_key) if tenant_key is None else None
-    return _ListingCacheKey(base_url, tenant_key, user_id, credential)
+    return _ListingCacheKey(base_url, tenant_key, user_id, credential, chat_only)
 
 
-# Least recently used first, so the cap in `_store_listing` evicts from the front.
-_minds_models_cache: OrderedDict[_ListingCacheKey, tuple[float, MindsModelListing]] = OrderedDict()
+# LRU order; entries are (stored_at, listing), (failed_at, empty), or after a failure
+# that kept the last success, (stored_at, last_success, failed_at).
+_minds_models_cache: OrderedDict[_ListingCacheKey, tuple] = OrderedDict()
+
+
+def _failed_at(entry: tuple) -> float | None:
+    """When this entry's latest fetch failed, or None if it succeeded."""
+    if len(entry) > 2:
+        return entry[2]
+    return None if entry[1].ids else entry[0]
 
 
 def _store_listing(key: _ListingCacheKey, listing: MindsModelListing) -> None:
     """Cache ``listing`` under ``key``: expired entries go first, then any past the cap.
 
-    Swept on write, the one place the cache grows, with the hub workspace
-    caches' ``sweep_cache``. A departed caller's entry is never read or
+    Swept on write, the one place the cache grows, with the MindsHub client's
+    ``sweep_cache``. A departed caller's entry is never read or
     overwritten again, so nothing else would drop it.
     """
-    sweep_cache(_minds_models_cache, max_ttl_s=_MINDS_MODELS_MAX_TTL_S)
-    _minds_models_cache[key] = (time.monotonic(), listing)
+    _store_entry(key, (time.monotonic(), listing))
+
+
+def _latest_stamp(entry: tuple) -> float:
+    """An entry's most recent write, so a late failure isn't swept with its old success."""
+    return max(entry[0], entry[2]) if len(entry) > 2 else entry[0]
+
+
+def _store_failure(key: _ListingCacheKey) -> None:
+    """Record a failed fetch, keeping a retained success readable by ``cached_minds_models``."""
+    now = time.monotonic()
+    prior = _minds_models_cache.get(key)
+    if prior and prior[1].ids and now - prior[0] < _MINDS_MODELS_RETAIN_S:
+        _store_entry(key, (prior[0], prior[1], now))
+    else:
+        _store_entry(key, (now, _empty_listing()))
+
+
+def _store_entry(key: _ListingCacheKey, entry: tuple) -> None:
+    sweep_cache(_minds_models_cache, max_ttl_s=_MINDS_MODELS_MAX_TTL_S, stamp=_latest_stamp)
+    _minds_models_cache[key] = entry
     _minds_models_cache.move_to_end(key)
     while len(_minds_models_cache) > _MINDS_MODELS_CACHE_MAX:
         _minds_models_cache.popitem(last=False)
@@ -420,6 +479,32 @@ def _is_embedding_row(row: dict, model_id: str) -> bool:
     return any(hint in lowered for hint in _EMBEDDING_ID_HINTS)
 
 
+def cached_minds_model_label(model_id: str) -> str | None:
+    """The catalog label for ``model_id`` from a cached MindsHub ``/v1/models`` listing, or None.
+
+    Labels are catalog-wide, so any MindsHub caller's listing answers. Only entries fetched from the
+    operator's MindsHub URL count, so a user's custom endpoint can never rename a MindsHub model.
+    """
+    try:
+        trusted_base = minds_chat_base_url(_org_catalog_url())
+        entries = list(_minds_models_cache.items())
+    except Exception:
+        return None
+    for key, entry in reversed(entries):
+        if getattr(key, "chat_only", True) or getattr(key, "base_url", None) != trusted_base:
+            continue
+        listing = entry[1] if len(entry) > 1 else None
+        label = getattr(listing, "labels", {}).get(model_id) if listing is not None else None
+        if label:
+            return label
+    return None
+
+
+def budget_model_label(model: str) -> str:
+    """The catalog label for a budget's model alias, or the alias when the catalog has none."""
+    return cached_minds_model_label(model) or model
+
+
 def cached_minds_models(
     minds_url: str,
     tenant_key: str | None = None,
@@ -432,9 +517,9 @@ def cached_minds_models(
     A synchronous read for callers that cannot await the fetch (the coding
     endpoints run in a threadpool) and need only what the gateway advertises per
     model, which changes on the gateway's release cadence rather than the cache
-    TTL's. None until something has fetched the listing since the process
-    started, and None for a negatively cached failure. An expired entry is read
-    until the next write drops it (``_store_listing``). ``tenant_key``,
+    TTL's. None until a fetch has succeeded; a later failure keeps the last success
+    readable (``_store_failure``). An expired entry is read
+    until a sweep drops it, so it may be older than the retain window. ``tenant_key``,
     ``user_id`` and ``api_key`` pick the entry the same way they do in
     ``fetch_minds_models``: with no ``tenant_key``, the entry is the one fetched
     with this ``api_key``.
@@ -462,6 +547,7 @@ async def fetch_minds_models(
     api_key: str,
     *,
     force_refresh: bool = False,
+    mindshub: bool = False,
     tenant_key: str | None = None,
     user_id: str | None = None,
 ) -> MindsModelListing:
@@ -484,17 +570,12 @@ async def fetch_minds_models(
     model id remains the value used everywhere else (selection, storage,
     resolution); a model missing from ``labels`` falls back to the client's
     id-derived label. Embedding and decision models are dropped entirely — they
-    share this listing but cannot serve planning/coding roles.
+    share this listing but cannot serve planning/coding roles. Image models
+    cannot either, so they are kept out of ``ids``/``enabled`` and listed in
+    ``image_models`` instead.
 
-    ``force_refresh`` skips the cache *read* for a cached success (a fresh
-    result is still cached for subsequent calls) — used when the caller knows
-    the cached answer may be stale, e.g. the Settings picker re-checking on
-    dropdown open after the user tops up credits in an external tab.
-
-    A cached *failure* is still honored under ``force_refresh``: the negative
-    TTL exists so an unreachable MindsHub isn't re-probed on every call, and
-    the picker opens on demand, so bypassing it would make every open pay the
-    fetch budget for as long as the outage lasts.
+    ``force_refresh`` skips a cached success. ``mindshub`` (MindsHub callers only) uses the
+    short success TTL and lets force_refresh retry a failure older than 5s.
 
     ``tenant_key`` and ``user_id`` scope the cache entry (see
     ``_ListingCacheKey``): pass the org id for an org-scoped catalog, and the
@@ -509,25 +590,33 @@ async def fetch_minds_models(
         return _empty_listing()
     base = minds_chat_base_url(minds_url)
     cache_key = _listing_cache_key(
-        base_url=base, api_key=api_key, tenant_key=tenant_key, user_id=user_id
+        base_url=base, api_key=api_key, tenant_key=tenant_key, user_id=user_id, chat_only=not mindshub
     )
 
     now = time.monotonic()
     cached = _minds_models_cache.get(cache_key)
     if cached:
-        ts, val = cached
-        ttl = _MINDS_MODELS_TTL if val.ids else _MINDS_MODELS_FAIL_TTL
-        # force_refresh only overrides the success TTL — see the negative-cache
-        # note above.
-        if (now - ts) < ttl and not (force_refresh and val.ids):
+        failed_at = _failed_at(cached)
+        if failed_at is not None:
+            retry = force_refresh and mindshub
+            window = _MINDS_MODELS_FORCED_RETRY_S if retry else _MINDS_MODELS_FAIL_TTL
+            if now - failed_at < window:
+                _minds_models_cache.move_to_end(cache_key)
+                return _empty_listing()
+        elif not force_refresh and now - cached[0] < (
+            _MINDS_MODELS_TTL if mindshub else _CUSTOM_MODELS_TTL
+        ):
             _minds_models_cache.move_to_end(cache_key)
-            return val
+            return cached[1]
 
     def _remember(val: MindsModelListing) -> MindsModelListing:
-        _store_listing(cache_key, val)
+        if val.ids:
+            _store_listing(cache_key, val)
+        else:
+            _store_failure(cache_key)
         return val
 
-    async def _fetch() -> httpx.Response:
+    async def _fetch(query: str = "") -> httpx.Response:
         # `max_redirects` low (not the httpx default of 20) so a same-origin
         # redirect loop can't multiply the per-op timeout into a long stall;
         # the endpoint is hit directly at `/models/` so no real redirect is
@@ -544,32 +633,50 @@ async def fetch_minds_models(
             # `/models/` directly is what the other frameworks' shared
             # model-catalog helper already does.
             return await client.get(
-                f"{base}/models/",
+                f"{base}/models/{query}",
                 headers={"Authorization": f"Bearer {api_key}"},
             )
 
+    def _rows(r: httpx.Response) -> Optional[list]:
+        # OpenAI shape: {"object": "list", "data": [{"id": "...", ...}]}.
+        # Accept a bare list too, defensively. Each row may carry the non-standard
+        # extension fields `reasoning_efforts` (list), `default_reasoning_effort`
+        # (str), `enabled` (bool), and `label` / `provider` / `family` (str) —
+        # OpenAI clients ignore unknown keys; we surface them for the picker.
+        if r.status_code >= 400:
+            logger.debug("minds /models fetch returned HTTP %s", r.status_code)
+            return None
+        data = r.json()
+        rows = data.get("data") if isinstance(data, dict) else data
+        return rows if isinstance(rows, list) else None
+
+    # MindsHub lists image models only when asked for with `?kind=image`, so a
+    # chat picker that predates `kind` never offers one. One listing: either half failing fails it.
+    fetches = [_fetch()] + ([_fetch(f"?kind={_IMAGE_KIND}")] if mindshub else [])
     try:
         # Hard TOTAL budget: httpx.Timeout is per-operation, so it alone does
         # not bound a redirect chain or a trickled response. asyncio.wait_for
         # cancels the whole fetch at the ceiling and the TimeoutError falls
         # through to the negative-cache path below.
-        r = await asyncio.wait_for(_fetch(), _MINDS_MODELS_TIMEOUT_S)
-        if r.status_code >= 400:
-            logger.debug("minds /models fetch returned HTTP %s", r.status_code)
-            return _remember(_empty_listing())
-        data = r.json()
+        # return_exceptions: one request failing must not leave the other's error unretrieved.
+        responses = await asyncio.wait_for(asyncio.gather(*fetches, return_exceptions=True), _MINDS_MODELS_TIMEOUT_S)
+        for response in responses:
+            if isinstance(response, BaseException):
+                raise response
+        parsed = [_rows(r) for r in responses]
     except Exception as exc:
         logger.debug("minds /models fetch failed: %s", exc)
         return _remember(_empty_listing())
-
-    # OpenAI shape: {"object": "list", "data": [{"id": "...", ...}]}.
-    # Accept a bare list too, defensively. Each row may carry the non-standard
-    # extension fields `reasoning_efforts` (list), `default_reasoning_effort`
-    # (str), `enabled` (bool), and `label` / `provider` / `family` (str) —
-    # OpenAI clients ignore unknown keys; we surface them for the picker.
-    rows = data.get("data") if isinstance(data, dict) else data
-    if not isinstance(rows, list):
+    if any(part is None for part in parsed):
         return _remember(_empty_listing())
+    rows = parsed[0]
+    if mindshub:
+        # Only the image rows: a gateway that ignores `kind` answers with its whole listing.
+        listed = {str(row.get("id")).strip() for row in rows if isinstance(row, dict)}
+        rows = rows + [
+            row for row in parsed[1]
+            if isinstance(row, dict) and row.get("kind") == _IMAGE_KIND and str(row.get("id")).strip() not in listed
+        ]
     ids: list[str] = []
     efforts: dict[str, dict] = {}
     enabled: dict[str, bool] = {}
@@ -578,6 +685,8 @@ async def fetch_minds_models(
     families: dict[str, str] = {}
     role_defaults: dict[str, str] = {}
     disabled_reasons: dict[str, str] = {}
+    image_models: dict[str, bool] = {}
+    covered_by_tier: dict[str, str] = {}
 
     def _text(row: dict, key: str) -> Optional[str]:
         """A non-empty string field, or None. Anything else is treated as absent.
@@ -598,24 +707,41 @@ async def fetch_minds_models(
         model_id = str(row.get("id")).strip()
         if not model_id:
             continue
-        # Embedding and decision models share this listing but aren't chat/completion
-        # models — chosen for planning/coding roles they'd error every turn.
-        # Filtered here, the single place every row is parsed, so neither the
-        # picker nor default-resolution ever sees them.
-        if row.get("kind") == "decision" or _is_embedding_row(row, model_id):
+        # Embedding, decision and voice models share this listing but aren't
+        # chat/completion models — chosen for planning/coding roles they'd error
+        # every turn. Only chat rows are kept (a row with no kind, from an older
+        # gateway, counts as chat). Filtered here, the single place every row is
+        # parsed, so neither the picker nor default-resolution ever sees them.
+        # Image models stay out of the chat ids too, but are recorded in
+        # `image_models`: the image picker lists them and the image role resolves
+        # against them.
+        kind = row.get("kind")
+        is_image = kind == _IMAGE_KIND
+        if (kind and kind not in ("chat", _IMAGE_KIND)) or _is_embedding_row(row, model_id):
             continue
-        ids.append(model_id)
         # A model the org's wallet can't currently pay for (or whose free
         # allowance is spent, or that an admin restricted) is listed with
         # enabled=false so the picker can show it as locked. Missing → available.
-        if "enabled" in row:
-            enabled[model_id] = bool(row.get("enabled"))
+        if is_image:
+            image_models[model_id] = bool(row.get("enabled")) if "enabled" in row else True
+        else:
+            ids.append(model_id)
+            if "enabled" in row:
+                enabled[model_id] = bool(row.get("enabled"))
         # Why it is locked, when the gateway says: an admin rule is not
         # something credits can lift, so the picker must not offer them for it.
         # Read only for a row the map marks false, so no reason outlives the
         # lock it explains.
-        if enabled.get(model_id) is False and (reason := _text(row, "disabled_reason")):
+        locked = (image_models if is_image else enabled).get(model_id) is False
+        if locked and (reason := _text(row, "disabled_reason")):
             disabled_reasons[model_id] = reason
+        # The tier whose allowance covers the model, whether or not
+        # it is locked: the picker shows it on covered rows and offers it as
+        # the upgrade on locked ones. `is_one_of` checks the type first: a custom
+        # endpoint's row may send a list or an object here, and `in` raises on
+        # an unhashable value.
+        if is_one_of(tier := row.get("covered_by_tier"), PLAN_TIERS):
+            covered_by_tier[model_id] = tier
         levels = row.get("reasoning_efforts")
         if isinstance(levels, list) and levels:
             entry: dict = {"efforts": [str(x) for x in levels]}
@@ -652,15 +778,34 @@ async def fetch_minds_models(
         # before it ships; this is what keeps a live one out of the settings row.
         # First declaration wins, which cannot arise against a validated catalog
         # and keeps the parse total when it does.
+        #
+        # Only an image model may claim the image role, and an image model may
+        # claim no other: the policy gate enforces both, and a claim that slipped
+        # past it would hand a chat role a model that cannot chat, or the
+        # reverse.
         for role in row.get("default_for") or ():
-            if isinstance(role, str) and role in AGENT_ROLE_NAMES:
+            if isinstance(role, str) and role in CATALOG_ROLE_NAMES and (role == IMAGE_ROLE) == is_image:
                 role_defaults.setdefault(role, model_id)
     return _remember(
         MindsModelListing(
             (ids or None), efforts, enabled, labels, providers, families, role_defaults,
-            disabled_reasons,
+            disabled_reasons, image_models, covered_by_tier,
         )
     )
+
+
+def _org_catalog_url() -> str:
+    """The operator endpoint the org catalog is fetched from and cached under."""
+    from cowork.common.settings.app_settings import (
+        TurnQueueSettings,
+        default_turn_minds_api_host,
+    )
+    return TurnQueueSettings().minds_base_url or f"{default_turn_minds_api_host()}/v1"
+
+
+def cached_org_model_catalog(*, org_id: str, user_id: str) -> MindsModelListing | None:
+    """The org catalog ``fetch_org_model_catalog`` last cached for this member, or None."""
+    return cached_minds_models(_org_catalog_url(), tenant_key=org_id, user_id=user_id)
 
 
 async def fetch_org_model_catalog(
@@ -679,13 +824,9 @@ async def fetch_org_model_catalog(
         raise ValueError("org catalog requires an organization id")
     if not user_id:
         raise ValueError("org catalog requires the caller's user id")
-    from cowork.common.settings.app_settings import (
-        TurnQueueSettings,
-        default_turn_minds_api_host,
-    )
-    url = TurnQueueSettings().minds_base_url or f"{default_turn_minds_api_host()}/v1"
     return await fetch_minds_models(
-        url, bearer_token, force_refresh=refresh, tenant_key=org_id, user_id=user_id
+        _org_catalog_url(), bearer_token, force_refresh=refresh, mindshub=True,
+        tenant_key=org_id, user_id=user_id,
     )
 
 
@@ -736,8 +877,8 @@ async def fetch_org_model_catalog(
 #     4. cowork/migrations.py (first-boot .env→DB seed)
 #     5. cowork/main/minds-auth.ts (login / token refresh) — excludes models
 #   Two more write settings but only their own fixed keys: channels.py
-#   (`channels_harness`) and the `minds_model_enabled` / `minds_model_restricted`
-#   refresh in settings.py.
+#   (`channels_harness`) and the `minds_model_enabled` / `minds_image_model_enabled`
+#   / `minds_model_restricted` refresh in settings.py.
 #
 #   OUT OF REACH of this gate: the standalone `anton` CLI reads models from
 #   ~/.anton/.env directly and never touches this DB (ENG-1140 covers its
@@ -746,8 +887,9 @@ async def fetch_org_model_catalog(
 #: The settings whose VALUE names a model id. `UserSettings` types these as bare
 #: `str | None`, so the settings API validates the key and the type and nothing
 #: else — an id no provider can serve saves cleanly and only fails much later, at
-#: turn time. Router model is included: same field shape, same failure.
-MODEL_VALUE_SETTINGS = frozenset({"planning_model", "coding_model", "router_model"})
+#: turn time. Router model is included: same field shape, same failure. So is the
+#: image model, checked against the catalog's image models instead of its chat ones.
+MODEL_VALUE_SETTINGS = frozenset({"planning_model", "coding_model", "router_model", "image_model"})
 
 
 #: Deprecated-but-live alias namespace. MindsHub aliases are bare (``sonnet``),
@@ -796,6 +938,8 @@ async def model_value_rejection(
       they exist, and blocking that would deadlock a fresh install;
     - the catalog fetch failed, timed out, or came back empty.
 
+    The image model is stricter: a good catalog listing no image models refuses it.
+
     An offline or degraded MindsHub must never stop someone changing settings,
     so every failure mode above resolves to "allow". The fetch is the cached one
     the picker already uses (TTL + negative TTL), so the common case costs no
@@ -808,16 +952,20 @@ async def model_value_rejection(
         return None
 
     # Which provider will actually serve this model. Only MindsHub has a catalog
-    # we can check; anything else is the user's own endpoint.
+    # we can check; anything else is the user's own endpoint. The image role has
+    # no provider setting: MindsHub is the only gateway serving image models, so
+    # its catalog is checked whenever there is one to fetch.
+    image = key == "image_model"
     provider_attr = {
         "planning_model": "resolved_planning_provider",
         "coding_model": "resolved_coding_provider",
         "router_model": "resolved_router_provider",
+        "image_model": None,
     }[key]
     try:
         from cowork.common.settings.user_settings import Provider
 
-        if getattr(settings, provider_attr, None) != Provider.MINDS_CLOUD:
+        if provider_attr is not None and getattr(settings, provider_attr, None) != Provider.MINDS_CLOUD:
             return None
         stored_key = settings.minds_api_key
         api_key = stored_key.get_secret_value() if stored_key is not None else ""
@@ -833,7 +981,7 @@ async def model_value_rejection(
                 org_id=org_id, user_id=user_id, bearer_token=bearer_token
             )
         elif api_key and settings.minds_url:
-            listing = await fetch_minds_models(settings.minds_url, api_key)
+            listing = await fetch_minds_models(settings.minds_url, api_key, mindshub=True)
         else:
             return None
     except Exception:
@@ -843,21 +991,30 @@ async def model_value_rejection(
         return None
 
     # ids is None on any failure and the list is empty for a gateway that serves
-    # no chat models; in both cases we hold no evidence, so we allow.
-    if not listing.ids:
+    # no chat models; in both cases we hold no evidence, so we allow. An image
+    # model is refused by any good catalog that lacks it, even one listing none.
+    served = list(listing.image_models) if image else listing.ids
+    if image and not served and (listing.ids or listing.enabled):
+        return (
+            f"'{value}' is not an image model this provider offers. "
+            "MindsHub lists no image models yet, so leave the image model unset."
+        )
+    if not served:
         return None
-    if value in listing.ids:
+    if value in served:
         return None
     if value.startswith(_LEGACY_MODEL_PREFIX) and (
-        value[len(_LEGACY_MODEL_PREFIX):] in listing.ids
+        value[len(_LEGACY_MODEL_PREFIX):] in served
     ):
         return None
 
     # Definitive: a real catalog that does not contain this id.
-    known = ", ".join(sorted(listing.ids)[:5])
+    known = ", ".join(sorted(served)[:5])
+    kind = "an image model" if image else "a model"
+    listed = "image model list" if image else "model list"
     return (
-        f"'{value}' is not a model this provider offers. "
-        f"Pick one from the model list in Settings (for example: {known})."
+        f"'{value}' is not {kind} this provider offers. "
+        f"Pick one from the {listed} in Settings (for example: {known})."
     )
 
 
@@ -869,8 +1026,10 @@ def persist_enabled_model_map(
     live_ids: list[str] | None = None,
     *,
     member_restricted: Collection[str] = (),
+    key: str = "minds_model_enabled",
 ) -> bool:
-    """Guarded write of the `minds_model_enabled` availability map.
+    """Guarded write of an availability map, `minds_model_enabled` unless ``key``
+    names the image models' `minds_image_model_enabled` (persist_image_model_map).
 
     Shared by every writer (the recommended-models endpoint and the startup /
     credential-sync warm below) so the invariants can't drift between them:
@@ -954,7 +1113,7 @@ def persist_enabled_model_map(
     desired = json.dumps(live_enabled)
     if desired == json.dumps(prior):
         return False
-    SettingService(session, scope).upsert_setting("minds_model_enabled", desired)
+    SettingService(session, scope).upsert_setting(key, desired)
     return True
 
 
@@ -972,7 +1131,8 @@ def persist_org_model_availability(
     restricted ids go to the map with the flag it already held for them
     (``persist_enabled_model_map``'s ``member_restricted``), and to this member's
     own ``minds_model_restricted`` row, which ``UserSettings._minds_enabled_map``
-    lays over the map as ``False``.
+    lays over the map as ``False``. The image models' map is an org row too and
+    is written the same way, and the one restriction list covers both.
 
     ``scope`` must name the caller: ``minds_model_restricted`` is a personal
     setting. ``prior`` is the caller's loaded settings. The restriction list
@@ -981,7 +1141,7 @@ def persist_org_model_availability(
     does is the whole answer, and an empty restriction set clears the list.
     Stored sorted and written only on a change, like ``persist_role_defaults_map``.
 
-    Returns True iff either row was updated.
+    Returns True iff any row was updated.
     """
     from cowork.services.settings import SettingService
 
@@ -992,12 +1152,45 @@ def persist_org_model_availability(
         session, scope, prior.minds_model_enabled, listing.enabled, listing.ids,
         member_restricted=restricted,
     )
+    changed = persist_image_model_map(
+        session, scope, prior.minds_image_model_enabled, listing, member_restricted=restricted,
+    ) or changed
     if not listing.enabled:
         return changed
     if restricted == sorted(prior._minds_restricted_ids()):
         return changed
     SettingService(session, scope).upsert_setting("minds_model_restricted", json.dumps(restricted))
     return True
+
+
+def _parsed_map(stored: str | None) -> dict:
+    try:
+        parsed = json.loads(stored or "{}")
+    except (ValueError, TypeError):
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def persist_image_model_map(
+    session, scope, prior_json: str | None, listing: MindsModelListing, *, member_restricted: Collection[str] = (),
+) -> bool:
+    """``persist_enabled_model_map`` for the image models' own availability map.
+
+    A failed fetch leaves the stored map alone. A good one that lists no image
+    models (including every gateway predating `kind`) empties it, so a retired
+    image model is never handed to Anton.
+    """
+    if not listing.image_models:
+        if not (listing.ids or listing.enabled) or _parsed_map(prior_json) == {}:
+            return False
+        from cowork.services.settings import SettingService
+
+        SettingService(session, scope).upsert_setting("minds_image_model_enabled", "{}")
+        return True
+    return persist_enabled_model_map(
+        session, scope, prior_json, listing.image_models, list(listing.image_models),
+        member_restricted=member_restricted, key="minds_image_model_enabled",
+    )
 
 
 def persist_role_defaults_map(session, scope, prior_json: str | None, live_role_defaults: dict) -> bool:
@@ -1066,8 +1259,9 @@ async def warm_enabled_model_map(session, scope=None) -> bool:
     on any error, bounded by a hard total budget (``_MINDS_MODELS_TIMEOUT_S``)
     so a degraded gateway can't stall the caller, and ``persist_enabled_model_map``
     never writes an empty map — so an unreachable MindsHub leaves the stored map
-    untouched and is never worse than today. Returns True iff the map was
-    updated.
+    untouched and is never worse than today. The image models' map is warmed
+    alongside, under the same rules, for a stored image pin. Returns True iff
+    either map was updated.
     """
     from cowork.db.scoped import LOCAL_SCOPE
     from cowork.services.settings import SettingService
@@ -1076,10 +1270,13 @@ async def warm_enabled_model_map(session, scope=None) -> bool:
     s = SettingService(session, scope).load()
     if s.minds_api_key is None or not s.minds_url:
         return False
-    listing = await fetch_minds_models(s.minds_url, s.minds_api_key.get_secret_value())
-    return persist_enabled_model_map(
+    listing = await fetch_minds_models(
+        s.minds_url, s.minds_api_key.get_secret_value(), mindshub=True
+    )
+    changed = persist_enabled_model_map(
         session, scope, s.minds_model_enabled, listing.enabled, listing.ids
     )
+    return persist_image_model_map(session, scope, s.minds_image_model_enabled, listing) or changed
 
 
 # ── Config readiness ─────────────────────────────────────────────────
@@ -1250,6 +1447,8 @@ async def ping_provider(p: dict[str, Any], *, minds_hub_configured: bool = True)
         `max_tokens` is kept at a small-but-safe 20 rather than 1 — some
         models reject a 1-token budget (or can't emit even a stop token),
         which would fail the probe for a perfectly valid key."""
+        from cowork.db.units import run_on_unit_threads
+
         payload = {"model": model, "max_tokens": 20, "messages": [{"role": "user", "content": "ping"}]}
         async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
             r = await client.post(url, headers=headers, json=payload)
@@ -1267,7 +1466,8 @@ async def ping_provider(p: dict[str, Any], *, minds_hub_configured: bool = True)
         return ProviderPing(
             status="fail",
             detail=f"HTTP {r.status_code}: {msg}" if msg else f"HTTP {r.status_code}",
-            denial=_probe_denial(response=r),
+            # Off the loop: the gateway check reads settings.
+            denial=await run_on_unit_threads(lambda: _probe_denial(response=r)),
         )
 
     try:
@@ -1513,7 +1713,7 @@ _warned_responses_transport_missing = False
 
 
 def openai_compatible_agent_api() -> OpenAICompatibleAPI:
-    """The API the planning and coding roles call on an openai_compatible provider.
+    """The API all agent roles call on an openai_compatible provider.
 
     COWORK_OPENAI_COMPATIBLE_API asks for it. The Responses API is used only
     when the installed anton reports its Responses path ready, because before
@@ -1534,7 +1734,7 @@ def openai_compatible_agent_api() -> OpenAICompatibleAPI:
         _warned_responses_transport_missing = True
         logger.warning(
             "Installed anton does not report RESPONSES_TRANSPORT_READY; "
-            "openai_compatible planning and coding stay on chat completions "
+            "openai_compatible planning, coding and router stay on chat completions "
             "although COWORK_OPENAI_COMPATIBLE_API=responses"
         )
     return "chat_completions"
@@ -1546,6 +1746,18 @@ class WebToolKwargs(TypedDict, total=False):
 
     web_search_enabled: bool
     web_fetch_enabled: bool
+    # False: the agent answers from the connected data only (no web tools, no
+    # scratchpad web_search(), no internet guidance in its prompt).
+    internet_research_enabled: bool
+
+
+# anton's own setting names, so the CLI and a cowork-server read the same variables.
+_WEB_TOOL_ENV = {
+    "web_search_enabled": "ANTON_WEB_SEARCH_ENABLED",
+    "web_fetch_enabled": "ANTON_WEB_FETCH_ENABLED",
+    "internet_research_enabled": "ANTON_INTERNET_RESEARCH_ENABLED",
+}
+_OFF_VALUES = frozenset({"0", "false", "no", "off"})
 
 
 def web_tool_kwargs_for(planning_provider: Provider) -> WebToolKwargs:
@@ -1558,15 +1770,37 @@ def web_tool_kwargs_for(planning_provider: Provider) -> WebToolKwargs:
     onto that flavor runs with both off. Every other session keeps anton's
     defaults: MindsHub keeps its native web tools, and direct OpenAI keeps
     what its flavor provides.
+
+    ``ANTON_WEB_SEARCH_ENABLED`` / ``ANTON_WEB_FETCH_ENABLED`` set to a false
+    value in the server's env turn that tool off for every session this server
+    runs, and ``ANTON_INTERNET_RESEARCH_ENABLED`` turns internet research off;
+    they never turn anything on. Org turns run in a pod through
+    ``anton.cloud_turn``, which doesn't read this env. A field the installed
+    anton's ChatSessionConfig lacks is dropped (``supported_kwargs``): passing
+    it would fail every turn.
     """
+    from anton.core.session import ChatSessionConfig
+
+    return WebToolKwargs(**supported_kwargs(ChatSessionConfig, **web_tool_switches(planning_provider)))
+
+
+def web_tool_switches(planning_provider: Provider) -> WebToolKwargs:
+    """The web tools this server turns off for a session on `planning_provider`,
+    before `web_tool_kwargs_for` drops the fields the installed anton lacks.
+    For callers that apply them themselves, such as the direct answer."""
     from cowork.common.settings.user_settings import Provider
 
     if (
         planning_provider is Provider.OPENAI_COMPATIBLE
         and openai_compatible_agent_api() == "responses"
     ):
-        return WebToolKwargs(web_search_enabled=False, web_fetch_enabled=False)
-    return WebToolKwargs()
+        kwargs = WebToolKwargs(web_search_enabled=False, web_fetch_enabled=False)
+    else:
+        kwargs = WebToolKwargs()
+    for field, env_name in _WEB_TOOL_ENV.items():
+        if os.environ.get(env_name, "").strip().lower() in _OFF_VALUES:
+            kwargs[field] = False
+    return kwargs
 
 
 def build_llm_client(
@@ -1646,10 +1880,9 @@ def build_llm_client(
     supports_api_key_provider = "api_key_provider" in openai_provider_params
     warned_about_static_runtime_credential = False
 
-    # Passed to the planning and coding builds only. The router stays on chat
-    # completions: the gate's first-event budget is sized for a model that
-    # doesn't reason, and a router model that reasons by default is held to
-    # that with router_reasoning_effort "none".
+    # The router shares this transport with planning and coding: its delegate
+    # function needs Responses on models that reject tools on chat completions.
+    # Its effort remains the operator's choice and its gate budgets still apply.
     agent_api = openai_compatible_agent_api()
 
     def _make_provider(
@@ -1826,7 +2059,7 @@ def build_llm_client(
         if "router_provider" in _params:
             router_kw = {
                 "router_provider": _make_provider(
-                    settings.resolved_router_provider, router_effort
+                    settings.resolved_router_provider, router_effort, api=agent_api
                 ),
                 "router_model": router_model,
             }

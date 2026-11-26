@@ -7,6 +7,7 @@ Emits typed events:
     response.output_text.delta  (assistant text deltas)
     response.answer_reset       (drop the answer so far; the next delta replaces it)
     response.answer_restore     (a hand-back gives back the answer a reset dropped)
+    response.browser_session_opened (the agent opened the person's browser session; carries its id only)
     response.memory_read        (whether the turn read learned memory, and how many entries)
     response.figure_sources     (each figure in the answer and the steps it came from)
     response.completed          (final response object)
@@ -23,10 +24,12 @@ import time
 import uuid
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field, replace
+from enum import StrEnum
 from typing import Annotated, Any, AsyncIterator, Callable, Literal, Optional
 
 from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, ValidationError
 
+from cowork.common.event_clock import event_at_ms
 from cowork.harnesses.anton_harness.agent_files import AgentFiles
 from cowork.harnesses.anton_harness.figure_sources import (
     CellResult,
@@ -50,9 +53,22 @@ from cowork.schemas.responses import (
     ResponseStatus,
     Role,
 )
+from cowork.schemas.artifact_card import ArtifactCard
+from cowork.streaming.addons import TurnAddon
 from cowork.streaming.liveness import MODEL_WAIT_PHASE, model_wait_sse
 
 logger = logging.getLogger(__name__)
+
+
+class BrowserSessionOpened(BaseModel):
+    """The ``response.browser_session_opened`` event's body: the session id
+    only, never a viewer link (a stored event opens nothing)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    type: Literal["response.browser_session_opened"] = "response.browser_session_opened"
+    sequence_number: int
+    session_id: str
 
 
 @dataclass
@@ -64,7 +80,7 @@ class ArtifactCreated:
     renderer shows an inline card for every artifact type, identically and
     deterministically — live and on reload."""
 
-    artifact: dict
+    artifact: ArtifactCard
 
 
 @dataclass(frozen=True)
@@ -113,6 +129,19 @@ class TurnHistory:
     # instead; None means `rows` are what the agent read. The pod's rows
     # arrive unchecked, so an entry may not be a row at all.
     read: list[object] | None = None
+
+
+@dataclass
+class PreviewCheckRequest:
+    """Synthetic event: a remote turn's anton asks the open preview whether an
+    artifact runs (turnqueue/preview_checks.py). Written to the stream as the
+    same ``response.artifact_check`` frame an in-process turn writes
+    (preview_checker.artifact_check_sse), and like that one never saved:
+    it means something only while the pod waits on it."""
+
+    check_id: str
+    artifact_slug: str
+    timeout_s: int
 
 
 @dataclass
@@ -251,6 +280,15 @@ class SkillCreated:
     skill: dict
 
 
+@dataclass
+class ConnectorDrafted:
+    """A connector template a cloud turn built, already checked again with the
+    draft parser. Mapped to a `response.connector_drafted` SSE event; nothing
+    is stored until the member saves it from the card."""
+
+    connector: dict
+
+
 PHASE_LABELS = {
     "planning": "Planning",
     "analyzing": "Analyzing",
@@ -269,6 +307,8 @@ PHASE_LABELS = {
     # A skill draft the pod reported was rejected, or trimmed a sibling file —
     # see `remote_skill_draft_result` (cowork/services/task_objects.py).
     "skill_draft_dropped": "Skill draft",
+    # A connector template the pod reported was refused or over the per-turn cap.
+    "connector_draft_dropped": "Connector template",
     # The completion verifier forced a continuation; the text after this
     # replaces the answer streamed before it.
     "continuation": "Continuing",
@@ -285,7 +325,15 @@ PROGRESS_THROTTLE = 0.25  # seconds
 _NOT_RUN_PREFIX = "Not run: "
 
 
-def classify_cell_status(content: str) -> str:
+class CellStatus(StrEnum):
+    """How a scratchpad result ended, as the renderer and the replay read it."""
+
+    ok = "ok"
+    timeout = "timeout"
+    error = "error"
+
+
+def classify_cell_status(content: str) -> CellStatus:
     """Classify a scratchpad tool-result as ok / timeout / error.
 
     The renderer uses this to show a killed cell as distinctly dead rather
@@ -305,7 +353,7 @@ def classify_cell_status(content: str) -> str:
     any other non-empty error → "error".
     """
     if not content:
-        return "ok"
+        return CellStatus.ok
     try:
         cell = json.loads(content)
     except (ValueError, TypeError):
@@ -313,20 +361,20 @@ def classify_cell_status(content: str) -> str:
     if isinstance(cell, dict) and "error" in cell:
         err = (cell.get("error") or "").strip()
         if not err:
-            return "ok"
+            return CellStatus.ok
         low = err.lower()
         if "timed out" in low or "of inactivity" in low or "cell killed" in low:
-            return "timeout"
-        return "error"
+            return CellStatus.timeout
+        return CellStatus.error
     # Fallback for non-JSON results (dump notebook, non-scratchpad tools).
     if content.startswith(_NOT_RUN_PREFIX):
-        return "error"
+        return CellStatus.error
     low = content.lower()
     if "cell timed out" in low or "of inactivity" in low or "cell killed" in low:
-        return "timeout"
+        return CellStatus.timeout
     if "[error]" in low or "exec failed" in low:
-        return "error"
-    return "ok"
+        return CellStatus.error
+    return CellStatus.ok
 
 
 # anton's reply when every attempt at the turn failed: its error, not an answer
@@ -345,11 +393,12 @@ _APPENDED_CONTEXT = re.compile(r"^\[[^\n]*Anton-only context[^\n]*\]$", re.MULTI
 # anton hands the model a cell's result in labeled parts (format_cell_result):
 # what the cell printed under [output], then [logs], [stderr] and [error].
 # anton's session appends [artifact lint] after a cell that changed an
-# artifact.
-_CELL_RESULT_PART = re.compile(r"^\[(?:output|logs|stderr|error|artifact lint)\]\n", re.MULTILINE)
+# artifact, and [live app] after a cell that relaunched a running live app.
+_CELL_RESULT_PART = re.compile(r"^\[(?:output|logs|stderr|error|artifact lint|live app)\]\n", re.MULTILINE)
 # The note format_cell_result puts after printed output it cut short, with
 # the line breaks before the next part.
-_TRUNCATION_NOTE = re.compile(r"\n\n\.\.\. \(truncated, \d+ chars total\)\n*\Z")
+# Newer anton follows it with a sentence on how to read files whole.
+_TRUNCATION_NOTE = re.compile(r"\n\n\.\.\. \(truncated, \d+ chars total\)[^\n]*\n*\Z")
 
 
 class _HistoryRow(BaseModel):
@@ -479,6 +528,128 @@ class ToolRows:
         return steps
 
 
+# The renderer's rule for a form block (cowork parseFormSpec.js extractFormSpec),
+# so the server sees the same blocks the side panel does.
+_FORM_BLOCK = re.compile(r"```data-vault-form[ \t]*\r?\n([\s\S]*?)\r?\n[ \t]*```")
+# A form fence glued to the end of a sentence, which the renderer moves onto
+# its own line (MarkdownContent.jsx _normalizeFormFences).
+_GLUED_FORM_FENCE = re.compile(r"(?<=[^\n])```data-vault-form")
+# A CommonMark code fence line: up to three spaces, then three or more
+# backticks or tildes, then the info string.
+_FENCE = re.compile(r"^( {0,3})(`{3,}|~{3,})(.*)$")
+# Cleanups the renderer's _looseClean (cowork parseFormSpec.js) applies before
+# its second JSON.parse. Its comment stripping is not copied.
+_STRAY_FENCE_OPEN = re.compile(r"^\s*```(?:json|data-vault-form|js|javascript)?\s*\n")
+_STRAY_FENCE_CLOSE = re.compile(r"\n\s*```\s*$")
+_SMART_QUOTES = str.maketrans({c: "'" for c in "‘’‚‛′‵"} | {c: '"' for c in "“”„‟″‶"})
+_SINGLE_QUOTED_VALUE = re.compile(r"(:\s*|,\s*|\[\s*)'((?:[^'\\]|\\.)*)'")
+_TRAILING_COMMA = re.compile(r",(\s*[}\]])")
+
+
+def _loose_json(body: str) -> str:
+    """``body`` after the renderer's cheap cleanups for model-written JSON."""
+    out = _STRAY_FENCE_CLOSE.sub("", _STRAY_FENCE_OPEN.sub("", body))
+    out = out.translate(_SMART_QUOTES)
+    out = _SINGLE_QUOTED_VALUE.sub(
+        lambda m: m.group(0) if '"' in m.group(2) else f'{m.group(1)}"{m.group(2)}"', out,
+    )
+    return _TRAILING_COMMA.sub(r"\1", out)
+
+
+def _form_id_in(body: str) -> str | None:
+    """The form id of a form block's body when the body parses, strictly or
+    after the renderer's cheap cleanups, or None.
+
+    A body that does not parse counts as no form, so a broken paste never
+    stands in for the form; the panel would show its parse error instead."""
+    for text in (body, _loose_json(body)):
+        try:
+            spec = json.loads(text)
+        except ValueError:
+            continue
+        form_id = spec.get("form_id") if isinstance(spec, dict) else None
+        return form_id if isinstance(form_id, str) else None
+    return None
+
+
+@dataclass(frozen=True)
+class RequestedForm:
+    """The connection form a `request_credentials` call returned: the fenced
+    block as the tool wrote it, and its form id."""
+
+    block: str
+    form_id: str
+
+
+def requested_form(tool_rows: Sequence[object]) -> RequestedForm | None:
+    """The form of the turn's last `request_credentials` call that returned
+    one, read from the turn's history rows (anton streams no result for this
+    tool). None when no call did: a refused call returns text with no block,
+    and a call anton marked is_error never ran.
+
+    The block is searched for anywhere in the result, since anton can add an
+    error-tracking note after it."""
+    rows = ToolRows.read(rows=tool_rows)
+    found: RequestedForm | None = None
+    for tool_use_id, call in rows.calls.items():
+        result = rows.results.get(tool_use_id)
+        if call.name != "request_credentials" or result is None or result.is_error:
+            continue
+        blocks = list(_FORM_BLOCK.finditer(result.text))
+        form_id = _form_id_in(blocks[-1].group(1)) if blocks else None
+        if form_id is not None:
+            found = RequestedForm(block=blocks[-1].group(0), form_id=form_id)
+    return found
+
+
+def _open_fence(answer: str) -> str | None:
+    """The opening fence of the code block ``answer`` ends inside, with its
+    indent, or None when it ends outside every code block.
+
+    Follows CommonMark's fence rules: a backtick fence whose info string holds
+    a backtick is inline code, and a block closes only on a fence of the same
+    character, at least as long, with nothing after it. The indent is kept so
+    a closing fence stays inside the list item its block belongs to."""
+    open_indent, open_fence = "", ""
+    lines = _GLUED_FORM_FENCE.sub("\n```data-vault-form", answer).split("\n")
+    for line in (line.rstrip("\r") for line in lines):
+        match = _FENCE.match(line)
+        if match is None:
+            continue
+        indent, fence, info = match.groups()
+        if not open_fence:
+            if not (fence[0] == "`" and "`" in info):
+                open_indent, open_fence = indent, fence
+        elif fence[0] == open_fence[0] and len(fence) >= len(open_fence) and not info.strip():
+            open_indent, open_fence = "", ""
+    return open_indent + open_fence if open_fence else None
+
+
+def missing_form_text(answer: str, form: RequestedForm) -> str:
+    """The text that puts ``form`` at the end of ``answer`` so the side panel
+    opens it, or "" when the answer already shows it.
+
+    The panel opens the answer's last form block, so the form counts as shown
+    only when that block has its id. A code fence the answer left open (an
+    answer cut off) is closed first. Otherwise the renderer would end an open
+    form fence at the added block's opening line and read neither form. After
+    a reload, the markdown would also show the added block as code, not as a
+    form card."""
+    blocks = list(_FORM_BLOCK.finditer(answer))
+    if blocks and _form_id_in(blocks[-1].group(1)) == form.form_id:
+        return ""
+    open_fence = _open_fence(answer)
+    closing = f"\n{open_fence}" if open_fence else ""
+    text = answer + closing
+    if not text or text.endswith("\n\n"):
+        gap = ""
+    elif text.endswith("\n"):
+        gap = "\n"
+    else:
+        gap = "\n\n"
+    return f"{closing}{gap}{form.block}\n"
+
+
 async def find_answer_sources(evidence: TurnEvidence) -> FigureSources:
     """The figures in an answer and the steps they came from.
 
@@ -566,8 +737,8 @@ def _cell_arguments(arguments: dict[str, Any]) -> _CellArguments:
 def _replayed_cell(result: str, *, arguments: _CellArguments) -> CellResult:
     """A cell's result as history rows hold it: its code and description
     from the call's arguments, and what it printed, the [output] part,
-    without the logs, stderr, error and artifact lint the model saw beside
-    it, or the note on how long output cut short was."""
+    without the logs, stderr, error, artifact lint and live-app lines the
+    model saw beside it, or the note on how long output cut short was."""
     stdout = ""
     if result.startswith("[output]\n"):
         printed = result[len("[output]\n"):]
@@ -576,10 +747,77 @@ def _replayed_cell(result: str, *, arguments: _CellArguments) -> CellResult:
     return CellResult(code=arguments.code, stdout=stdout, description=arguments.one_line_description)
 
 
+# anton's image tool. Its result names the file it wrote by path, never by its
+# bytes.
+GENERATE_IMAGE_TOOL = "generate_image"
+_IMAGE_SUFFIXES = (".png", ".jpg", ".jpeg", ".webp", ".gif")
+# Well past the per-turn image cap, so a result is never cut short by this.
+_MAX_IMAGES_PER_RESULT = 16
+
+
+# The keys a generate_image result names a file under: `absolute_path` is the
+# path the agent's OS wrote it at, `path` the same file in the project's terms.
+_PATH_KEYS = ("absolute_path", "path")
+
+
+def _named_files(value: Any, *, depth: int = 0) -> list[tuple[str, ...]]:
+    """Each object in a parsed tool result that names a file, as the paths it
+    gives for it, in ``_PATH_KEYS`` order."""
+    if depth > 4:
+        return []
+    found: list[tuple[str, ...]] = []
+    if isinstance(value, dict):
+        names = tuple(name for key in _PATH_KEYS if isinstance(name := value.get(key), str) and name)
+        if names:
+            found.append(names)
+        for key, item in value.items():
+            if key not in _PATH_KEYS:
+                found.extend(_named_files(item, depth=depth + 1))
+    elif isinstance(value, list):
+        for item in value:
+            found.extend(_named_files(item, depth=depth + 1))
+    return found
+
+
+def generated_images(content: str, files: AgentFiles) -> list[dict[str, str]]:
+    """The images a ``generate_image`` result names, as project files the UI
+    can fetch (``GET /projects/{name}/files-raw/{path}``): ``[{"path": ...}]``.
+
+    Each image is read by the path the agent's OS wrote it at first, then by
+    its path in the project's terms (AgentFiles.reported_file), since on a
+    cloud pod neither is a project path: the working directory is the
+    conversation's folder, and a new image artifact is written to the
+    project's artifacts folder through the pod's own mount of it. An image
+    that resolves to no image file in the project, an attachment included, is
+    left out, and a result that is not a JSON object or list (a refusal, an
+    error) names none.
+    """
+    try:
+        parsed = json.loads(content)
+    except (TypeError, ValueError):
+        return []
+    images: list[dict[str, str]] = []
+    for names in _named_files(parsed):
+        for literal in names:
+            if not literal.lower().endswith(_IMAGE_SUFFIXES):
+                continue
+            named = files.reported_file(literal)
+            if named is None or named.path is None:
+                continue
+            if {"path": named.path} not in images:
+                images.append({"path": named.path})
+            break
+        if len(images) >= _MAX_IMAGES_PER_RESULT:
+            break
+    return images
+
+
 async def format_responses_stream(
     event_stream: AsyncIterator,
     model: str,
     event_sink: Optional[Callable[[str, dict], None]] = None,
+    *,
+    form_blocks: bool = False,
 ) -> AsyncIterator[str]:
     """Yield Responses-API SSE strings derived from ChatSession events.
 
@@ -588,10 +826,17 @@ async def format_responses_stream(
     route to capture a per-turn event log to disk so the client can
     rebuild the Thinking block + scratchpad cells when the conversation
     is reopened (without keeping localStorage state).
+
+    `form_blocks` is for a turn shown in the Cowork UI. With it on, a
+    connection form the turn's `request_credentials` returned and the answer
+    left out is added to the end of the answer as one more text delta, so the
+    side panel opens it and the saved answer keeps it. A channel or a
+    non-streaming caller leaves it off: it has no side panel.
     """
     from anton.core.llm.provider import (
         StreamAskUser,
         StreamAskUserAnswered,
+        StreamBrowserSession,
         StreamComplete,
         StreamContextCompacted,
         StreamTaskProgress,
@@ -643,6 +888,11 @@ async def format_responses_stream(
     # What the last spent boundary set aside, returned if the turn hands back
     # instead of delivering the replacement it promised.
     superseded_stash = ""
+    # Where in `collected_text` the current answer starts: just past the last
+    # tool call. Text before a tool call is narration, which the app files as
+    # a step (ENG-3554), so a boundary sets aside only the text after it and a
+    # hand-back gives back the answer alone (ENG-4194).
+    answer_from = 0
     # Why a turn that handed back stopped (anton's `ended_by`); None if it finished.
     ended_by: str | None = None
 
@@ -654,9 +904,11 @@ async def format_responses_stream(
         # reducer would otherwise see every `now()` collapse to the
         # same JS-tick value, producing 0ms across the board.
         # Persisted into the turns sidecar via `event_sink`, so the
-        # field is also there for future replays.
+        # field is also there for future replays. A held step's card
+        # compares it with the approvals-off stamp, which event_clock
+        # keeps at or after it.
         if "at_ms" not in data:
-            data["at_ms"] = int(time.time() * 1000)
+            data["at_ms"] = event_at_ms()
         if event_sink is not None:
             try:
                 event_sink(event_type, data)
@@ -704,7 +956,8 @@ async def format_responses_stream(
     }
     yield _event("response.created", created_data)
 
-    async for event in event_stream:
+    from cowork.services.content_safety import guarded_events
+    async for event in guarded_events(event_stream):
         if isinstance(event, StreamTextDelta):
             if event.text.strip():
                 failure_reply = event.text.startswith(_ANTON_FAILURE_REPLY)
@@ -718,8 +971,13 @@ async def format_responses_stream(
                 # answer it promised; if it hands back instead, the answer that
                 # was already read has to come back rather than be lost from the
                 # transcript and from the history the next turn is rebuilt from.
-                superseded_stash = "".join(collected_text)
+                # The answer the user read: the text after the last tool
+                # call, or all of it when nothing followed that call.
+                superseded_stash = "".join(collected_text[answer_from:]).lstrip("\n")
+                if not superseded_stash.strip():
+                    superseded_stash = "".join(collected_text)
                 collected_text.clear()
+                answer_from = 0
                 # The armed paragraph break belongs between two rounds of the
                 # answer being discarded, not in front of its replacement.
                 round_break = False
@@ -749,6 +1007,7 @@ async def format_responses_stream(
             })
 
         elif isinstance(event, StreamToolUseStart):
+            answer_from = len(collected_text)
             tool_names[event.id] = event.name
             tool_json_parts[event.id] = []
             if is_evidence_tool(name=event.name):
@@ -799,18 +1058,16 @@ async def format_responses_stream(
                 role = Role.thought_recall_end.value
             else:
                 role = Role.thought_progress.value
-            # 64 KB cap — old 2 KB cap routinely chopped scratchpad
-            # JSON mid-`code` field, leaving the desktop renderer with
-            # an unparseable string and the inspector showing "No code
-            # captured for this cell." 64 KB covers every cell we've
-            # seen in practice without bloating the SSE stream or the
-            # persisted turns log.
+            # Replay needs the whole scratchpad call: a cut in its code
+            # hides earlier bindings from the next turn's write check. Every
+            # other tool's input, an MCP tool named like the scratchpad's
+            # included, and result output keep their length cap.
             seq += 1
             yield _event("response.in_progress", {
                 "type": "response.in_progress",
                 "sequence_number": seq,
                 "thought_role": role,
-                "content": accumulated[:65536],
+                "content": accumulated if name == "scratchpad" else accumulated[:65536],
                 "tool_use_id": event.id,
             })
 
@@ -838,6 +1095,40 @@ async def format_responses_stream(
                 "tool_name": getattr(event, "name", "") or "",
                 "tool_use_id": getattr(event, "id", None) or "",
             })
+
+        elif isinstance(event, StreamToolResult) and getattr(event, "name", "") == GENERATE_IMAGE_TOOL:
+            # An image the agent generated, shown inline in the chat: the
+            # result's JSON (path, size, type, model, usage) under its own role,
+            # so the UI renders it rather than patching it into a scratchpad
+            # cell, and so neither the cell replay nor the figure sources read
+            # it (it is not in turn_results). Through _event, so it is saved with
+            # the turn and a reload shows it too.
+            seq += 1
+            image_payload = {
+                "type": "response.in_progress",
+                "sequence_number": seq,
+                "thought_role": Role.thought_tool_call_result.value,
+                "content": event.content[:65536],
+                "tool_name": GENERATE_IMAGE_TOOL,
+                "tool_use_id": getattr(event, "id", None) or "",
+            }
+            # The result's path is the one the agent's OS read: the project's
+            # on the desktop, but a mount of the conversation's folder on a cloud
+            # pod, which the UI cannot map. So the files it names are also
+            # given as project paths, the ones files-raw serves. Always present,
+            # empty when none resolves to an image in the project, so the UI
+            # shows nothing rather than guessing from the raw path, which on a
+            # pod can name a different file at the project root.
+            images: list[dict[str, str]] = []
+            if turn_context.files is not None:
+                try:
+                    images = await asyncio.to_thread(generated_images, event.content, turn_context.files)
+                except Exception:
+                    # Never fail the turn over showing an image: the content
+                    # still names the file.
+                    logger.warning("Could not resolve the images a generate_image result names", exc_info=True)
+            image_payload["generated_images"] = images
+            yield _event("response.in_progress", image_payload)
 
         elif isinstance(event, StreamToolResult):
             tool_use_id = getattr(event, "id", None) or ""
@@ -912,6 +1203,7 @@ async def format_responses_stream(
                 superseded_pending = False
                 if superseded_stash:
                     collected_text.insert(0, superseded_stash)
+                    answer_from = 0
                     seq += 1
                     yield _event("response.answer_restore", {
                         "type": "response.answer_restore",
@@ -930,7 +1222,7 @@ async def format_responses_stream(
             # A lost/trimmed skill draft is one-shot per draft, same shape as
             # the rate-limit notice — throttling it away would silently
             # recreate the exact bug it exists to surface.
-            is_skill_draft_notice = phase_str == "skill_draft_dropped"
+            is_draft_notice = phase_str in ("skill_draft_dropped", "connector_draft_dropped")
             is_tool_progress = phase_str == "tool_progress"
             is_tool_done = phase_str == "tool_done" and event.id in progress_tool_ids
 
@@ -966,7 +1258,7 @@ async def format_responses_stream(
                     or is_tool_done
                     or is_tool_progress
                     or is_rate_limited_notice
-                    or is_skill_draft_notice
+                    or is_draft_notice
                 )
                 now = time.time()
                 should_emit = never_throttle or (now - last_progress >= PROGRESS_THROTTLE)
@@ -1047,12 +1339,23 @@ async def format_responses_stream(
                 "content": event.message,
             })
 
+        elif isinstance(event, StreamBrowserSession):
+            # The agent opened the person's browser session: the app shows the
+            # browser beside the chat. Persisted like every event, so a reload
+            # reopens the pane. The session id only, never a viewer link: on the
+            # web, whoever opens the pane mints their own link with their own
+            # credential (POST /browse/embed), so a stored event opens nothing.
+            seq += 1
+            yield _event("response.browser_session_opened", BrowserSessionOpened(
+                sequence_number=seq, session_id=event.session_id,
+            ).model_dump())
+
         elif isinstance(event, ArtifactCreated):
             seq += 1
             yield _event("response.artifact_created", {
                 "type": "response.artifact_created",
                 "sequence_number": seq,
-                "artifact": event.artifact,
+                "artifact": event.artifact.to_json(),
             })
 
         elif isinstance(event, StreamAskUser):
@@ -1106,12 +1409,34 @@ async def format_responses_stream(
         elif isinstance(event, TurnContext):
             turn_context = event
 
+        elif isinstance(event, PreviewCheckRequest):
+            from cowork.harnesses.anton_harness.preview_checker import artifact_check_sse
+
+            # Not through _event: never recorded with the turn's events.
+            yield artifact_check_sse(
+                check_id=event.check_id, artifact_slug=event.artifact_slug, timeout_s=event.timeout_s,
+            )
+
+        elif isinstance(event, TurnAddon):
+            # A message the person added mid-turn: accepted, read by the
+            # model, or returned to run next (cowork.streaming.addons).
+            seq += 1
+            yield _event("response.addon", {**event.payload(), "sequence_number": seq})
+
         elif isinstance(event, SkillCreated):
             seq += 1
             yield _event("response.skill_created", {
                 "type": "response.skill_created",
                 "sequence_number": seq,
                 "skill": event.skill,
+            })
+
+        elif isinstance(event, ConnectorDrafted):
+            seq += 1
+            yield _event("response.connector_drafted", {
+                "type": "response.connector_drafted",
+                "sequence_number": seq,
+                "connector": event.connector,
             })
 
         elif isinstance(event, TurnMemoryRead):
@@ -1145,6 +1470,22 @@ async def format_responses_stream(
         elif isinstance(event, StreamTurnEnded):
             ended_by = event.ended_by
 
+    # Models that rank the system prompt's "summarize tool output" above the
+    # tool's "paste this block" leave the form out of their answer.
+    form = requested_form(tool_rows) if form_blocks and not failure_reply else None
+    added = missing_form_text("".join(collected_text), form) if form is not None else ""
+    if added:
+        from cowork.services.content_safety import check_content
+        await check_content(''.join(collected_text)[-8000:] + added, purpose='output')
+        collected_text.append(added)
+        seq += 1
+        yield _event("response.output_text.delta", {
+            "type": "response.output_text.delta",
+            "sequence_number": seq,
+            "item_id": msg_id,
+            "delta": added,
+        })
+
     full_text = "".join(collected_text)
     # A turn the user stops, or one that fails or stalls, never reaches this
     # line, so its partial answer carries no figure sources. A turn that
@@ -1166,6 +1507,8 @@ async def format_responses_stream(
         ) if compacted and not tool_rows_arrived else (),
     ))
     if sources.figures:
+        from cowork.services.content_safety import check_content
+        await check_content(json.dumps(sources.model_dump(mode='json'), ensure_ascii=False), purpose='output')
         seq += 1
         yield _event("response.figure_sources", {
             "type": "response.figure_sources",

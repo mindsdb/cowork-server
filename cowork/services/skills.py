@@ -1,19 +1,21 @@
 from __future__ import annotations
 
+import hashlib
 import io
 import json
 import logging
 import os
 import shutil
+import stat
 import tempfile
 import zipfile
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
-from functools import cached_property
+from functools import cached_property, lru_cache
 from pathlib import Path
-from typing import NamedTuple
+from typing import TYPE_CHECKING, NamedTuple
 from uuid import uuid4
 
 from anton.core.tools.skill_format import (
@@ -26,15 +28,20 @@ from anton.core.tools.skill_format import (
 
 from cowork import shared_skills
 from cowork.common.paths import (
+    O_NOFOLLOW,
+    dir_atomic_write,
+    dir_open,
     dir_rename,
     dir_replace,
     dir_rmtree,
+    dir_scandir,
     dir_unlink,
+    opened_subdir_nofollow,
     pinned_dir,
     safe_join,
 )
 from cowork.common.settings import get_app_settings
-from cowork.creators import changer_for
+from cowork.creators import changer_for, turn_changer_for
 from cowork.db.personal_resources import PersonalResource
 from cowork.db.scoped import TenantScope, scope_for_identity, scoped_storage_root
 from cowork.managed import (
@@ -50,6 +57,7 @@ from cowork.models.skill import (
     META_CREATED_BY,
     META_DISPLAY_NAME,
     META_ENABLED,
+    META_MANAGED_BY,
     META_PROJECTS,
     META_UPDATED_AT,
     Skill,
@@ -63,6 +71,19 @@ from cowork.services.skill_links import (
 # Re-exported beside the other sharing texts and errors, for the routes and the
 # operator command.
 from cowork.shared_skills import SKILL_SHARING_BUSY, SharedSkillsBusyError  # noqa: F401
+from cowork.schemas.turn_skills import TurnSkillEntry, TurnSkills
+from cowork.services.skill_sharing import (
+    BUILTIN_RULE,
+    SkillAccessRule,
+    SkillViewer,
+    access_rule_for,
+    fail_closed_viewer,
+    sharing_applies,
+)
+
+if TYPE_CHECKING:
+    from cowork.db.scoped import ScopedSession
+    from cowork.models.skill_access import SkillAccess
 
 logger = logging.getLogger(__name__)
 
@@ -117,7 +138,7 @@ _TURN_SKILL_FILE_MAX = 200_000
 # Desktop seeding (unkeyed store, DB sentinel) lives in migrations.py and shares
 # this version; org seeding (per-org store, file marker) is a SkillService method.
 BUILTIN_SKILLS_DIR = Path(__file__).parent.parent / "skills_builtin"
-BUILTIN_SKILLS_VERSION = 1
+BUILTIN_SKILLS_VERSION = 3
 # Versioned identity manifest. Authorization must not depend on the packaged
 # directory being readable: an incomplete image must not make an existing
 # shared-volume copy mutable.
@@ -130,12 +151,74 @@ BUILTIN_SKILL_SLUGS = frozenset(
         "google-slides",
         "pdf",
         "presentations",
+        "scheduled-artifact-refresh",
         "skill-creator",
     }
 )
 #: Org-mode version marker, a file in the org's own store. See
 #: ``SkillService.ensure_builtin_skills`` for why this is not a Setting row.
 BUILTIN_SKILLS_MARKER = ".builtins_seeded"
+
+#: Every version of each packaged builtin we have shipped, as fingerprints, and
+#: the BUILTIN_SKILLS_VERSION each one first shipped in. Regenerated from git
+#: history by ``scripts/builtin_skills_shipped.py``; a test fails when a packaged
+#: skill's current content is missing from it.
+BUILTIN_SKILLS_SHIPPED = BUILTIN_SKILLS_DIR / "shipped.json"
+
+#: Written into a skill's folder at run time (anton's usage counters), so it is
+#: left out of a fingerprint and carried over when a builtin is updated.
+BUILTIN_RUNTIME_SIDECAR = "stats.json"
+
+
+def fingerprint_skill_files(files: dict[str, bytes]) -> str:
+    """One fingerprint for a skill's files, keyed by POSIX path in the skill folder."""
+    digest = hashlib.sha256()
+    for rel in sorted(files):
+        if rel == BUILTIN_RUNTIME_SIDECAR:
+            continue
+        digest.update(rel.encode("utf-8") + b"\0" + hashlib.sha256(files[rel]).hexdigest().encode() + b"\n")
+    return digest.hexdigest()
+
+
+def builtin_fingerprint(skill_dir: Path) -> str | None:
+    """The fingerprint of a skill folder on disk, or None if it holds a link or
+    anything but regular files and folders (never treated as a shipped copy)."""
+    files: dict[str, bytes] = {}
+    for dirpath, dirnames, filenames in os.walk(skill_dir, followlinks=False):
+        base = Path(dirpath)
+        for name in dirnames:
+            if (base / name).is_symlink():
+                return None
+        for name in filenames:
+            path = base / name
+            if path.is_symlink() or not path.is_file():
+                return None
+            files[path.relative_to(skill_dir).as_posix()] = path.read_bytes()
+    return fingerprint_skill_files(files)
+
+
+def _is_skill_write_temp(name: str) -> bool:
+    """A temp file a skill write leaves beside SKILL.md if it is interrupted."""
+    return name.startswith(f".{SKILL_FILE}.") and name.endswith((".tmp", ".restore"))
+
+
+@lru_cache(maxsize=1)
+def _builtin_skills_shipped() -> dict:
+    try:
+        return json.loads(BUILTIN_SKILLS_SHIPPED.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        logger.warning("Could not read %s; packaged builtins will not be updated", BUILTIN_SKILLS_SHIPPED)
+        return {}
+
+
+def shipped_builtin_fingerprints(slug: str) -> frozenset[str]:
+    return frozenset(_builtin_skills_shipped().get(slug, {}).get("shipped", ()))
+
+
+def builtin_introduced_in(slug: str) -> int:
+    """The BUILTIN_SKILLS_VERSION a packaged builtin first shipped in. A slug the
+    manifest doesn't know counts as new, so it is still seeded."""
+    return int(_builtin_skills_shipped().get(slug, {}).get("introduced", 1 << 30))
 
 # Skills in this set belong to the coding product, not the general Cowork
 # assistant. They remain packaged beside the other builtins for now, but are
@@ -145,6 +228,28 @@ CODE_ONLY_BUILTIN_SKILL_NAMES = frozenset({
 })
 CODE_BUILTIN_SKILLS_VERSION = 1
 CODE_BUILTIN_SKILLS_MARKER = ".builtins_seeded"
+
+
+# The org's Brand guidelines skill: generated from the org's branding in
+# auth by cowork.services.org_branding. In MindsHub mode it is shared with
+# everyone and always on; on a local server it is an ordinary skill
+# recalled on demand. In every mode it is told from a person's own skill of
+# that name only by its META_MANAGED_BY. Nobody edits, renames, deletes or
+# shares the generated one as a skill; an org admin changes it through the
+# org's appearance (its ``guidelines``). Each person may still turn it off
+# for themselves. In MindsHub mode a new skill may not take the name, but a
+# member's skill that already had it stays theirs.
+BRAND_GUIDELINES_SLUG = "brand-guidelines"
+BRAND_GUIDELINES_MANAGER = "org-branding"
+BRAND_GUIDELINES_NAME_RESERVED = (
+    f"The name {BRAND_GUIDELINES_SLUG!r} is kept for your organization's Brand guidelines "
+    "skill. Choose another name."
+)
+BRAND_GUIDELINES_REFUSAL = (
+    "The Brand guidelines skill is generated from your organization's branding and can't "
+    "be changed, renamed, shared or deleted here. An organization admin edits it in "
+    "Settings > Branding (Brand guidelines for Anton). You can still turn it off for yourself."
+)
 
 
 def is_builtin_skill(slug: str) -> bool:
@@ -250,22 +355,48 @@ def _used_in(skill: Skill, *, project_name: str | None) -> bool:
 def select_turn_skills(
     *, service: SkillService, project_name: str | None
 ) -> list[TurnSkill]:
-    """The skills of ``service``'s store that a turn in ``project_name`` uses.
+    """The skills of ``service``'s store that a turn in ``project_name`` uses
+    (_selected_turn_skills)."""
+    return [selected.turn_skill for selected in _selected_turn_skills(service, project_name)]
+
+
+class SelectedSkill(NamedTuple):
+    """A skill a turn uses, and its parsed SKILL.md."""
+
+    turn_skill: TurnSkill
+    skill: Skill
+
+
+class AlwaysOnSplit(NamedTuple):
+    """A turn's selected skills, split by whether the pod puts them in every
+    turn's prompt (_split_always_on)."""
+
+    always_on: list[TurnSkill]
+    on_demand: list[TurnSkill]
+
+
+def _selected_turn_skills(
+    service: SkillService, project_name: str | None
+) -> list[SelectedSkill]:
+    """The skills of ``service``'s store that a turn in ``project_name`` uses,
+    each with its parsed SKILL.md.
 
     Selection mirrors skill_links: enabled skills whose ``metadata.projects`` is
-    empty or names this project.
+    empty or names this project, less the ones the scope's person turned off
+    for themselves (SkillService.off_for_me), packaged built-ins included.
 
-    Slug and files both come from the DIRECTORY, not frontmatter ``name`` — the
+    Slug and files both come from the DIRECTORY, not frontmatter ``name``: the
     two can drift on a hand-edited store, and resolving by frontmatter could
     ship another (e.g. disabled) skill's files. Every drop is logged.
     """
     root = service.root
     if not root.exists():
         return []
-    selected: list[TurnSkill] = []
+    off_for_me = service.off_for_me()
+    selected: list[SelectedSkill] = []
     for skill_dir in sorted(p for p in root.iterdir() if p.is_dir()):
         slug = skill_dir.name
-        if not service.allows_skill(slug):
+        if not service.allows_skill(slug) or slug in off_for_me:
             continue
         if skill_dir.is_symlink():
             # is_dir() follows the link, so a symlinked dir could point into
@@ -287,8 +418,51 @@ def select_turn_skills(
             continue
         if not _used_in(skill, project_name=project_name):
             continue
-        selected.append(TurnSkill(slug=slug, path=skill_dir))
+        if not service.visible_to_viewer(skill):
+            continue
+        selected.append(SelectedSkill(TurnSkill(slug=slug, path=skill_dir), skill))
     return selected
+
+
+def _always_on_rank(service: SkillService, slug: str, skill: Skill) -> int | None:
+    """0 for an always-on skill shared with everyone, 1 for an always-on one
+    shared with one of the viewer's teams, None for a skill that is only on
+    demand, a skill shared with the viewer personally among them. Packaged
+    built-ins are never always on: they read as shared with everyone only
+    because they predate sharing."""
+    if is_builtin_skill(slug):
+        return None
+    viewer = service.viewer
+    rule = service.access_rule(skill)
+    if viewer is not None:
+        rule = viewer.effective(rule)
+    if not rule.always_on:
+        return None
+    if rule.org_allowed:
+        return 0
+    if viewer is not None and viewer.in_team_of(rule):
+        return 1
+    return None
+
+
+def _split_always_on(service: SkillService, selected: list[SelectedSkill]) -> AlwaysOnSplit:
+    """A turn's selected skills by always on, in MindsHub mode: always on
+    are the ones shared with everyone or with one of the viewer's teams and
+    marked ``always_on`` in their skill_access row, everyone's first, then
+    the team's, each by slug; the rest keep their order. Outside MindsHub
+    mode nothing is always on."""
+    if not service.org_sharing:
+        return AlwaysOnSplit(always_on=[], on_demand=[chosen.turn_skill for chosen in selected])
+    ranked: list[tuple[int, str, TurnSkill]] = []
+    on_demand: list[TurnSkill] = []
+    for chosen in selected:
+        rank = _always_on_rank(service, chosen.turn_skill.slug, chosen.skill)
+        if rank is None:
+            on_demand.append(chosen.turn_skill)
+        else:
+            ranked.append((rank, chosen.turn_skill.slug, chosen.turn_skill))
+    always_on = [turn_skill for _rank, _slug, turn_skill in sorted(ranked, key=lambda r: r[:2])]
+    return AlwaysOnSplit(always_on=always_on, on_demand=on_demand)
 
 
 def shared_turn_skills(
@@ -299,11 +473,15 @@ def shared_turn_skills(
 
     SkillService.shared_with_owner's skills, with the selection rule the
     owner's own get (select_turn_skills), applied to each skill's own
-    metadata: its creator's disable or project scope reaches everyone. Each
-    path is the skill's folder in its creator's own store, read live.
+    metadata: its creator's disable or project scope reaches everyone, and
+    the owner's own off (SkillService.off_for_me) them alone. Each path is
+    the skill's folder in its creator's own store, read live.
     """
     selected: list[TurnSkill] = []
+    off_for_me = service.off_for_me()
     for slug, skill_dir in sorted(service.shared_with_owner().items()):
+        if slug in off_for_me:
+            continue
         skill = _skill_from_dir(skill_dir)
         if skill is not None and _used_in(skill, project_name=project_name):
             selected.append(TurnSkill(slug=slug, path=skill_dir))
@@ -312,8 +490,9 @@ def shared_turn_skills(
 
 def agent_skill_names() -> frozenset[str]:
     """The skills every person's agent already has from a read-only root
-    beside the managed folder: the harness's own (HOST_SKILLS_DIR) and
-    anton's packaged ones (anton's SkillStore.builtin_root).
+    beside the managed folder: the harness's own (HOST_SKILLS_DIR and the
+    doc skill's root, DOC_SKILLS_ROOT) and anton's packaged ones (anton's
+    SkillStore.builtin_root).
 
     anton reads the harness's root ahead of the shared skills and its
     packaged ones after them, so a shared skill by one of these names would
@@ -322,10 +501,13 @@ def agent_skill_names() -> frozenset[str]:
     """
     from anton.core.memory.skills import SkillStore
 
+    from cowork.docs.prompt import DOC_SKILLS_ROOT
     from cowork.harnesses.anton_harness.harness import HOST_SKILLS_DIR
 
     return frozenset(
-        {*readonly_skill_dirs(HOST_SKILLS_DIR).reserved, *readonly_skill_dirs(SkillStore().builtin_root).reserved}
+        name
+        for root in (HOST_SKILLS_DIR, DOC_SKILLS_ROOT, SkillStore().builtin_root)
+        for name in readonly_skill_dirs(root).reserved
     )
 
 
@@ -336,35 +518,105 @@ def reads_shared_skills(scope: TenantScope | None) -> bool:
     return reads_shared_registry(scope, resource=PersonalResource.SKILLS)
 
 
+def _turn_skill_service(
+    scope: TenantScope | None, *, viewer: SkillViewer | None, session: ScopedSession | None
+) -> SkillService:
+    """The store as a turn of ``viewer`` selects from it: in MindsHub mode
+    a missing viewer is the fail-closed one, and an admin's role grants no
+    other member's private skills (SkillViewer.for_turns)."""
+    if sharing_applies(scope):
+        viewer = (viewer or fail_closed_viewer(scope)).for_turns()
+    return SkillService(scope, viewer=viewer, session=session)
+
+
+def has_always_on_rows(*, session: ScopedSession) -> bool:
+    """Whether any of the org's skill_access rows is always on: the database
+    half of has_always_on_skills, which reads no SKILL.md and lists no store.
+    No turn has an always-on skill when it is False. Never outside MindsHub
+    mode.
+
+    It reads the rows as they stand, without the backfill that gives each
+    skill from before sharing its row (backfill_legacy_access). That backfill
+    lists the store on the file store, and every row it writes is shared with
+    everyone and never always on, so it can't change this answer;
+    has_always_on_skills runs it once this read finds an always-on row."""
+    if not sharing_applies(session.scope):
+        return False
+    from cowork.services.skill_access import access_rows
+
+    return any(row.always_on for row in access_rows(session).values())
+
+
+def has_always_on_skills(
+    scope: TenantScope | None,
+    *,
+    project_name: str | None,
+    viewer: SkillViewer | None,
+    session: ScopedSession,
+) -> bool:
+    """Whether a turn in ``project_name`` puts an always-on skill in its
+    prompt: the skills build_turn_skills would flag ``always_on``. The
+    routing gate's own answer would not follow one, so such a turn goes to
+    the agent (cowork.handlers.responses). Never outside MindsHub mode.
+
+    Reads the org's skill_access rows first, which the turn's selection
+    reads anyway, and parses no SKILL.md when none of them is always on.
+    """
+    svc = _turn_skill_service(scope, viewer=viewer, session=session)
+    # No rows outside MindsHub mode (SkillService._access_rows).
+    if not any(row.always_on for row in svc._access_rows().values()):
+        return False
+    return bool(_split_always_on(svc, _selected_turn_skills(svc, project_name)).always_on)
+
+
 def build_turn_skills(
-    scope: TenantScope | None, project_path: str | None = None
-) -> dict[str, dict]:
-    """Skills for a remote turn: ``{slug: {"files": {relpath: text}}}``.
+    scope: TenantScope | None,
+    project_path: str | None = None,
+    *,
+    project_name: str | None = None,
+    viewer: SkillViewer | None = None,
+    session: ScopedSession | None = None,
+) -> TurnSkills:
+    """Skills for a remote turn, by slug: each one's files
+    (TurnSkillEntry.files), and ``always_on`` on each skill the turn applies
+    on every task.
 
     Org-keyed through the passed `scope` (the producer binds no ambient scope).
-    Selection is select_turn_skills's, by this project's folder name.
+    Selection is select_turn_skills's, by ``project_name``, else this project's
+    folder name. In MindsHub mode only the skills ``viewer`` sees go in (a
+    missing viewer is the fail-closed one), and the always-on ones
+    (_split_always_on) come first, in their order, since the pod renders
+    them in the order it reads them. Who each skill is shared with is read
+    from ``session``'s skill_access rows (SkillService).
+
+    This is every skill the pod's agent can recall in the turn: the pod's
+    anton recalls only what a block names (its cloud turn contract's
+    ``skills``), so a skill the caller doesn't see is never there to recall.
+    Every cloud turn sends it, empty when the caller sees nothing
+    (cowork.handlers.responses.remote_turn_skills).
     """
-    svc = SkillService(scope)
+    svc = _turn_skill_service(scope, viewer=viewer, session=session)
     # A fresh org's store starts empty and there is no org-creation hook, so the
-    # builtins are seeded on first read. This function has no production caller
-    # today — cloud turns read skills off the shared mount directly rather than
-    # through this payload (see `_stage_remote_workspace_files`, which is the
-    # actual seed trigger for a chat-first org) — but it seeds too, so it stays
-    # correct if a future caller reappears. No-op after the first run, and in
-    # local mode.
+    # builtins are seeded on first read: here, behind ``GET /skills``, and in
+    # `_stage_remote_workspace_files`. No-op after the first run, and in local
+    # mode.
     svc.ensure_builtin_skills()
 
-    project_name = Path(project_path).name if project_path else None
+    if project_name is None:
+        project_name = Path(project_path).name if project_path else None
 
-    out: dict[str, dict] = {}
-    for skill in select_turn_skills(service=svc, project_name=project_name):
+    # One selection, split by always-on: each SKILL.md is parsed once.
+    split = _split_always_on(svc, _selected_turn_skills(svc, project_name))
+    always_on_slugs = {skill.slug for skill in split.always_on}
+    out: TurnSkills = {}
+    for skill in [*split.always_on, *split.on_demand]:
         files = _skill_wire_files(skill.path, svc.root)
         if files is None:
             logger.warning(
                 "turn skills: dropping %r (no SKILL.md within size bounds)", skill.slug
             )
             continue
-        out[skill.slug] = {"files": files}
+        out[skill.slug] = TurnSkillEntry(files=files, always_on=skill.slug in always_on_slugs)
     return out
 
 
@@ -374,6 +626,7 @@ def link_turn_skills(
     project_name: str,
     skills_dir: Path,
     shared_skills_dir: Path | None = None,
+    off_for_me: frozenset[str] = frozenset(),
 ) -> tuple[Path, ...]:
     """Link the skills one in-process turn uses into ``skills_dir``, from the
     asker's own store, and the ones others share with the asker into
@@ -396,8 +649,12 @@ def link_turn_skills(
     store, and it takes a name from the first read-only root that has one
     (SkillStore._readonly_roots), so a shared skill never hides a host or
     managed skill of the same name.
+
+    ``off_for_me`` is the slugs the asker turned off for themselves
+    (cowork.services.skill_user_settings.off_for_me), read by the caller in
+    its own unit of work: none of them is linked.
     """
-    service = SkillService(scope)
+    service = SkillService(scope, off_for_me=off_for_me)
     service.ensure_builtin_skills()
     own = {
         skill.slug: skill.path
@@ -412,6 +669,37 @@ def link_turn_skills(
         }
         sync_turn_skill_links(skills_dir=shared_skills_dir, wanted=shared)
     return (*own.values(), *shared.values())
+
+
+def artifact_skill_dirs(
+    *,
+    scope: TenantScope | None,
+    project_name: str,
+    off_for_me: frozenset[str] = frozenset(),
+) -> tuple[Path, ...]:
+    """The folders of the asker's own skills that an artifact build follows
+    without a recall: part of anton's ``skills_artifact_roots``, beside the
+    host's and the managed folder's.
+
+    linked_turn_skills's selection, kept to the skills the turn may change
+    (cowork.creators.turn_changer_for): the asker's whole store where skills
+    are personal and on the desktop, only the ones they created where every
+    person reads one store, and none there for a turn with no person, such
+    as a channel's or a shared schedule's, which is no operator. A skill
+    another person shares is never among them: it lives in its creator's
+    store. anton follows a skill marked ``applies_to: artifacts`` only when
+    its folder, links resolved, sits under one of these roots
+    (SkillStore.list_for_artifacts), so another person's text never steers
+    the asker's build unasked.
+    """
+    service = SkillService(scope, off_for_me=off_for_me)
+    changer = turn_changer_for(scope, resource=PersonalResource.SKILLS)
+    own: list[Path] = []
+    for turn_skill in linked_turn_skills(service=service, project_name=project_name):
+        skill = _skill_from_dir(turn_skill.path)
+        if skill is not None and (changer is None or changer.may_change(skill.created_by)):
+            own.append(turn_skill.path)
+    return tuple(own)
 
 
 def linked_turn_skills(
@@ -541,9 +829,38 @@ class SkillService:
     seed_builtins_in_local_mode = False
     immutable_builtins_in_local_mode = False
 
-    def __init__(self, scope: TenantScope | None = None) -> None:
+    def __init__(
+        self,
+        scope: TenantScope | None = None,
+        *,
+        viewer: SkillViewer | None = None,
+        session: ScopedSession | None = None,
+        off_for_me: frozenset[str] | None = None,
+    ) -> None:
         settings = get_app_settings()
         self._scope = scope
+        # MindsHub mode only (cowork.services.skill_sharing): who reads the
+        # store, so the listing, reads and turns keep to what they see. None
+        # reads the whole store, as the project-rename cascade and seeding do.
+        self.viewer = viewer
+        # MindsHub mode only: the session whose org's skill_access rows say
+        # who each skill is shared with (cowork.services.skill_access), read
+        # once per instance, after the org's skills from before sharing got
+        # theirs (backfill_legacy_access). Without one no row or creator is
+        # known, and every skill but a built-in reads as access_rule_for has
+        # a skill with neither: nobody's.
+        self._session = session
+        self._rows: dict[str, SkillAccess] | None = None
+        # The creator each skill's attribution row records, read in one query
+        # the first time a skill with no skill_access row needs it
+        # (access_rule), so a listing doesn't read one row per such skill.
+        self._creators: dict[str, str | None] | None = None
+        self._backfilled = False
+        # The slugs the scope's person turned off for themselves
+        # (cowork.services.skill_user_settings): given, as an in-process
+        # turn reads them in its own unit of work, else read once from
+        # ``session``. Without either, none.
+        self._off_for_me = off_for_me
         base = Path(settings.skill.root_dir)
         if self.store_name != "skills":
             base = base.parent / self.store_name
@@ -565,6 +882,80 @@ class SkillService:
             if self.store_name == "skills"
             else None
         )
+
+    @property
+    def org_sharing(self) -> bool:
+        """Whether this store's skills carry per-skill sharing: the general
+        store in MindsHub mode (cowork.services.skill_sharing)."""
+        return self.store_name == "skills" and sharing_applies(self._scope)
+
+    def visible_to_viewer(self, skill: Skill) -> bool:
+        """Whether this instance's viewer sees ``skill``, one of the store's
+        own. Always outside MindsHub mode, without a viewer, and for a
+        packaged built-in."""
+        if not self.org_sharing or self.viewer is None or is_builtin_skill(skill.name):
+            return True
+        return self.viewer.sees(self.access_rule(skill))
+
+    def _access_rows(self) -> dict[str, SkillAccess]:
+        if self._session is None or not self.org_sharing:
+            return {}
+        if self._rows is None:
+            from cowork.services.skill_access import access_rows, backfill_legacy_access
+
+            if not self._backfilled:
+                backfill_legacy_access(
+                    self._session,
+                    lambda: [slug for slug in self.store_slugs() if not is_builtin_skill(slug)],
+                )
+                self._backfilled = True
+            self._rows = access_rows(self._session)
+        return self._rows
+
+    def access_rule(self, skill: Skill) -> SkillAccessRule:
+        """Who ``skill``, one of the store's own, is shared with in MindsHub
+        mode, and who owns it: its skill_access row's rule, or with no row the
+        creator its SharedResourceAttribution records alone (access_rule_for).
+        A packaged built-in is shared with everyone and never always on. The
+        org's default team is left as stored; SkillViewer.effective reads it
+        as everyone."""
+        if is_builtin_skill(skill.name):
+            return BUILTIN_RULE
+        row = self._access_rows().get(skill.name)
+        if row is None and self._session is not None and self.org_sharing:
+            return access_rule_for(None, self._creator_ids().get(skill.name))
+        return access_rule_for(row)
+
+    def _creator_ids(self) -> dict[str, str | None]:
+        """Every skill's recorded creator in the org, by slug, read once per
+        instance (SharedResourceAccess.snapshots)."""
+        if self._creators is None:
+            from cowork.services.shared_resources import SKILL, SharedResourceAccess
+
+            snapshots = SharedResourceAccess(self._session).snapshots(SKILL)
+            self._creators = {slug: snapshot.created_by_id for slug, snapshot in snapshots.items()}
+        return self._creators
+
+    def forget_access(self) -> None:
+        """Drop the rows and creators read so far: the next read asks the
+        database again, after a change to them or under a lock another change
+        waited on."""
+        self._rows = None
+        self._creators = None
+
+    def off_for_me(self) -> frozenset[str]:
+        """The slugs this scope's person turned off for themselves, read in
+        one query per instance (cowork.services.skill_user_settings.off_for_me).
+        A turn leaves them out whatever else selects them."""
+        if self._off_for_me is None:
+            from cowork.services.skill_user_settings import off_for_me
+
+            self._off_for_me = off_for_me(self._session)
+        return self._off_for_me
+
+    def forget_off_for_me(self) -> None:
+        """Drop the settings read so far, after a change to them."""
+        self._off_for_me = None
 
     @property
     def builtin_skills_dir(self) -> Path:
@@ -669,6 +1060,20 @@ class SkillService:
     def is_managed_skill(self, slug: str) -> bool:
         return slug in self.managed_skill_slugs()
 
+    def is_brand_guidelines(self, slug: str) -> bool:
+        """Whether ``slug`` is the org's generated Brand guidelines skill:
+        BRAND_GUIDELINES_SLUG while the store's folder by that name is the
+        generated one (META_MANAGED_BY), in every mode. A person's own skill
+        of that name is theirs to change."""
+        if slug != BRAND_GUIDELINES_SLUG or self.store_name != "skills":
+            return False
+        try:
+            skill_dir = self._skill_entry(slug)
+        except ValueError:
+            return False
+        skill = _skill_from_dir(skill_dir) if (skill_dir / SKILL_FILE).is_file() else None
+        return skill is not None and skill.metadata.get(META_MANAGED_BY) == BRAND_GUIDELINES_MANAGER
+
     @cached_property
     def _sharing(self) -> _Sharing:
         """What this store's owner shares and is shared, read live from the
@@ -755,6 +1160,15 @@ class SkillService:
         """
         if any(self.is_managed_skill(slug) for slug in slugs):
             raise SkillImmutableError(SHARED_SKILL_REFUSAL)
+        if any(self.is_brand_guidelines(slug) for slug in slugs):
+            raise SkillImmutableError(BRAND_GUIDELINES_REFUSAL)
+        if (
+            creating
+            and self.org_sharing
+            and BRAND_GUIDELINES_SLUG in slugs
+            and not self._skill_entry(BRAND_GUIDELINES_SLUG).exists()
+        ):
+            raise SkillImmutableError(BRAND_GUIDELINES_NAME_RESERVED)
         shared = self.shared_with_owner()
         taken = [slug for slug in slugs if slug in shared]
         if taken:
@@ -783,7 +1197,16 @@ class SkillService:
     def _stamp_creator(self, metadata: dict[str, str]) -> None:
         """Record in ``metadata`` who creates the skill, where creators are
         recorded: the changer's (cowork.creators.Changer.creator), never a
-        value the caller passed."""
+        value the caller passed.
+
+        In MindsHub mode, nothing, and any creator an uploaded SKILL.md
+        claims is dropped: the skill's owner is its skill_access row's
+        (the route writes it beside the skill) and its creator its
+        SharedResourceAttribution's, so a third copy in the file could only
+        disagree with them."""
+        if self.org_sharing:
+            metadata.pop(META_CREATED_BY, None)
+            return
         if self._changer is None:
             return
         metadata.pop(META_CREATED_BY, None)
@@ -1102,6 +1525,31 @@ class SkillService:
                 metadata.pop(META_PROJECTS, None)
 
     # ── reads ────────────────────────────────────────────────────────────────
+    def store_slugs(self) -> list[str]:
+        """Every skill folder of the store, by name, whether or not its
+        SKILL.md parses: each direct child directory whose name allows_skill
+        and validate_name accept and that holds a SKILL.md. What the one-time
+        backfill gives a row (cowork.services.skill_access.backfill_legacy_access),
+        so a skill whose file can't be read at that moment keeps its row
+        shared with everyone for when the file is fixed; list_skills leaves
+        such a folder out."""
+        if not self.root.exists():
+            return []
+        slugs: list[str] = []
+        for entry in self.root.iterdir():
+            if not (
+                self.allows_skill(entry.name)
+                and entry.is_dir()
+                and (entry / SKILL_FILE).exists()
+            ):
+                continue
+            try:
+                validate_name(entry.name)
+            except ValueError:
+                continue
+            slugs.append(entry.name)
+        return sorted(slugs)
+
     def list_skills(self) -> list[Skill]:
         if not self.root.exists():
             return []
@@ -1143,7 +1591,7 @@ class SkillService:
         visible.extend(
             VisibleSkill(skill=skill, origin=SkillOrigin.OWN, shared=skill.name in sharing.by_owner)
             for skill in self.list_skills()
-            if skill.name not in managed
+            if skill.name not in managed and self.visible_to_viewer(skill)
         )
         for skill_dir in sharing.with_owner.values():
             skill = _skill_from_dir(skill_dir)
@@ -1162,7 +1610,16 @@ class SkillService:
         shared = None if shared_dir is None else _skill_from_dir(shared_dir)
         if shared is not None:
             return VisibleSkill(skill=shared, origin=SkillOrigin.SHARED, shared=True)
-        return self.as_own(self.get_skill(slug))
+        return self.as_own(self.get_seen_skill(slug))
+
+    def get_seen_skill(self, slug: str) -> Skill:
+        """get_skill, kept to what this instance's viewer sees: a skill they
+        don't see answers SkillNotFoundError, as one that doesn't exist does,
+        so its name gives nothing away."""
+        skill = self.get_skill(slug)
+        if not self.visible_to_viewer(skill):
+            raise SkillNotFoundError(f"Skill {slug!r} not found.")
+        return skill
 
     def get_skill(self, slug: str) -> Skill:
         if not self.allows_skill(slug):
@@ -1642,6 +2099,27 @@ class SkillService:
             raise ValueError("Invalid staged skill deletion path")
         return absolute.name
 
+    def stage_org_access(self, slug: str, rule: SkillAccessRule) -> bool:
+        """Stage ``rule`` as who ``slug``, one of the store's own, is shared
+        with, in MindsHub mode, in this instance's session; the caller
+        commits it. Who may is the caller's to check
+        (cowork.services.skill_sharing.SkillViewer). False, staging nothing,
+        when the skill already has a row that reads this way."""
+        from cowork.services.skill_access import access_row, stage_access
+
+        if not self.org_sharing or self._session is None:
+            raise SkillSharingUnavailableError(SKILL_SHARING_UNAVAILABLE)
+        self._refuse_if_reserved(slug)
+        skill = self.get_seen_skill(slug)
+        if is_builtin_skill(skill.name):
+            raise SkillImmutableError(builtin_skill_refusal(skill.name))
+        row = access_row(self._session, skill.name)
+        if row is not None and SkillAccessRule.from_row(row) == rule.normalized():
+            return False
+        stage_access(self._session, skill.name, rule)
+        self.forget_access()
+        return True
+
     def project_reference_slugs(self, project_name: str) -> list[str]:
         """Canonical skill identities whose metadata names ``project_name``."""
         return sorted(
@@ -1796,6 +2274,49 @@ class SkillService:
             raise
 
     # ── builtin seeding ──────────────────────────────────────────────────────
+    def _refresh_builtin_skill(self, src: Path) -> bool:
+        """Replace a store's copy of a packaged builtin with the packaged one,
+        only when that copy is exactly a version we shipped.
+
+        Every builtin is one SKILL.md, so the update is one atomic file
+        replace: the new text is written to a temp file beside SKILL.md and
+        renamed over it, and the skill is never missing or half written. The
+        folder is opened without following links and the rename replaces the
+        name itself, so a link anywhere in the copy is never written through.
+        A copy someone edited, one holding anything but SKILL.md and the usage
+        sidecar, and one holding a link are all left alone.
+        """
+        slug = src.name
+        shipped = shipped_builtin_fingerprints(slug)
+        packaged = [p for p in src.rglob("*") if not p.is_dir()]
+        if not shipped or [p.name for p in packaged] != [SKILL_FILE] or packaged[0].is_symlink():
+            return False
+        entry = self._skill_entry(slug)
+        if entry.is_symlink() or not entry.is_dir():
+            return False
+        new_body = packaged[0].read_bytes()
+        with opened_subdir_nofollow(self.root, entry.name) as skill_dir:
+            names = set()
+            for child in dir_scandir(skill_dir):
+                if _is_skill_write_temp(child.name):
+                    continue  # left by an interrupted write; not part of the skill
+                if child.is_symlink() or not child.is_file(follow_symlinks=False):
+                    return False
+                names.add(child.name)
+            if names - {BUILTIN_RUNTIME_SIDECAR} != {SKILL_FILE}:
+                return False
+            fd = dir_open(skill_dir, SKILL_FILE, os.O_RDONLY | O_NOFOLLOW)
+            with os.fdopen(fd, "rb") as handle:
+                current = handle.read()
+            current_print = fingerprint_skill_files({SKILL_FILE: current})
+            if current_print not in shipped or current == new_body:
+                return False
+            dir_atomic_write(
+                skill_dir, SKILL_FILE, content=new_body,
+                mode=stat.S_IMODE(packaged[0].stat().st_mode),
+            )
+        return True
+
     def _copy_builtin_skill(self, src: Path) -> bool:
         """Copy one packaged builtin without replacing an existing skill."""
         dest = self._skill_dir(src.name)
@@ -1810,11 +2331,16 @@ class SkillService:
             shutil.copy2(child, target)
         return True
 
-    def _copy_builtin_skills(self) -> int:
-        """Copy packaged builtins into this store, skipping slugs it already has.
+    def _copy_builtin_skills(self, seeded_version: int = 0) -> int:
+        """Bring this store's packaged builtins up to the packaged versions.
 
-        Returns how many were copied. Never overwrites, so a skill the user
-        edited or deleted stays as they left it.
+        ``seeded_version`` is the version this store was last seeded at (0 for
+        never). A builtin the store lacks is copied only if it is new since
+        then, so a builtin someone deleted stays deleted. A builtin the store
+        has is replaced only when it is exactly a version we shipped, so a
+        skill someone edited stays as they left it.
+
+        Returns how many were copied or updated.
         """
         builtin_dir = self.builtin_skills_dir
         if not builtin_dir.exists():
@@ -1826,22 +2352,33 @@ class SkillService:
                 continue
             if not self.includes_packaged_builtin(src.name):
                 continue
+            slug = src.name
             try:
-                if not self._copy_builtin_skill(src):
-                    continue  # keep the user-editable copy untouched
+                if os.path.lexists(self._skill_entry(slug)):
+                    if not self._refresh_builtin_skill(src):
+                        continue  # current already, or edited: leave it
+                elif seeded_version and builtin_introduced_in(slug) <= seeded_version:
+                    continue  # it was seeded before and has been deleted since
+                elif not self._copy_builtin_skill(src):
+                    continue
             except ValueError:
-                # Either the slug resolves outside the store, or safe_join rejected a
-                # destination. The agent writes into its own org's tree on shared
-                # storage, so it can plant a symlink under `dest` between the exists()
-                # check above and the write. Skip this builtin: propagating would 500
-                # every skills read and every turn for the org, which a tenant must
-                # not be able to do to itself.
+                # The slug resolves outside the store, or safe_join rejected a
+                # destination. Turn pods don't mount the skill store, so only
+                # this server writes here; the checks stay so a planted link is
+                # refused rather than followed. Skip this builtin: propagating
+                # would fail every skills read and every turn for the org.
                 logger.warning(
                     "Skipping builtin %r: it does not resolve inside %s",
                     src.name,
                     self.root,
                     exc_info=True,
                 )
+                continue
+            except OSError as exc:
+                # A locked or unreadable file (Windows antivirus, say) costs
+                # this one builtin, never the boot or the request. Its old copy
+                # is still a shipped version, so the next version bump retries.
+                logger.warning("Could not update builtin %r: %s", slug, type(exc).__name__)
                 continue
             copied += 1
         return copied
@@ -1892,7 +2429,7 @@ class SkillService:
                     self.root,
                 )
                 return False
-            copied = self._copy_builtin_skills()
+            copied = self._copy_builtin_skills(current)
             marker.write_text(f"{self.builtin_skills_version}\n", encoding="utf-8")
         except OSError:
             logger.warning(

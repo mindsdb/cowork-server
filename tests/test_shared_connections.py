@@ -26,11 +26,12 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 from pathlib import Path
+from types import SimpleNamespace
 
 
 import pytest
-from anton.core.datasources.data_vault import LocalDataVault
 from anton.utils.datasources import build_datasource_context
 from fastapi import HTTPException
 from fastapi.testclient import TestClient
@@ -40,11 +41,13 @@ import cowork.server as cowork_server
 from cowork.api.v1.endpoints.connectors import connections as connections_ep
 from cowork.code_sandbox import PlantedLinkError
 from cowork.api.v1.endpoints.connectors import submissions as submissions_ep
+from cowork.common.record_files import MAX_RECORD_BYTES
 from cowork.common.settings.app_settings import get_app_settings
 from cowork.common.settings.user_settings import use_settings_scope
 from cowork.db.personal_resources import ALL_PERSONAL_RESOURCES, PersonalResource
 from cowork.db.scoped import LOCAL_SCOPE, TenantScope, scope_from_principal, service_principal_for
 from cowork.db.session import get_open_session
+from cowork.handlers import probe as probe_handler
 from cowork.handlers.probe import ProbeHandler
 from cowork.harnesses.anton_harness.tools import _cowork_label_connection, _cowork_request_credentials
 from cowork.models.conversation import Conversation
@@ -60,6 +63,7 @@ from cowork.services.connectors.layered_vault import (
     SharedConnectionError,
 )
 from cowork.services.connectors.persist import (
+    data_vault_at,
     own_vault_for_scope,
     own_vault_root,
     persist_connection,
@@ -67,6 +71,8 @@ from cowork.services.connectors.persist import (
     turn_vault_for_scope,
     vault_for_scope,
 )
+from cowork.services.connectors.probe import ProbeOutcome
+from cowork.services.connectors.sealed_vault import SEALED_FIELD, ReservedFieldError
 from tests._fakes import FakeRequest
 from tests._turns import built_turn, connect_in_chat
 
@@ -181,7 +187,7 @@ async def _every_change_is_refused(scope: TenantScope, name: str = "erp") -> Non
             "postgres", name, PatchPickedFilesBody(files=[{"id": "f1", "name": "f"}]), scope, None
         )
     )
-    _refused(lambda: connections_ep.delete_picked_file("postgres", name, "f1", "general", scope))
+    await _refused_async(lambda: connections_ep.delete_picked_file("postgres", name, "f1", "general", scope))
     await _refused_async(
         lambda: connections_ep.patch_access_mode(
             "postgres", name, connections_ep.PatchAccessModeBody(access_mode="write"), scope, None
@@ -364,6 +370,23 @@ def _share_alices_acme(managed_dir) -> None:
     )
 
 
+@pytest.fixture
+def accepting_probe(monkeypatch):
+    """A handcrafted step is probed before it is saved; this probe accepts, so
+    the save and its sharing rules decide the outcome."""
+
+    class AcceptingProbe:
+        def __init__(self, **kwargs) -> None:
+            pass
+
+        async def run(self):
+            yield "verdict", ProbeOutcome(status="success", summary="Connection works.")
+
+    monkeypatch.setattr(probe_handler, "CredentialProbe", AcceptingProbe)
+    monkeypatch.setattr(ProbeHandler, "_build_llm_client", staticmethod(lambda settings=None: object()))
+    monkeypatch.setattr("anton.workspace.Workspace", lambda path: SimpleNamespace(path=path))
+
+
 def _grant_step(name: str) -> SubmitFormRequest:
     """The connect's second form, adding the grant's tokens to ``name``."""
     return SubmitFormRequest(
@@ -372,6 +395,7 @@ def _grant_step(name: str) -> SubmitFormRequest:
         form_spec={
             "form_id": "fm_acmegrant1",
             "engine": "acme_crm",
+            "title": "Acme CRM",
             "fields": [],
             "_extends_connection": name,
             "_existing_name": name,
@@ -388,7 +412,7 @@ def _vault_files(scope: TenantScope) -> dict[str, bytes]:
     return {str(path.relative_to(root)): path.read_bytes() for path in root.rglob("*") if path.is_file()}
 
 
-async def test_bobs_later_step_naming_alices_shared_connection_is_refused(sharing, monkeypatch):
+async def test_bobs_later_step_naming_alices_shared_connection_is_refused(sharing, accepting_probe, monkeypatch):
     """Bob's vault reads Alice's shared connection, so its record would
     merge into his step. The submission answers 403 before anything is
     staged; the save itself is refused too, so the probe saves nothing.
@@ -407,7 +431,8 @@ async def test_bobs_later_step_naming_alices_shared_connection_is_refused(sharin
     probed = "".join(
         [event async for event in ProbeHandler(scope=BOB).run(submission_id, "acme_crm", None, "acme", None)]
     )
-    assert f"Could not save: `{SHARED_CONNECTION_REFUSAL}`" in probed
+    assert f"Probe succeeded but save failed: {SHARED_CONNECTION_REFUSAL}" in probed
+    assert "Saved as" not in probed
     staged: list = []
     monkeypatch.setattr(submissions_ep.store, "stage", lambda **kwargs: staged.append(kwargs))
 
@@ -418,7 +443,83 @@ async def test_bobs_later_step_naming_alices_shared_connection_is_refused(sharin
     assert own_vault_for_scope(BOB).list_connections() == []
 
 
-async def test_alice_adds_a_later_step_to_her_own_shared_connection(sharing):
+def _frames(stream: str, kind: str) -> list[dict]:
+    """The data of each ``kind`` event in a probe stream, in order."""
+    found = []
+    for frame in stream.split("\n\n"):
+        event, _, data = frame.partition("\n")
+        if event == f"event: {kind}":
+            found.append(json.loads(data.removeprefix("data: ")))
+    return found
+
+
+def _said(stream: str) -> str:
+    """The text a probe stream tells the conversation: its output text deltas, joined."""
+    return "".join(frame["delta"] for frame in _frames(stream, "response.output_text.delta"))
+
+
+FLAG = "flag-value-6150"
+_GRANT_METHOD = {
+    "id": "oauth", "label": "Sign in", "submit_action": "oauth_launch",
+    "oauth": {"auth_url": "https://example.com/auth", "token_url": "https://example.com/token"},
+}
+_HANDCRAFTED_FORM = {"form_id": "fm_acmeseal1", "engine": "acme_crm", "title": "Acme CRM", "fields": [
+    {"name": "api_token", "label": "API token", "type": "password"},
+    {"name": SEALED_FIELD, "label": "Sealed", "type": "text"},
+]}
+_GRANT_FORM = {"form_id": "fm_acmeseal2", "engine": "acme_crm", "title": "Acme CRM", "methods": [_GRANT_METHOD]}
+_RESERVED = re.escape(str(ReservedFieldError(connection="acme_crm/acme")))
+_TOO_LARGE = (
+    r"The saved connection acme_crm/acme is too large to save: sealed, its record file would be \d+ bytes, and "
+    rf"the limit is {MAX_RECORD_BYTES}\."
+)
+
+
+@pytest.mark.parametrize(
+    ("form_spec", "values", "method", "reason", "status"),
+    [
+        (_HANDCRAFTED_FORM, {"api_token": "acme-token-1", SEALED_FIELD: FLAG}, None, _RESERVED, "retry"),
+        (_HANDCRAFTED_FORM, {"api_token": FLAG + "x" * MAX_RECORD_BYTES}, None, _TOO_LARGE, "retry"),
+        (_GRANT_FORM, {**ACME_GRANT, SEALED_FIELD: FLAG}, "oauth", _RESERVED, "failed"),
+        (_GRANT_FORM, {**ACME_GRANT, "access_token": FLAG + "x" * MAX_RECORD_BYTES}, "oauth", _TOO_LARGE, "failed"),
+    ],
+    ids=[
+        "handcrafted form after its probe, field named like the mark",
+        "handcrafted form after its probe, too large once sealed",
+        "oauth grant before its probe, field named like the mark",
+        "oauth grant before its probe, too large once sealed",
+    ],
+)
+async def test_a_keyed_save_the_sealed_vault_refuses_says_why_and_logs_no_error(
+    trusted, accepting_probe, key_file, caplog, form_spec, values, method, reason, status,
+):
+    """With a key file, the sealed vault refuses a field named like the sealed mark and a record
+    too large to read back once sealed. On a deployment that trusts identity headers, the probe
+    stream saves a handcrafted form itself after its probe, and an OAuth grant before its probe.
+    Each tells the conversation the vault's own reason, which names the connection and never a
+    value, ends with that site's failure status, saves nothing, and logs no error: the refusal is
+    of the person's input, not a server fault."""
+    submission_id = submissions_ep.store.stage(
+        form_id=form_spec["form_id"], connector_id="acme_crm", conversation_id=None,
+        values=values, form_spec=form_spec,
+    )
+
+    with caplog.at_level(logging.DEBUG):
+        probed = "".join(
+            [event async for event in ProbeHandler(scope=BOB).run(submission_id, "acme_crm", method, "acme", None)]
+        )
+
+    said = _said(probed)
+    assert re.search(reason, said), said
+    assert "Could not save" not in said and "save failed" not in said
+    assert "Saved as" not in probed
+    assert _frames(probed, "response.completed")[-1]["response"]["status"] == status
+    assert [r for r in caplog.records if r.name == probe_handler.logger.name and r.levelno >= logging.ERROR] == []
+    assert FLAG not in probed and FLAG not in caplog.text
+    assert own_vault_for_scope(BOB).list_connections() == []
+
+
+async def test_alice_adds_a_later_step_to_her_own_shared_connection(sharing, accepting_probe):
     _share_alices_acme(sharing)
 
     response = await submissions_ep.submit_form(_grant_step("acme"), ALICE)
@@ -430,7 +531,7 @@ async def test_alice_adds_a_later_step_to_her_own_shared_connection(sharing):
     assert vault_for_scope(BOB).load("acme_crm", "acme")["access_token"] == ACME_GRANT["access_token"]
 
 
-async def test_a_later_step_adds_to_a_persons_own_connection(trusted):
+async def test_a_later_step_adds_to_a_persons_own_connection(trusted, accepting_probe):
     persist_connection("acme_crm", "app", "acme", dict(ACME_APP), scope=BOB)
 
     response = await submissions_ep.submit_form(_grant_step("acme"), BOB)
@@ -615,11 +716,12 @@ def test_only_registry_entries_of_existing_connections_are_read(sharing):
     assert vault.can_change("postgres", "gone")
 
 
+@pytest.mark.usefixtures("with_and_without_key_file")
 def test_an_earlier_layer_hides_a_later_same_named_one(sharing):
     # Saved before the share: a save after it would see Alice's erp and the
     # operator's warehouse, and take another name.
     own_vault_for_scope(BOB).save("postgres", "erp", {**ERP, "host": "bob.example"})
-    LocalDataVault(sharing.vault_dir).save("postgres", "warehouse", {"host": "operator.example"})
+    data_vault_at(sharing.vault_dir).save("postgres", "warehouse", {"host": "operator.example"})
     own_vault_for_scope(ALICE).save("postgres", "warehouse", {**ERP, "host": "alice-wh.example"})
     _write_registry(
         sharing,
@@ -702,9 +804,10 @@ def test_only_a_scope_with_personal_connections_reads_the_registry(sharing):
     assert _names(vault_for_scope(LOCAL_SCOPE)) == set()
 
 
+@pytest.mark.usefixtures("with_and_without_key_file")
 async def test_the_operators_own_entry_answers_the_shared_sentence(trusted, managed_dir, monkeypatch):
     get_app_settings.cache_clear()
-    LocalDataVault(managed_dir.vault_dir).save("postgres", "erp", dict(ERP))
+    data_vault_at(managed_dir.vault_dir).save("postgres", "erp", dict(ERP))
     revoked = _no_revoke(monkeypatch)
 
     await _every_change_is_refused(ALICE)
@@ -872,7 +975,7 @@ async def test_the_desktop_keeps_every_connections_route(desktop, monkeypatch):
         LOCAL_SCOPE,
         None,
     )
-    connections_ep.delete_picked_file("postgres", "erp", "f1", "p", LOCAL_SCOPE)
+    await connections_ep.delete_picked_file("postgres", "erp", "f1", "p", LOCAL_SCOPE)
     await connections_ep.patch_access_mode(
         "postgres", "erp", connections_ep.PatchAccessModeBody(access_mode="none"), LOCAL_SCOPE, None
     )
@@ -929,8 +1032,9 @@ async def test_hosted_org_tenancy_keeps_every_connections_route(hosted, monkeypa
         )
     assert refused.value.status_code == 501
 
-    # The loopback save and the picked-file untag still use the org's vault,
-    # unlayered and unstamped.
+    # Called directly: over HTTP, /save refuses org mode before this runs. The
+    # save and the picked-file untag still use the org's vault, unlayered and
+    # unstamped.
     saved = connections_ep.save_connection_direct(
         DirectSaveRequest(connector_id="postgres", name="erp", values=dict(ERP)), ORG
     )
@@ -939,4 +1043,4 @@ async def test_hosted_org_tenancy_keeps_every_connections_route(hosted, monkeypa
     assert Path(vault._dir) == hosted / "shared" / ORG_ID / "data-vault"
     assert CREATED_BY_FIELD not in vault.read_record("postgres", saved["name"])["fields"]
     ConnectionsService(ORG).merge_picked_files("postgres", "erp", [{"id": "f1", "projects": ["p"]}])
-    assert connections_ep.delete_picked_file("postgres", "erp", "f1", "p", ORG)["ok"] is True
+    assert (await connections_ep.delete_picked_file("postgres", "erp", "f1", "p", ORG))["ok"] is True

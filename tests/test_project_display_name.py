@@ -304,10 +304,10 @@ def test_org_same_slug_rename_moves_the_label_and_stays_gated(org_engine):
     from cowork.schemas.projects import ProjectCreateRequest, ProjectUpdateRequest
 
     alice = _org_scoped(org_engine, ALICE)
-    created = project_endpoints.create_project(
-        ProjectCreateRequest(name="Мій тестовий проєкт"),
+    created = project_endpoints._create_project(
         alice,
-        _org_principal(ALICE),
+        body=ProjectCreateRequest(name="Мій тестовий проєкт"),
+        principal=_org_principal(ALICE),
     )
     assert created["name"].startswith("untitled-project")
     assert created["display_name"] == "Мій тестовий проєкт"
@@ -315,19 +315,19 @@ def test_org_same_slug_rename_moves_the_label_and_stays_gated(org_engine):
     # Bob did not create it, and a label rename is still a rename.
     bob = _org_scoped(org_engine, BOB)
     with pytest.raises(HTTPException) as denied:
-        project_endpoints.update_project(
-            created["id"],
-            ProjectUpdateRequest(name="Інший проєкт"),
+        project_endpoints._update_project(
             bob,
-            _org_principal(BOB),
+            project_id=created["id"],
+            body=ProjectUpdateRequest(name="Інший проєкт"),
+            principal=_org_principal(BOB),
         )
     assert denied.value.status_code == 403
 
-    renamed = project_endpoints.update_project(
-        created["id"],
-        ProjectUpdateRequest(name="Інший проєкт"),
+    renamed = project_endpoints._update_project(
         alice,
-        _org_principal(ALICE),
+        project_id=created["id"],
+        body=ProjectUpdateRequest(name="Інший проєкт"),
+        principal=_org_principal(ALICE),
     )
     assert renamed["display_name"] == "Інший проєкт"
     # Identity untouched: same slug, same directory. That is the design.
@@ -354,28 +354,28 @@ def test_org_slug_changing_rename_also_moves_the_label(org_engine):
     from cowork.schemas.projects import ProjectCreateRequest, ProjectUpdateRequest
 
     alice = _org_scoped(org_engine, ALICE)
-    created = project_endpoints.create_project(
-        ProjectCreateRequest(name="Report"), alice, _org_principal(ALICE),
+    created = project_endpoints._create_project(
+        alice, body=ProjectCreateRequest(name="Report"), principal=_org_principal(ALICE),
     )
     assert created["name"] == "Report"
     assert created["display_name"] == "Report"
 
-    renamed = project_endpoints.update_project(
-        created["id"],
-        ProjectUpdateRequest(name="Quarterly Report"),
+    renamed = project_endpoints._update_project(
         alice,
-        _org_principal(ALICE),
+        project_id=created["id"],
+        body=ProjectUpdateRequest(name="Quarterly Report"),
+        principal=_org_principal(ALICE),
     )
     assert renamed["name"] == "Quarterly-Report"
     assert renamed["display_name"] == "Quarterly Report"
 
     # And the case the ticket exists for: the slug carries nothing, so if the
     # label does not follow, the rename is invisible to the user.
-    cyrillic = project_endpoints.update_project(
-        created["id"],
-        ProjectUpdateRequest(name="Мій проєкт"),
+    cyrillic = project_endpoints._update_project(
         alice,
-        _org_principal(ALICE),
+        project_id=created["id"],
+        body=ProjectUpdateRequest(name="Мій проєкт"),
+        principal=_org_principal(ALICE),
     )
     assert cyrillic["name"].startswith("untitled-project")
     assert cyrillic["display_name"] == "Мій проєкт"

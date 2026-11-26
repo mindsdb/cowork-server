@@ -56,13 +56,17 @@ def test_project_root_artifact_is_owned_by_its_creator(world):
         assert caps["role"] == "owner"
         assert caps["canEdit"] is True
         assert "ownerUnknown" not in caps
+        assert caps["ownerUserId"] == creator
         assert require_artifact_owner(session, source, "mine")["canEdit"] is True
 
 
 def test_each_member_owns_only_their_own_artifact(world):
     org_id, creator, member, _project, source = world
     with scoped(org_id, creator) as session:
-        assert artifact_capabilities(session, source, "theirs")["role"] == "reviewer"
+        theirs = artifact_capabilities(session, source, "theirs")
+        assert theirs["role"] == "reviewer"
+        # A reviewer is told whose artifact it is, so the app can name them.
+        assert theirs["ownerUserId"] == member
         with pytest.raises(HTTPException) as refused:
             require_artifact_owner(session, source, "theirs")
         assert refused.value.status_code == 403
@@ -95,14 +99,18 @@ def test_legacy_artifact_stays_owned_by_its_creator(tmp_path):
     project = make_project(tmp_path, org_id)
     source = legacy_root(project, str(make_conversation(project, creator)))
     with scoped(org_id, creator) as session:
-        assert artifact_capabilities(session, source, "old")["role"] == "owner"
+        caps = artifact_capabilities(session, source, "old")
+        assert caps["role"] == "owner"
+        assert caps["ownerUserId"] == creator
 
 
 def test_desktop_is_a_single_owner_boundary(tmp_path):
     project = make_project(tmp_path, None)
     with Session(get_engine(get_app_settings().database.uri)) as raw:
         session = ScopedSession(raw, LOCAL_SCOPE)
-        assert artifact_capabilities(session, project_root(project), "a")["canEdit"] is True
+        caps = artifact_capabilities(session, project_root(project), "a")
+        assert caps["canEdit"] is True
+        assert "ownerUserId" not in caps
 
 
 def _principal(org_id, user_id, *, admin):
@@ -138,9 +146,11 @@ def test_cards_carry_per_artifact_capabilities(world):
     for slug in ("mine", "theirs", "orphan"):
         write_artifact(source.base, slug)
     with scoped(org_id, creator) as session:
-        cards = {c["slug"]: c for c in artifacts_ep._artifact_cards(session, [source])}
+        cards = {card.slug: card.to_json() for card in artifacts_ep._artifact_cards(session, [source])}
     assert cards["mine"]["capabilities"]["role"] == "owner"
     assert cards["theirs"]["capabilities"]["role"] == "reviewer"
+    assert cards["theirs"]["capabilities"]["ownerUserId"] == _member
+    assert "ownerUserId" not in cards["orphan"]["capabilities"]
     assert cards["orphan"]["capabilities"]["ownerUnknown"] is True
 
 
@@ -159,18 +169,18 @@ async def test_creator_can_open_the_workspace_of_a_project_root_artifact(
     )
     with scoped(org_id, creator) as session:
         result = await artifact_workspace.artifact_source(
-            str(project.id), local_id, session, path=None
+            str(project.id), local_id, session.scope, path=None
         )
         assert result["capabilities"]["role"] == "owner"
         assert result["capabilities"]["canEdit"] is True
     with scoped(org_id, member) as session:
         with pytest.raises(HTTPException) as refused:
-            await artifact_workspace.artifact_source(str(project.id), local_id, session, path=None)
+            await artifact_workspace.artifact_source(str(project.id), local_id, session.scope, path=None)
         assert refused.value.status_code == 403
 
 
 from cowork.services import artifact_access
-from cowork.services.artifact_authorization_identity import ArtifactIdentity, _session as identity_session
+from cowork.services.artifact_authorization_identity import ArtifactIdentity, authorization_session as identity_session
 
 
 @pytest.fixture
@@ -204,7 +214,7 @@ async def test_owner_delete_removes_the_owner_row(
     org_id, creator, _member, project, source = world
     local_id, folder = _write(source, "mine")
     with scoped(org_id, creator) as session:
-        await artifacts_ep.delete_artifact_for_request(session, local_id, project_id=project.id)
+        await artifacts_ep.delete_artifact_for_request(session.scope, local_id, project_id=project.id)
     assert not folder.exists()
     with scoped(org_id, creator) as session:
         assert ownership.resolve_artifact_owner(session, source, "mine").unknown
@@ -231,11 +241,11 @@ async def test_admin_may_delete_an_ownerless_artifact_but_not_an_owned_one(
         ids.commit()
     with scoped(org_id, admin) as session:
         await artifacts_ep.delete_artifact_for_request(
-            session, orphan_id, project_id=project.id, principal=principal
+            session.scope, orphan_id, project_id=project.id, principal=principal
         )
         with pytest.raises(HTTPException) as refused:
             await artifacts_ep.delete_artifact_for_request(
-                session, owned_id, project_id=project.id, principal=principal
+                session.scope, owned_id, project_id=project.id, principal=principal
             )
         assert refused.value.status_code == 403
     assert not orphan.exists()
@@ -250,7 +260,7 @@ async def test_without_a_principal_there_is_no_admin_exception(
     orphan_id, orphan = _write(source, "orphan")
     with scoped(org_id, str(uuid4())) as session:
         with pytest.raises(HTTPException) as refused:
-            await artifacts_ep.delete_artifact_for_request(session, orphan_id, project_id=project.id)
+            await artifacts_ep.delete_artifact_for_request(session.scope, orphan_id, project_id=project.id)
         assert refused.value.detail == "Artifact owner is unknown"
     assert orphan.exists()
 
@@ -273,7 +283,7 @@ async def test_delete_resolves_the_owner_once(
     monkeypatch.setattr(ownership, "resolve_artifact_owner", counting)
     with scoped(org_id, creator) as session:
         await artifacts_ep.delete_artifact_for_request(
-            session, local_id, project_id=project.id,
+            session.scope, local_id, project_id=project.id,
             principal=_principal(org_id, creator, admin=True),
         )
     assert not folder.exists()

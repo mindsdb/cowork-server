@@ -25,7 +25,7 @@ The Electron app (`cowork/`) manages the server lifecycle:
 The server API was restructured from the original for clarity, but the client wasn't updated in lockstep. To bridge the gap, a **compat layer** was introduced:
 
 - **CamelCase translation**: The original server used camelCase in JSON responses (matching the JS client). The new server uses snake_case internally. `CamelResponse`/`CamelRequest` base classes (`schemas/base.py`) apply `alias_generator = to_camel` so the wire format stays camelCase. Tagged `SHIM:client-compat` for future removal.
-- **Compat stubs** (`api/v1/endpoints/compat/stubs.py`): Placeholder endpoints for features not yet ported (integrations/OAuth, browse status). Return safe empty responses so the client doesn't 404.
+- **Compat stubs** (`api/v1/endpoints/compat/stubs.py`): Placeholder endpoints for features not yet ported (integrations/OAuth, attachments, scratchpad). Return safe empty responses so the client doesn't 404.
 - **Attachments bridge**: The design doc replaced attachments with a Files API + input_file content blocks in the Responses request. The compat layer maps old attachment endpoints to the new `FileService` so the current client still works.
 
 Key structural API changes from the design doc:
@@ -41,7 +41,7 @@ Key structural API changes from the design doc:
 - Artifacts service — still entirely filesystem-based (`<project>/.anton/artifacts/<slug>/`), reading `metadata.json` from disk. No DB table.
 - Publish service — same flow, same `state.json` on disk.
 - Scratchpad — only the cancel stub exists; the full scratchpad is still managed by the harness (Anton core).
-- Connectors/data vault — `LocalDataVault` from Anton core, filesystem-based encrypted credentials.
+- Connectors/data vault — `LocalDataVault` from Anton core, one JSON file per connection on the filesystem.
 
 **Rethought:**
 - **Conversations and messages** — previously stored as episodes on the filesystem by Anton's `HistoryStore`. Now first-class DB entities. Messages are persisted during streaming with a companion `message_events` table that stores the SSE event log for replay, with each run of adjacent text deltas stored as one merged delta.

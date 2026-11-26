@@ -1,0 +1,10 @@
+# Cases for tests/test_autopublish_self_heal.py.
+
+# Two projects of published artifacts whose content is older than their
+# publish record. In each, a remote turn's pod names the one artifact it
+# edited. The turn end makes as many file calls in the large project as in
+# the small one. Without the pod's list it lists the project and checks every
+# folder, so its file calls grow with the project's size.
+turn_end:
+  small_project: 1
+  large_project: 200

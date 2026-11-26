@@ -7,12 +7,11 @@ for development/test environments.
 
 from pathlib import Path
 
-from sqlalchemy.engine import make_url
 from sqlmodel import Session as SQLSession
 
 from cowork.common.settings.app_settings import get_app_settings
 from cowork.db.migrations import run_schema_migrations
-from cowork.db.session import get_engine
+from cowork.db.session import get_engine, sqlite_database_file
 from cowork.models.project import Project
 from cowork.services.projects import GENERAL_PROJECT, GENERAL_PROJECT_ID
 
@@ -36,14 +35,14 @@ def _migrate_env_to_db_if_local(session) -> None:
 def _distribute_skill_links() -> None:
     """Boot-time symlink fan-out of the skill store into project dirs.
 
-    Desktop-only: in org mode this reads the unkeyed root and scans every
-    project dir. Cloud turns read skills straight off the shared mount instead
-    (no payload); the pod's org gets seeded lazily, see
+    Desktop-only: in MindsHub mode this reads the unkeyed root and scans every
+    project dir. Cloud turns get their skills in the request instead
+    (cowork.handlers.responses.remote_turn_skills); the pod's org gets seeded lazily, see
     `_stage_remote_workspace_files` and `SkillService.ensure_builtin_skills`.
     The base store is LOCAL_SCOPE's, named explicitly because a deployment that
     trusts identity headers refuses a store with no scope. Wherever skills are
-    partitioned (org tenancy, or a trusted-identity deployment that keeps
-    skills per person) nothing is fanned out: each turn links its own skills.
+    partitioned (MindsHub mode, or single-tenant mode keeping skills per
+    person) nothing is fanned out: each turn links its own skills.
     """
     from cowork.services.skill_links import reconcile_all, skill_partitions_enabled
 
@@ -60,13 +59,9 @@ def run_dev_setup() -> None:
     settings = get_app_settings()
     db_uri = settings.database.uri
 
-    parsed = make_url(db_uri)
-    if (
-        parsed.drivername.startswith("sqlite")
-        and parsed.database
-        and parsed.database != ":memory:"
-    ):
-        Path(parsed.database).parent.mkdir(parents=True, exist_ok=True)
+    database_file = sqlite_database_file(db_uri=db_uri)
+    if database_file is not None:
+        database_file.parent.mkdir(parents=True, exist_ok=True)
 
     engine = get_engine(db_uri)
     run_schema_migrations(engine, db_uri)
@@ -89,7 +84,11 @@ def run_dev_setup() -> None:
             session.commit()
 
     # Migrate .env settings to DB (one-time, idempotent).
-    from cowork.migrations import backfill_minds_url, normalize_retired_harness_rows
+    from cowork.migrations import (
+        backfill_minds_url,
+        enable_limits_for_saved_budgets,
+        normalize_retired_harness_rows,
+    )
 
     with SQLSession(engine) as session:
         _migrate_env_to_db_if_local(session)
@@ -101,6 +100,9 @@ def run_dev_setup() -> None:
         # Repair settings rows naming a harness we no longer ship, so the
         # read-side tolerance in UserSettings is a fallback, not the norm.
         normalize_retired_harness_rows(session)
+        # A budget saved before the limits switch existed keeps applying:
+        # turn the switch on at that row's scope. Every boot, all tenancies.
+        enable_limits_for_saved_budgets(session)
 
     # Migrate harness-local memory into ~/.cowork/memory, then create the
     # canonical slot files. Desktop-only: both write the unkeyed root; org-mode

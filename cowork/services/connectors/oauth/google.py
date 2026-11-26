@@ -19,6 +19,7 @@ from cowork.services.connectors.oauth.config import OAUTH_SERVICES
 from cowork.services.connectors.identity import oauth_default_label
 from cowork.services.connectors.oauth.state import OAuthStateStore
 from cowork.services.connectors.persist import persist_connection
+from cowork.services.connectors.sealed_vault import RecordTooLargeError, ReservedFieldError
 from cowork.services.connectors.specs._registry import registry as spec_registry
 
 import logging as _logging
@@ -39,6 +40,8 @@ _SERVICE_CREDENTIAL_ATTRS: dict[str, tuple[str, str | None]] = {
     "supabase":         ("supabase_client_id",          "supabase_client_secret"),
     "posthog":          ("posthog_client_id",           None),
     "hubspot":          ("hubspot_client_id",           "hubspot_client_secret"),
+    "notion":           ("notion_client_id",            None),
+    "slack":            ("slack_client_id",             "slack_client_secret"),
 }
 
 # engine name (e.g. "google_drive") → service id (e.g. "google-drive")
@@ -245,6 +248,15 @@ def _fetch_userinfo_supabase(access_token: str) -> dict[str, Any]:
     return {"email": f"org:{slug}" if slug else "", "name": name}
 
 
+def _slack_api(method: str, access_token: str) -> dict[str, Any]:
+    """A Slack Web API call. Slack reports failures as HTTP 200 with
+    `{"ok": false, "error": ...}`, so a body without `ok: true` is an error."""
+    result = _json_request(f"https://slack.com/api/{method}", headers={"Authorization": f"Bearer {access_token}"})
+    if not result.get("ok"):
+        raise HTTPException(status_code=502, detail=f"Slack {method} failed: {result.get('error') or 'unknown error'}")
+    return result
+
+
 # engine → identity-fetch function. The one piece of connector onboarding
 # that can't be pure spec-JSON data — response shape (REST vs GraphQL) is
 # genuinely provider-specific code, not configuration. New OAuth-builtin
@@ -323,12 +335,34 @@ def _revoke_posthog(token: str, client_id: str, client_secret: str) -> None:
         pass
 
 
+def _revoke_notion(token: str, client_id: str, client_secret: str) -> None:
+    """Public client, same shape as `_revoke_posthog`. Notion documents no
+    client-side revoke, but its metadata advertises this endpoint; revoke()
+    already treats any failure as local-cleanup-only."""
+    request = Request(
+        "https://mcp.notion.com/token",
+        data=urlencode({"token": token, "client_id": client_id}).encode("utf-8"),
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+        method="POST",
+    )
+    with urlopen(request, timeout=10):
+        pass
+
+
+def _revoke_slack(token: str, client_id: str, client_secret: str) -> None:
+    """auth.revoke takes the access token itself as the bearer. It revokes
+    that token only; the app stays installed in the workspace."""
+    _slack_api("auth.revoke", token)
+
+
 # engine → custom revoke function, for providers whose revoke call doesn't
 # fit the generic revoke_url/POST/form-body shape (see OAuthConfig.revoke_url).
 # Checked before the generic path in revoke() below.
 _REVOKE_HANDLERS: dict[str, Callable[[str, str, str], None]] = {
     "github": _revoke_github,
+    "notion": _revoke_notion,
     "posthog": _revoke_posthog,
+    "slack": _revoke_slack,
     "supabase": _revoke_supabase,
 }
 
@@ -584,6 +618,15 @@ class OAuthService:
                 "An error occurred during the sign-in flow. Return to CoWork and try again.",
                 success=False,
             )
+        except (RecordTooLargeError, ReservedFieldError) as exc:
+            # The sealed vault refuses these values (SealedDataVault.save), and a new sign-in from
+            # the same form brings the same ones, so the page gives its reason, not "try again". The
+            # reason names the connection and never a value. It refuses the person's input, not a
+            # server fault, so nothing is logged.
+            err_msg = str(exc)
+            store.clear_pending(service, error=err_msg)
+            store.set_outcome(state, {"status": "error", "error": err_msg})
+            return _callback_page(f"{service_label} connection failed", err_msg, success=False)
         except Exception as exc:
             err_msg = str(exc)
             _log.exception("OAuth callback failed for %s", service)
@@ -619,9 +662,26 @@ class OAuthService:
             fields = _vault_for(connector_settings, scope).load(engine, name) or {}
         except Exception:
             return
+        from cowork.services.connectors import app_held
+        from cowork.services.connectors.persist import own_vault_root
+
+        # An MCP connection's token may be held in memory only, not in the file.
+        fields = app_held.overlay(own_vault_root(scope), engine, name, fields, keys=("access_token",))
         if fields.get("auth_type") != "oauth":
             return
-        token = fields.get("refresh_token", "").strip() or fields.get("access_token", "").strip()
+        if engine == "notion" and fields.get("_method") != "mcp":
+            # The hidden `oauth` method's token is api.notion.com's; only an
+            # MCP sign-in's token belongs to mcp.notion.com's revoke endpoint.
+            _log.debug("Not revoking %s/%s remotely: not an MCP sign-in", engine, name)
+            return
+        if engine == "slack" and fields.get("_method") != "mcp":
+            # The hidden `oauth` method signs in with the user's own Slack app,
+            # whose token may be shared with other integrations.
+            _log.debug("Not revoking %s/%s remotely: not an MCP sign-in", engine, name)
+            return
+        refresh, access = fields.get("refresh_token", "").strip(), fields.get("access_token", "").strip()
+        # Slack's auth.revoke authenticates with the access token itself.
+        token = access if engine == "slack" else (refresh or access)
         if not token:
             return
         if engine == "supabase" and not fields.get("refresh_token", "").strip():

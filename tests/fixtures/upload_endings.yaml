@@ -1,0 +1,105 @@
+# How an owner's save of an artifact's sharing can end once its upload is
+# under way, and what each ending does to the sharing the owner last chose
+# (cowork/services/artifact_owner_choice.py). The save narrowed that record
+# before its upload (tests/test_artifact_authorization_identity.py).
+#
+# restored: MindsHub's upload service refused the save before it changed who
+# can open the artifact or what it serves, so the record goes back to what it
+# held before the save. Another publisher's refusal never restores: its order
+# of writes is unknown.
+# narrowed: the ending can follow such a change, so the record keeps the
+# narrower mode. A local error after the upload's request, such as an answer
+# anton can't read, follows the upload service's writes: it never restores.
+#
+# An HTTP ending is the upload service's answer: its status and JSON body, or
+# `raw_body` for a body that isn't JSON. A `raises` ending is an error with no
+# answer: `timeout` and `connection_error` while the request is out,
+# `state_publish_blocked` and `os_error` inside anton's publish before it
+# sends anything. `save_raises` names the error the save raises for the
+# ending, which the route answers; the restore never changes it.
+restored:
+  - name: share_org_required
+    status: 403
+    body: {error: Sharing an artifact with everyone in the organization needs the artifacts.share_org permission., code: share_org_required}
+    save_raises: ShareOrgRequired
+  - name: permission_denied
+    status: 403
+    body: {error: Permission denied, code: permission_denied}
+    save_raises: ProductPermissionDenied
+  - name: organization_inactive
+    status: 403
+    body: {error: Organization is inactive, code: organization_inactive}
+    save_raises: PublishRejected
+  - name: forbidden_with_no_code
+    status: 403
+    body: {message: Forbidden}
+    save_raises: PublishRejected
+  - name: invalid_token
+    status: 401
+    body: {error: Invalid token}
+    save_raises: PublishRejected
+  - name: upgrade_required
+    status: 402
+    body: {error: Upgrade required, code: upgrade_required}
+    save_raises: PublishRejected
+  - name: artifact_key_required
+    status: 409
+    body: {error: This report has a stable key; publish it with that key, code: artifact_key_required}
+    save_raises: PublishRejected
+  - name: conflict_with_no_code
+    status: 409
+    body: {error: The report belongs to another kind of artifact}
+    save_raises: PublishRejected
+  - name: artifact_owned_by_other_user
+    status: 409
+    body: {error: This artifact was published by another owner., code: artifact_owned_by_other_user}
+    save_raises: PublishOwnedByOtherUser
+  - name: publish_host_moved
+    status: 410
+    body: {error: publish_host_moved}
+    save_raises: PublishRejected
+  - name: too_large
+    status: 413
+    body: {message: Request Too Long}
+    save_raises: PublishTooLarge
+  - name: throttled
+    status: 429
+    body: {message: Too Many Requests}
+    save_raises: PublishRejected
+  - name: state_schema_change
+    raises: state_publish_blocked
+    save_raises: PublishRejected
+narrowed:
+  - name: bad_request
+    status: 400
+    body: {error: Fullstack bundle missing static/index.html}
+    save_raises: PublishRejected
+  - name: internal_error
+    status: 500
+    body: {error: Internal Server Error}
+    save_raises: PublishRejected
+  - name: bad_gateway
+    status: 502
+    body: {message: Internal server error}
+    save_raises: PublishRejected
+  - name: service_unavailable
+    status: 503
+    body: {error: Service Unavailable}
+    save_raises: UploadServiceUnavailable
+  - name: gateway_timeout
+    status: 504
+    body: {message: Endpoint request timed out}
+    save_raises: PublishRejected
+  - name: timeout
+    raises: timeout
+    save_raises: RuntimeError
+  - name: connection_error
+    raises: connection_error
+    save_raises: PublishRejected
+  - name: local_error
+    raises: os_error
+    save_raises: RuntimeError
+  - name: answer_unreadable_after_upload
+    status: 200
+    raw_body: <html><body>Saved</body></html>
+    save_raises: RuntimeError

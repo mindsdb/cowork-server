@@ -40,7 +40,7 @@ PAID_ENABLED = {"mindshub_air": True, "sonnet": True, "haiku": True, "kimi": Tru
 def _listing(enabled):
     from cowork.services.providers import MindsModelListing
 
-    return MindsModelListing(list(enabled), {}, enabled, {}, {}, {}, {}, {})
+    return MindsModelListing(list(enabled), {}, enabled, {}, {}, {}, {}, {}, {}, {})
 
 
 def _empty():
@@ -76,7 +76,8 @@ def _fresh_session():
 def test_warm_populates_empty_map(monkeypatch):
     from cowork.services import providers
 
-    async def fake_fetch(url, key, *, force_refresh=False, tenant_key=None):
+    async def fake_fetch(url, key, *, force_refresh=False, tenant_key=None, **_kw):
+        assert _kw.get("mindshub") is True, "the warm reads MindsHub's short-lived listing"
         return _listing(FREE_ENABLED)
 
     monkeypatch.setattr(providers, "fetch_minds_models", fake_fetch)
@@ -96,7 +97,7 @@ def test_warm_noops_without_a_minds_key(monkeypatch):
 
     called = False
 
-    async def fake_fetch(url, key, *, force_refresh=False, tenant_key=None):
+    async def fake_fetch(url, key, *, force_refresh=False, tenant_key=None, **_kw):
         nonlocal called
         called = True
         return _listing(FREE_ENABLED)
@@ -141,7 +142,7 @@ def test_warm_ignores_a_publish_key_and_stays_silent(monkeypatch):
 def test_warm_is_fail_open_on_fetch_failure(monkeypatch):
     from cowork.services import providers
 
-    async def fake_fetch(url, key, *, force_refresh=False, tenant_key=None):
+    async def fake_fetch(url, key, *, force_refresh=False, tenant_key=None, **_kw):
         return _empty()  # fetch_minds_models swallows errors -> empty listing
 
     monkeypatch.setattr(providers, "fetch_minds_models", fake_fetch)
@@ -161,7 +162,7 @@ def test_warm_is_fail_open_on_fetch_failure(monkeypatch):
 def test_warm_is_a_noop_when_map_already_current(monkeypatch):
     from cowork.services import providers
 
-    async def fake_fetch(url, key, *, force_refresh=False, tenant_key=None):
+    async def fake_fetch(url, key, *, force_refresh=False, tenant_key=None, **_kw):
         return _listing(FREE_ENABLED)
 
     monkeypatch.setattr(providers, "fetch_minds_models", fake_fetch)
@@ -180,7 +181,7 @@ def test_warm_is_a_noop_when_map_already_current(monkeypatch):
 def test_warm_flips_a_stored_paid_pin_off_the_paid_canonical(monkeypatch):
     from cowork.services import providers
 
-    async def fake_fetch(url, key, *, force_refresh=False, tenant_key=None):
+    async def fake_fetch(url, key, *, force_refresh=False, tenant_key=None, **_kw):
         return _listing(FREE_ENABLED)
 
     monkeypatch.setattr(providers, "fetch_minds_models", fake_fetch)
@@ -359,7 +360,7 @@ def test_boot_warm_populates_map_on_desktop(monkeypatch):
     from cowork import server
     from cowork.services import providers
 
-    async def fake_fetch(url, key, *, force_refresh=False, tenant_key=None):
+    async def fake_fetch(url, key, *, force_refresh=False, tenant_key=None, **_kw):
         return _listing(FREE_ENABLED)
 
     monkeypatch.setattr(providers, "fetch_minds_models", fake_fetch)
@@ -432,7 +433,7 @@ def test_boot_warm_is_gated_off_in_org_mode(monkeypatch):
 
     called = False
 
-    async def fake_fetch(url, key, *, force_refresh=False, tenant_key=None):
+    async def fake_fetch(url, key, *, force_refresh=False, tenant_key=None, **_kw):
         nonlocal called
         called = True
         return _listing(FREE_ENABLED)

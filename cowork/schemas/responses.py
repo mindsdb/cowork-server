@@ -1,10 +1,10 @@
 import time
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 import uuid
 from enum import Enum
 from uuid import UUID
 
-from pydantic import BaseModel, Field, StrictBool, model_serializer, model_validator
+from pydantic import BaseModel, Field, StrictBool, StringConstraints, model_serializer, model_validator
 
 from cowork.schemas.connectors import DisabledConnection
 from cowork.schemas.figure_sources import FigureSources
@@ -32,6 +32,8 @@ class Role(str, Enum):
     thought_tool_call_end = "thought.tool_call.end"
     # A tool's message to the user, rendered as an agent message between steps.
     thought_tool_call_message = "thought.tool_call.message"
+    # A tool's result the UI renders itself: generate_image's, shown inline.
+    thought_tool_call_result = "thought.tool_call.result"
 
 
 class ContentType(str, Enum):
@@ -90,9 +92,12 @@ class IncompleteDetails(BaseModel):
             "`spend_ceiling` (the token budget), `round_cap` (the step limit), "
             "`handback_budget` (automatic continuations ran out), "
             "`handback_verifier_failure` (the completion check returned no verdict), "
-            "`handback_stuck` (the completion check judged the task stuck) or "
-            "`retry_exhausted` (repeated errors). Treat any other value as a stop "
-            "for an unlisted reason."
+            "`handback_stuck` (the completion check judged the task stuck), "
+            "`time_limit` (the task's time limit, after Stop here or no answer), "
+            "`retry_exhausted` (repeated errors), `content_filter` (the model "
+            "provider's content filter blocked a reply) or `question_unanswered` "
+            "(an `ask_user` question timed out or was skipped). Treat any other "
+            "value as a stop for an unlisted reason."
         ),
     )
 
@@ -143,6 +148,30 @@ class StreamingResponse(BaseModel):
     response: Response | ResponseDelta
 
 
+# A per-conversation pick a turn can save or reset (ResponsesRequest.reset_picks).
+TurnPick = Literal["model", "reasoning_effort"]
+
+
+class DocViewSelection(BaseModel):
+    blockIds: list[Annotated[str, StringConstraints(max_length=40)]] = Field(default_factory=list, max_length=200)
+    quote: str | None = Field(default=None, max_length=4000)
+
+
+class DocViewContext(BaseModel):
+    """The doc beside the chat. Data about the view, never instructions."""
+
+    artifactId: str = Field(max_length=64)
+    projectId: str | None = Field(default=None, max_length=64)
+    title: str | None = Field(default=None, max_length=300)
+    tab: str | None = Field(default=None, max_length=64)
+    tabTitle: str | None = Field(default=None, max_length=300)
+    rev: int | None = None
+    mode: Literal["view", "edit"] | None = None
+    selection: DocViewSelection | None = None
+    # Words the person asked the agent to act on from the doc ("Edit with agent").
+    request: str | None = Field(default=None, max_length=4000)
+
+
 class ResponsesRequest(BaseModel):
     input: str | list[Message] | None = Field(
         default=None, description="Input for the responses request, either a string or a list of messages"
@@ -163,9 +192,11 @@ class ResponsesRequest(BaseModel):
     # In OpenAI's Responses API, the model is required; here it is optional.
     # When set (the composer's per-conversation model pick), it overrides the
     # account-wide planning/coding/router model settings for this turn only
-    # (see AntonHarness._apply_model_override) and is persisted onto the new
-    # conversation's Conversation.model so a reopened task remembers the pick.
-    # When omitted, the account-wide user settings govern as before.
+    # (see AntonHarness._apply_model_override). The turn also saves it as the
+    # conversation's Conversation.model (ConversationService.record_turn_picks),
+    # so a reopened task comes back on the latest pick. When omitted, the
+    # account-wide user settings govern as before, and the saved pick stays
+    # unless `reset_picks` names it.
     model: str | None = Field(
         default=None,
         description="Model name for the chat completion request"
@@ -173,15 +204,27 @@ class ResponsesRequest(BaseModel):
     # The composer's per-task reasoning-effort pick — mirrors `model` above.
     # Overrides the account-wide planning/coding reasoning-effort settings for
     # THIS turn only (see providers.build_llm_client's effort_override param).
-    # When set on the turn that creates a new conversation, it is persisted
-    # onto Conversation.reasoning_effort so a reopened task remembers the pick,
-    # same as `model`. Not validated against the model's advertised effort
+    # When set, the turn saves it as Conversation.reasoning_effort, and when
+    # omitted the saved pick stays unless `reset_picks` names it, same as
+    # `model`. Not validated against the model's advertised effort
     # levels here — the client only offers levels the picked model supports
     # (settings.modelEfforts), and an invalid pair is rejected reactively by
     # the provider/gateway, same as an invalid model name.
     reasoning_effort: str | None = Field(
         default=None,
         description="Reasoning effort level for the chat completion request",
+    )
+    # The picks this turn sends back to the default: "model" for Model Router
+    # or the operator's default model, "reasoning_effort" for the default
+    # effort. An omitted pick keeps the conversation's saved one, since Cowork
+    # also sends no model for a pinned model its picker no longer offers, such
+    # as one the wallet locks, and that pin must come back after a top-up. A
+    # reset clears the saved pick instead (record_turn_picks), so a reopened
+    # task comes back on the default the user went back to. A model or effort
+    # the turn sends wins over its own reset, since the turn runs on it.
+    reset_picks: list[TurnPick] = Field(
+        default_factory=list,
+        description="Picks this turn returns to the default, clearing the conversation's saved model or reasoning effort",
     )
     # The composer's per-task harness pick (Coding Mode). Overrides the
     # account-wide `harness` setting for THIS conversation only — mirrors
@@ -218,6 +261,17 @@ class ResponsesRequest(BaseModel):
         ),
     )
 
+    # One task's opt-out of the agent's browser: the composer's Browser
+    # switch. "off" runs this turn as browser_enabled=false does: no browser
+    # tool, and on the web no scope call that would start the browser.
+    browser: Literal["on", "off"] = Field(
+        default="on",
+        description=(
+            '"off" runs this turn without the shared browser. '
+            '"on", the default, follows the user\'s browser setting and never turns the browser on.'
+        ),
+    )
+
     @model_validator(mode="after")
     def disconnect_requires_streaming(self) -> "ResponsesRequest":
         if self.cancel_on_disconnect and self.stream is not True:
@@ -235,6 +289,26 @@ class ResponsesRequest(BaseModel):
     disabled_connections: list[DisabledConnection] | None = Field(
         default=None,
         description="Connections to exclude from this turn (client sends on every request)",
+    )
+    # What the person has open beside the chat when they send: the doc, its tab,
+    # and the blocks or words they selected. Handed to the agent as a
+    # <doc-view-context> block ahead of their message, so "this" and "here"
+    # resolve; never persisted as part of what they typed.
+    doc_context: DocViewContext | None = Field(
+        default=None,
+        description="The doc open beside the chat, and the person's selection in it",
+    )
+    # Off unless the client says so: an app whose renderer predates docs would
+    # get docs from the agent it has no way to show. doc_context and
+    # output="doc" come only from a client that shows them, so they imply it.
+    docs: bool = Field(
+        default=False,
+        description="The client shows docs, so the agent may write them",
+    )
+    # The composer's Output choice: "doc" asks for the answer as a doc.
+    output: Literal["doc"] | None = Field(
+        default=None,
+        description='"doc": answer this message by writing a doc rather than in chat',
     )
     # Generic observability pass-through. Whatever a caller puts here is
     # forwarded verbatim to the harness → LLM router → Langfuse trace, so new

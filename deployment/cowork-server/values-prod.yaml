@@ -30,6 +30,22 @@ networkPolicy:
   enabled: true
 
 deployment:
+  # Same autoscaling as staging. values-staging.yaml explains the 70% target and
+  # why the ceiling stays at 4.
+  autoscaling:
+    enabled: true
+    minReplicas: 2
+    maxReplicas: 4
+    targetCPUUtilizationPercentage: 70
+
+  # Cloud datasource turns and the methods offered, on for prod by the
+  # release gate. Rollback removes both lines; see the chart README.
+  datasourceTurnsEnabled: "true"
+  datasourceCapabilities: '{"manifest_version": 1, "enabled": ["mysql:host-password", "postgres:host-port"]}'
+  # Members' custom API connections on their turns. Rollback removes this line,
+  # as does rolling the scratchpad image back past anton v2.26.11.23.1.
+  customApiTurnsEnabled: "true"
+
   ingress:
     enabled: true
     name: cowork-server
@@ -46,6 +62,15 @@ deployment:
           - path: /api
             serviceName: cowork-server
             servicePort: 80
+
+  # Draft-preview host. values.yaml builds the draft Ingress and the
+  # COWORK_DRAFT_* variables from these two; ingress_secondary.enabled is not
+  # templated, so it is switched on here too. webOrigin is the primary host
+  # above, where the web app runs.
+  draftHost: draft.mindshub.co
+  webOrigin: https://cowork.mindshub.ai
+  ingress_secondary:
+    enabled: true
 
   extraEnvs:
 
@@ -68,8 +93,26 @@ deployment:
     - name: COWORK_ORGANIZATION_SWITCH_ENABLED
       value: "true"
 
+    # The agent's browser on the web: the browser router, served on this host
+    # under /browser. Unset, the web app offers no browser; see README.md.
+    - name: COWORK_BROWSER_ROUTER_URL
+      value: "https://cowork.mindshub.ai/browser"
+
     - name: COWORK_TURN_MINDS_BASE_URL
       value: "https://api.mindshub.ai/v1"
+
+    # Per-task time limit for web turns, in seconds: at it anton asks
+    # "Keep going / Stop here" and ends with a summary. 0 or unset turns it
+    # off. Needs auth's turn-key extension and the controller's time-limited
+    # backstop live first. A turn's key lives the limit plus
+    # COWORK_TURN_TIME_LIMIT_KEY_MARGIN_SECONDS (2400), so auth's turn-key cap
+    # (turn_key_max_ttl_seconds) must be at least the limit + 2400 + 300 s of
+    # clock skew: 6300 for 3600. Under a lower cap auth refuses that key, and
+    # each turn runs untimed on a 1200 s key instead. Above 3600 also needs
+    # auth's turn-key lifetime limit and the controller's ceiling raised; see
+    # time_limit_seconds in cowork/common/settings/app_settings.py.
+    - name: COWORK_TURN_TIME_LIMIT_SECONDS
+      value: "3600"
 
     # Agent tool budgets — deployment-level DEFAULTS for users who never set
     # the per-user setting (hosted has no Settings UI; inference cost lands on
@@ -78,6 +121,8 @@ deployment:
     # conservatively. Changing these requires a pod restart (env is read once
     # per process).
     # - name: COWORK_DEFAULT_MAX_TOOL_ROUNDS
-    #   value: "50"
+    #   value: "250"
     # - name: COWORK_DEFAULT_MAX_CONTINUATIONS
-    #   value: "5"
+    #   value: "10"
+    # - name: COWORK_DEFAULT_MAX_TURN_TOKENS
+    #   value: "25000000"

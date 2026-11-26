@@ -45,8 +45,12 @@ store. ``refuse_planted_links`` refuses a link, or a hard-linked file, that
 agent code before the sandbox left there, before the server follows it into
 another person's space.
 
+``live_apps_on`` asks anton whether live apps run full-stack apps in app
+slots outside this server.
+
 ``check_startup`` runs in create_app. It refuses identity headers with the
-sandbox off, and ``landlock`` where it can't hold. ``_probe_abi`` and
+sandbox off, live apps without what keeps each app to its launcher
+(``_check_live_apps_startup``), and ``landlock`` where it can't hold. ``_probe_abi`` and
 ``_run_self_test`` are the one seam tests stub, since neither a macOS machine
 nor every CI kernel has Landlock.
 """
@@ -60,8 +64,10 @@ import os
 import stat
 from collections.abc import Iterable
 from contextlib import ExitStack
+from functools import lru_cache
 from pathlib import Path
 from typing import TYPE_CHECKING, NamedTuple
+from urllib.parse import urlsplit
 from uuid import UUID
 
 from cowork.common.logger import get_logger
@@ -75,7 +81,7 @@ from cowork.common.paths import (
     pinned_dir,
 )
 from cowork.common.settings.app_settings import AppSettings, get_app_settings
-from cowork.db.personal_resources import PersonalResource
+from cowork.db.personal_resources import STORE_RESOURCE, PersonalResource
 from cowork.db.scoped import TenantScope, scoped_storage_root
 
 if TYPE_CHECKING:
@@ -97,6 +103,43 @@ NO_CODE_MODE_DETAIL = (
 def code_sandbox_on() -> bool:
     """Whether agent code runs under Landlock on this deployment."""
     return get_app_settings().code_sandbox == "landlock"
+
+
+#: anton's live-apps switch, which the live-apps overlay sets on this service.
+#: anton reads it (live_apps_enabled); check_startup reads it by name only to
+#: refuse it on an anton that can't.
+LIVE_APP_SLOTS_VARIABLE = "ANTON_LIVE_APP_SLOTS"
+
+#: The shortest COWORK_LIVE_APPS_LAUNCH_TOKEN check_startup accepts.
+MIN_LIVE_APPS_LAUNCH_TOKEN_LENGTH = 32
+
+#: What this server uses of anton's live-app slots (anton.core.artifacts.live_app_slots).
+_LIVE_APP_SLOTS_API = (
+    "live_apps_enabled",
+    "live_app_slot_addresses",
+    "SlotStatus",
+    "LiveAppLauncher",
+    "LiveAppHost",
+    "LiveAppLaunchError",
+    "LAUNCH_FILES",
+    "LAUNCH_DIRS",
+    "MAX_LAUNCH_FILES",
+    "MAX_LAUNCH_FILE_BYTES",
+    "MAX_LAUNCH_TOTAL_BYTES",
+    "MAX_REPLY_BYTES",
+)
+
+
+def live_apps_on() -> bool:
+    """Whether live apps run in app slots outside this server: anton's own
+    reading of ANTON_LIVE_APP_SLOTS. An anton without the slots reads as off,
+    and that means the variable is unset: check_startup refuses it on such an
+    anton (_live_apps_gap)."""
+    try:
+        from anton.core.artifacts.live_app_slots import live_apps_enabled
+    except ImportError:
+        return False
+    return live_apps_enabled()
 
 
 def refuse_a_missing_policy(cell_sandbox: CellSandbox | None, *, site: str) -> None:
@@ -171,8 +214,9 @@ def _trusted_roots() -> list[Path]:
 class _TrustedRoots:
     """Configured roots resolved for one policy build, never descendant grants."""
 
-    def __init__(self) -> None:
-        self.resolved = {root: _real(root) for root in dict.fromkeys(_trusted_roots())}
+    def __init__(self, roots: Iterable[Path] | None = None) -> None:
+        configured = _trusted_roots() if roots is None else roots
+        self.resolved = {root: _real(root) for root in dict.fromkeys(configured)}
         self.forms = tuple(
             (Path(os.path.normcase(form)).parts, real)
             for root, real in self.resolved.items()
@@ -203,6 +247,21 @@ def _anchored(path: Path, *, roots: _TrustedRoots | None = None) -> _Anchored | 
         if best is None or len(names) > len(best.names):
             best = _Anchored(real, names)
     return best
+
+
+@lru_cache(maxsize=8)
+def _resolved_once(roots: tuple[Path, ...]) -> _TrustedRoots:
+    return _TrustedRoots(roots)
+
+
+def anchored_below_a_trusted_root(path: Path) -> _Anchored | None:
+    """``_anchored`` for the server's own opens of a person's storage on a
+    request, such as an artifacts folder (artifact_identity). Those run many
+    times a request, so the configured roots are resolved once per
+    configuration rather than once a call, where each would cost a stat per
+    folder in each root's path. Only the match uses the resolved roots: a
+    caller opens the root as ``path`` spells it."""
+    return _anchored(path, roots=_resolved_once(tuple(_trusted_roots())))
 
 
 def _granted_dir(
@@ -290,6 +349,14 @@ def refuse_a_linked_project(project_dir: Path) -> None:
     link into another person's space before the policy refused it.
     """
     _required_dir(project_dir, create=True)
+
+
+def refuse_a_linked_folder(folder: Path) -> None:
+    """Raise OSError when a folder on the way to ``folder`` below the server's
+    roots is a link or not a folder (``_required_dir``), and FileNotFoundError
+    when ``folder`` is gone. Unlike refuse_a_linked_project it makes nothing,
+    so it fits a read of someone else's folder."""
+    _required_dir(folder, create=False)
 
 
 class PlantedLinkError(OSError):
@@ -605,25 +672,152 @@ def _policy_model_gap() -> str | None:
     return None
 
 
+def _live_apps_gap() -> str | None:
+    """What the installed anton lacks of the live-app slots this server hands
+    its people's launches to, or None when it has all of it."""
+    try:
+        from anton.core.artifacts import live_app_slots
+    except ImportError:
+        return "has no anton.core.artifacts.live_app_slots"
+    missing = [name for name in _LIVE_APP_SLOTS_API if not hasattr(live_app_slots, name)]
+    if missing:
+        return f"has a live_app_slots without {', '.join(missing)}"
+    missing_hooks = [name for name in ("launch_lock", "slots_full", "slots_available")
+                     if not callable(getattr(live_app_slots.LiveAppHost, name, None))]
+    if missing_hooks:
+        return f"has a LiveAppHost without {', '.join(missing_hooks)}"
+    from anton.core.session import ChatSessionConfig
+
+    if "live_app_host" not in inspect.signature(ChatSessionConfig).parameters:
+        return "has a ChatSessionConfig that takes no live_app_host"
+    return None
+
+
+def _check_live_apps_startup(settings: AppSettings) -> None:
+    """Raise RuntimeError, naming what to change, where ANTON_LIVE_APP_SLOTS
+    is set and live apps can't keep each app to the person who launched it.
+
+    It runs when either the variable is set or anton reads live apps as on,
+    since every runtime decision (live_apps_on) asks anton, and the slot
+    paths skip the bearer only behind these refusals."""
+    if not (os.environ.get(LIVE_APP_SLOTS_VARIABLE, "").strip() or live_apps_on()):
+        return
+    if settings.code_sandbox != "landlock":
+        raise RuntimeError(
+            f"{LIVE_APP_SLOTS_VARIABLE} needs COWORK_CODE_SANDBOX=landlock. Live apps run "
+            "outside this server only for an agent whose code is locked to its person's "
+            "space; leave the sandbox on and add the live-apps overlay beside it."
+        )
+    if not settings.trust_identity_headers:
+        raise RuntimeError(
+            f"{LIVE_APP_SLOTS_VARIABLE} needs COWORK_TRUST_IDENTITY_HEADERS. Only the person "
+            "who launched an app may open it, and without identity headers this server "
+            "knows no person."
+        )
+    if PersonalResource.PROJECTS not in settings.personal_resources:
+        raise RuntimeError(
+            f"{LIVE_APP_SLOTS_VARIABLE} needs projects in COWORK_PERSONAL_RESOURCES. In a "
+            "shared project every member's agent can rewrite an app's backend, which then "
+            "runs with the connections of whoever launches it next."
+        )
+    gap = _live_apps_gap()
+    if gap is not None:
+        raise RuntimeError(
+            f"{LIVE_APP_SLOTS_VARIABLE} needs an anton with live-app slots. The installed "
+            f"anton {gap}. Install the anton this cowork-server pins."
+        )
+    from anton.core.artifacts.live_app_slots import live_app_slot_addresses
+
+    try:
+        # A blank entry fails to parse, so a set variable names a slot.
+        live_app_slot_addresses()
+    except ValueError as error:
+        raise RuntimeError(f"{LIVE_APP_SLOTS_VARIABLE} doesn't parse: {error}") from error
+    viewer_login_url = settings.live_apps_viewer_login_url
+    if viewer_login_url != viewer_login_url.strip() or not _is_viewer_login_url(viewer_login_url):
+        raise RuntimeError(
+            f"{LIVE_APP_SLOTS_VARIABLE} needs COWORK_LIVE_APPS_VIEWER_LOGIN_URL, the viewer "
+            "sign-in's http:// or https:// address that tells this server who opens an app, "
+            "for example http://viewer-login:4180."
+        )
+    token = settings.live_apps_launch_token.get_secret_value()
+    if (
+        len(token) < MIN_LIVE_APPS_LAUNCH_TOKEN_LENGTH
+        or token != token.strip()
+        or not token.isascii()
+        or not token.isprintable()
+    ):
+        raise RuntimeError(
+            f"{LIVE_APP_SLOTS_VARIABLE} needs COWORK_LIVE_APPS_LAUNCH_TOKEN of at least "
+            f"{MIN_LIVE_APPS_LAUNCH_TOKEN_LENGTH} printable ASCII characters with no space "
+            "around them, the token every app slot checks before it takes a launch."
+        )
+
+
+def _is_viewer_login_url(value: str) -> bool:
+    """Whether ``value`` is an http or https address with a host and no query
+    or fragment, which the access check can join /oauth2/userinfo to."""
+    try:
+        parts = urlsplit(value)
+    except ValueError:
+        return False
+    return parts.scheme in ("http", "https") and bool(parts.hostname) and not parts.query and not parts.fragment
+
+
 #: cowork-home's own files and folders the server reads and writes at fixed
 #: names: its settings (.env), the encryption key, every answer stream, the
 #: turns' scratch folders and the self-test's, and the shared registries.
 _COWORK_HOME_ENTRIES = (".env", ".master_key", "streams", "tmp", "shared")
 
 
+def _refuse_links(entries: Iterable[Path], *, what: str, leads: str, real: str) -> None:
+    """Raise RuntimeError naming the first of ``entries`` that is a link, or
+    that the server can't check. The server isn't locked, so it would read
+    and write ``what`` wherever the link leads. ``leads`` ends that sentence
+    and ``real`` names what to put back."""
+    for entry in entries:
+        try:
+            linked = entry.is_symlink()
+        except OSError as error:
+            raise RuntimeError(
+                f"COWORK_CODE_SANDBOX=landlock: the server can't check whether {entry} is "
+                f"a link ({error.strerror or error}). Give the server's user access to it, then "
+                "start again."
+            ) from error
+        if linked:
+            raise RuntimeError(
+                f"COWORK_CODE_SANDBOX=landlock: {entry} is a link, and the server reads "
+                f"and writes {what} outside the sandbox, so it would follow it wherever it "
+                f"leads{leads}. Agent code that ran before the sandbox may have left it "
+                f"there: remove the link and put the real {real} back, then start again."
+            )
+
+
 def _refuse_linked_cowork_home_entries() -> None:
     """Raise RuntimeError when one of _COWORK_HOME_ENTRIES is a link. The
     server isn't locked, so it would read and write wherever the link leads,
     such as every person's answer streams into the shared folder."""
-    for name in _COWORK_HOME_ENTRIES:
-        entry = cowork_home() / name
-        if entry.is_symlink():
-            raise RuntimeError(
-                f"COWORK_CODE_SANDBOX=landlock: {entry} is a link, and the server reads "
-                "and writes it outside the sandbox, so it would follow it wherever it "
-                "leads. Agent code that ran before the sandbox may have left it there: "
-                "remove the link and put the real file or folder back, then start again."
-            )
+    home = cowork_home()
+    _refuse_links(
+        (home / name for name in _COWORK_HOME_ENTRIES),
+        what="it", leads="", real="file or folder",
+    )
+
+
+def _refuse_linked_partitions(settings: AppSettings) -> None:
+    """Raise RuntimeError when a person's partition folder in the shared
+    root, or one of its stores (STORE_RESOURCE), is a link. The server isn't
+    locked, so it would read and write that person's projects, files, memory
+    and connections wherever the link leads, such as another person's
+    partition."""
+    shared_root = _real(Path(settings.storage.shared_root))
+    for partition in _partition_roots(shared_root):
+        folder = shared_root / partition.name
+        _refuse_links(
+            (folder, *(folder / store for store in STORE_RESOURCE)),
+            what="a person's space there", leads=", maybe into another person's space",
+            real="folder",
+        )
 
 
 def check_startup(settings: AppSettings, *, remote_turns: bool) -> None:
@@ -631,11 +825,14 @@ def check_startup(settings: AppSettings, *, remote_turns: bool) -> None:
     what a shared project leaves shared.
 
     Raises RuntimeError, naming COWORK_CODE_SANDBOX and the fix: identity
-    headers with the sandbox off; and with ``landlock``, org tenancy, remote
-    turns, an anton without the launcher or whose policy model refuses this
+    headers with the sandbox off; live apps without what keeps each app to
+    its launcher (_check_live_apps_startup); and with ``landlock``, org tenancy, remote
+    turns, private connections with shared projects, an anton without the launcher or whose policy model refuses this
     server's policy, a kernel below the Landlock floor, a link at one of
-    cowork-home's own entries (_COWORK_HOME_ENTRIES), or a self-test that
-    can't confirm a denied path is denied. Then creates the shared folder.
+    cowork-home's own entries (_COWORK_HOME_ENTRIES), a link at a person's
+    partition folder or one of its stores (_refuse_linked_partitions), or a
+    self-test that can't confirm a denied path is denied. Then creates the
+    shared folder.
     """
     if settings.trust_identity_headers and settings.code_sandbox == "off":
         raise RuntimeError(
@@ -645,6 +842,7 @@ def check_startup(settings: AppSettings, *, remote_turns: bool) -> None:
             "space. Set COWORK_CODE_SANDBOX=landlock on a Linux host with Landlock "
             "(kernel 6.2 or later)."
         )
+    _check_live_apps_startup(settings)
     if settings.code_sandbox != "landlock":
         return
     if settings.tenancy_mode == "org":
@@ -658,6 +856,17 @@ def check_startup(settings: AppSettings, *, remote_turns: bool) -> None:
             "COWORK_CODE_SANDBOX=landlock is not supported with COWORK_TURN_BACKEND=remote: "
             "remote workers start agent code without the launcher. Leave "
             "COWORK_TURN_BACKEND unset to run turns in this process."
+        )
+    if (
+        settings.trust_identity_headers
+        and PersonalResource.CONNECTIONS in settings.personal_resources
+        and PersonalResource.PROJECTS not in settings.personal_resources
+    ):
+        raise RuntimeError(
+            "With COWORK_TRUST_IDENTITY_HEADERS, private connections require personal projects: "
+            "shared project venvs and saved cell state can run one person's code with another "
+            "person's connections. Add projects to COWORK_PERSONAL_RESOURCES before starting. "
+            "Preserve any shared project files before changing their storage namespace."
         )
     gap = _anton_sandbox_gap()
     if gap is not None:
@@ -679,6 +888,7 @@ def check_startup(settings: AppSettings, *, remote_turns: bool) -> None:
             "under Docker Engine 20.10.18 or later."
         )
     _refuse_linked_cowork_home_entries()
+    _refuse_linked_partitions(settings)
     try:
         _run_self_test()
     except Exception as error:

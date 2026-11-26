@@ -3,13 +3,20 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
+from pydantic import ValidationError
+
+from tests.support.coding.service_fakes import git, repository
 
 from cowork.coding.contracts import PermissionMode, TaskWorkspace, WorkspaceKind
 from cowork.coding.control_models import CodeTask, RunStatus, RuntimeCommand, TaskRun
 from cowork.coding.project_models import (
     CodeProject,
+    DeliveryPlanItem,
+    DraftPullRequestRequest,
+    DraftPullRequestSpec,
     LocalFolderResource,
     RepositoryResource,
 )
@@ -19,6 +26,7 @@ from cowork.coding.project_workspaces import (
 )
 from cowork.coding.runtime_operations import RuntimeWorkspaceOperations
 from cowork.coding.runtime_protocol import RuntimeExecutionConfig, RuntimeLease
+from cowork.coding.task_delivery import TaskDeliveryService
 from cowork.coding.workspace import WorkspaceManager
 
 
@@ -102,3 +110,108 @@ def test_refresh_project_rejects_a_malformed_payload(payload: dict[str, object])
 
     assert result is None
     assert error == "A project command refresh needs a commands map"
+
+
+def test_draft_request_distinguishes_an_empty_selection_from_an_omitted_selection() -> None:
+    assert DraftPullRequestRequest(title="Publish", confirmed=True).drafts == []
+    with pytest.raises(ValidationError):
+        DraftPullRequestRequest(title="Publish", confirmed=True, drafts=[])
+
+
+@pytest.fixture
+def publish_operation(tmp_path: Path):
+    repo = repository(tmp_path)
+    remote = tmp_path / "origin.git"
+    git(tmp_path, "init", "--bare", str(remote))
+    git(repo, "remote", "add", "origin", str(remote))
+    manager = ProjectWorkspaceManager(WorkspaceManager(tmp_path / "coding"))
+    workspace = TaskWorkspace(
+        folder_id="repo", folder_name="Repo", source_path=str(repo),
+        workspace_path=str(repo), workspace_kind=WorkspaceKind.git_worktree,
+    )
+    prepared = PreparedProjectWorkspace(primary=workspace, workspaces=(workspace,), ports={})
+    operations = RuntimeWorkspaceOperations(lease(), manager, prepared, object())
+    runner = manager.workspaces.git
+    payload = {
+        "operation": "push_confirmed_commit", "folder_id": "repo",
+        "revision": runner.run(repo, "rev-parse", "HEAD").stdout.strip(),
+        "task_branch": runner.run(repo, "branch", "--show-current").stdout.strip(),
+        "remote_url": str(remote),
+    }
+    return operations, payload, repo, remote, runner
+
+
+def test_remote_push_publishes_the_confirmed_commit_to_the_confirmed_repository(publish_operation, tmp_path: Path) -> None:
+    operations, payload, repo, remote, runner = publish_operation
+    secondary = tmp_path / "secondary.git"
+    git(tmp_path, "init", "--bare", str(secondary))
+    git(repo, "remote", "set-url", "--push", "origin", str(secondary))
+
+    item = DeliveryPlanItem(
+        folder_id="repo", folder_name="Repo", workspace_path=str(repo), base_branch="main",
+        task_branch=payload["task_branch"], head_revision=payload["revision"], remote_url=str(remote), status="ready",
+    )
+    session = SimpleNamespace(id="task", task_id=None, deliveries=[])
+    remote_service = Mock()
+    remote_service.is_remote.return_value = True
+
+    def remote_operation(_session, name, body, **_kwargs):
+        if name == "delivery_plan":
+            return {"items": [item.model_dump(mode="json")]}
+        result, error = operations.execute(operation(0, {"operation": name, **body}))
+        if error:
+            raise RuntimeError(error)
+        return result
+
+    remote_service.operation.side_effect = remote_operation
+    store = Mock()
+    store.load_session.return_value = session
+    delivery = TaskDeliveryService(store, Mock(), lambda _: operations.project, Mock(), remote_service, lambda _: session)
+    integrations = Mock()
+    integrations.create_draft_pull_request.return_value = "https://github.example/pull/1"
+    request = DraftPullRequestRequest(
+        title="Publish",
+        confirmed=True,
+        drafts=[DraftPullRequestSpec(
+            folder_id="repo", title="Publish", task_branch=item.task_branch,
+            remote_url=item.remote_url, head_revision=item.head_revision,
+        )],
+    )
+    [record] = delivery.create_drafts(session.id, request, integrations)
+
+    assert record.status == "published", record.detail
+    integrations.create_draft_pull_request.assert_called_once()
+    assert integrations.create_draft_pull_request.call_args.kwargs["repository_url"] == str(remote)
+    assert runner.run(remote, "rev-parse", payload["task_branch"]).stdout.strip() == payload["revision"]
+    assert runner.run(secondary, "for-each-ref").stdout == ""
+
+
+@pytest.mark.parametrize("change", ["branch", "remote", "revision"])
+def test_remote_push_refuses_changes_after_confirmation(publish_operation, tmp_path: Path, change: str) -> None:
+    operations, payload, repo, remote, runner = publish_operation
+    if change == "branch":
+        git(repo, "switch", "-c", "another-branch")
+    elif change == "remote":
+        git(repo, "remote", "set-url", "origin", str(tmp_path / "other.git"))
+    else:
+        git(repo, "commit", "--allow-empty", "-m", "Later commit")
+
+    result, error = operations.execute(operation(0, payload))
+
+    assert result is None
+    assert "confirm again" in error
+    assert runner.run(remote, "for-each-ref").stdout == ""
+
+
+def test_remote_push_refuses_lfs_before_publishing(publish_operation) -> None:
+    operations, payload, repo, remote, runner = publish_operation
+    (repo / ".gitattributes").write_text("*.bin filter=lfs diff=lfs merge=lfs -text\n", encoding="utf-8")
+    git(repo, "add", ".gitattributes")
+    git(repo, "commit", "-m", "Track LFS")
+    payload["revision"] = runner.run(repo, "rev-parse", "HEAD").stdout.strip()
+
+    result, error = operations.execute(operation(0, payload))
+
+    assert result is None
+    assert "Git LFS" in error
+    assert runner.run(remote, "for-each-ref").stdout == ""

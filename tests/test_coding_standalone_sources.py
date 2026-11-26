@@ -7,7 +7,7 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-from coding_service_fakes import CREDS, FakeEngine, service_with, wait_for_workspace
+from tests.support.coding.service_fakes import CREDS, FakeEngine, service_with, wait_for_workspace
 from cowork.api.v1.endpoints import coding
 from cowork.coding.contracts import SessionCreateRequest, SourceContext
 from cowork.coding.integrations import DeveloperIntegrationService
@@ -83,7 +83,7 @@ def test_folder_task_persists_linked_context_and_delivers_it_to_the_agent(tmp_pa
     engine = FakeEngine()
     service = service_with(tmp_path, engine)
     session = service.create_session(SessionCreateRequest(
-        path=str(folder), allow_direct_folder=True, prompt="Fix this issue", engine_id="fake",
+        path=str(folder), allow_folder_copy=True, prompt="Fix this issue", engine_id="fake",
         source_contexts=[SOURCE],
     ), CREDS, default_engine="fake", default_model="fake-model")
     session = wait_for_workspace(service, session.id)

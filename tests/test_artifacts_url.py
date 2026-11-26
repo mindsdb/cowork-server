@@ -70,7 +70,26 @@ def test_project_base_accepts_registered_path_through_symlink(tmp_path):
         "cowork.services.artifacts._projects_root",
         return_value=alias_root,
     ), patch(
-        "cowork.services.artifacts._external_project_artifacts_base",
+        "cowork.services.artifacts._external_project_dir",
         return_value=None,
     ):
         assert _project_artifacts_base("proj", session) == artifacts.resolve()
+
+
+def test_serve_url_is_empty_for_a_linked_artifacts_folder(tmp_path):
+    """The route refuses a project whose `.anton/artifacts` is a link, so a
+    card URL for a file there would get only a 404."""
+    project_dir = tmp_path / "my-project"
+    elsewhere = tmp_path / "elsewhere"
+    (elsewhere / "dash").mkdir(parents=True)
+    (elsewhere / "dash" / "index.html").write_text("<h1>hi</h1>")
+    (project_dir / ".anton").mkdir(parents=True)
+    (project_dir / ".anton" / "artifacts").symlink_to(elsewhere, target_is_directory=True)
+
+    with patch(
+        "cowork.services.artifacts._registered_project_dirs",
+        return_value=[project_dir],
+    ):
+        url = serve_url_for(str(project_dir / ".anton" / "artifacts" / "dash" / "index.html"), scope=LOCAL_SCOPE)
+
+    assert url == ""

@@ -2,6 +2,7 @@
 
 import logging
 import re
+from dataclasses import dataclass
 from http import HTTPMethod, HTTPStatus
 from time import monotonic
 from uuid import uuid4
@@ -19,8 +20,69 @@ _REFUSAL_REASONS = frozenset(
         "expected_organization_missing",
         "expected_organization_invalid",
         "organization_mismatch",
+        # The draft-preview host (cowork/draft_host/app.py): why a signed link
+        # was refused, never the link itself.
+        "draft_links_disabled",
+        "draft_host_unknown",
+        "draft_no_fetch_metadata",
+        "draft_token_malformed",
+        "draft_token_kid",
+        "draft_token_signature",
+        "draft_token_purpose",
+        "draft_token_env",
+        "draft_token_expired",
+        "draft_token_identity",
     }
 )
+
+
+@dataclass(frozen=True, slots=True)
+class _InFlight:
+    """One request this process is serving."""
+
+    method: str
+    started: float
+    #: The request's ASGI scope. Routing adds the matched route to it, so the
+    #: summary names the request by the route's template, never by its path.
+    scope: Scope
+
+    @property
+    def route(self) -> str:
+        return getattr(self.scope.get("route"), "path", None) or "<unrouted>"
+
+
+#: Requests this process is serving, by an id of their own. Written on the
+#: event loop; cowork.common.loop_watchdog reads a copy from its own thread
+#: when the loop stalls.
+_in_flight: dict[int, _InFlight] = {}
+#: Requests listed from each end, the oldest and the newest.
+_IN_FLIGHT_LISTED_EACH = 10
+_PATH_CHARS = 200
+
+
+def in_flight_summary() -> str:
+    """The requests in flight, oldest first, as ``METHOD /route (age s)``.
+
+    A request is named by its route's template (``/drafts/{project_ref}/...``),
+    so the line carries no id, path or token a request's own path holds; one
+    that routing has not matched yet reads ``<unrouted>``.
+
+    Past twice _IN_FLIGHT_LISTED_EACH, the oldest and the newest of them,
+    with a count of the rest between. Open turn streams fill the oldest end,
+    so the request that arrived just before a stall is still named.
+    """
+    now = monotonic()
+    requests = sorted(_in_flight.copy().values(), key=lambda entry: entry.started)
+    unlisted = len(requests) - 2 * _IN_FLIGHT_LISTED_EACH
+    if unlisted > 0:
+        requests = requests[:_IN_FLIGHT_LISTED_EACH] + requests[-_IN_FLIGHT_LISTED_EACH:]
+    listed = [
+        f"{entry.method} {entry.route[:_PATH_CHARS]} ({now - entry.started:.1f}s)"
+        for entry in requests
+    ]
+    if unlisted > 0:
+        listed.insert(_IN_FLIGHT_LISTED_EACH, f"{unlisted} more")
+    return "; ".join(listed)
 
 
 class RequestLoggingApp(FastAPI):
@@ -50,6 +112,12 @@ class RequestLoggingMiddleware:
         started = monotonic()
         status = 0
         escaped = False
+        in_flight_key = id(scope)
+        _in_flight[in_flight_key] = _InFlight(
+            method=scope["method"] if scope["method"] in HTTPMethod else "OTHER",
+            started=started,
+            scope=scope,
+        )
 
         def fields():
             route = getattr(scope.get("route"), "path", None)
@@ -91,6 +159,7 @@ class RequestLoggingMiddleware:
             exc._cowork_diagnostic_logged = True
             raise
         finally:
+            _in_flight.pop(in_flight_key, None)
             if not escaped and status >= 400:
                 candidate = scope.get("state", {}).get("_request_log_reason")
                 reason = candidate if candidate in _REFUSAL_REASONS else None

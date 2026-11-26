@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 
+import pytest
 from anton.core.datasources.data_vault import LocalDataVault
 from anton.utils.datasources import _reset_registered_ds_vars, begin_ds_turn_scope, scrub_credentials
 
@@ -69,3 +70,123 @@ async def test_an_empty_vault_skips_the_registry_rebuild(monkeypatch, tmp_path):
     await register_vault_secrets(LOCAL_SCOPE)
 
     assert rebuilds == []
+
+
+async def test_a_busy_file_store_refuses_the_registration_instead_of_scrubbing_by_shape(
+    monkeypatch, tmp_path, request
+):
+    """A saved DSN password has no API-key shape: only its registered value
+    redacts it. With every file store slot of the caller's share held, the
+    registration refuses with FilesystemBusy rather than let the turn go on
+    scrubbing by shape alone."""
+    import cowork.db.session as db_session
+    from cowork.db.units import FilesystemBusy
+    from test_run_efs import holding
+
+    monkeypatch.setattr(db_session.settings.database, "pool_timeout", 1)
+    vault = LocalDataVault(tmp_path / "data-vault")
+    vault.save("postgres", "mydb", {
+        "host": "db.example.com", "port": "5432", "database": "app",
+        "user": "svc", "password": "hunter2DsnPass",
+    })
+    monkeypatch.setattr(vault_secrets_mod, "vault_for_scope", lambda scope: vault)
+    request.addfinalizer(_reset_registered_ds_vars)
+    alice = TenantScope(org_mode=True, org_id="org-1", user_id="alice")
+
+    async with holding(db_session.settings.storage.efs_share, alice):
+        with pytest.raises(FilesystemBusy):
+            await register_vault_secrets(alice)
+
+    await register_vault_secrets(alice)
+    assert "hunter2DsnPass" not in scrub_credentials("connect with hunter2DsnPass")
+
+
+async def test_a_web_turn_answers_503_when_the_file_store_is_too_busy_to_register_its_secrets(monkeypatch):
+    """The refusal reaches the client as the busy answer it can retry: 503
+    server_busy with Retry-After, before the routing gate reads any history."""
+    import httpx
+
+    import cowork.db.session as db_session
+    import cowork.handlers.responses as responses_mod
+    from cowork.server import create_app
+    from test_run_efs import holding
+
+    monkeypatch.setattr(db_session.settings.database, "pool_timeout", 1)
+    routed = []
+
+    async def route_request(self, **kwargs):
+        routed.append(kwargs)
+        raise RuntimeError("the gate ran")
+
+    monkeypatch.setattr(responses_mod.ResponsesHandler, "_route_request", route_request)
+    transport = httpx.ASGITransport(app=create_app(), raise_app_exceptions=False)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        async with holding(db_session.settings.storage.efs_slots, LOCAL_SCOPE):
+            response = await client.post("/api/v1/responses/", json={"input": "hi", "stream": True})
+
+    assert response.status_code == 503, response.text
+    assert response.json()["code"] == "server_busy"
+    assert response.headers["retry-after"] == "1"
+    assert routed == []
+
+
+@pytest.fixture
+def unparsable_sealed_record(monkeypatch, request, key_file, tmp_path):
+    """A key file, and a base vault whose one sealed record is cut short, so
+    the vault can't list its connections."""
+    from cowork.services.connectors.persist import own_vault_for_scope
+
+    monkeypatch.setenv("COWORK_VAULT_DIR", str(tmp_path / "vault"))
+    get_app_settings.cache_clear()
+    request.addfinalizer(get_app_settings.cache_clear)
+    vault = own_vault_for_scope(LOCAL_SCOPE)
+    vault.save("postgres", "sales", {"password": "salesDsnPass"})
+    path = vault._path_for("postgres", "sales")
+    path.write_bytes(path.read_bytes()[:100])
+    request.addfinalizer(_reset_registered_ds_vars)
+
+
+async def test_a_sealed_record_that_wont_open_stops_the_registration_naming_it(unparsable_sealed_record, owned_logger):
+    """Scrubbing by shape alone would replay every connection's saved values
+    unredacted, so the registration stops instead of going on without them."""
+    from cowork.services.connectors.sealed_vault import SealedRecordError
+    from tests._logging_assertions import assert_log_fields
+
+    logged = owned_logger(vault_secrets_mod.logger.name, level=logging.WARNING)
+
+    with pytest.raises(SealedRecordError, match="postgres-sales"):
+        await register_vault_secrets(LOCAL_SCOPE)
+
+    assert_log_fields(
+        logged.output(),
+        log_level="ERROR",
+        event="sealed_connection_unopenable",
+        connection="postgres-sales",
+        reason="its record file isn't valid JSON",
+    )
+    assert "Could not register vault secrets" not in logged.output()
+
+
+async def test_a_web_turn_answers_409_naming_a_sealed_record_that_wont_open(monkeypatch, unparsable_sealed_record):
+    """Before the routing gate reads any history, through create_app's handler."""
+    import httpx
+
+    import cowork.handlers.responses as responses_mod
+    from cowork.server import create_app
+
+    routed = []
+
+    async def route_request(self, **kwargs):
+        routed.append(kwargs)
+        raise RuntimeError("the gate ran")
+
+    monkeypatch.setattr(responses_mod.ResponsesHandler, "_route_request", route_request)
+    transport = httpx.ASGITransport(app=create_app(), raise_app_exceptions=False)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.post("/api/v1/responses/", json={"input": "hi", "stream": True})
+
+    assert response.status_code == 409, response.text
+    assert response.json() == {
+        "detail": "The saved connection postgres-sales can't be opened: its record file isn't valid JSON."
+    }
+    assert routed == []

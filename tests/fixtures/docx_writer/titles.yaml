@@ -1,0 +1,11 @@
+# core_title: the package's core title property. The head's <title> wins;
+# with none, the writer falls back to the title argument.
+- {name: head_title, html: "<html><head><title>  Head\n title </title></head><body><p>x</p></body></html>", title_arg: Argument title, core_title: Head title}
+- {name: no_head_title, html: "<p>x</p>", title_arg: Argument title, core_title: Argument title}
+- {name: empty_head_title, html: "<title>  </title><p>x</p>", title_arg: Argument title, core_title: Argument title}
+- {name: title_in_the_body_is_ignored, html: "<body><svg><title>Svg title</title></svg><p>x</p></body>", title_arg: Argument title, core_title: Argument title}
+- {name: controls_in_head_title, html: "<title>Re\x01port&#5;</title><p>x</p>", title_arg: Argument title, core_title: Report}
+- {name: controls_in_title_argument, html: "<p>x</p>", title_arg: "Fall\x02back\ud800", core_title: Fallback}
+- {name: empty_document, html: "", title_arg: Argument title, core_title: Argument title}
+- {name: whitespace_document, html: "  \n\t ", title_arg: Argument title, core_title: Argument title}
+- {name: comment_only_document, html: "<!-- only a comment -->", title_arg: Argument title, core_title: Argument title}

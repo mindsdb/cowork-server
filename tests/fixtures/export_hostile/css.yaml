@@ -1,0 +1,166 @@
+# CSS that names a resource: an @page background, an @import chain, a data:
+# stylesheet, CSS-escaped url( in style attributes and style elements, and
+# SVG presentation attributes that point out.
+# Fields and placeholders: see tests/test_export_hostile.py.
+
+- id: page-background
+  html: |
+    <style>
+    @page { background: url("{server_url}/page.png"); }
+    @page :first { background-image: url(../other/secret.png); }
+    @page { @top-center { content: "header"; background: url({sentinel_file_url}); } }
+    </style>
+    <p>paged</p>
+  markdown: |
+    <style>
+    @page { background: url("{server_url}/page.png"); }
+    @page :first { background-image: url(../other/secret.png); }
+    @page { @top-center { content: "header"; background: url({sentinel_file_url}); } }
+    </style>
+
+    paged
+  text: paged
+  omitted:
+    - [scheme, "{server_url}/page.png"]
+    - [traversal, ../other/secret.png]
+    - [scheme, "{sentinel_file_url}"]
+
+# The artifact's own stylesheets splice in; each of their imports that points
+# out is refused, two levels down.
+- id: import-chain
+  files:
+    css/chain.css: |
+      @import url("{server_url}/chained.css");
+      @import "../../other/secret.css";
+      @import "deeper.css";
+      .chain-rule { color: red }
+    css/deeper.css: |
+      @import url({server_url}/deepest.css) screen;
+      @import "../../other/secret.css" print;
+      .deeper-rule { color: blue }
+  html: |
+    <style>
+    @import url("{server_url}/top.css");
+    @import "../other/secret.css";
+    @import url(css/chain.css);
+    p { color: black }
+    </style>
+    <p>imported</p>
+  markdown: |
+    <style>
+    @import url("{server_url}/top.css");
+    @import "../other/secret.css";
+    @import url(css/chain.css);
+    p { color: black }
+    </style>
+
+    imported
+  text: imported
+  present: [chain-rule, deeper-rule]
+  omitted:
+    - [scheme, "{server_url}/top.css"]
+    - [traversal, ../other/secret.css]
+    - [scheme, "{server_url}/chained.css"]
+    - [traversal, ../../other/secret.css]
+    - [scheme, "{server_url}/deepest.css"]
+    - [traversal, ../../other/secret.css]
+
+- id: import-data-stylesheet
+  html: |
+    <style>@import "data:text/css,body{background:url({server_url}/data.png)}";</style>
+    <p>data import</p>
+  markdown: |
+    <style>@import "data:text/css,body{background:url({server_url}/data.png)}";</style>
+
+    data import
+  text: data import
+  omitted:
+    - [unsupported_type, "data:text/css,body{background:url({server_url}/data.png)}"]
+
+# tinycss2 decodes escapes before it recognizes url(, so every spelling is
+# found, and the recorded reference is the decoded URL.
+- id: escaped-css-url
+  html: |
+    <p style="background: u\72 l({server_url}/escaped.png)">escaped</p>
+    <p style="background-image: \75\72\6c(../other/secret.png)">two</p>
+    <p style='background: url("\2e\2e/other/secret.png")'>three</p>
+    <p style="list-style: \55 RL({server_url}/upper.png)">four</p>
+    <p style="background: image-set('{server_url}/set.png' 1x)">five</p>
+    <style>
+    .sheet { background: \75 rl({server_url}/sheet.png) }
+    .sheet-src { background: src("{server_url}/src.png") }
+    </style>
+  markdown: |
+    <div>
+    <p style="background: u\72 l({server_url}/escaped.png)">escaped</p>
+    <p style="background-image: \75\72\6c(../other/secret.png)">two</p>
+    <p style='background: url("\2e\2e/other/secret.png")'>three</p>
+    <p style="list-style: \55 RL({server_url}/upper.png)">four</p>
+    <p style="background: image-set('{server_url}/set.png' 1x)">five</p>
+    </div>
+
+    <style>
+    .sheet { background: \75 rl({server_url}/sheet.png) }
+    .sheet-src { background: src("{server_url}/src.png") }
+    </style>
+  text: escaped
+  omitted:
+    - [scheme, "{server_url}/escaped.png"]
+    - [traversal, ../other/secret.png]
+    - [traversal, ../other/secret.png]
+    - [scheme, "{server_url}/upper.png"]
+    - [scheme, "{server_url}/set.png"]
+    - [scheme, "{server_url}/sheet.png"]
+    - [scheme, "{server_url}/src.png"]
+
+# Only url(#fragment) survives on an SVG attribute. A reference that points
+# out is listed with its fragment, as written.
+- id: svg-presentation-url
+  html: |
+    <p>vector</p>
+    <svg width="20" height="20">
+    <defs><linearGradient id="local"><stop offset="0" stop-color="red"/></linearGradient></defs>
+    <rect width="5" height="5" fill="url({server_url}/fill.svg#paint)"/>
+    <rect width="5" height="5" filter="url(../other/secret.svg#blur)"/>
+    <rect width="5" height="5" mask="url('{sentinel_file_url}#mask')"/>
+    <rect width="5" height="5" clip-path="url(&quot;{server_url}/clip.svg#clip&quot;)"/>
+    <rect width="5" height="5" marker-start="u\72 l({server_url}/marker.svg#m)"/>
+    <rect width="5" height="5" style="fill: url({server_url}/style.svg#paint)"/>
+    <rect width="5" height="5" fill="url(#local)"/>
+    <use href="{server_url}/sprite.svg#icon"/>
+    <use xlink:href="../other/secret.svg#icon"/>
+    <image href="{server_url}/image.png" width="5" height="5"/>
+    <filter id="f"><feImage href="{server_url}/fe.png"/></filter>
+    </svg>
+  markdown: |
+    vector
+
+    <div>
+    <svg width="20" height="20">
+    <defs><linearGradient id="local"><stop offset="0" stop-color="red"/></linearGradient></defs>
+    <rect width="5" height="5" fill="url({server_url}/fill.svg#paint)"/>
+    <rect width="5" height="5" filter="url(../other/secret.svg#blur)"/>
+    <rect width="5" height="5" mask="url('{sentinel_file_url}#mask')"/>
+    <rect width="5" height="5" clip-path="url(&quot;{server_url}/clip.svg#clip&quot;)"/>
+    <rect width="5" height="5" marker-start="u\72 l({server_url}/marker.svg#m)"/>
+    <rect width="5" height="5" style="fill: url({server_url}/style.svg#paint)"/>
+    <rect width="5" height="5" fill="url(#local)"/>
+    <use href="{server_url}/sprite.svg#icon"/>
+    <use xlink:href="../other/secret.svg#icon"/>
+    <image href="{server_url}/image.png" width="5" height="5"/>
+    <filter id="f"><feImage href="{server_url}/fe.png"/></filter>
+    </svg>
+    </div>
+  text: vector
+  present: ['fill="url(#local)"']
+  omitted:
+    - [scheme, "{server_url}/fill.svg#paint"]
+    - [traversal, "../other/secret.svg#blur"]
+    - [scheme, "{sentinel_file_url}#mask"]
+    - [scheme, "{server_url}/clip.svg#clip"]
+    - [scheme, "{server_url}/marker.svg#m"]
+    - [scheme, "{server_url}/style.svg#paint"]
+    - [scheme, "{server_url}/sprite.svg#icon"]
+    - [traversal, "../other/secret.svg#icon"]
+    - [scheme, "{server_url}/image.png"]
+    - [scheme, "{server_url}/fe.png"]

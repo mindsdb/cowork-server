@@ -15,6 +15,7 @@ from cowork.coding.contracts import (  # noqa: F401
     TerminalShellPreference,
     utc_now,
     ReasoningEffort,
+    WorkspaceMode,
 )
 from cowork.coding.git_transport import validate_git_source
 from cowork.coding.skill_models import ProjectSkillSource
@@ -260,6 +261,8 @@ class CodeProject(BaseModel):
     # None means "use the model's own default"; tasks may still override it.
     default_reasoning_effort: ReasoningEffort | None = None
     permission_mode: PermissionMode = PermissionMode.supervised
+    # None lets the server choose for the computer running each task.
+    default_workspace_mode: WorkspaceMode | None = None
     created_at: datetime = Field(default_factory=utc_now)
     updated_at: datetime = Field(default_factory=utc_now)
 
@@ -339,6 +342,8 @@ class ProjectCreateRequest(BaseModel):
     # None means "use the model's own default"; tasks may still override it.
     default_reasoning_effort: ReasoningEffort | None = None
     permission_mode: PermissionMode = PermissionMode.supervised
+    # None lets the server choose for the computer running each task.
+    default_workspace_mode: WorkspaceMode | None = None
 
     @model_validator(mode="after")
     def require_resources(self) -> ProjectCreateRequest:
@@ -359,6 +364,7 @@ class ProjectUpdateRequest(BaseModel):
     default_model: str | None = None
     default_reasoning_effort: ReasoningEffort | None = None
     permission_mode: PermissionMode | None = None
+    default_workspace_mode: WorkspaceMode | None = None
 
     @model_validator(mode="after")
     def reject_duplicate_resource_inputs(self) -> ProjectUpdateRequest:
@@ -451,12 +457,19 @@ class DraftPullRequestSpec(BaseModel):
     folder_id: str = Field(min_length=1, max_length=120)
     title: str = Field(min_length=1, max_length=256)
     body: str = Field(default="", max_length=100_000)
+    # What the person reviewed and confirmed. When given, publishing refuses a
+    # folder whose commit or destination has moved since, so a later commit or
+    # a changed remote never rides an earlier confirmation.
+    head_revision: str | None = Field(default=None, pattern=r"^[0-9a-f]{40}([0-9a-f]{24})?$")
+    base_branch: str | None = Field(default=None, max_length=512)
+    task_branch: str | None = Field(default=None, max_length=512)
+    remote_url: str | None = Field(default=None, max_length=8_192)
 
 
 class DraftPullRequestRequest(BaseModel):
     title: str = Field(min_length=1, max_length=256)
     body: str = Field(default="", max_length=100_000)
-    drafts: list[DraftPullRequestSpec] = Field(default_factory=list, max_length=24)
+    drafts: list[DraftPullRequestSpec] = Field(default_factory=list, min_length=1, max_length=24)
     connection_name: str | None = Field(default=None, max_length=512)
     confirmed: bool = False
 
@@ -535,6 +548,7 @@ class DeliveryPlanItem(BaseModel):
     remote_url: str | None = None
     base_branch: str | None = None
     task_branch: str | None = None
+    head_revision: str | None = None
     status: Literal["ready", "needs_commit", "no_changes", "unavailable", "published"]
     detail: str = ""
     external_url: str | None = None

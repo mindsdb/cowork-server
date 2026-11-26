@@ -7,10 +7,21 @@ and all necessary configurations for the Cowork service.
 
 import asyncio
 import contextlib
+import contextvars
 import os
+import signal
+import stat
+import threading
+import time
 from contextlib import asynccontextmanager
+from functools import partial
+from pathlib import Path
+from types import FrameType
 
+import psutil
 from fastapi import FastAPI
+from fastapi.exception_handlers import http_exception_handler
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.exc import TimeoutError as PoolTimeoutError
 from starlette.datastructures import MutableHeaders
@@ -28,12 +39,21 @@ from cowork.auth_middleware import (
 from cowork.code_sandbox import check_startup as check_code_sandbox_startup
 from cowork.coding.inference_proxy import INFERENCE_PATHS
 from cowork.db.personal_resources import PersonalResource, check_personal_resource_dependencies
-from cowork.db.scoped import MissingTenantScopeError
-from cowork.db.units import DatabaseBusy, busy_retry_seconds
+from cowork.db.scoped import MissingTenantScopeError, ScopedSession
+from cowork.db.units import (
+    TURN_END_RECORD_DRAIN_SECONDS,
+    DatabaseBusy,
+    FilesystemBusy,
+    busy_retry_seconds,
+    drain_turn_end_records,
+    loop_limiters,
+    run_efs,
+)
+from cowork.common.loop_watchdog import LoopWatchdog
+from cowork.draft_host.listener import start_draft_listener, stop_draft_listener
 from cowork.handlers.turn_errors import SERVER_BUSY_CODE, server_busy_message
 from cowork.harnesses.anton_harness.settings import AntonHarnessSettings, check_write_approval_startup
 from cowork.harnesses.memory.policy import memory_start_warning
-from cowork.harnesses.memory.store import deployment_memory_root
 from cowork.managed import (
     ManagedFolder,
     SharedRegistryError,
@@ -42,20 +62,112 @@ from cowork.managed import (
 )
 from cowork.shared_skills import read_shared_skills, shared_skills_file
 from cowork.principal import TrustedHeaderMiddleware
+from cowork.services.live_apps import live_app_slot_paths
+from cowork.services.product_permissions import ProductPermissionUnavailable, report_permission_unavailable
 from cowork.schemas.refusals import TURN_IN_PROGRESS, Refusal
 from cowork.services.connectors.layered_vault import SharedConnectionError
-from cowork.streaming import TurnInProgress
+from cowork.services.connectors.sealed_vault import RecordTooLargeError, ReservedFieldError, SealedRecordError
+from cowork.streaming import ServerShuttingDown, TurnInProgress, registry
+from cowork.streaming.registry import TURN_SHUTDOWN_GRACE_SECONDS
+from cowork.streaming.turn_claim import TurnClaimUnavailable
 from cowork.common.request_logging import RequestLoggingApp
 from cowork.common.logger import find_database_error, relayed_error, setup_logging
+from cowork.common.paths import O_NONBLOCK, dir_open, dir_scandir, dir_stat, pinned_dir
 from cowork.common.paths import cowork_home
-from cowork.common.settings.app_settings import TurnQueueSettings, get_app_settings
+from cowork.common.settings.app_settings import (
+    TurnQueueSettings,
+    get_app_settings,
+    get_export_pdf_settings,
+)
+from cowork.common.settings.secret_files import file_variable, process_secret
 from cowork.dev_setup import run_dev_setup
-from cowork.scheduler import start_scheduler
+from cowork.scheduler import start_scheduler, stop_scheduler, wait_for_scheduled_runs
+from cowork.services.artifact_autopublish import cancel_self_heals
+from cowork.services.artifact_heal_sweep import cancel_heal_sweep
 from cowork.services.pending_credential_clear import consume_pending_credential_clear
 
 
 # Set up logging
 logger = setup_logging()
+
+# When the operating system started this process, in epoch seconds, so
+# startup_finished counts the whole boot liveness counts: interpreter start
+# and imports too, not only the lifespan.
+_PROCESS_STARTED_AT = psutil.Process().create_time()
+# A lifespan step still running this long logs startup_step_running, and logs
+# startup_step_slow as it ends.
+_SLOW_STEP_S = 10.0
+
+
+def _log_running_step(name: str, started: float) -> None:
+    """What a step's timer logs once the step has run for _SLOW_STEP_S. Runs
+    on the timer's thread, and does nothing there but log."""
+    logger.warning(
+        "Startup step running",
+        extra={
+            "event": "startup_step_running",
+            "step": name,
+            "duration_ms": round((time.monotonic() - started) * 1000),
+        },
+    )
+
+
+class _StartupClock:
+    """How long each lifespan step took, for one line at the end of startup.
+
+    Liveness starts counting before the lifespan ends, so a boot that grows
+    past its budget restarts the pod before it serves. One WARNING line, the
+    level hosted pods print, says which step grew. A step still running after
+    _SLOW_STEP_S logs its own WARNING then, from a timer thread, and another
+    as it ends, so a boot liveness kills before that line still names its
+    slow steps and the step it was killed in.
+    """
+
+    def __init__(self) -> None:
+        self._steps: list[str] = []
+        self._name: str | None = None
+        self._mark = time.monotonic()
+        self._timer: threading.Timer | None = None
+
+    def begin(self, name: str) -> None:
+        """End the running step, if any, and start ``name``."""
+        self._end()
+        self._name = name
+        self._mark = time.monotonic()
+        self._timer = threading.Timer(_SLOW_STEP_S, _log_running_step, args=(name, self._mark))
+        self._timer.daemon = True
+        self._timer.start()
+
+    def stop_timer(self) -> None:
+        """Cancel the running step's timer, if any."""
+        if self._timer is not None:
+            self._timer.cancel()
+            self._timer = None
+
+    def _end(self) -> None:
+        self.stop_timer()
+        if self._name is None:
+            return
+        took = time.monotonic() - self._mark
+        self._steps.append(f"{self._name}={round(took * 1000)}ms")
+        if took >= _SLOW_STEP_S:
+            logger.warning(
+                "Startup step slow",
+                extra={"event": "startup_step_slow", "step": self._name, "duration_ms": round(took * 1000)},
+            )
+        self._name = None
+
+    def finished(self) -> None:
+        """End the running step and log the boot's length and every step's."""
+        self._end()
+        logger.warning(
+            "Startup finished",
+            extra={
+                "event": "startup_finished",
+                "duration_ms": round((time.time() - _PROCESS_STARTED_AT) * 1000),
+                "steps": ", ".join(self._steps),
+            },
+        )
 
 
 async def _start_channels(app: FastAPI) -> None:
@@ -130,6 +242,176 @@ async def _cancel_and_wait(task: asyncio.Task | None) -> None:
         await task
 
 
+async def _end_remote_turns() -> None:
+    """End this replica's turns for a shutdown, where turns run remotely.
+
+    Refuses new turns and cancels the scheduler's poll loop and the artifact
+    self-heals and heal sweep it started, then ends every turn in flight:
+    RunRegistry.shutdown writes each remote turn's controller cancel flag, and
+    the turn's relay saves it as interrupted and writes response.failed to its
+    stream. Only then does it wait for the poll loop, which finishes a database
+    read it was in before it stops, for the self-heals and the sweep to unwind,
+    and for the scheduled runs those turns belonged to, so each run's record
+    lands.
+    TURN_SHUTDOWN_GRACE_SECONDS bounds all of it. Each step does nothing for
+    what an earlier call ended.
+    """
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + TURN_SHUTDOWN_GRACE_SECONDS
+
+    def remaining() -> float:
+        return max(0.0, deadline - loop.time())
+
+    registry.close()
+    poll_loop = stop_scheduler()
+    self_heals = cancel_self_heals()
+    heal_sweep = cancel_heal_sweep()
+    _log_cancelled_turns(await registry.shutdown(timeout_seconds=remaining()))
+    stopping = [task for task in (poll_loop, heal_sweep, *self_heals) if task is not None]
+    if stopping:
+        await asyncio.wait(stopping, timeout=remaining())
+    unfinished = await wait_for_scheduled_runs(timeout_seconds=remaining())
+    if unfinished:
+        logger.warning(
+            "Scheduled runs still recording their outcome at shutdown",
+            extra={"event": "shutdown_scheduled_runs_unfinished", "count": unfinished},
+        )
+
+
+def _log_cancelled_turns(cancelled: int) -> None:
+    """The WARNING naming how many turns a shutdown ended. The count is a
+    field: the hosted log formatter drops a message's arguments."""
+    if cancelled:
+        logger.warning(
+            "Cancelled in-flight turns for shutdown",
+            extra={"event": "shutdown_turns_cancelled", "count": cancelled},
+        )
+
+
+def _server_busy(*, retry_after: int, status_code: int) -> JSONResponse:
+    """The refusal a client reads as "Cowork is busy": a sentence naming the
+    wait, its code, and Retry-After, which the web UI waits for before it
+    offers a retry."""
+    return JSONResponse(
+        Refusal(detail=server_busy_message(retry_after), code=SERVER_BUSY_CODE).model_dump(),
+        status_code=status_code,
+        headers={"Retry-After": str(retry_after)},
+    )
+
+
+# Another replica already serves while this one shuts down, so the retry needs
+# no longer than the client's own round trip.
+_SHUTDOWN_RETRY_AFTER_SECONDS = 1
+
+# A Redis call that failed or timed out; a failover or a dropped connection
+# usually settles within a couple of seconds.
+_TURN_CLAIM_RETRY_AFTER_SECONDS = 2
+
+
+async def _release_own_turn_claims() -> None:
+    """On the Redis stream backend, release the turn claims a process of this
+    pod left behind (turn_claim.release_pod_claims): one whose container was
+    restarted in place, by an OOM kill or a crash, whose claims would
+    otherwise refuse a send to each of its conversations until the claim's
+    TTL passed, and whose sandbox turns would run on. The same pass removes
+    the listings of claims that lapsed on pods that are gone. Bounded and
+    fail-open; a claim it cannot release lapses with its TTL."""
+    from cowork.streaming.backend import get_backend
+    from cowork.streaming.turn_claim import REDIS_CALL_SECONDS, pod_name, release_pod_claims
+
+    if get_backend() != "redis":
+        return
+    pod = pod_name()
+    try:
+        async with asyncio.timeout(REDIS_CALL_SECONDS):
+            result = await release_pod_claims(pod=pod)
+    except Exception:
+        logger.warning(
+            "Could not release the turn claims an earlier process of this pod left; they lapse with their TTL.",
+            exc_info=True,
+            extra={"event": "turn_claims_boot_release_failed", "pod": pod},
+        )
+        return
+    if result.released:
+        logger.warning(
+            "Released turn claims an earlier process of this pod left behind.",
+            extra={"event": "turn_claims_released_at_boot", "pod": pod, "count": result.released},
+        )
+    if result.pruned:
+        logger.warning(
+            "Removed the listings of turn claims that lapsed without a release.",
+            extra={"event": "turn_claim_listings_pruned_at_boot", "pod": pod, "count": result.pruned},
+        )
+
+
+def _end_remote_turns_on_sigterm() -> None:
+    """Run _end_remote_turns on the first SIGTERM, then hand the signal on.
+
+    Uvicorn sets its own SIGTERM handler before lifespan startup runs
+    (Server.capture_signals), so the handler found here is Uvicorn's. On
+    SIGTERM it closes the listeners, waits at most --timeout-graceful-shutdown
+    for open responses, cuts the ones still open mid-stream, and only then
+    runs the lifespan's shutdown. Ending the turns first lets each open answer
+    stream carry its response.failed frame and end cleanly before that cut.
+    A second SIGTERM goes straight to Uvicorn.
+
+    The turns end in the context lifespan startup installed the handler in,
+    not in that of whatever task the signal interrupted, which may hold one
+    organization's settings scope.
+    """
+    if threading.current_thread() is not threading.main_thread():
+        logger.warning(
+            "Server lifespan runs off the main thread, where no signal handler can be set; "
+            "turns in progress are ended only after the server's request drain",
+            extra={"event": "shutdown_predrain_not_installed", "reason": "off_main_thread"},
+        )
+        return
+    previous = signal.getsignal(signal.SIGTERM)
+    if not callable(previous):
+        # SIG_DFL or SIG_IGN, or None for a handler not set from Python.
+        reason = previous.name if isinstance(previous, signal.Handlers) else "not_set_from_python"
+        logger.warning(
+            "SIGTERM handler is not one to hand the signal on to; turns in progress "
+            "are ended only after the server's request drain",
+            extra={"event": "shutdown_predrain_not_installed", "reason": reason},
+        )
+        return
+    loop = asyncio.get_running_loop()
+    drain_context = contextvars.copy_context()
+    signalled = False
+    # Held here because the event loop keeps only a weak reference to a task.
+    drain: asyncio.Task | None = None
+
+    def on_sigterm(signum: int, frame: FrameType | None) -> None:
+        nonlocal signalled
+        if signalled:
+            previous(signum, frame)
+            return
+        signalled = True
+
+        def hand_on(task: asyncio.Task) -> None:
+            if not task.cancelled() and task.exception() is not None:
+                logger.error(
+                    "Ending turns before shutdown failed",
+                    exc_info=task.exception(),
+                    extra={"event": "shutdown_predrain_failed"},
+                )
+            previous(signum, frame)
+
+        def begin() -> None:
+            nonlocal drain
+            drain = loop.create_task(_end_remote_turns())
+            drain.add_done_callback(hand_on)
+
+        # A signal handler runs between two bytecodes of whatever the loop was
+        # doing, possibly while it waits in select(); call_soon_threadsafe
+        # wakes it to run begin(). Without a context it would run begin() in a
+        # copy of the interrupted task's, and the drain task would inherit it.
+        loop.call_soon_threadsafe(begin, context=drain_context)
+
+    signal.signal(signal.SIGTERM, on_sigterm)
+
+
 async def _run_artifact_owner_backfill() -> None:
     """Background, one-time owner backfill (ENG-2961). Never affects startup."""
     try:
@@ -140,6 +422,134 @@ async def _run_artifact_owner_backfill() -> None:
         raise
     except Exception:
         logger.exception("artifact owner backfill failed (non-fatal)")
+
+
+# How long the lifespan teardown waits for the artifact backfills' task (the
+# location backfill, then the held-root backfill, then the sort-time
+# backfill) once it sets the walks' stop. A file store call already started
+# is never abandoned (cowork.db.units.run_efs), so during a stall a walk can
+# outlast any wait; the teardown goes on without it, and the walk's thread,
+# which is not a daemon thread, ends at its next project, root or id, or at
+# the kubelet's SIGKILL. Counted in the grace period
+# (tests/test_chart_values.py).
+LOCATION_BACKFILL_SHUTDOWN_SECONDS = 2
+
+
+async def _stop_location_backfill(*, task: asyncio.Task | None, stop: threading.Event | None) -> None:
+    """Set the stop of the artifact backfills (location, held-root and
+    sort-time), cancel their task, and wait at most
+    LOCATION_BACKFILL_SHUTDOWN_SECONDS for it to end."""
+    if stop is not None:
+        stop.set()
+    if task is None:
+        return
+    task.cancel()
+    done, _pending = await asyncio.wait({task}, timeout=LOCATION_BACKFILL_SHUTDOWN_SECONDS)
+    if not done:
+        logger.warning(
+            "artifact backfills (location, held-root, sort-time) still running at shutdown; going on",
+            extra={"event": "shutdown_location_backfill_unfinished"},
+        )
+
+
+async def _run_artifact_location_backfill(stop: threading.Event) -> None:
+    """Background, one-time location backfill, then the held-root backfill
+    (cowork.services.held_artifact_roots), then the sort-time backfill, which
+    reads the roots the held rows name (cowork.services.artifact_sort_times):
+    each one file store call with no deadline, so the task holds one file
+    store slot at a time for its walks.
+    Never affects startup. Shutdown sets ``stop``, which each walk reads,
+    before it cancels the task, since a cancelled file store call waits for
+    its work."""
+    from cowork.db.scoped import SYSTEM_SCOPE
+    from cowork.db.units import run_efs
+    from cowork.services.artifact_location_backfill import run_artifact_location_backfill
+    from cowork.services.artifact_sort_times import run_sort_time_backfill
+    from cowork.services.held_artifact_roots import run_held_root_backfill
+
+    for operation, backfill in (
+        ("artifact_location_backfill", run_artifact_location_backfill),
+        ("held_artifact_roots_backfill", run_held_root_backfill),
+        ("artifact_sort_times_backfill", run_sort_time_backfill),
+    ):
+        try:
+            await run_efs(partial(backfill, stop=stop), scope=SYSTEM_SCOPE, deadline=False)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception(
+                "artifact backfill failed (non-fatal)",
+                extra={"event": "artifact_backfill_failed", "operation": operation},
+            )
+
+
+# How long the startup task waits before it runs the artifact backfills again
+# while the held-root or the sort-time backfill's sentinel is missing:
+# another replica held a walk's lock when this one tried, and may have died
+# since, or a walk here ended in an error. A run after another replica
+# finished skips the location pass and walks only the projects each
+# sentinel lists as unread, as a later start does.
+ARTIFACT_BACKFILL_RETRY_SECONDS = 300
+# How long it waits once both sentinels exist while either lists a project
+# its pass could not read, such as one whose root failed with EIO, or one
+# that moved or went away during its walk: every list in the organization
+# reads every folder of such a project. A run then walks only the listed
+# projects, one replica at a time, so the wait is longer. A project that
+# moved is read at its new path at the next run, and one deleted since
+# leaves the list there, since the run's query no longer finds it. A
+# project whose folder is missing for good, or one the server may not read
+# (artifact_owner_backfill.walked_folder_is_gone), is listed by the first
+# sort-time pass alone, and leaves that list at the next run, which counts
+# it as read with no rows (artifact_sort_times._time_project): only a root
+# that keeps failing, as on EIO, keeps the task going.
+ARTIFACT_BACKFILL_UNREAD_RETRY_SECONDS = 1800
+
+
+def _artifact_backfill_wait(session: ScopedSession) -> int | None:
+    """The seconds the startup task waits before it runs the artifact
+    backfills again: ARTIFACT_BACKFILL_RETRY_SECONDS while the held-root or
+    the sort-time backfill has written no sentinel it can read
+    (held_artifact_roots.read_sentinel,
+    artifact_sort_times.read_sort_sentinel), and
+    ARTIFACT_BACKFILL_UNREAD_RETRY_SECONDS while either sentinel lists an
+    unread project. None once both exist and list none: the task ends."""
+    from cowork.services.artifact_sort_times import read_sort_sentinel
+    from cowork.services.held_artifact_roots import read_sentinel
+
+    held, sort = read_sentinel(session), read_sort_sentinel(session)
+    if held is None or sort is None:
+        return ARTIFACT_BACKFILL_RETRY_SECONDS
+    if held.unread or sort.unread:
+        return ARTIFACT_BACKFILL_UNREAD_RETRY_SECONDS
+    return None
+
+
+async def _run_artifact_backfills(stop: threading.Event) -> None:
+    """The startup task: the artifact backfills
+    (_run_artifact_location_backfill), then again after the wait
+    _artifact_backfill_wait gives, until both sentinels exist and list no
+    unread project, or shutdown sets ``stop``. A failed read of the
+    sentinels waits ARTIFACT_BACKFILL_RETRY_SECONDS. Shutdown cancels the
+    task during its wait."""
+    from cowork.db.scoped import SYSTEM_SCOPE
+    from cowork.db.units import run_db
+
+    while True:
+        await _run_artifact_location_backfill(stop)
+        if stop.is_set():
+            return
+        try:
+            wait = await run_db(_artifact_backfill_wait, scope=SYSTEM_SCOPE)
+        except Exception:
+            logger.warning(
+                "could not read the artifact backfills' sentinels; the artifact backfills run again later",
+                exc_info=True,
+                extra={"event": "artifact_backfill_failed", "operation": "artifact_backfill_sentinels"},
+            )
+            wait = ARTIFACT_BACKFILL_RETRY_SECONDS
+        if wait is None:
+            return
+        await asyncio.sleep(wait)
 
 
 # Imported lazily by the first agent turn otherwise, adding their import time to
@@ -166,20 +576,65 @@ def _warm_agent_runtime() -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    clock = _StartupClock()
+    # A step that raises never reaches the next begin(), so its timer would
+    # still log it as running once _SLOW_STEP_S passed. The end of the task
+    # that runs the lifespan stops that timer.
+    asyncio.current_task().add_done_callback(lambda _task: clock.stop_timer())
+    clock.begin("sealing_check")
+    # Before anything reads a setting or could make a legacy key: a deployment
+    # sealed under a key file doesn't start without one.
+    from cowork.services.sealing import refuse_sealed_state_without_key_file, refuse_unopenable_sealed_data
+
+    await asyncio.to_thread(refuse_sealed_state_without_key_file)
+    clock.begin("dev_setup")
     run_dev_setup()
+    clock.begin("sealed_data_check")
+    # After migrations, before anything serves: every sealed setting and
+    # connection opens with the key file, or the start stops naming each one.
+    await asyncio.to_thread(refuse_unopenable_sealed_data)
+    clock.begin("credential_clear")
     # After migrations and the .env seed, before anything reads a credential.
     app_settings = get_app_settings()
     consume_pending_credential_clear(app_settings.database.uri, app_settings.tenancy_mode)
+    clock.begin("shared_root")
+    # Once, before the port binds: a database unit that checks which partition
+    # of the shared root a project's folder sits in then reads this answer
+    # rather than resolving the root on the file store.
+    from cowork.db.scoped import SYSTEM_SCOPE
+    from cowork.services.projects import resolve_shared_root
+
+    await run_efs(resolve_shared_root, scope=SYSTEM_SCOPE, deadline=False)
+    clock.begin("published_page_backfill")
+    # Ownership recovery runs before the first request can mint a page. A pass
+    # that cannot read publish history or verify the publisher does not stop
+    # Cowork: published_page_ownership._require_backfill retries it on each
+    # protected publish, unpublish or delete and answers 503 until it completes.
+    from cowork.services.published_page_owner_backfill import (
+        PublishedPageBackfillUnavailable,
+        run_published_page_owner_backfill,
+    )
+
+    try:
+        await asyncio.to_thread(run_published_page_owner_backfill)
+    except PublishedPageBackfillUnavailable as exc:
+        # Its messages are fixed text, raised without the underlying error.
+        logger.error(
+            "Published page ownership backfill did not finish; publishing answers 503 and retries it",
+            extra={"event": "published_page_backfill_unavailable", "reason": str(exc)},
+        )
+    clock.begin("warm_agent_runtime")
     # After the clear, since resolving MEMORY_ENABLED where memory is shared
     # loads the stored settings.
     try:
         memory_warning = memory_start_warning()
         if memory_warning is not None:
-            logger.warning("memory: %s (%s)", memory_warning, deployment_memory_root())
+            logger.warning(memory_warning)
     except Exception:
         logger.exception("memory start warning failed (non-fatal)")
     # Before the server reports ready, so the first turn does not pay for imports.
     await asyncio.to_thread(_warm_agent_runtime)
+    clock.begin("turn_history_recovery")
     # History recovery also retries buffers sealed by an earlier failed sweep.
     try:
         from cowork.db.scoped import ScopedSession, SYSTEM_SCOPE
@@ -194,6 +649,7 @@ async def lifespan(app: FastAPI):
             history_session.close()
     except Exception:
         logger.exception("turn-history boot recovery failed (non-fatal)")
+    clock.begin("turn_buffer_recovery")
     # Seal any turn buffers left open by a previous process (crash/restart)
     # so reconnecting clients get a clean Interrupted end-of-stream rather
     # than hanging. GC of old buffers happens lazily; cheap no-op when none.
@@ -204,6 +660,10 @@ async def lifespan(app: FastAPI):
         gc_old_buffers(get_streams_dir(), max_age_days=7)
     except Exception:
         logger.exception("turn-buffer boot recovery failed (non-fatal)")
+    clock.begin("turn_claim_release")
+    # Before the port takes requests, so no turn of this process holds a claim yet.
+    await _release_own_turn_claims()
+    clock.begin("scratchpad_session_sweep")
     # Reclaim scratchpad namespace snapshots whose conversation is gone (ENG-1124).
     # `delete_conversation` prunes its own from now on; this catches everything
     # deleted before that shipped, plus any path that drops a conversation row
@@ -219,33 +679,60 @@ async def lifespan(app: FastAPI):
             sweep_session.close()
     except Exception:
         logger.exception("scratchpad-session boot sweep failed (non-fatal)")
+    clock.begin("scheduled_run_recovery")
     # Release scheduled runs left in `running` by a previous process (crash/
     # restart). Otherwise the due-check treats the stale row as an in-flight
-    # run and never fires that schedule again.
+    # run and never fires that schedule again. In org mode other replicas
+    # share the database and may still be running theirs, so only runs old
+    # enough to be presumed dead are released here. A younger run left by a
+    # hard-killed pod, including this one, stays `running` and wedges its
+    # schedule until a replica boots after it ages past the cutoff.
     try:
         from cowork.db.scoped import ScopedSession, SYSTEM_SCOPE
         from cowork.db.session import get_open_session
+        from cowork.scheduler import boot_reap_cutoff
         from cowork.services.schedules import ScheduleRunService
 
         recovery_session = ScopedSession(get_open_session(), SYSTEM_SCOPE)
         try:
-            reaped = ScheduleRunService(recovery_session).reap_orphaned_runs()
+            reaped = ScheduleRunService(recovery_session).reap_orphaned_runs(
+                started_before=boot_reap_cutoff(),
+            )
             if reaped:
                 logger.warning("Reaped orphaned scheduled runs", extra={"event": "orphaned_runs_reaped", "count": reaped})
         finally:
             recovery_session.close()
     except Exception:
         logger.exception("scheduled-run boot recovery failed (non-fatal)")
+    clock.begin("model_map_warm")
     # Warm the MindsHub availability map at boot (desktop, returning or
     # freshly-signed-in user) so the empty-map state — which keeps a stored
     # paid pin and 402s the first message on a free-tier wallet (ENG-748) —
     # is closed before the first turn. Bounded and fail-open; see the helper.
     if await _warm_model_map_on_boot():
         logger.info("warmed MindsHub model-availability map on boot")
+    clock.begin("scheduler_and_channels")
     start_scheduler()
     await _start_channels(app)
+    # Shared docs catch up on what was still waiting when the app quit (see
+    # cowork.docs.sync; on a background thread, so boot never waits).
+    from cowork.docs import sync as shared_docs
+
+    shared_docs.start()
+    from cowork.docs.relay import start_doc_relay, stop_doc_relay
+    from cowork.docs.publish_queue import (
+        pause_doc_publish_worker,
+        start_doc_publish_worker,
+        stop_doc_publish_worker,
+    )
+
+    clock.begin("draft_listener")
+    app.state.doc_relay = None
+    app.state.doc_publish_worker = None
     app.state.channel_ingress_reconciler = None
     app.state.artifact_owner_backfill = None
+    app.state.artifact_location_backfill = None
+    app.state.artifact_location_backfill_stop = threading.Event()
     if get_app_settings().tenancy_mode == "org":
         from cowork.channels.ingress import start_reconciler
 
@@ -256,39 +743,108 @@ async def lifespan(app: FastAPI):
         app.state.artifact_owner_backfill = asyncio.create_task(
             _run_artifact_owner_backfill()
         )
+        app.state.artifact_location_backfill = asyncio.create_task(
+            _run_artifact_backfills(app.state.artifact_location_backfill_stop)
+        )
+    app.state.router_startup_probe = None
+    if (
+        app_settings.deployment_kind == "self-hosted"
+        and app_settings.tenancy_mode == "local"
+        and not TurnQueueSettings().is_remote
+    ):
+        from cowork.services.router_probe import run_router_startup_probe
+
+        # Bootstrap and credential clearing finish first; provider checks must
+        # not delay readiness while the configured endpoint is unavailable.
+        app.state.router_startup_probe = asyncio.create_task(run_router_startup_probe())
+    draft_listener = None
+    # Only where turns run remotely: desktop and in-process deployments keep
+    # Uvicorn's own SIGTERM handling and end their turns in the teardown below.
+    remote_turns = TurnQueueSettings().is_remote
+    if remote_turns:
+        _end_remote_turns_on_sigterm()
+    watchdog = None
     try:
+        # Doc events reach the other replicas' editors; only where replicas share Redis.
+        app.state.doc_relay = start_doc_relay()
+        # Shared doc pages follow their edits; only on an org deployment with Redis.
+        app.state.doc_publish_worker = start_doc_publish_worker()
+        draft_listener = await start_draft_listener()
+        clock.finished()
+        # Last, once nothing left in startup blocks the loop on purpose.
+        watchdog = LoopWatchdog(loop_limiters())
+        watchdog.start()
         yield
     finally:
+        # Turns still draining queue their pages for the other replicas; this
+        # replica stops taking new uploads it would have to abandon.
+        await pause_doc_publish_worker(getattr(app.state, "doc_publish_worker", None))
+        if watchdog is not None:
+            watchdog.stop()
+        # Early, so no draft request is still reading files or the database
+        # while the steps below close them.
+        await stop_draft_listener(draft_listener)
         from cowork.channels.webhooks import drain_background_tasks
+        from cowork.services.push.dispatch import drain_background_tasks as drain_push_notifications
         from cowork.common.chat_session import drain_scratchpad_closes
         from cowork.common.http_client import close_proxy_client
         from cowork.coding.inference_proxy import close_inference_client
+        from cowork.handlers.jev_route import close_client as close_jev_client
         from cowork.services.artifacts import shutdown_launched_backends
         from cowork.services.scratchpad_runtime import close_all as close_scratchpads
         from cowork.coding.service import get_coding_service
-        from cowork.streaming.registry import registry
 
         # Uvicorn's request drain is bounded by the image command. Persist
         # interrupted turns before their database and runtime resources close.
-        cancelled = await registry.shutdown()
-        if cancelled:
-            logger.warning("Cancelled %d in-flight turn(s) for shutdown", cancelled)
+        # Remote turns were usually ended already, by the SIGTERM handler while
+        # their streams were still open, and each step then does nothing; this
+        # covers a shutdown that began any other way.
+        if remote_turns:
+            await _end_remote_turns()
+        else:
+            _log_cancelled_turns(await registry.shutdown())
 
         await _cancel_and_wait(getattr(app.state, "channel_ingress_reconciler", None))
         await _cancel_and_wait(getattr(app.state, "artifact_owner_backfill", None))
+        await _stop_location_backfill(
+            task=getattr(app.state, "artifact_location_backfill", None),
+            stop=getattr(app.state, "artifact_location_backfill_stop", None),
+        )
+        await _cancel_and_wait(getattr(app.state, "router_startup_probe", None))
 
         await app.state.channel_ingress.stop_all()
         await drain_background_tasks()
+        # After the turn drains above, whose endings may each have started a
+        # push, and the scheduled runs, which push when they finish.
+        await drain_push_notifications()
+        shared_docs.stop()
+        await stop_doc_relay(getattr(app.state, "doc_relay", None))
         # After both turn drains above: each turn they unwound has queued the
-        # close of its scratchpad processes, and those must finish before the
-        # event loop stops.
-        await drain_scratchpad_closes()
+        # close of its scratchpad processes, and its last doc writes their
+        # pages. The worker's stop runs inside the closes' wait: the pod's
+        # grace period has no room for a wait of its own.
+        closes, worker_stop = await asyncio.gather(
+            drain_scratchpad_closes(),
+            stop_doc_publish_worker(getattr(app.state, "doc_publish_worker", None)),
+            return_exceptions=True,
+        )
+        if isinstance(worker_stop, BaseException):
+            logger.warning("doc_publish", exc_info=worker_stop, extra={
+                "event": "doc_publish", "outcome": "stop_failed", "error_type": type(worker_stop).__name__})
+        if isinstance(closes, BaseException):
+            # As before the gather: a failed wait for the closes ends the teardown.
+            raise closes
         await app.state.channel_adapters.shutdown()
         get_coding_service().close_all()
         shutdown_launched_backends()
         await close_scratchpads()
         await close_proxy_client()
         await close_inference_client()
+        await close_jev_client()
+        # Last: a turn's artifact record that the drains above left waiting on
+        # a stalled file store gets up to TURN_END_RECORD_DRAIN_SECONDS more,
+        # since the event loop's close would cancel it and lose its rows.
+        await drain_turn_end_records(timeout=TURN_END_RECORD_DRAIN_SECONDS)
 
 
 @asynccontextmanager
@@ -347,14 +903,14 @@ def _refuse_unreadable_managed_stores(managed: ManagedFolder) -> None:
     remedy, rather than surface here with the path and the fix."""
     from anton.core.tools.skill_format import SKILL_FILE
 
-    for folder in (managed.skills_dir, managed.vault_dir):
-        if not os.access(folder, os.R_OK | os.X_OK):
-            raise RuntimeError(
-                f"COWORK_MANAGED_DIR's {folder.name} folder {folder} can't be read: the "
-                "server's user needs read and search permission on it. Run "
-                f"`chmod -R a+rX {folder}` on the host copy (and `chown -R 1000:1000 "
-                f"{folder}` if it is owned by another user)."
-            )
+    folder = managed.skills_dir
+    if not os.access(folder, os.R_OK | os.X_OK):
+        raise RuntimeError(
+            f"COWORK_MANAGED_DIR's {folder.name} folder {folder} can't be read: the "
+            "server's user needs read and search permission on it. Run "
+            f"`chmod -R a+rX {folder}` on the host copy (and `chown -R 1000:1000 "
+            f"{folder}` if it is owned by another user)."
+        )
     for slug_dir in sorted(managed.skills_dir.iterdir()):
         if not slug_dir.is_dir():
             continue
@@ -369,16 +925,59 @@ def _refuse_unreadable_managed_stores(managed: ManagedFolder) -> None:
                 f"COWORK_MANAGED_DIR's skill file {skill_file} can't be read: run "
                 f"`chmod -R a+rX {managed.skills_dir}` on the host copy."
             )
-    # A managed connection file the server's user can't read vanishes for
-    # everyone and frees its name, so a tester could save their own under it.
-    # Refuse at start rather than silently share less.
-    for vault_file in sorted(managed.vault_dir.iterdir()):
-        if vault_file.is_file() and not os.access(vault_file, os.R_OK):
-            raise RuntimeError(
-                f"COWORK_MANAGED_DIR's connection file {vault_file} can't be read: run "
-                f"`chown 1000:1000 {vault_file}` on the host copy so it is not freed and "
-                "re-saved by a tester."
-            )
+    _refuse_unreadable_managed_connections(managed.vault_dir)
+
+
+def _refuse_unreadable_managed_connections(vault_dir: Path) -> None:
+    """Probe as the server's user, without loading credentials or logging a record.
+
+    A bind mount can pass os.access but still deny open. Refuse startup before
+    LocalDataVault silently skips that connection and exposes a lower layer.
+    """
+    try:
+        if not os.access(vault_dir, os.R_OK | os.X_OK):
+            raise PermissionError
+        with pinned_dir(vault_dir) as directory:
+            with dir_scandir(directory) as entries:
+                names = sorted(entry.name for entry in entries)
+            for name in names:
+                try:
+                    if not stat.S_ISREG(dir_stat(directory, name).st_mode):
+                        continue
+                    fd = dir_open(directory, name, os.O_RDONLY | O_NONBLOCK)
+                    try:
+                        if not stat.S_ISREG(os.fstat(fd).st_mode):
+                            raise OSError("Managed connection is no longer a regular file")
+                    finally:
+                        os.close(fd)
+                except FileNotFoundError:
+                    continue  # The operator may remove a connection during the scan.
+                except OSError as error:
+                    logger.error(
+                        "Cowork cannot read a managed connection; check its ownership "
+                        "and permissions before restarting.",
+                        extra={
+                            "event": "managed_connection_unreadable",
+                            "reason": "file_unreadable",
+                            "managed_connection_file": name,
+                            "error_type": type(error).__name__,
+                        },
+                    )
+                    raise RuntimeError(
+                        f"COWORK_MANAGED_DIR's connection file {vault_dir / name} can't be read: "
+                        f"run `chown 1000:1000 {vault_dir / name}` on the host copy."
+                    ) from None
+    except OSError as error:
+        logger.error(
+            "Cowork cannot read the managed data-vault directory; check its ownership "
+            "and permissions before restarting.",
+            extra={
+                "event": "managed_connection_unreadable",
+                "reason": "vault_unreadable",
+                "error_type": type(error).__name__,
+            },
+        )
+        raise RuntimeError("COWORK_MANAGED_DIR's data-vault folder can't be read") from None
 
 
 def create_app() -> FastAPI:
@@ -390,6 +989,19 @@ def create_app() -> FastAPI:
     """
 
     settings = get_app_settings()
+    # PDF export settings come from the process environment alone. An engine
+    # other than "render", or "render" without an http(s) URL, stops the start.
+    get_export_pdf_settings()
+    # So does COWORK_KEY_FILE: a key file that is missing, unreadable or
+    # malformed stops the start, naming the cause and never a key.
+    from cowork.common.encryption import sealing_keys, warn_ignored_key_settings
+
+    sealing_keys()
+    warn_ignored_key_settings(
+        master_key=settings.master_key,
+        master_key_path_set="master_key_path" in settings.model_fields_set,
+        code_sandbox=settings.code_sandbox,
+    )
 
     from cowork.deployment_identity import initialize_deployment_identity
 
@@ -409,22 +1021,77 @@ def create_app() -> FastAPI:
     async def _missing_tenant_scope(request, exc):
         return JSONResponse({"detail": "Unauthorized"}, status_code=401)
 
+    # Connector submissions and datasource management take passwords, DSNs and
+    # CA material in the body, and FastAPI's default 422 hands the offending
+    # value straight back in `input`. Answer with the location and the reason
+    # only; that is enough to fix a malformed request.
+    @app.exception_handler(RequestValidationError)
+    async def _validation_error(request, exc):
+        detail = [
+            {"loc": error.get("loc", ()), "msg": error.get("msg", ""), "type": error.get("type", "")}
+            for error in exc.errors()
+        ]
+        return JSONResponse({"detail": detail}, status_code=422)
+
     # No database connection freed within POOL_TIMEOUT. DatabaseBusy, a unit
     # that waited for its slot or its connection, subclasses the pool timeout,
     # so this answers both. The web UI waits for Retry-After before it offers
     # a retry, and the sentence names the wait for clients that don't read it.
     @app.exception_handler(PoolTimeoutError)
     async def _database_busy(request, exc):
-        retry_after = busy_retry_seconds()
         logger.warning(
             "%s %s refused with 503: no database connection freed in time",
             request.method, request.url.path,
         )
-        return JSONResponse(
-            Refusal(detail=server_busy_message(retry_after), code=SERVER_BUSY_CODE).model_dump(),
-            status_code=DatabaseBusy.status_code,
-            headers={"Retry-After": str(retry_after)},
+        return _server_busy(retry_after=busy_retry_seconds(), status_code=DatabaseBusy.status_code)
+
+    # No shared file store slot freed within POOL_TIMEOUT (cowork.db.units.
+    # run_efs). Answered as a busy database is, so the client waits the same
+    # Retry-After before it retries.
+    @app.exception_handler(FilesystemBusy)
+    async def _filesystem_busy(request, exc):
+        logger.warning(
+            "Request refused with 503: no shared file store slot freed in time",
+            extra={
+                "event": "filesystem_busy",
+                "method": request.method,
+                "route": getattr(request.scope.get("route"), "path", None),
+                # Which limit ran out, and whose share it was
+                # (cowork.db.units.FilesystemBusy).
+                "limiter": exc.limiter,
+                "share": exc.share,
+            },
         )
+        return _server_busy(retry_after=busy_retry_seconds(), status_code=FilesystemBusy.status_code)
+
+    # A permission auth could not verify, answered 503 as any HTTPException
+    # is. The line saying why is logged here, where a person gets the answer,
+    # not where it was raised: a turn that goes on without what auth couldn't
+    # confirm logs its own line instead.
+    @app.exception_handler(ProductPermissionUnavailable)
+    async def _permission_unavailable(request, exc):
+        report_permission_unavailable(exc)
+        return await http_exception_handler(request, exc)
+
+    # A question that reached a replica already ending its turns for a
+    # shutdown (RunRegistry.close). Refused as a busy server is: the client
+    # waits Retry-After, and its retry reaches another replica, which the
+    # rollout made ready before it stopped this one.
+    @app.exception_handler(ServerShuttingDown)
+    async def _shutting_down(request, exc: ServerShuttingDown):
+        return _server_busy(retry_after=_SHUTDOWN_RETRY_AFTER_SECONDS, status_code=exc.status_code)
+
+    # Redis could not say whether another replica's run holds the
+    # conversation (turn_claim). Refused as a busy server is, so the client
+    # waits Retry-After and sends again.
+    @app.exception_handler(TurnClaimUnavailable)
+    async def _turn_claim_unavailable(request, exc: TurnClaimUnavailable):
+        logger.warning(
+            "Refused a turn; Redis could not say whether another run holds the conversation.",
+            exc_info=exc,
+            extra={"event": "turn_claim_unavailable", "conversation_id": exc.conversation_id},
+        )
+        return _server_busy(retry_after=_TURN_CLAIM_RETRY_AFTER_SECONDS, status_code=exc.status_code)
 
     # A second question into a conversation whose turn is still answering.
     @app.exception_handler(TurnInProgress)
@@ -438,6 +1105,30 @@ def create_app() -> FastAPI:
     @app.exception_handler(SharedConnectionError)
     async def _shared_connection(request, exc: SharedConnectionError):
         return JSONResponse({"detail": exc.detail}, status_code=403)
+
+    # A sealed connection whose record won't open, read by a request: a list,
+    # a delete, or a turn's scrubbing registration. Its message names the
+    # connection and the cause, never a value.
+    @app.exception_handler(SealedRecordError)
+    async def _sealed_connection_unopenable(request, exc: SealedRecordError):
+        logger.error(
+            "A saved connection can't be opened",
+            extra={"event": "sealed_connection_unopenable", "connection": exc.connection, "reason": exc.cause},
+        )
+        return JSONResponse({"detail": str(exc)}, status_code=409)
+
+    # A save whose sealed record would be larger than the vault reads back
+    # (SealedDataVault.save). Its message names the connection and the sizes.
+    @app.exception_handler(RecordTooLargeError)
+    async def _record_too_large(request, exc: RecordTooLargeError):
+        return JSONResponse({"detail": str(exc)}, status_code=422)
+
+    # A save with a key file whose values hold a field named like the sealed
+    # mark (SealedDataVault.save). Its message names the connection and the
+    # field, never a value.
+    @app.exception_handler(ReservedFieldError)
+    async def _reserved_field(request, exc: ReservedFieldError):
+        return JSONResponse({"detail": str(exc)}, status_code=422)
 
     # Bearer-token auth. On by default in local mode (see AppSettings.
     # require_auth). Token is auto-generated on first startup when
@@ -519,13 +1210,19 @@ def create_app() -> FastAPI:
                 f"COWORK_MANAGED_DIR's shared registry is malformed: {error}. "
                 "Fix or remove the file; a missing one shares nothing."
             ) from error
-        from anton.core.datasources.data_vault import LocalDataVault
+        from cowork.services.connectors.persist import data_vault_at
 
+        try:
+            managed_connections = str(len(data_vault_at(managed.vault_dir).list_connections()))
+        except SealedRecordError:
+            # The lifespan's sealed-data check names every record that won't
+            # open (refuse_unopenable_sealed_data); this count leaves it to that.
+            managed_connections = "an unknown number of"
         logger.info(
-            "managed folder: %s (%d skills, %d connections, %d shared connections)",
+            "managed folder: %s (%d skills, %s connections, %d shared connections)",
             managed.root,
             len(managed.skill_slugs()),
-            len(LocalDataVault(managed.vault_dir).list_connections()),
+            managed_connections,
             len(shared_connections.root),
         )
 
@@ -551,6 +1248,11 @@ def create_app() -> FastAPI:
     # Identity headers need the code sandbox, and the sandbox needs a kernel
     # and an anton that hold it (cowork.code_sandbox.check_startup).
     check_code_sandbox_startup(settings, remote_turns=TurnQueueSettings().is_remote)
+    # The edge's access check and stopped page for each live-app slot carry
+    # only the visitor's viewer sign-in cookie, and a slot's stop report
+    # carries nothing; each route checks its caller itself
+    # (cowork.services.live_apps.live_app_slot_paths).
+    channel_webhook_paths.update(live_app_slot_paths())
     # ANTON_WRITE_APPROVAL needs an anton that reads it, a way to ask, and
     # turns in this process (check_write_approval_startup).
     check_write_approval_startup(
@@ -610,19 +1312,21 @@ def create_app() -> FastAPI:
                 "Org deployments authenticate at the ingress instead."
             )
         env_path = cowork_home() / ".env"
-        if settings.trust_identity_headers:
+        if settings.trust_identity_headers or os.environ.get(file_variable(name="COWORK_AUTH_TOKEN")):
             # With identity headers on, the token acts as any person, and the
             # desktop app, which reads the copy in cowork-home's .env, never
-            # runs here. The token comes from the process environment alone,
-            # never settings.auth_token, which cowork-home's .env also fills,
-            # and a copy an earlier start wrote there is removed.
-            token = os.environ.get("COWORK_AUTH_TOKEN", "")
+            # runs here. A token in the file COWORK_AUTH_TOKEN_FILE names is
+            # kept off the disk the same way, with identity headers on or off.
+            # The token comes from the process environment alone, or that
+            # file, never settings.auth_token, which cowork-home's .env also
+            # fills, and a copy an earlier start wrote there is removed.
+            token = process_secret(name="COWORK_AUTH_TOKEN")
             if not token:
                 raise RuntimeError(
-                    "COWORK_TRUST_IDENTITY_HEADERS needs COWORK_AUTH_TOKEN in the server's "
-                    "environment: with identity headers on, the token acts as any person, "
-                    "so Cowork neither generates it nor keeps a copy in cowork-home's .env. "
-                    "Set COWORK_AUTH_TOKEN where the server starts."
+                    "COWORK_TRUST_IDENTITY_HEADERS needs COWORK_AUTH_TOKEN or COWORK_AUTH_TOKEN_FILE "
+                    "in the server's environment: with identity headers on, the token acts as any "
+                    "person, so Cowork neither generates it nor keeps a copy in cowork-home's .env. "
+                    "Set one of them where the server starts."
                 )
             remove_auth_token(env_path)
         else:

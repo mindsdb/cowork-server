@@ -1,0 +1,113 @@
+name: Lock anton's final release on staging
+
+# Desktop installs exactly the anton-agent cowork/release-requirements.txt
+# names. Staging may lock an anton release candidate to test new agent code; a
+# production release may not, and `release_contract.py --require-final` keeps
+# the staging -> main release PR red until staging locks a final.
+#
+# anton's release workflow sends `anton-final-published` once a final is on
+# PyPI, so this runs within minutes of it. A run every six hours catches a
+# notice that never arrived. Either way the version comes from PyPI, not from
+# the notice.
+#
+# When staging locks a candidate and a newer final exists, it relocks staging
+# to that final, raises a candidate anton-agent floor in pyproject.toml to it,
+# and opens (or updates) one PR into staging. CI runs on it because
+# the release-train App opens it, not GITHUB_TOKEN. A person still reviews and
+# merges it: a newer version number does not prove the final carries the
+# candidate's code, so the PR's CI is that check.
+#
+# A scheduled or repository_dispatch run uses main's copy of this file and
+# starts on main, so the job checks out staging explicitly. It arms only once
+# this file reaches main.
+
+on:
+  repository_dispatch:
+    # Sent by mindsdb/anton's release.yml after its PyPI upload.
+    types: [anton-final-published]
+  schedule:
+    # The fallback, off the top of the hour. Most runs find nothing to do and
+    # exit without minting an App token.
+    - cron: "7 */6 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: anton-final-lock
+  cancel-in-progress: false
+
+jobs:
+  relock:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+    env:
+      BRANCH: bot/anton-final-lock
+      REPO: ${{ github.repository }}
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          ref: staging
+          persist-credentials: false
+
+      - name: Setup uv
+        uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7
+        with:
+          version: "0.11.30"
+          python-version: "3.12"
+
+      - name: Find a final anton to replace a locked candidate
+        id: final
+        env:
+          # Set only on a run anton's release started. It decides how long to
+          # wait for PyPI to list the final, not which version gets locked.
+          ANNOUNCED_VERSION: ${{ github.event.client_payload.version }}
+        run: uv run --no-project --with packaging==26.3 python scripts/anton_final_lock.py
+
+      - name: Relock staging to the final
+        if: steps.final.outputs.version != ''
+        env:
+          VERSION: ${{ steps.final.outputs.version }}
+        run: |
+          set -euo pipefail
+          uv run --no-project --with packaging==26.3 python scripts/anton_final_lock_pr.py --relock "${VERSION}"
+          git diff --stat
+
+      - name: Find the existing bump PR
+        id: existing
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          number=$(gh pr list --repo "$REPO" --base staging --head "$BRANCH" --state open --json number --jq '.[0].number // empty')
+          echo "number=$number" >> "$GITHUB_OUTPUT"
+
+      - name: Mint release-train App token
+        id: app-token
+        # A bump to propose, or an open bot PR that no longer has one to close.
+        if: steps.final.outputs.version != '' || steps.existing.outputs.number != ''
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          client-id: ${{ vars.RELEASE_APP_CLIENT_ID }}
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+          permission-contents: write
+          permission-pull-requests: write
+
+      - name: Reconcile the bump PR with staging
+        if: steps.app-token.outputs.token != ''
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          APP_SLUG: ${{ steps.app-token.outputs.app-slug }}
+          LOCKED: ${{ steps.final.outputs.locked }}
+          VERSION: ${{ steps.final.outputs.version }}
+          LOCKED_FINAL: ${{ steps.final.outputs.final }}
+          ANNOUNCED_VERSION: ${{ github.event.client_payload.version }}
+        run: |
+          # The helper reads GH_TOKEN from the environment. No token in a URL
+          # or persisted checkout credential; the App action revokes it on exit.
+          gh auth setup-git
+          # Up to three attempts. A staging race refreshes the disposable
+          # checkout and repeats selection/export before reconciling again.
+          uv run --no-project --with packaging==26.3 python scripts/anton_final_lock_pr.py --retry-staging

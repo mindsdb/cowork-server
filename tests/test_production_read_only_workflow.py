@@ -161,7 +161,7 @@ def test_workflow_runs_only_the_read_only_selection_and_notifies() -> None:
     assert "actions: read" in WORKFLOW
     assert "secrets: inherit" in WORKFLOW
     assert "test/integration-production-read-only:" in MAKEFILE
-    assert '-m "not production_read_only"' in MAKEFILE
+    assert '-m "not production_read_only and not redis_service"' in MAKEFILE
     production_target = MAKEFILE.split(
         "test/integration-production-read-only:", 1
     )[1].split("\n\n", 1)[0]
@@ -182,7 +182,7 @@ def test_workflow_runs_only_the_read_only_selection_and_notifies() -> None:
         text=True,
     )
     assert dry_run.stdout == (
-        "uv run python -m pytest -v "
+        "uv run --locked python -m pytest -v "
         "tests/integration/test_production_read_only.py\n"
     )
 
