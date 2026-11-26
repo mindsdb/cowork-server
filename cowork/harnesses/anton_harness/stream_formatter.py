@@ -397,8 +397,13 @@ _APPENDED_CONTEXT = re.compile(r"^\[[^\n]*Anton-only context[^\n]*\]$", re.MULTI
 _CELL_RESULT_PART = re.compile(r"^\[(?:output|logs|stderr|error|artifact lint|live app)\]\n", re.MULTILINE)
 # The note format_cell_result puts after printed output it cut short, with
 # the line breaks before the next part.
-# Newer anton follows it with a sentence on how to read files whole.
-_TRUNCATION_NOTE = re.compile(r"\n\n\.\.\. \(truncated, \d+ chars total\)[^\n]*\n*\Z")
+# Newer anton follows it with a sentence on how to read files whole, and then
+# with the output's last characters under a line saying so, or with a note
+# that the cell changed the working directory.
+_TRUNCATION_NOTE = re.compile(
+    r"\n\n\.\.\. \(truncated, \d+ chars total\)[^\n]*"
+    r"(?:(?P<tail>\nThe last [\d,]+ characters of the output follow\.\n)|\n*\Z|(?=\n))"
+)
 
 
 class _HistoryRow(BaseModel):
@@ -743,7 +748,8 @@ def _replayed_cell(result: str, *, arguments: _CellArguments) -> CellResult:
     if result.startswith("[output]\n"):
         printed = result[len("[output]\n"):]
         next_part = _CELL_RESULT_PART.search(printed)
-        stdout = _TRUNCATION_NOTE.sub("", printed[:next_part.start()] if next_part else printed)
+        output = printed[:next_part.start()] if next_part else printed
+        stdout = _TRUNCATION_NOTE.sub(lambda note: "\n" if note["tail"] else "", output)
     return CellResult(code=arguments.code, stdout=stdout, description=arguments.one_line_description)
 
 

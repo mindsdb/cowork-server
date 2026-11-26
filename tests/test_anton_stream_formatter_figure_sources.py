@@ -8,6 +8,7 @@ from uuid import uuid4
 
 import pytest
 from anton.core.backends.base import Cell
+from anton.core.backends.wire import truncation_note
 from anton.core.llm.provider import (
     StreamComplete,
     StreamContextCompacted,
@@ -525,6 +526,51 @@ class TestStepsFromTheTurnsToolRows:
         figures = _by_text(_figures(events))
         assert figures["250"]["origin"] == "step"
         assert figures[str(len(stdout))]["origin"] == "none"
+
+    async def test_a_replayed_cells_kept_tail_is_what_it_printed_and_its_note_is_not(self):
+        """anton's scratchpad keeps the first 6,000 and the last 4,000
+        characters of long output, with the note between them."""
+        total = 20_000
+        head = "P100,S1,250\n" + "x" * 5_988
+        tail = "y" * 3_988 + "\nP900,S9,875"
+        stdout = (
+            head + truncation_note(total) + f"\nThe last {len(tail):,} characters of the output follow.\n" + tail
+        )
+        code = "print(dump)"
+        result = format_cell_result(Cell(code=code, stdout=stdout, stderr="", error=None))
+
+        events = await _run_turn(
+            TurnContext(question="What is at S1 and S9?"),
+            StreamTextDelta(text=f"S1 holds 250 units and S9 875; the dump ran {total} characters."),
+            TurnHistory(_tool_rows("toolu_rows", "scratchpad", {"action": "exec", "name": "main", "code": code}, result)),
+        )
+
+        figures = _by_text(_figures(events))
+        assert figures["250"]["origin"] == "step"
+        assert figures["875"]["origin"] == "step"
+        assert figures[str(total)]["origin"] == "none"
+
+    async def test_a_replayed_cells_note_before_a_working_directory_note_is_not_what_it_printed(self):
+        """Without a kept tail, the note can be followed by anton's note that
+        the cell changed the working directory."""
+        total = 20_000
+        stdout = (
+            "P100,S1,250\n" + "x" * 9_988 + truncation_note(total)
+            + "\nNote: this cell changed the working directory from /w to /w/data; "
+            "it persists for subsequent cells in this scratchpad.\n"
+        )
+        code = "print(dump)"
+        result = format_cell_result(Cell(code=code, stdout=stdout, stderr="", error=None))
+
+        events = await _run_turn(
+            TurnContext(question="What is at S1?"),
+            StreamTextDelta(text=f"S1 holds 250 units; the dump ran {total} characters."),
+            TurnHistory(_tool_rows("toolu_rows", "scratchpad", {"action": "exec", "name": "main", "code": code}, result)),
+        )
+
+        figures = _by_text(_figures(events))
+        assert figures["250"]["origin"] == "step"
+        assert figures[str(total)]["origin"] == "none"
 
     async def test_a_web_call_anton_refused_is_not_a_step(self):
         """anton answers a call whose arguments it could not read with an
