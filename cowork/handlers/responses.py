@@ -1751,7 +1751,10 @@ class ResponsesHandler:
                         # MindsHub, and no LLM gate in its place, so every
                         # turn runs the agent.
                         decision = RouteDecision(route=DELEGATED_AGENTIC, reason="jev_disabled")
-                    elif jev == "zdr_on":
+                    elif jev == "zdr_on" or (
+                        # A doc-open turn skips Jev for the LLM gate, whose MindsHub model ZDR refuses.
+                        doc_open and callable(jev) and jev_may_fall_back is not None and not await jev_may_fall_back()
+                    ):
                         # ZDR: MindsHub refuses Jev and the LLM gate's model, so the agent decides.
                         decision = RouteDecision(route=DELEGATED_AGENTIC, reason="zdr_on")
                     else:

@@ -453,6 +453,47 @@ async def test_route_request_hands_the_jev_gate_to_decide_route(monkeypatch):
     assert decision.reason == "jev_direct"
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("may_fall_back", [False, True])
+async def test_a_doc_open_turn_skips_the_llm_gate_when_it_may_not_fall_back(monkeypatch, may_fall_back):
+    """A doc-open turn goes to the LLM gate instead of the org's own model; under ZDR
+    that gate's MindsHub model is refused, so the agent decides."""
+    import cowork.handlers.responses as responses
+
+    handler = ResponsesHandler()
+    handler.harness_name = "anton"
+    asked = []
+
+    async def fall_back():
+        asked.append(True)
+        return may_fall_back
+
+    handler._turn_gate = _turn_gate(_jev(jev_route.JevRoute(direct=True, p_direct=0.9)), fall_back)
+    seen = {}
+
+    async def fake_decide_route(**kwargs):
+        seen.update(kwargs)
+        return RouteDecision(route=DIRECT_CONTEXT, reason="llm_direct")
+
+    monkeypatch.setattr(responses, "decide_route", fake_decide_route)
+    decision, _turn_llm = await handler._route_request(
+        conversation_id=None,
+        gate_rows=[],
+        harness_input=[{"type": "text", "text": "hi"}],
+        has_attachments=False,
+        has_disabled_connections=False,
+        doc_open=True,
+    )
+
+    assert asked == [True]
+    if may_fall_back:
+        assert seen["jev"] is None
+        assert decision.reason == "llm_direct"
+    else:
+        assert seen == {}
+        assert (decision.route, decision.reason) == (DELEGATED_AGENTIC, "zdr_on")
+
+
 # ── direct_answer ──────────────────────────────────────────────────────────
 
 
