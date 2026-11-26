@@ -5,7 +5,7 @@ from fastapi import HTTPException, status
 
 from cowork.principal import Principal, can_manage_org
 from cowork.services.artifact_export import ExportSource, offered_export_formats
-from cowork.services.artifact_metadata import is_widget
+from cowork.services.artifact_metadata import publish_refusal
 from cowork.services.product_permissions import has_product_permission
 
 _OWNER_ONLY = "Only the artifact owner can change this draft"
@@ -20,6 +20,7 @@ def artifact_capabilities(
     resolution=None,
     export_source: ExportSource | None = None,
     display: str | None = None,
+    artifact_type: str | None = None,
 ) -> dict:
     """Return the permissions the API will enforce for this artifact.
 
@@ -36,8 +37,9 @@ def artifact_capabilities(
     none for a caller who can't edit, and none in organization mode while
     org export is off.
 
-    ``display`` is the artifact's metadata.json ``display``: a widget's
-    capabilities say it can't be published or shared (with_display_limits).
+    ``display`` and ``artifact_type`` are the artifact's metadata.json
+    ``display`` and ``type``: a widget's or a stateful app's capabilities say
+    it can't be published or shared (with_display_limits).
     """
     scope = getattr(session, "scope", None)
     if not scope or not scope.org_mode:
@@ -73,17 +75,20 @@ def artifact_capabilities(
             capabilities["ownerUserId"] = str(owner_id)
     if export_source is not None:
         capabilities = with_export_formats(scope, capabilities, export_source)
-    return with_display_limits(capabilities, display)
+    return with_display_limits(capabilities, display, artifact_type)
 
 
-def with_display_limits(capabilities: dict, display: str | None) -> dict:
-    """*capabilities* with ``canPublish`` and ``canShare`` false for a widget
-    (metadata.json ``display: "widget"``, ENG-4684), which the publish and
-    access routes refuse. Any other artifact's capabilities leave both keys
+def with_display_limits(capabilities: dict, display: str | None, artifact_type: str | None = None) -> dict:
+    """*capabilities* with ``canPublish`` and ``canShare`` false for an
+    artifact the publish and access routes refuse (publish_refusal): a widget
+    (metadata.json ``display: "widget"``, ENG-4684) or a stateful app while
+    publishing them is off. ``publishRefusal`` then says why, for the Share
+    control's explanation. Any other artifact's capabilities leave these keys
     out, and a missing key means the route decides as before."""
-    if not is_widget(display):
+    refusal = publish_refusal(display=display, artifact_type=artifact_type)
+    if refusal is None:
         return capabilities
-    return {**capabilities, "canPublish": False, "canShare": False}
+    return {**capabilities, "canPublish": False, "canShare": False, "publishRefusal": refusal}
 
 
 def with_export_formats(scope, capabilities: dict, export_source: ExportSource) -> dict:

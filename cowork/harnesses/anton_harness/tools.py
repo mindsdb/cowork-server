@@ -176,6 +176,10 @@ _FULLSTACK_CARD_RULE = (
     "- Publishing a full-stack app can show the user a card listing the connections whose\n"
     "  credentials it uploads. If they cancel, don't work around the card by editing\n"
     "  `.published.json`, `metadata.json` or the artifact's id.\n"
+    "- A `fullstack-stateful-app` (an app that keeps its own data) can't be published or\n"
+    "  shared for now: build and run it here, and when the user asks to share it, say that\n"
+    "  publishing apps that keep their own data is off for now. Never change its `type` to\n"
+    "  get it published.\n"
 )
 COWORK_PUBLISH_DESCRIPTION = _PUBLISH_DESCRIPTION.format(
     panel="In the desktop app the user can also publish via the Live Artifacts panel",

@@ -55,7 +55,7 @@ from cowork.services.artifact_autopublish import job_budget_for, lock_ttl_for
 from cowork.services.preview_html import prepare_preview_html
 from cowork.services.quick_edit import direct_edit_available, edits_in_place, quick_edit_available
 from cowork.services.artifact_identity import opened_artifact_folder
-from cowork.services.artifact_metadata import WIDGET_PUBLISH_REFUSAL, ArtifactMetadata, is_widget
+from cowork.services.artifact_metadata import ArtifactMetadata, publish_refusal
 from cowork.schemas.artifact_export import ExportRequest, ExportResult
 from cowork.schemas.artifact_access import (
     ArtifactAccessRequest,
@@ -815,7 +815,7 @@ async def artifact_source(
         capabilities = await _current_capabilities(
             scope,
             with_display_limits(
-                with_export_formats(scope, owner_capabilities, export_source), metadata.display
+                with_export_formats(scope, owner_capabilities, export_source), metadata.display, metadata.type
             ),
             source_path=result.get("path"),
         )
@@ -1003,7 +1003,8 @@ async def artifact_review_entry(
         scope,
         await run_db(
             lambda unit: artifact_capabilities(
-                unit, artifact.source, artifact.folder.name, display=artifact.metadata.display
+                unit, artifact.source, artifact.folder.name,
+                display=artifact.metadata.display, artifact_type=artifact.metadata.type,
             ),
             scope=scope,
         ),
@@ -1264,12 +1265,14 @@ def _owner_publish_context(scope: TenantScope, folder: Path):
     )
 
 
-def _refuse_widget(metadata: ArtifactMetadata | None) -> None:
-    """400 for a widget: it is never published or shared (ENG-4684). Checked
-    before the publish lock and the audience checks; publish_artifact refuses
-    it again for every other path."""
-    if metadata is not None and is_widget(metadata.display):
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=WIDGET_PUBLISH_REFUSAL)
+def _refuse_unpublishable(metadata: ArtifactMetadata | None) -> None:
+    """400 for an artifact that is never published or shared (publish_refusal):
+    a widget (ENG-4684), or a stateful app while publishing them is off.
+    Checked before the publish lock and the audience checks; publish_artifact
+    refuses it again for every other path."""
+    refusal = None if metadata is None else publish_refusal(display=metadata.display, artifact_type=metadata.type)
+    if refusal is not None:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=refusal)
 
 
 def _artifact_primary(folder: Path, metadata: ArtifactMetadata | None):
@@ -1496,7 +1499,7 @@ async def set_artifact_access(
     source, folder, metadata, _capabilities = await _owner_workspace(
         scope, project_ref, artifact_id
     )
-    _refuse_widget(metadata)
+    _refuse_unpublishable(metadata)
     if await run_efs(partial(_artifact_primary, folder, metadata), scope=scope) is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -1680,7 +1683,7 @@ async def republish_artifact(
     source, folder, metadata, _capabilities = await _owner_workspace(
         scope, project_ref, artifact_id
     )
-    _refuse_widget(metadata)
+    _refuse_unpublishable(metadata)
     if await run_efs(partial(_artifact_primary, folder, metadata), scope=scope) is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,

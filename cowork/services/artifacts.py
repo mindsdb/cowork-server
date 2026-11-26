@@ -51,7 +51,7 @@ from cowork.db.personal_resources import PersonalResource
 from cowork.models.artifact_owner_choice import AccessMode
 from cowork.schemas.artifact_access import ArtifactAccessView, ArtifactStatusView
 from cowork.schemas.artifact_card import ArtifactCard
-from cowork.services.artifact_metadata import ArtifactMetadata, is_widget, lenient_text, shows_inline
+from cowork.services.artifact_metadata import ArtifactMetadata, is_stateful_app, is_widget, lenient_text, shows_inline
 from anton.core.artifacts.internal_files import (
     NON_CONTENT_NAMES,
     REVISIONS_DIRNAME,
@@ -2366,8 +2366,9 @@ def _publishable_in_folder(
     ]
     meta = _load_metadata(folder) if (folder / "metadata.json").is_file() else None
     meta = meta or ArtifactMetadata.empty()
-    if is_widget(meta.display):
-        # A widget is never published (publish.WidgetPublishRefused).
+    if is_widget(meta.display) or is_stateful_app(meta.type):
+        # A widget is never published (publish.WidgetPublishRefused), nor is
+        # a stateful app for now (publish.StatefulAppPublishRefused).
         return []
     if meta.type not in fullstack_types:
         return [

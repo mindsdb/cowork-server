@@ -555,7 +555,7 @@ def _make_fullstack(tmp_path: Path) -> Path:
     (root / "metadata.json").write_text(
         json.dumps({
             "id": "fullstack-art",
-            "type": "fullstack-stateful-app",
+            "type": "fullstack-stateless-app",
             "primary": "static/index.html",
         }),
         encoding="utf-8",

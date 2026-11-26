@@ -440,6 +440,7 @@ def _card_capabilities(session, *, sources, cards: list[_FoundCard]) -> list[Art
                 resolution=resolutions[slug],
                 export_source=found.export_source,
                 display=found.card.display,
+                artifact_type=found.card.type,
             )
     plain = [found.card for found in cards]
     _mark_received_live_apps(session, cards_by_base=cards_by_base, by_base=by_base, cards=plain)

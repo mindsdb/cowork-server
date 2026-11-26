@@ -301,7 +301,7 @@ def test_publish_description_says_what_to_pass_not_where_artifacts_live():
 # The publish tool's description and prompt as hosts without
 # COWORK_DEPLOYMENT_KIND get them; update the hashes when that text changes.
 DEFAULT_DESCRIPTION_SHA256 = "5bae1e84c433d3e09c5b572e6b1e60221143a30086a8e71b4898e2239149a6b1"
-DEFAULT_PROMPT_SHA256 = "7445d67a5666f5ee19660dbab859b663a0dda921185143dbb34f69e05c89af5c"
+DEFAULT_PROMPT_SHA256 = "271066112bdbf8bf0e1ca801a759462c10713e0f4b9bee95b9bbf96c1b9a98cf"
 
 
 @pytest.mark.asyncio

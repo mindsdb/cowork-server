@@ -152,6 +152,7 @@ def needs_publish(folder: Path, artifacts_base: Path) -> PublishDecision:
         _resolve_publish_target,
         compute_publish_md5,
         is_publishable_static,
+        is_stateful_app_folder,
         is_widget_folder,
     )
 
@@ -159,6 +160,9 @@ def needs_publish(folder: Path, artifacts_base: Path) -> PublishDecision:
         return PublishDecision(None, REASON_NO_CONTENT)
     if is_widget_folder(folder):
         # A widget is never published (publish.WidgetPublishRefused).
+        return PublishDecision(None, REASON_NOT_PUBLISHABLE)
+    if is_stateful_app_folder(folder):
+        # Nor is a stateful app, for now (publish.StatefulAppPublishRefused).
         return PublishDecision(None, REASON_NOT_PUBLISHABLE)
 
     try:

@@ -66,6 +66,36 @@ WIDGET_PUBLISH_REFUSAL = (
 )
 
 
+#: A full-stack app that keeps its own data. Publishing one is off for now: a
+#: published backend runs on MindsHub's shared runner, where one owner's
+#: backend could read another's credentials from a warm process (ENG-232).
+#: It still builds and runs in the desktop app; the cloud app, which can only
+#: run an app by publishing it, offers the desktop app instead.
+STATEFUL_APP_TYPE = "fullstack-stateful-app"
+
+#: What publishing or sharing a stateful app answers, on every route that refuses it.
+STATEFUL_APP_PUBLISH_REFUSAL = (
+    "Apps that keep their own data can't be published or shared for now. "
+    "They run in the Cowork desktop app."
+)
+
+
+def is_stateful_app(artifact_type: Any) -> bool:
+    """Whether this metadata.json ``type`` is a stateful full-stack app (STATEFUL_APP_TYPE)."""
+    return artifact_type == STATEFUL_APP_TYPE
+
+
+def publish_refusal(*, display: Any = None, artifact_type: Any = None) -> str | None:
+    """Why an artifact with this ``display`` and ``type`` can never be
+    published or shared, or None when it can: a widget (ENG-4684), or a
+    stateful app while publishing them is off (STATEFUL_APP_TYPE)."""
+    if is_widget(display):
+        return WIDGET_PUBLISH_REFUSAL
+    if is_stateful_app(artifact_type):
+        return STATEFUL_APP_PUBLISH_REFUSAL
+    return None
+
+
 def shows_inline(display: Any) -> bool:
     """Whether a card with this ``display`` shows live in the chat reply: an
     inline piece or a widget. Everything inline gets (state.json, the card's

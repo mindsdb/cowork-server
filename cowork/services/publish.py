@@ -91,7 +91,7 @@ from anton.publish_access import resolve_access as _resolve_access
 from anton.publish_access import resolve_publish_target as _anton_resolve_publish_target
 from cowork.docs.store import DOC_HTML, is_doc_folder, is_doc_primary
 from cowork.schemas.export_child import PublishFileRequest, PublishMarkdownRequest
-from cowork.services.artifact_metadata import WIDGET_PUBLISH_REFUSAL, is_widget
+from cowork.services.artifact_metadata import STATEFUL_APP_PUBLISH_REFUSAL, WIDGET_PUBLISH_REFUSAL, is_stateful_app, is_widget
 from cowork.services.file_page import (
     DOCUMENT_VIEWER_PATH,
     PUBLISHABLE_FILE_SUFFIXES,
@@ -141,6 +141,26 @@ class WidgetPublishRefused(ValueError):
 
     def __init__(self) -> None:
         super().__init__(WIDGET_PUBLISH_REFUSAL)
+
+
+class StatefulAppPublishRefused(ValueError):
+    """Publishing or sharing a stateful full-stack app while that's off
+    (artifact_metadata.STATEFUL_APP_TYPE, ENG-232). A ValueError, as
+    WidgetPublishRefused, so every caller's existing mapping applies
+    unchanged: 400 on the REST paths, a failed tool result for the agent, a
+    skip for autopublish."""
+
+    def __init__(self) -> None:
+        super().__init__(STATEFUL_APP_PUBLISH_REFUSAL)
+
+
+def is_stateful_app_folder(folder: Path) -> bool:
+    """Whether ``folder`` is an artifact folder whose metadata.json makes it a
+    stateful full-stack app. A folder without readable metadata is not one."""
+    if not (folder / "metadata.json").is_file():
+        return False
+    metadata = _load_metadata(folder)
+    return metadata is not None and is_stateful_app(metadata.type)
 
 
 def is_widget_folder(folder: Path) -> bool:
@@ -1917,6 +1937,10 @@ def publish_artifact(
     # from going live or being shared; the routes also refuse it up front.
     if is_widget_folder(published_dir):
         raise WidgetPublishRefused()
+    # The same one place keeps a stateful app from going live while
+    # publishing them is off; the routes refuse it up front too.
+    if is_stateful_app_folder(published_dir):
+        raise StatefulAppPublishRefused()
     # anton bundles files from this folder by path. A file there with a second
     # name, such as a hard link a cell made to the project's `.anton/.env`,
     # would publish that file's current content on every publish.
