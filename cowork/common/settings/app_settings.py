@@ -1018,6 +1018,21 @@ class AppSettings(Settings):
         validation_alias=AliasChoices("COWORK_DEPLOYMENT_KIND"),
         description="Explicit self-hosted agent identity. Unset keeps the desktop and hosted defaults.",
     )
+    private_project_dirs: bool = Field(
+        default=False,
+        validation_alias=AliasChoices("COWORK_PRIVATE_PROJECT_DIRS"),
+        description="The desktop launcher requests owner-only .anton directories in its projects.",
+    )
+
+    @property
+    def protect_desktop_project_dirs(self) -> bool:
+        return (
+            self.private_project_dirs
+            and self.tenancy_mode == "local"
+            and self.deployment_kind is None
+            and not self.trust_identity_headers
+        )
+
     deployment_brand_file: Path | None = Field(
         default=None,
         validation_alias=AliasChoices("COWORK_DEPLOYMENT_BRAND_FILE"),

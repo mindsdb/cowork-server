@@ -92,7 +92,11 @@ async def start_oauth(service: str, request: Request, scope: ScopeDep,
                 "Connect it with its credentials instead."
             ),
         )
-    return oauth_service.start(service, OAuthSettings(), client_id=body.client_id, client_secret=body.client_secret, extra_fields=body.extra_fields)
+    return await run_efs(
+        lambda: oauth_service.start(service, OAuthSettings(), client_id=body.client_id,
+                                    client_secret=body.client_secret, extra_fields=body.extra_fields),
+        scope=scope,
+    )
 
 
 # LoopbackDesktopOnly: returns a raw client_secret, so the credential is the
@@ -294,7 +298,10 @@ async def _resolve_notion_identity(call_mcp_tool, body: McpIdentityRequest) -> d
 async def oauth_catalogue(request: Request, scope: ScopeDep):
     if scope.org_mode:
         return await auth_proxy.proxy_catalogue(request, OAuthSettings())
-    return {"items": oauth_service.get_catalogue(ConnectorSettings(), OAuthSettings(), scope=scope)}
+    items = await run_efs(
+        lambda: oauth_service.get_catalogue(ConnectorSettings(), OAuthSettings(), scope=scope), scope=scope
+    )
+    return {"items": items}
 
 
 # AuthenticatedInOrgMode: in org mode this forwards to auth_proxy.proxy_status.
@@ -302,15 +309,9 @@ async def oauth_catalogue(request: Request, scope: ScopeDep):
 # (IsAuthenticated) independently of anything cowork-server does.
 @router.get("/status", dependencies=[Depends(require(AuthenticatedInOrgMode))])
 async def oauth_status(request: Request, scope: ScopeDep, state: str = Query(...)):
-    settings = OAuthSettings()
     if scope.org_mode:
-        return await auth_proxy.proxy_status(state, request, settings)
-    outcome = oauth_service.get_outcome(state, settings)
-    if outcome is None:
-        return {"status": "expired"}
-    if outcome.get("status") in {"success", "error"}:
-        oauth_service.clear_outcome(state, settings)
-    return outcome
+        return await auth_proxy.proxy_status(state, request, OAuthSettings())
+    return await run_efs(lambda: oauth_service.poll_status(state, OAuthSettings()), scope=scope)
 
 
 # OpenByDesign, standalone reason: this is the OAuth provider's own redirect

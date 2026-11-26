@@ -25,7 +25,8 @@ from cowork.code_sandbox import (
 from cowork.common.chat_session import build_chat_session, close_session_scratchpads
 from cowork.common.history_scrub import scrub_credentials, scrubbed_openai_dump
 from cowork.common.logger import get_logger, log_context
-from cowork.common.paths import cowork_home, makedirs_below_nofollow, pod_local_only
+from cowork.common.paths import cowork_home, makedirs_below_nofollow, pinned_dir, pod_local_only
+from cowork.common.private_project import private_project_folder
 from cowork.common.settings.app_settings import get_app_settings
 from cowork.common.settings.user_settings import current_settings_scope, effective_turn_limits
 from cowork.deployment_identity import identity_for_turn, learned_memory_scope
@@ -1833,7 +1834,13 @@ class AntonHarness:
         _apply_user_credentials(anton_settings, user)
 
         workspace = Workspace(base)
-        if sandboxed:
+        if get_app_settings().protect_desktop_project_dirs:
+            # The installed Anton may predate project privacy. Secure the
+            # directory before its first write with every supported release.
+            with pinned_dir(base, nofollow_base=True) as project:
+                with private_project_folder(project, memory=True):
+                    workspace.initialize(refuse_links=True)
+        elif sandboxed:
             # .anton, .anton/memory, anton.md and .env never follow a link.
             # Passed directly, never through supported_kwargs: create_app
             # refuses the sandbox on an anton without it (_anton_sandbox_gap).

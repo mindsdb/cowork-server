@@ -14,7 +14,6 @@ lock serializes the changes in the process.
 from __future__ import annotations
 
 import errno
-import logging
 import os
 import stat
 import threading
@@ -177,18 +176,54 @@ def test_a_failed_read_raises_and_leaves_the_file_unchanged(tmp_path, monkeypatc
     assert path.read_bytes() == before
 
 
-def test_a_path_with_no_file_name_logs_a_warning(tmp_path, caplog):
-    path = tmp_path / "missing" / ".."
+def test_invalid_destination_raises_before_publishing(tmp_path):
+    (tmp_path / "folder").mkdir()
+    store = OAuthStateStore(str(tmp_path / "folder" / ".."))
+    with pytest.raises(ValueError, match="direct-child"):
+        store._save(data={})
 
-    with caplog.at_level(logging.WARNING, logger=state_module.__name__):
-        _start_sign_in(OAuthStateStore(str(path)))
 
-    warnings = [
-        record
-        for record in caplog.records
-        if record.name == state_module.__name__ and record.levelno == logging.WARNING
-    ]
-    assert [record.msg for record in warnings] == ["Could not save OAuth state to %s: %s"]
+def test_a_failed_save_refuses_the_authorization_url(tmp_path, monkeypatch):
+    from fastapi import HTTPException
+
+    from cowork.common.settings.app_settings import OAuthSettings
+    from cowork.services.connectors.oauth.google import OAuthService
+
+    def failed_write(*args, **kwargs):
+        raise PermissionError("directory is read-only")
+
+    monkeypatch.setattr(state_module, "dir_atomic_write", failed_write)
+    settings = OAuthSettings(state_path=str(tmp_path / "state.json"))
+    with pytest.raises(HTTPException, match="Could not save the connector sign-in state"):
+        OAuthService().start("github", settings, client_id="id", client_secret="secret")
+
+
+async def test_local_oauth_disk_work_uses_workers_and_terminal_status_is_consumed_once(tmp_path, monkeypatch):
+    import asyncio
+
+    from cowork.api.v1.endpoints.connectors import oauth
+    from cowork.common.settings.app_settings import OAuthSettings
+    from cowork.db.scoped import LOCAL_SCOPE
+    from cowork.schemas.connectors import OAuthStartRequest
+
+    settings = OAuthSettings(state_path=str(tmp_path / "state.json"))
+    monkeypatch.setattr(oauth, "OAuthSettings", lambda: settings)
+    monkeypatch.setenv("COWORK_VAULT_DIR", str(tmp_path / "vault"))
+    loop_thread = threading.get_ident()
+    real_load = OAuthStateStore._load
+
+    def load_on_worker(store):
+        assert threading.get_ident() != loop_thread
+        return real_load(store)
+
+    monkeypatch.setattr(OAuthStateStore, "_load", load_on_worker)
+    start = await oauth.start_oauth("github", None, LOCAL_SCOPE, OAuthStartRequest(client_id="id", client_secret="secret"))
+    assert (await oauth.oauth_catalogue(None, LOCAL_SCOPE))["items"]
+    assert await oauth.oauth_status(None, LOCAL_SCOPE, start.state) == {"status": "pending"}
+    store = OAuthStateStore(settings.state_path)
+    await asyncio.to_thread(store.set_outcome, start.state, {"status": "success"})
+    polls = await asyncio.gather(*(oauth.oauth_status(None, LOCAL_SCOPE, start.state) for _ in range(2)))
+    assert sorted(poll["status"] for poll in polls) == ["expired", "success"]
 
 
 def test_a_change_waits_for_one_already_saving(tmp_path, monkeypatch):

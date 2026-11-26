@@ -56,6 +56,8 @@ from cowork.common.paths import (
     read_bounded,
     safe_join,
 )
+from cowork.common.private_project import private_project_folder
+from cowork.common.settings.app_settings import get_app_settings
 from cowork.db.personal_resources import PersonalResource
 from cowork.db.scoped import (
     ScopedSession,
@@ -930,7 +932,9 @@ def _write_bytes_at_project_root(
     if dirs != path.parts[:-1] or name != path.parts[-1]:
         raise ValueError("invalid path component")
 
-    with _opened_pinned_descendant(root, dirs, create=True) as parent:
+    private_instructions = _is_instructions_path(path) and get_app_settings().protect_desktop_project_dirs
+    folder = private_project_folder(root) if private_instructions else _opened_pinned_descendant(root, dirs, create=True)
+    with folder as parent:
         try:
             existing = dir_lstat(parent, name)
         except FileNotFoundError:
@@ -943,6 +947,8 @@ def _write_bytes_at_project_root(
         # Replacing the entry detaches any pre-existing hardlink. Truncating
         # its inode could edit protected artifact bytes through an ordinary name.
         mode = stat.S_IMODE(existing.st_mode) if existing is not None else 0o644
+        if private_instructions:
+            mode = 0o600
         temporary, fd = _create_project_temp(parent, ".cowork-file-", mode)
         try:
             try:

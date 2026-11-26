@@ -7,7 +7,10 @@ contract: one per org, no duplicates, no created_by attribution.
 """
 from __future__ import annotations
 
+import os
 import shutil
+import stat
+from contextlib import nullcontext
 from pathlib import Path
 
 import pytest
@@ -646,6 +649,95 @@ def test_the_desktop_still_adopts_a_folder(db, tmp_path):
     project = desktop.create_project("notes", path=chosen)
     assert Path(project.path) == chosen.resolve()
     assert desktop.directory_is_external(project) is True
+
+
+@pytest.mark.parametrize("resource", ["instructions", "memory"])
+@pytest.mark.parametrize("initial", ["new", "existing", "protection-fails"])
+def test_desktop_first_write_protects_adopted_project_data(db, tmp_path, monkeypatch, resource, initial):
+    from fastapi import HTTPException
+
+    from cowork.api.v1.endpoints import project_files
+    from cowork.common import private_project
+    from cowork.common.settings.app_settings import get_app_settings
+    from cowork.harnesses.memory.registry import MemorySlot, SLOT_REGISTRY
+    from cowork.services.memory import MemoryService
+
+    monkeypatch.setenv("COWORK_PRIVATE_PROJECT_DIRS", "true")
+    monkeypatch.setenv("COWORK_HOME", str(tmp_path / "home"))
+    get_app_settings.cache_clear()
+    repo = tmp_path / "adopted"
+    repo.mkdir()
+    if os.name == "nt":
+        import subprocess
+        icacls = Path(os.environ["SystemRoot"]) / "System32" / "icacls.exe"
+        subprocess.run([icacls, repo, "/grant", "*S-1-5-32-545:(OI)(CI)RX"], check=True)
+    folder = repo / ".anton"
+    if initial != "new":
+        folder.mkdir()
+        if os.name != "nt":
+            folder.chmod(0o755)
+    repo_mode = stat.S_IMODE(repo.stat().st_mode)
+    if initial == "protection-fails":
+        def refused(*args, **kwargs):
+            raise PermissionError("cannot protect project data")
+        if os.name == "nt":
+            monkeypatch.setattr(private_project, "_protect_windows_directory", refused)
+        else:
+            monkeypatch.setattr(os, "fchmod", refused)
+    target = folder / "anton.md" if resource == "instructions" else folder / "memory" / SLOT_REGISTRY[MemorySlot.RULES].filename
+    expected = pytest.raises((HTTPException, PermissionError)) if initial == "protection-fails" else nullcontext()
+    with Session(db) as session, expected:
+        scoped = ScopedSession(session, LOCAL_SCOPE)
+        project = ProjectService(scoped).create_project("adopted", path=repo)
+        if resource == "instructions":
+            project_files._write_project_file(
+                scoped, project_name=project.name, path=project_files._validated_project_path(".anton/anton.md"),
+                req=project_files._FileWriteRequest(content="Only this user"), principal=None,
+            )
+        else:
+            MemoryService(scoped).update_memory_sync(
+                scope="project", category=MemorySlot.RULES, content="Only this user", project_id=project.id,
+            )
+    if initial == "protection-fails":
+        assert not target.exists()
+        return
+    assert target.read_text(encoding="utf-8").strip() == "Only this user"
+    assert stat.S_IMODE(repo.stat().st_mode) == repo_mode
+    if os.name == "nt":
+        import win32security as security
+        def grants(path):
+            descriptor = security.GetNamedSecurityInfo(str(path), security.SE_FILE_OBJECT, security.DACL_SECURITY_INFORMATION)
+            acl = descriptor.GetSecurityDescriptorDacl()
+            return {security.ConvertSidToStringSid(acl.GetAce(i)[-1]) for i in range(acl.GetAceCount())}
+        assert "S-1-5-32-545" in grants(repo)
+        assert "S-1-5-32-545" not in grants(folder) | grants(target)
+        assert {"S-1-5-18", "S-1-5-32-544"} <= grants(folder)
+    else:
+        assert stat.S_IMODE(folder.stat().st_mode) == 0o700
+        assert stat.S_IMODE(target.stat().st_mode) == 0o600
+
+
+@pytest.mark.parametrize("setting,value", [
+    ("COWORK_PRIVATE_PROJECT_DIRS", "false"),
+    ("COWORK_TENANCY_MODE", "org"),
+    ("COWORK_DEPLOYMENT_KIND", "self-hosted"),
+    ("COWORK_TRUST_IDENTITY_HEADERS", "true"),
+])
+def test_managed_project_permissions_stay_with_operator(tmp_path, monkeypatch, setting, value):
+    from cowork.common.settings.app_settings import get_app_settings
+    from cowork.harnesses.memory.registry import MemorySlot
+    from cowork.harnesses.memory.store import ProjectMemoryStore
+
+    monkeypatch.setenv("COWORK_PRIVATE_PROJECT_DIRS", "true")
+    monkeypatch.setenv(setting, value)
+    get_app_settings.cache_clear()
+    assert not get_app_settings().protect_desktop_project_dirs
+    folder = tmp_path / ".anton"
+    folder.mkdir()
+    folder.chmod(0o770)
+    before = stat.S_IMODE(folder.stat().st_mode)
+    ProjectMemoryStore(tmp_path).write(MemorySlot.RULES, "shared rule")
+    assert stat.S_IMODE(folder.stat().st_mode) == before
 
 
 def test_no_partition_project_reads_as_an_adopted_folder(db, personal_deployment):

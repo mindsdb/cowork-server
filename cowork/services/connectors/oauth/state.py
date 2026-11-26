@@ -60,14 +60,9 @@ class OAuthStateStore:
         # profile passes down, so there the folder takes the default.
         content = json.dumps(data, indent=2).encode("utf-8")
         folder_mode = 0o777 if _IS_WINDOWS else 0o700
-        try:
-            self._path.parent.mkdir(mode=folder_mode, parents=True, exist_ok=True)
-            with pinned_dir(self._path.parent) as folder:
-                dir_atomic_write(folder, self._path.name, content=content)
-        except (OSError, ValueError) as exc:
-            # dir_atomic_write raises ValueError for a path with no file name,
-            # such as one that ends in "..".
-            _log.warning("Could not save OAuth state to %s: %s", self._path, exc)
+        self._path.parent.mkdir(mode=folder_mode, parents=True, exist_ok=True)
+        with pinned_dir(self._path.parent) as folder:
+            dir_atomic_write(folder, self._path.name, content=content)
 
     def read_all(self) -> dict[str, Any]:
         """The whole file: each service's entry and the stored outcomes."""
@@ -102,6 +97,7 @@ class OAuthStateStore:
             entry.setdefault("lastError", "")
             entry.setdefault("lastErrorAt", "")
             data[service] = entry
+            data.setdefault("_outcomes", {})[state] = {"status": "pending", "_ts": datetime.now(timezone.utc).isoformat()}
             self._save(data=data)
 
     def get_pending(self, service: str) -> dict[str, Any] | None:
@@ -117,7 +113,7 @@ class OAuthStateStore:
             outcomes[state] = {**outcome, "_ts": datetime.now(timezone.utc).isoformat()}
             self._save(data=data)
 
-    def get_outcome(self, state: str) -> dict[str, Any] | None:
+    def get_outcome(self, state: str, *, consume_terminal: bool = False) -> dict[str, Any] | None:
         with _LOCK:
             data = self._load()
             outcomes = data.get("_outcomes", {})
@@ -132,6 +128,9 @@ class OAuthStateStore:
                     return None
             except (KeyError, ValueError) as exc:
                 _log.debug("Could not parse outcome timestamp for state %r: %s", state, exc)
+            if consume_terminal and entry.get("status") in {"success", "error"}:
+                outcomes.pop(state)
+                self._save(data=data)
         return {k: v for k, v in entry.items() if k != "_ts"}
 
     def clear_outcome(self, state: str) -> None:
