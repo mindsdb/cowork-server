@@ -60,6 +60,18 @@ from cowork.services.artifact_revision_records import (
 logger = logging.getLogger(__name__)
 
 EDITABLE_EXTENSIONS = frozenset({".md", ".txt", ".html", ".htm"})
+# An inline html-app's saved state (ENG-4684): what the page's
+# `anton.setState` holds, which the renderer saves through the source routes.
+# The one name those routes take that isn't an editable source, only at the
+# folder's top level, only for an html-app, and the one they may create: a
+# save with no expected revision writes the first one. Until then a read
+# answers 404, as for any missing source.
+INLINE_STATE_FILE = "state.json"
+INLINE_STATE_TYPE = "html-app"
+try:  # anton's own limit, where the installed anton has it
+    from anton.core.artifacts.internal_files import INLINE_STATE_MAX_BYTES
+except ImportError:  # pragma: no cover - an anton from before ENG-4684
+    INLINE_STATE_MAX_BYTES = 32 * 1024
 MAX_SOURCE_BYTES = 2_000_000
 MAX_REVISIONS = 80
 # Names inside the journal folder (artifact_journal.JOURNAL_DIRNAME).
@@ -80,7 +92,7 @@ QUEUED_REPAIR_TTL_SECONDS = 3600
 class RevisionConflict(RuntimeError):
     """``current`` is the head revision as the API shows it."""
 
-    def __init__(self, current: dict, message: str = "Artifact changed since this edit began"):
+    def __init__(self, current: dict | None, message: str = "Artifact changed since this edit began"):
         super().__init__(message)
         self.current = current
 
@@ -356,8 +368,25 @@ def _finish_queued_repairs(
         _write_repair(folder, repair)
 
 
-def resolve_source(folder: Path, metadata: ArtifactMetadata, rel_path: str | None = None) -> tuple[Path, str]:
-    """Resolve an editable source without accepting an absolute/client path."""
+def _names_inline_state(metadata: ArtifactMetadata, rel_path: str | None) -> bool:
+    """Whether a source route addresses an html-app's inline state.json."""
+    return metadata.type == INLINE_STATE_TYPE and (rel_path or "").strip() == INLINE_STATE_FILE
+
+
+def resolve_source(
+    folder: Path,
+    metadata: ArtifactMetadata,
+    rel_path: str | None = None,
+    *,
+    inline_state: bool | None = None,
+) -> tuple[Path, str]:
+    """Resolve an editable source without accepting an absolute/client path.
+
+    ``inline_state`` lets ``rel_path`` name INLINE_STATE_FILE, which may not
+    exist yet; by default only an html-app's explicit request does.
+    """
+    if inline_state is None:
+        inline_state = _names_inline_state(metadata, rel_path)
     canonical_folder = folder.resolve(strict=False)
     candidate_rel = (rel_path or metadata.primary or "").strip().replace("\\", "/")
     if not candidate_rel:
@@ -384,6 +413,12 @@ def resolve_source(folder: Path, metadata: ArtifactMetadata, rel_path: str | Non
             target.relative_to(canonical_folder)
         except ValueError as exc:
             raise RevisionValidationError("Invalid artifact source path") from exc
+        if inline_state and candidate_rel == INLINE_STATE_FILE and not os.path.lexists(
+            canonical_folder / INLINE_STATE_FILE
+        ):
+            # Not saved yet: a read of it is refused (_read_source), and the
+            # first save creates it.
+            return canonical_folder / INLINE_STATE_FILE, INLINE_STATE_FILE
     from cowork.services.artifacts import _is_the_projects_secrets
 
     # The source route reads and writes the file in place, so the project's
@@ -395,9 +430,12 @@ def resolve_source(folder: Path, metadata: ArtifactMetadata, rel_path: str | Non
         or _is_the_projects_secrets(target.lstat(), anton_dir=canonical_folder.parent.parent)
     ):
         raise FileNotFoundError("Artifact source not found")
-    if target.suffix.lower() not in EDITABLE_EXTENSIONS:
+    relative = target.resolve(strict=False).relative_to(canonical_folder).as_posix()
+    if target.suffix.lower() not in EDITABLE_EXTENSIONS and not (
+        inline_state and relative == INLINE_STATE_FILE
+    ):
         raise RevisionValidationError("This artifact type is not source-editable")
-    return target, target.resolve(strict=False).relative_to(canonical_folder).as_posix()
+    return target, relative
 
 
 def _read_source(target: Path) -> bytes:
@@ -413,6 +451,22 @@ def _read_source(target: Path) -> bytes:
         return b"".join(read_bounded(fd, found.st_size))
     finally:
         os.close(fd)
+
+
+def _read_source_at(target: Path, relative: str) -> bytes:
+    """``_read_source`` for a write, where an inline state.json not saved yet
+    is empty (resolve_source only hands one back that way for that name)."""
+    if relative == INLINE_STATE_FILE and not os.path.lexists(target):
+        return b""
+    return _read_source(target)
+
+
+def _source_mode(target: Path, relative: str) -> int | None:
+    """The permissions a source write keeps: the file's own, or the default
+    for an inline state.json the write is about to create."""
+    if relative == INLINE_STATE_FILE and not os.path.lexists(target):
+        return None
+    return target.stat().st_mode & 0o777
 
 
 def _refused_blob(reason: str) -> None:
@@ -691,8 +745,13 @@ def _recover_pending_source_write(folder: Path) -> None:
         _abandon_pending(folder, "blob_refused")
         return
     try:
-        target, _ = resolve_source(folder, ArtifactMetadata.empty(), pending.path)
-        current = _read_source(target)
+        target, relative = resolve_source(
+            folder,
+            ArtifactMetadata.empty(),
+            pending.path,
+            inline_state=pending.path == INLINE_STATE_FILE,
+        )
+        current = _read_source_at(target, relative)
     except (FileNotFoundError, ValueError):
         _abandon_pending(folder, "source_unavailable")
         return
@@ -713,7 +772,7 @@ def _recover_pending_source_write(folder: Path) -> None:
         _clear_pending(folder)
         return
     if current_hash == pending.before_content_hash:
-        _atomic_bytes(target, content, mode=target.stat().st_mode & 0o777)
+        _atomic_bytes(target, content, mode=_source_mode(target, relative))
     _persist_revision(folder, manifest, entry, content)
     _clear_pending(folder)
 
@@ -730,7 +789,7 @@ def _commit_source_revision(
     actor_kind: str,
     actor_id: str | None,
     summary: str,
-    base_revision_id: str,
+    base_revision_id: str | None,
     conversation_id: str | None = None,
     comment_thread_ids: list[str] | None = None,
 ) -> RevisionEntry:
@@ -757,7 +816,7 @@ def _commit_source_revision(
             revision=entry,
         ),
     )
-    _atomic_bytes(target, content, mode=target.stat().st_mode & 0o777)
+    _atomic_bytes(target, content, mode=_source_mode(target, rel_path))
     _persist_revision(folder, manifest, entry, content)
     _clear_pending(folder)
     return entry
@@ -860,7 +919,7 @@ def save_source(
     artifact_id: str,
     *,
     content: str,
-    expected_revision_id: str,
+    expected_revision_id: str | None,
     rel_path: str | None = None,
     actor_kind: str = "manual",
     actor_id: str | None = None,
@@ -874,6 +933,36 @@ def save_source(
     with artifact_lock(folder):
         _recover_pending_source_write(folder)
         target, relative = resolve_source(folder, metadata, rel_path)
+        if relative == INLINE_STATE_FILE and len(encoded) > INLINE_STATE_MAX_BYTES:
+            raise RevisionValidationError("Inline state is too large to save")
+        if relative == INLINE_STATE_FILE and not os.path.lexists(target):
+            # The first save of an inline page's state: it creates the file,
+            # and only a save that expects no revision may.
+            manifest = _read_manifest(folder)
+            head = manifest.head(relative)
+            if expected_revision_id is not None:
+                raise RevisionConflict(head.to_json() if head is not None else None)
+            entry = _commit_source_revision(
+                folder,
+                manifest,
+                target,
+                artifact_id=artifact_id,
+                rel_path=relative,
+                before_content=b"",
+                content=encoded,
+                actor_kind=actor_kind,
+                actor_id=actor_id,
+                summary=summary,
+                base_revision_id=head.id if head is not None else None,
+                conversation_id=conversation_id,
+                comment_thread_ids=comment_thread_ids,
+            )
+            return {
+                "artifactId": artifact_id,
+                "path": relative,
+                "content": content,
+                "revision": entry.to_json(),
+            }
         existing = _read_source(target)
         manifest = _read_manifest(folder)
         latest = manifest.head(relative)
@@ -1576,6 +1665,21 @@ def finalize_agent_repair(
 #: How long after a publish's content mtime a revision may be stamped and still
 #: be the one it published: a save writes the file, then its revision.
 _PUBLISHED_AT_SLACK_S = 2.0
+
+
+def head_revision_id(folder: Path, rel_path: str) -> str | None:
+    """The id of *rel_path*'s newest revision while it is still the file on
+    disk, else None: what an inline chat card names as the version its turn
+    left (ENG-4684). Reads only, takes no lock, never raises."""
+    try:
+        head = _read_manifest(folder).head(rel_path)
+        if head is None:
+            return None
+        content = _read_source(folder / rel_path)
+        return head.id if _sha(content) == head.content_hash else None
+    except Exception:
+        logger.debug("Could not read an artifact's head revision", exc_info=True)
+        return None
 
 
 def published_head_revision_id(folder: Path) -> str | None:

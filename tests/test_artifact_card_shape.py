@@ -190,3 +190,60 @@ async def test_any_other_display_sends_no_key(session, tmp_path, local_mode, val
     assert "display" not in listed
     assert "display" not in _json(card)
     assert "display" not in await _stream_event(card)
+
+
+async def test_an_inline_card_names_the_revision_its_turn_left(session, tmp_path, local_mode):
+    """ENG-4684: an inline card carries `revisionId` right after `display`,
+    the primary's head revision, so a chat card from an earlier turn can open
+    the version it showed."""
+    from cowork.services.artifact_revisions import capture_agent_revision, list_revisions
+
+    row, folder = _project_with_artifact(session, tmp_path, name="mine", org_id=None, slug="chart")
+    _with_display(folder, "inline")
+    first = capture_agent_revision(folder, conversation_id="conversation-1")
+
+    [card] = cards_for_slugs(folder.parent, ["chart"], scope=LOCAL_SCOPE, project_id=str(row.id), project_name="mine")
+    [listed] = await ep.list_artifacts(LOCAL_SCOPE, project_id=row.id, project_path=None)
+    streamed = await _stream_event(card)
+
+    with_revision = _INLINE[: _INLINE.index("display") + 1] + ["revisionId"] + _INLINE[_INLINE.index("display") + 1 :]
+    for sent in (_json(card), listed, streamed):
+        assert sent["revisionId"] == first["id"]
+        assert list(sent)[: len(with_revision)] == with_revision
+
+    # The next turn's card names the next revision; the first card keeps its own.
+    (folder / "index.html").write_text("<html>two</html>")
+    second = capture_agent_revision(folder, conversation_id="conversation-1")
+    [later] = cards_for_slugs(folder.parent, ["chart"], scope=LOCAL_SCOPE, project_id=str(row.id), project_name="mine")
+    assert later.to_json()["revisionId"] == second["id"] != first["id"]
+    assert [r["id"] for r in list_revisions(folder, rel_path="index.html")] == [second["id"], first["id"]]
+
+
+async def test_a_card_names_no_revision_that_is_not_the_file_it_shows(session, tmp_path, local_mode):
+    row, folder = _project_with_artifact(session, tmp_path, name="mine", org_id=None, slug="chart")
+    _with_display(folder, "inline")
+
+    # No revision recorded yet.
+    [card] = cards_for_slugs(folder.parent, ["chart"], scope=LOCAL_SCOPE, project_id=str(row.id), project_name="mine")
+    assert "revisionId" not in _json(card)
+
+    # The page moved past its head revision.
+    from cowork.services.artifact_revisions import capture_agent_revision
+
+    capture_agent_revision(folder, conversation_id="conversation-1")
+    (folder / "index.html").write_text("<html>edited outside a turn</html>")
+    [card] = cards_for_slugs(folder.parent, ["chart"], scope=LOCAL_SCOPE, project_id=str(row.id), project_name="mine")
+    assert "revisionId" not in _json(card)
+
+
+async def test_a_card_that_is_not_inline_names_no_revision(session, tmp_path, local_mode):
+    from cowork.services.artifact_revisions import capture_agent_revision
+
+    row, folder = _project_with_artifact(session, tmp_path, name="mine", org_id=None, slug="chart")
+    capture_agent_revision(folder, conversation_id="conversation-1")
+
+    [card] = cards_for_slugs(folder.parent, ["chart"], scope=LOCAL_SCOPE, project_id=str(row.id), project_name="mine")
+    [listed] = await ep.list_artifacts(LOCAL_SCOPE, project_id=row.id, project_path=None)
+
+    assert "revisionId" not in _json(card)
+    assert "revisionId" not in listed

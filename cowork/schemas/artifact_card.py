@@ -48,6 +48,9 @@ class ArtifactCard(BaseModel):
     # "inline" for an artifact the chat reply shows live (metadata.json
     # `display`); set only then, so other cards carry no key.
     display: str | None = None
+    # On an inline card, the primary's revision the card shows: the head
+    # revision while it still matches the file. Set only then.
+    revision_id: str | None = None
     project_id: str | None
     project_name: str
     origin_conversation_id: str

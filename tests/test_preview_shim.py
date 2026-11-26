@@ -831,3 +831,162 @@ def test_a_theme_does_not_take_the_restore():
     # still replays.
     out = _run_restore(_THEME + f"theme('dark'); restore({json.dumps({'inputs': [_KEY], 'heading': 'Two'})});")
     assert out["restored"] == ["ok"]
+
+
+# The page's own state, for a page shown inside a chat reply (ENG-4684):
+# `window.anton` posts `state` and `submit`, and takes the app's `state` on
+# the restore's channel. A scenario reports what the page saw as a `probe`.
+_STATE = """
+const warnings = [];
+console.warn = (text) => warnings.push(String(text));
+const sendState = (state, more = {}) => fire('message', Object.assign({
+  isTrusted: true, source: fakeWindow.parent,
+  data: { source: 'anton-preview-parent', type: 'state', state },
+}, more));
+const probe = (what) => posted.push({ type: 'probe', what: JSON.parse(JSON.stringify(what === undefined ? null : what)) });
+"""
+
+
+def _run_state(scenario: str) -> dict:
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("node is not installed")
+    script = _VIEW_HARNESS.replace("__SHIM__", SHIM_JS.replace("__LINE_OFFSET__", "0")).replace(
+        "__SCENARIO__", _STATE + scenario + "\nprobe({ warnings });"
+    )
+    done = subprocess.run([node, "-e", script], capture_output=True, text=True, timeout=30, check=True)
+    posted = json.loads(done.stdout)["posted"]
+    *probes, last = [m["what"] for m in posted if m["type"] == "probe"]
+    sent = [m for m in posted if m["type"] in ("state", "submit")]
+    for message in sent:
+        assert message["source"] == "anton-preview"
+    return {"sent": sent, "probes": probes, "warnings": last["warnings"]}
+
+
+def test_set_state_posts_the_state_and_get_state_returns_a_copy():
+    out = _run_state(
+        "const list = { people: [{ name: 'Ana', contact: true }] };\n"
+        "probe(window.anton.getState());\n"
+        "probe(window.anton.setState(list));\n"
+        "list.people[0].contact = false;\n"
+        "const got = window.anton.getState(); got.people = [];\n"
+        "probe(window.anton.getState());"
+    )
+    assert out["sent"] == [
+        {"type": "state", "state": {"people": [{"name": "Ana", "contact": True}]}, "source": "anton-preview"}
+    ]
+    assert out["probes"] == [None, True, {"people": [{"name": "Ana", "contact": True}]}]
+    assert out["warnings"] == []
+
+
+@pytest.mark.parametrize(
+    "value",
+    ["'x'.repeat(32 * 1024)", "'é'.repeat(16 * 1024)", "undefined", "() => 1", "(() => { const o = {}; o.o = o; return o; })()"],
+)
+def test_set_state_refuses_what_is_not_json_or_over_32_kb_with_a_warning(value):
+    out = _run_state(
+        "window.anton.setState({ kept: 1 });\n"
+        f"probe(window.anton.setState({value}));\n"
+        "probe(window.anton.getState());"
+    )
+    assert [m["state"] for m in out["sent"]] == [{"kept": 1}]
+    assert out["probes"] == [False, {"kept": 1}]
+    assert len(out["warnings"]) == 1 and out["warnings"][0].startswith("anton.setState:")
+
+
+def test_a_state_just_under_32_kb_is_sent():
+    # The serialized string, quotes included, is exactly 32 KB.
+    out = _run_state("probe(window.anton.setState('x'.repeat(32 * 1024 - 2)));")
+    assert out["probes"] == [True]
+    assert len(out["sent"]) == 1
+
+
+def test_the_apps_state_reaches_on_state_and_get_state():
+    out = _run_state(
+        "const seen = [];\n"
+        "window.anton.onState((s) => seen.push(s));\n"
+        "sendState({ people: ['Ana'] });\n"
+        "sendState({ people: ['Ana', 'Bo'] });\n"
+        "probe(seen); probe(window.anton.getState());"
+    )
+    assert out["probes"] == [[{"people": ["Ana"]}, {"people": ["Ana", "Bo"]}], {"people": ["Ana", "Bo"]}]
+    # Taking the app's state sends nothing back.
+    assert out["sent"] == []
+
+
+def test_a_state_the_app_sent_before_on_state_is_passed_on_the_next_tick():
+    out = _run_state(
+        "sendState({ saved: true });\n"
+        "const seen = [];\n"
+        "window.anton.onState((s) => seen.push(s));\n"
+        "const off = window.anton.onState((s) => seen.push('removed'));\n"
+        "off();\n"
+        "probe(seen.slice());\n"
+        "advance(1);\n"
+        "probe(seen);"
+    )
+    assert out["probes"] == [[], [{"saved": True}]]
+
+
+def test_a_state_is_taken_from_the_parent_only_with_its_tag():
+    out = _run_state(
+        "const seen = [];\n"
+        "window.anton.onState((s) => seen.push(s));\n"
+        "sendState({ a: 1 }, { source: {} });\n"
+        "sendState({ a: 1 }, { isTrusted: false });\n"
+        "sendState({ a: 1 }, { data: { source: 'anton-preview', type: 'state', state: { a: 1 } } });\n"
+        "sendState({ a: 1 }, { data: { type: 'state', state: { a: 1 } } });\n"
+        "sendState({ a: 1 }, { data: 'state' });\n"
+        "sendState(undefined);\n"
+        "sendState('x'.repeat(40000));\n"
+        "probe(seen); probe(window.anton.getState());"
+    )
+    assert out["probes"] == [[], None]
+
+
+def test_a_listeners_error_does_not_stop_the_others():
+    out = _run_state(
+        "const seen = [];\n"
+        "window.anton.onState(() => { throw new Error('page bug'); });\n"
+        "window.anton.onState((s) => seen.push(s));\n"
+        "sendState({ ok: 1 });\n"
+        "probe(seen);"
+    )
+    assert out["probes"] == [[{"ok": 1}]]
+
+
+def test_submit_sends_the_given_state_or_the_last_one_with_a_short_message():
+    out = _run_state(
+        "window.anton.setState({ people: ['Ana'] });\n"
+        "probe(window.anton.submit());\n"
+        "probe(window.anton.submit({ people: ['Ana', 'Bo'] }, 'Contact these two'));\n"
+        "probe(window.anton.getState());\n"
+        "window.anton.submit(undefined, 'y'.repeat(600));\n"
+        "window.anton.submit(undefined, 42);"
+    )
+    submits = [m for m in out["sent"] if m["type"] == "submit"]
+    assert submits[0] == {"type": "submit", "state": {"people": ["Ana"]}, "source": "anton-preview"}
+    assert submits[1] == {
+        "type": "submit", "state": {"people": ["Ana", "Bo"]}, "message": "Contact these two",
+        "source": "anton-preview",
+    }
+    assert submits[2]["message"] == "y" * 500
+    assert "message" not in submits[3]
+    assert out["probes"] == [True, True, {"people": ["Ana", "Bo"]}]
+
+
+def test_submit_refuses_a_state_over_32_kb():
+    out = _run_state("probe(window.anton.submit('x'.repeat(40000), 'done'));")
+    assert out["probes"] == [False]
+    assert out["sent"] == []
+    assert len(out["warnings"]) == 1 and out["warnings"][0].startswith("anton.submit:")
+
+
+def test_the_state_does_not_take_the_restore_or_the_theme():
+    out = _run_restore(
+        _THEME + _STATE
+        + "sendState({ a: 1 }); theme('dark');"
+        + f" restore({json.dumps({'inputs': [_KEY], 'heading': 'Two'})});"
+    )
+    assert out["restored"] == ["ok"]
+    assert out["theme"] == {"dataset": "dark", "colorScheme": "dark"}

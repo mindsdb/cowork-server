@@ -28,7 +28,7 @@
   // later and silently swallow every diagnostic this shim reports.
   var PARENT = window.parent, IS_TOP = window.parent === window;
   var TAG = 'anton-preview';
-  /* The tag on what the parent window sends in: a `restore` and a `theme`. */
+  /* The tag on what the parent window sends in: a `restore`, a `theme` and a `state`. */
   var PARENT_TAG = 'anton-preview-parent';
   var LINE_OFFSET = __LINE_OFFSET__;
   var MAX_REPORTS = 20;
@@ -798,6 +798,99 @@
     document.addEventListener('DOMContentLoaded', reapplyTheme);
     window.addEventListener('load', reapplyTheme);
   } catch (e) { /* no theme: the page keeps its own */ }
+
+  /* The page's own state, for a page shown inside a chat reply (ENG-4684):
+     a checklist the user ticks, then confirms. `window.anton` is the page's
+     side of it:
+       setState(obj)          keep obj and post `state` to the app, which
+                              saves it; false (and a console warning) when
+                              obj isn't JSON or is over MAX_STATE serialized
+       getState()             the last state, set here or sent by the app
+                              (a copy; null before any)
+       onState(cb)            cb(state) for each state the app sends: the
+                              saved one, sent once the document starts, and
+                              any later one. One the app sent before cb was
+                              added is passed to it on the next tick.
+                              Returns a function that removes cb.
+       submit(obj?, message?) post `submit` with obj (or the last state) and
+                              an optional short message (MAX_MESSAGE
+                              characters, longer is cut): the user is done.
+     What the page gets back is always a copy, so it can't change the state
+     the shim holds without calling setState. The app's `state` comes with
+     the restore's checks and tag, and is taken every time. */
+  try {
+    /* anton's INLINE_STATE_MAX_BYTES, which the save route enforces too. */
+    var MAX_STATE = 32 * 1024;
+    var MAX_MESSAGE = 500;
+    var stateText = null;
+    var stateFromParent = false;
+    var stateListeners = [];
+    /* The state as JSON text, or null (with the reason) when it can't be
+       one. Its size is counted in UTF-8 bytes, as it is saved. */
+    var stateJson = function (value) {
+      var text;
+      try { text = JSON.stringify(value); } catch (inner) { return { error: 'is not JSON-serializable' }; }
+      if (typeof text !== 'string') return { error: 'is not JSON-serializable' };
+      var bytes = typeof TextEncoder === 'function' ? new TextEncoder().encode(text).length : text.length;
+      if (bytes > MAX_STATE) return { error: 'is ' + bytes + ' bytes; the most is ' + MAX_STATE };
+      return { text: text };
+    };
+    var warn = function (what, reason) {
+      try { console.warn('anton.' + what + ': the state ' + reason + ', so it was not sent.'); } catch (inner) { /* no console */ }
+    };
+    var stateCopy = function () { return stateText === null ? null : JSON.parse(stateText); };
+    var tellListener = function (cb) {
+      try { cb(stateCopy()); } catch (inner) { /* one listener's error is its own */ }
+    };
+    var anton = {
+      setState: function (value) {
+        var json = stateJson(value);
+        if (json.error) { warn('setState', json.error); return false; }
+        stateText = json.text;
+        post({ type: 'state', state: JSON.parse(json.text) });
+        return true;
+      },
+      getState: function () { return stateCopy(); },
+      onState: function (cb) {
+        if (typeof cb !== 'function') return function () {};
+        stateListeners.push(cb);
+        if (stateFromParent) {
+          setTimeout(function () { if (stateListeners.indexOf(cb) >= 0) tellListener(cb); }, 0);
+        }
+        return function () {
+          var at = stateListeners.indexOf(cb);
+          if (at >= 0) stateListeners.splice(at, 1);
+        };
+      },
+      submit: function (value, message) {
+        var text = stateText;
+        if (value !== undefined) {
+          var json = stateJson(value);
+          if (json.error) { warn('submit', json.error); return false; }
+          text = json.text;
+        }
+        stateText = text;
+        var payload = { type: 'submit', state: text === null ? null : JSON.parse(text) };
+        if (typeof message === 'string' && message) payload.message = message.slice(0, MAX_MESSAGE);
+        post(payload);
+        return true;
+      }
+    };
+    window.anton = Object.freeze(anton);
+    window.addEventListener('message', function (ev) {
+      try {
+        var data = ev.data;
+        if (IS_TOP || !ev.isTrusted || ev.source !== PARENT || !data || typeof data !== 'object') return;
+        if (data.source !== PARENT_TAG || data.type !== 'state') return;
+        var json = stateJson(data.state);
+        if (json.error) return;
+        stateText = json.text;
+        stateFromParent = true;
+        var listeners = stateListeners.slice();
+        for (var i = 0; i < listeners.length; i++) tellListener(listeners[i]);
+      } catch (inner) { /* never break the page */ }
+    });
+  } catch (e) { /* no page state: the page still runs */ }
 
   var nativeStorageWorks = true;
   try { void window.localStorage; } catch (e) { nativeStorageWorks = false; }

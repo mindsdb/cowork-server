@@ -530,3 +530,174 @@ async def test_a_markdown_page_the_conversion_refuses_stops_live_sync_without_a_
     assert said in record.getMessage()
     assert record.exc_info is None
     assert artifact_locks.acquire(folder.parent, folder.name, ttl_s=60) is True
+
+
+# An inline html-app's state.json (ENG-4684): the renderer reads it through
+# the workspace GET and saves it through the PUT, which creates it.
+def _read_state(folder, metadata, path="state.json"):
+    """What GET /workspace/{project}/{artifact}?path=state.json answers from
+    the folder, in its one file store hop."""
+    return workspace._workspace_state(
+        _source_for(folder), folder, metadata, ARTIFACT_ID, path, with_export=False
+    ).result
+
+
+async def _save_state(folder, metadata, content, expected, path="state.json"):
+    return await workspace.update_artifact_source(
+        "project-1",
+        ARTIFACT_ID,
+        workspace._SourceUpdateBody(
+            content=content, expectedRevisionId=expected, path=path, summary="Inline state",
+        ),
+        ORG_SCOPE,
+    )
+
+
+@pytest.fixture
+def owned(artifact, monkeypatch):
+    folder, metadata = artifact
+    monkeypatch.setattr(
+        workspace,
+        "_owner_workspace",
+        awaitable(lambda *_args: (_source_for(folder), folder, metadata, {})),
+    )
+
+    async def unexpected_sync(*_args, **_kwargs):
+        raise AssertionError("saving the inline state must not re-publish the page")
+
+    monkeypatch.setattr(workspace, "_sync_live_artifact", unexpected_sync)
+    return folder, metadata
+
+
+@pytest.mark.asyncio
+async def test_the_put_creates_an_html_apps_state_json_and_the_get_reads_it_back(owned):
+    folder, metadata = owned
+    _publish(folder, {})
+
+    # Not saved yet: the GET answers 404, which the renderer takes as no state.
+    with pytest.raises(FileNotFoundError):
+        _read_state(folder, metadata)
+    assert not (folder / "state.json").exists()
+
+    # The first save expects no revision, and creates the file.
+    state = json.dumps({"people": [{"name": "Ana", "contact": True}]})
+    saved = await _save_state(folder, metadata, state, None)
+
+    assert (folder / "state.json").read_text(encoding="utf-8") == state
+    assert saved["path"] == "state.json"
+    assert saved["revision"]["summary"] == "Inline state"
+    assert saved["revision"]["actor"]["kind"] == "manual"
+    again = _read_state(folder, metadata)
+    assert (again["content"], again["contentType"]) == (state, "json")
+    assert again["revision"]["id"] == saved["revision"]["id"]
+    assert [r["summary"] for r in again["revisions"]] == ["Inline state"]
+
+    # Then it is an ordinary optimistic edit: a stale token, or a second
+    # "first" save, answers 409 with the current revision.
+    newer = await _save_state(folder, metadata, "{}", saved["revision"]["id"])
+    for stale_token in (saved["revision"]["id"], None):
+        with pytest.raises(workspace.HTTPException) as stale:
+            await _save_state(folder, metadata, '{"late": 1}', stale_token)
+        assert stale.value.status_code == 409
+        assert stale.value.detail["currentRevision"]["id"] == newer["revision"]["id"]
+    assert (folder / "state.json").read_text(encoding="utf-8") == "{}"
+
+    # The page's own history is untouched.
+    page = _read_state(folder, metadata, path=None)
+    assert page["path"] == "report.html"
+    assert all(r["path"] == "report.html" for r in page["revisions"])
+
+
+@pytest.mark.asyncio
+async def test_a_first_state_save_with_a_token_conflicts(owned):
+    folder, metadata = owned
+    with pytest.raises(workspace.HTTPException) as stale:
+        await _save_state(folder, metadata, "{}", "some-revision")
+    assert stale.value.status_code == 409
+    assert stale.value.detail["currentRevision"] is None
+    assert not (folder / "state.json").exists()
+
+
+@pytest.mark.asyncio
+async def test_a_state_over_32_kb_is_refused(owned):
+    folder, metadata = owned
+    with pytest.raises(workspace.HTTPException) as refused:
+        await _save_state(folder, metadata, json.dumps("x" * (32 * 1024)), None)
+    assert refused.value.status_code == 422
+    assert not (folder / "state.json").exists()
+
+
+@pytest.mark.asyncio
+async def test_a_state_save_does_not_move_the_card_off_its_page(owned):
+    from cowork.services.artifacts import _pick_primary, _user_files
+
+    folder, metadata = owned
+    await _save_state(folder, metadata, '{"a": 1}', None)
+
+    # state.json is the newest file, and is still not what opens or publishes.
+    assert _pick_primary(folder, _user_files(folder), primary_hint=metadata.primary).name == "report.html"
+    assert _pick_primary(folder, _user_files(folder)).name == "report.html"
+
+
+def test_with_no_html_page_state_json_is_still_not_the_primary(tmp_path):
+    from cowork.services.artifacts import _pick_primary, _user_files
+
+    (tmp_path / "page.htm").write_text("<p>page</p>", encoding="utf-8")
+    time.sleep(0.01)
+    (tmp_path / "state.json").write_text("{}", encoding="utf-8")
+
+    assert _pick_primary(tmp_path, _user_files(tmp_path)).name == "page.htm"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("path", ["data.json", "sub/state.json", "State.json", "state.json.html"])
+async def test_only_a_top_level_state_json_may_be_created(owned, path):
+    folder, metadata = owned
+    (folder / "sub").mkdir()
+
+    with pytest.raises(workspace.HTTPException) as refused:
+        _read_state(folder, metadata, path=path)
+    assert refused.value.status_code == 404
+    with pytest.raises(workspace.HTTPException) as refused:
+        await _save_state(folder, metadata, "{}", None, path=path)
+    assert refused.value.status_code == 404
+    assert sorted(p.name for p in folder.iterdir() if not p.name.startswith(".")) == [
+        "metadata.json", "report.html", "sub",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_a_state_json_is_refused_for_any_other_artifact_type(owned, monkeypatch):
+    folder, _metadata = owned
+    document = ArtifactMetadata.model_validate({"slug": "report", "type": "document", "primary": "report.html"})
+    monkeypatch.setattr(
+        workspace,
+        "_owner_workspace",
+        awaitable(lambda *_args: (_source_for(folder), folder, document, {})),
+    )
+
+    with pytest.raises(FileNotFoundError):
+        _read_state(folder, document)
+    with pytest.raises(workspace.HTTPException) as refused:
+        await _save_state(folder, document, "{}", None)
+    assert refused.value.status_code == 404
+    assert not (folder / "state.json").exists()
+
+    # One that exists is no editable source there either.
+    (folder / "state.json").write_text("{}", encoding="utf-8")
+    with pytest.raises(workspace.HTTPException) as refused:
+        await _save_state(folder, document, "{}", "any")
+    assert refused.value.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_a_state_json_link_is_refused(owned, tmp_path):
+    folder, metadata = owned
+    outside = tmp_path / "outside.json"
+    outside.write_text("{}", encoding="utf-8")
+    os.symlink(outside, folder / "state.json")
+
+    with pytest.raises(workspace.HTTPException) as refused:
+        await _save_state(folder, metadata, '{"x": 1}', None)
+    assert refused.value.status_code == 404
+    assert outside.read_text(encoding="utf-8") == "{}"

@@ -1896,3 +1896,50 @@ def test_comment_on_viewer_capture_keeps_its_id_and_content(artifact):
     assert first["id"] not in {r["id"] for r in list_revisions(folder)}
     _refresh(folder, "# Data 3\n")
     assert revision_with_content(folder, observed["id"])["content"] == "# Data 2\n"
+
+
+@pytest.fixture
+def inline_app(tmp_path):
+    folder = tmp_path / "contacts"
+    folder.mkdir()
+    metadata = {"id": "c0ffee00", "slug": "contacts", "type": "html-app", "primary": "index.html", "display": "inline"}
+    (folder / "metadata.json").write_text(json.dumps(metadata), encoding="utf-8")
+    (folder / "index.html").write_text("<ul></ul>", encoding="utf-8")
+    artifact_id, metadata = ensure_full_id(folder, ArtifactMetadata.model_validate(metadata))
+    return folder, metadata, artifact_id
+
+
+def test_an_interrupted_first_state_save_is_finished_on_the_next_read(inline_app, monkeypatch):
+    """ENG-4684: the save that creates state.json recovers like any other."""
+    folder, metadata, artifact_id = inline_app
+    with pytest.raises(FileNotFoundError):
+        current_source(folder, metadata, artifact_id, "state.json")
+    write_manifest = revision_service._write_manifest
+
+    def fail_once(folder_arg, payload):
+        monkeypatch.setattr(revision_service, "_write_manifest", write_manifest)
+        raise OSError("simulated manifest interruption")
+
+    monkeypatch.setattr(revision_service, "_write_manifest", fail_once)
+    with pytest.raises(OSError, match="simulated manifest interruption"):
+        save_source(
+            folder, metadata, artifact_id,
+            content='{"done": true}', expected_revision_id=None,
+            rel_path="state.json", actor_id="user-1", summary="Inline state",
+        )
+
+    recovered = current_source(folder, metadata, artifact_id, "state.json")
+    assert recovered["content"] == '{"done": true}'
+    assert recovered["revision"]["summary"] == "Inline state"
+    assert not (folder / ".revisions" / "pending-source-write.json").exists()
+
+
+def test_the_turn_capture_never_takes_state_json_for_the_page(inline_app):
+    folder, metadata, artifact_id = inline_app
+    save_source(folder, metadata, artifact_id, content="{}", expected_revision_id=None, rel_path="state.json")
+    (folder / "index.html").write_text("<ul><li>Ana</li></ul>", encoding="utf-8")
+
+    captured = capture_agent_revision(folder, conversation_id="conversation-1")
+
+    assert captured["path"] == "index.html"
+    assert current_source(folder, metadata, artifact_id)["path"] == "index.html"

@@ -397,7 +397,9 @@ def _pick_primary(
     html = next((f for f in files if f.suffix.lower() == ".html"), None)
     if html is not None:
         return html
-    return files[0]
+    # An inline page's saved state (artifact_revisions.INLINE_STATE_FILE) is
+    # its data, not what opens, unless it is all the folder holds.
+    return next((f for f in files if f.name != "state.json"), files[0])
 
 
 def _load_published_map(folder: Path) -> dict:
@@ -1706,6 +1708,15 @@ def _prepare_artifact_card(
             card.draft_url = draft_url_for(
                 project_id=project_id, artifact_id=artifact_id, rel_path=rel
             )
+            if card.display:
+                from cowork.services.artifact_revisions import head_revision_id
+
+                # The version this card shows, so a chat card from an earlier
+                # turn can open that one (ENG-4684). Inline cards only: it
+                # reads the revision journal and hashes the page.
+                revision_id = head_revision_id(io_folder, rel)
+                if revision_id:
+                    card.revision_id = revision_id
     return _PreparedArtifactCard(
         card=card,
         io_folder=io_folder,
