@@ -873,7 +873,10 @@ def test_set_state_posts_the_state_and_get_state_returns_a_copy():
         "probe(window.anton.getState());"
     )
     assert out["sent"] == [
-        {"type": "state", "state": {"people": [{"name": "Ana", "contact": True}]}, "source": "anton-preview"}
+        {
+            "type": "state", "state": {"people": [{"name": "Ana", "contact": True}]}, "handed": False,
+            "source": "anton-preview",
+        }
     ]
     assert out["probes"] == [None, True, {"people": [{"name": "Ana", "contact": True}]}]
     assert out["warnings"] == []
@@ -990,3 +993,50 @@ def test_the_state_does_not_take_the_restore_or_the_theme():
     )
     assert out["restored"] == ["ok"]
     assert out["theme"] == {"dataset": "dark", "colorScheme": "dark"}
+
+
+# ENG-4684: two frames of one artifact (the chat card's and the viewer's)
+# bounced a state between them without end: each page set again what it was
+# handed, and set a default before the app's state reached it.
+
+
+def test_a_state_set_before_the_apps_state_arrived_says_so():
+    out = _run_state(
+        "window.anton.setState({ picked: ['all'] });\n"
+        "sendState({ picked: ['li'] });\n"
+        "window.anton.setState({ picked: [] });"
+    )
+    assert [(m["state"], m["handed"]) for m in out["sent"]] == [({"picked": ["all"]}, False), ({"picked": []}, True)]
+
+
+def test_a_state_set_again_while_the_apps_state_is_taken_is_not_sent_back():
+    out = _run_state(
+        "window.anton.onState((s) => { window.anton.setState({ picked: s.picked, at: 1 }); });\n"
+        "sendState({ picked: ['li'] });\n"
+        "probe(window.anton.getState());\n"
+        "window.anton.setState({ picked: [] });"
+    )
+    # The echo stays in the page; the user's next change goes out.
+    assert out["probes"] == [{"picked": ["li"], "at": 1}]
+    assert [m["state"] for m in out["sent"]] == [{"picked": []}]
+
+
+def test_a_click_the_page_answered_with_a_state_is_not_kept_for_a_restore():
+    views = _views(
+        _STATE
+        + "click(next); mutate(h2); window.anton.setState({ picked: ['li'] }); advance(300);\n"
+        "click(prev); mutate(h1); advance(300);\n"
+    )
+    # The state brings the tick back; only the navigation is the place.
+    assert views[-1]["inputs"] == [{"type": "click", "path": "nav:0/button:0", "label": "Prev"}]
+
+
+def test_a_restore_replay_sets_no_state_for_the_app():
+    out = _run_restore(
+        _STATE
+        + "pageHandlers.push((ev) => { if (ev.type === 'click' && ev.target === next) window.anton.setState({ picked: ['x'] }); });\n"
+        + f"restore({json.dumps({'inputs': [_CLICK], 'heading': 'Two'})});\n"
+        + "advance(5000); window.anton.setState({ picked: ['y'] });"
+    )
+    assert out["restored"] == ["ok"]
+    assert [m["state"] for m in out["posted"] if m["type"] == "state"] == [{"picked": ["y"]}]

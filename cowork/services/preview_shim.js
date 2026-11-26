@@ -30,6 +30,13 @@
   var TAG = 'anton-preview';
   /* The tag on what the parent window sends in: a `restore`, a `theme` and a `state`. */
   var PARENT_TAG = 'anton-preview-parent';
+  /* Shared by the view and state halves below. While a restore replays a
+     view, the page's setState calls are the replay's, not the user's, and
+     stay in the frame (the app hands the state again once the replay is
+     done). stateSets counts the page's setState calls, so an input the page
+     answered with one is known for a state edit: the state brings it back,
+     and replaying it too would undo it. */
+  var replaying = false, stateSets = 0;
   var LINE_OFFSET = __LINE_OFFSET__;
   var MAX_REPORTS = 20;
   /* What the new report types carry at most. The app and the server cut a
@@ -321,9 +328,9 @@
     var MAX_LABEL = 80, SETTLE_MS = 250;
     var ID_RE = /^[A-Za-z][\w.:-]{0,99}$/;
     var viewInputs = [], viewOverflow = false, scrolled = null, lastView = '';
-    /* True while a restore (below) replays a view: no report goes out and the
-       user's own input waits, so the page settles where the app asked. */
-    var replaying = false;
+    /* `replaying` (above) is true while a restore (below) replays a view: no
+       report goes out and the user's own input waits, so the page settles
+       where the app asked. */
     var viewTimers = [], scrollTimer = 0;
 
     var inLayer = function (el) {
@@ -414,10 +421,12 @@
       viewTimers = [setTimeout(sendView, 150), setTimeout(sendView, 900)];
     };
 
-    /* Kept only when the page changed its DOM in response. */
+    /* Kept only when the page changed its DOM in response, and not when it
+       set its state in response: a ticked box is the page's state, which the
+       app hands back to a new document (window.anton below). */
     var record = function (input) {
       if (viewOverflow || typeof MutationObserver !== 'function' || !document.body) return;
-      var changed = false;
+      var changed = false, setsBefore = stateSets;
       var observer = new MutationObserver(function (list) {
         for (var i = 0; i < list.length; i++) {
           if (!inLayer(list[i].target)) { changed = true; return; }
@@ -429,7 +438,7 @@
       setTimeout(function () {
         try {
           observer.disconnect();
-          if (!changed) return;
+          if (!changed || stateSets !== setsBefore) return;
           if (viewInputs.length >= MAX_INPUTS) {
             viewOverflow = true;
             viewInputs = [];
@@ -804,7 +813,9 @@
      side of it:
        setState(obj)          keep obj and post `state` to the app, which
                               saves it; false (and a console warning) when
-                              obj isn't JSON or is over MAX_STATE serialized
+                              obj isn't JSON or is over MAX_STATE serialized.
+                              Kept but not posted while a restore replays or
+                              while an onState callback runs (an echo).
        getState()             the last state, set here or sent by the app
                               (a copy; null before any)
        onState(cb)            cb(state) for each state the app sends: the
@@ -825,6 +836,10 @@
     var stateText = null;
     var stateFromParent = false;
     var stateListeners = [];
+    /* True while the page's onState callbacks take the app's state: a
+       setState they make echoes it, and is not sent back (another frame of
+       the artifact would hand it on, and the two would bounce it forever). */
+    var takingState = false;
     /* The state as JSON text, or null (with the reason) when it can't be
        one. Its size is counted in UTF-8 bytes, as it is saved. */
     var stateJson = function (value) {
@@ -840,14 +855,21 @@
     };
     var stateCopy = function () { return stateText === null ? null : JSON.parse(stateText); };
     var tellListener = function (cb) {
+      takingState = true;
       try { cb(stateCopy()); } catch (inner) { /* one listener's error is its own */ }
+      takingState = false;
     };
     var anton = {
       setState: function (value) {
         var json = stateJson(value);
         if (json.error) { warn('setState', json.error); return false; }
         stateText = json.text;
-        post({ type: 'state', state: JSON.parse(json.text) });
+        stateSets += 1;
+        if (replaying || takingState) return true;
+        /* `handed`: whether the app's state had reached the page yet. One set
+           before it did is the page's default, which the app's state
+           replaces. */
+        post({ type: 'state', state: JSON.parse(json.text), handed: stateFromParent });
         return true;
       },
       getState: function () { return stateCopy(); },
