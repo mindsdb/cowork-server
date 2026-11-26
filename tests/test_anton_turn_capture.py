@@ -172,7 +172,9 @@ def _scripted_llm(*, mode: str):
         return gen()
 
     llm.plan_stream = plan_stream
-    llm.summarize = AsyncMock(return_value=LLMResponse(content="SUMMARY of earlier turns"))
+    # A state record, as anton asks for: it keeps a proactive summary only when
+    # it carries the record's headings (`_SUMMARY_SECTION`).
+    llm.summarize = AsyncMock(return_value=LLMResponse(content="## Goal\nSUMMARY of earlier turns"))
     return llm
 
 

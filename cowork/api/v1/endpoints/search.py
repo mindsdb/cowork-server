@@ -9,6 +9,7 @@ from pydantic import BaseModel
 from cowork.api.v1.permissions import AuthenticatedInOrgMode, require
 from cowork.db.scoped import ScopedSession, TenantScope, get_tenant_scope
 from cowork.db.units import run_db, run_efs
+from cowork.services.artifact_metadata import is_widget
 from cowork.services.artifact_roots import artifacts_sources_for_scan as _sources_for_scan
 from cowork.services.artifacts import list_artifacts as _list_artifacts
 from cowork.services.conversations import ConversationService
@@ -134,6 +135,9 @@ def _search_rows(session: ScopedSession, query: str) -> _RowMatches:
 def _artifact_rows(artifacts: list[ArtifactCard], query: str) -> list[SearchHit]:
     results: list[SearchHit] = []
     for artifact in artifacts:
+        if is_widget(artifact.display):
+            # A widget lives in its chat, not on the Artifacts page this opens.
+            continue
         text = " ".join([artifact.title, artifact.description, artifact.path, artifact.kind])
         score = _score(text, query)
         if score:

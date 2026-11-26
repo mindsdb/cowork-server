@@ -7,7 +7,7 @@ from uuid import UUID
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request, status
 
-from cowork.api.v1.permissions import AuthenticatedInOrgMode, require
+from cowork.api.v1.permissions import AuthenticatedInOrgMode, WindowProof, require
 from cowork.common.settings.app_settings import OAuthSettings
 from cowork.db.scoped import ScopedSession, ScopedSessionDep, TenantScope, TenantScopeDep
 from cowork.db.units import run_db, run_efs_unit
@@ -58,7 +58,9 @@ def list_schedules(scoped: ScopedSessionDep, project_id: UUID | None = None):
     return {"schedules": [_serialize(s, scoped, run_count=counts.get(s.id, 0)) for s in schedules]}
 
 
-@router.post("/", status_code=status.HTTP_201_CREATED, response_model=ScheduleResponse)
+@router.post(
+    "/", status_code=status.HTTP_201_CREATED, response_model=ScheduleResponse, dependencies=[Depends(require(WindowProof))]
+)
 async def create_schedule(body: ScheduleCreateRequest, scope: TenantScopeDep, request: Request):
     # A schedule with no project runs in the caller's default project, which
     # checks the general project's folder on the file store.
@@ -149,8 +151,8 @@ def get_schedule(schedule_id: UUID, scoped: ScopedSessionDep):
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
 
 
-@router.put("/{schedule_id}", response_model=ScheduleResponse)
-@router.patch("/{schedule_id}", response_model=ScheduleResponse)
+@router.put("/{schedule_id}", response_model=ScheduleResponse, dependencies=[Depends(require(WindowProof))])
+@router.patch("/{schedule_id}", response_model=ScheduleResponse, dependencies=[Depends(require(WindowProof))])
 async def update_schedule(schedule_id: UUID, body: ScheduleUpdateRequest, scope: TenantScopeDep, request: Request):
     changes = body.model_dump(exclude_none=True)
     # "No project" arrives as an explicit null, which exclude_none drops.
@@ -197,7 +199,7 @@ def pause_schedule(schedule_id: UUID, scoped: ScopedSessionDep):
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
 
 
-@router.post("/{schedule_id}/resume", response_model=ScheduleResponse)
+@router.post("/{schedule_id}/resume", response_model=ScheduleResponse, dependencies=[Depends(require(WindowProof))])
 def resume_schedule(schedule_id: UUID, scoped: ScopedSessionDep):
     try:
         return _serialize(ScheduleService(scoped).resume_schedule(schedule_id), scoped)
@@ -207,7 +209,7 @@ def resume_schedule(schedule_id: UUID, scoped: ScopedSessionDep):
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
 
 
-@router.post("/{schedule_id}/run-now", status_code=status.HTTP_202_ACCEPTED)
+@router.post("/{schedule_id}/run-now", status_code=status.HTTP_202_ACCEPTED, dependencies=[Depends(require(WindowProof))])
 def run_schedule_now(
     schedule_id: UUID, scoped: ScopedSessionDep, background_tasks: BackgroundTasks, trial: bool = False,
 ):

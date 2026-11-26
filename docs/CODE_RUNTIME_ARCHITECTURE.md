@@ -67,6 +67,7 @@ Long-lived MindsHub, GitHub and Linear credentials remain in the control plane.
 - The runtime has a hashed-at-rest computer token for registration/leases only.
 - Each leased run receives a new per-run agent token; only its digest is durable.
 - Inference is proxied centrally and authenticates that run/computer/epoch/lease token.
+- On the desktop, Codex reaches the server's loopback inference proxy with an `inference` capability token of its own engine session (`cowork/capability_tokens.py`). The server keeps only the token's hash, revokes it when the session closes, and refuses the window's bearer token on those routes. The commands the app-server runs see `MINDSHUB_CODEX_API_KEY` empty (`shell_environment_policy.set`).
 - Linked GitHub/Linear items receive exact-URL, action-, run-, epoch- and computer-scoped `ConnectorGrant`s with short expiry and bounded use.
 - The runtime writes these short-lived capabilities to a mode `0600` file, exposes them through an agent-neutral MCP server and deletes the file when the run closes.
 - OAuth tokens never enter a lease, event, Task, Project, command, log or execution config.

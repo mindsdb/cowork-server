@@ -52,6 +52,37 @@ def _port(value: Any) -> int | None:
     return value if 0 < value < 65536 else None
 
 
+#: The ways to show an artifact other than as a card, live in the chat reply
+#: (ENG-4684): "inline", a piece of the answer, and "widget", a piece that
+#: collects the user's input in the chat and is no deliverable, so it is never
+#: published, shared or listed with the user's artifacts.
+INLINE_DISPLAY = "inline"
+WIDGET_DISPLAY = "widget"
+INLINE_DISPLAYS = frozenset({INLINE_DISPLAY, WIDGET_DISPLAY})
+
+#: What publishing or sharing a widget answers, on every route that refuses it.
+WIDGET_PUBLISH_REFUSAL = (
+    "This is a widget that collects input in the chat, so it can't be published or shared."
+)
+
+
+def shows_inline(display: Any) -> bool:
+    """Whether a card with this ``display`` shows live in the chat reply: an
+    inline piece or a widget. Everything inline gets (state.json, the card's
+    revisionId, the preview shim's page API) asks this, never one value."""
+    return isinstance(display, str) and display in INLINE_DISPLAYS
+
+
+def is_widget(display: Any) -> bool:
+    """Whether this ``display`` makes the artifact a widget (see INLINE_DISPLAYS)."""
+    return display == WIDGET_DISPLAY
+
+
+def _display(value: Any) -> str | None:
+    # Anything but one of INLINE_DISPLAYS reads as missing.
+    return value if shows_inline(value) else None
+
+
 LenientStr = Annotated[str | None, BeforeValidator(lenient_text)]
 LenientPort = Annotated[int | None, BeforeValidator(_port)]
 
@@ -109,6 +140,7 @@ class ArtifactMetadata(BaseModel):
     description: LenientStr = None
     type: LenientStr = None
     primary: LenientStr = None
+    display: Annotated[str | None, BeforeValidator(_display)] = None
     port: LenientPort = None
     datasources: Annotated[list[DatasourceRef], BeforeValidator(_datasource_items)] = []
     provenance: Annotated[list[ProvenanceEntry | None], BeforeValidator(_provenance_items)] = []

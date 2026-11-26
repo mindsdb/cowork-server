@@ -30,6 +30,7 @@ from cowork.api.v1.route_walker import contradictory_routes, route_key, undeclar
 from cowork.api.v1.router import api_router as v1_router
 from starlette.responses import JSONResponse
 
+from cowork import app_secret
 from cowork.auth_middleware import (
     BearerTokenMiddleware,
     ensure_auth_token,
@@ -73,6 +74,7 @@ from cowork.streaming.turn_claim import TurnClaimUnavailable
 from cowork.common.request_logging import RequestLoggingApp
 from cowork.common.logger import find_database_error, relayed_error, setup_logging
 from cowork.common.paths import O_NONBLOCK, dir_open, dir_scandir, dir_stat, pinned_dir
+from cowork.common.launch_environment import launch_value
 from cowork.common.paths import cowork_home
 from cowork.common.settings.app_settings import (
     TurnQueueSettings,
@@ -1131,9 +1133,12 @@ def create_app() -> FastAPI:
         return JSONResponse({"detail": str(exc)}, status_code=422)
 
     # Bearer-token auth. On by default in local mode (see AppSettings.
-    # require_auth). Token is auto-generated on first startup when
-    # COWORK_AUTH_TOKEN is not set, then persisted to <cowork_home>/.env so
-    # the desktop app and subsequent server runs share the same secret.
+    # require_auth), and always on while the server holds the desktop app's
+    # launch hand-off (cowork.app_secret.held_handoff), whose token lives in
+    # memory for this launch only. Otherwise the token is auto-generated on
+    # first startup when COWORK_AUTH_TOKEN is not set, then persisted to
+    # <cowork_home>/.env so a client started from a terminal and later server
+    # runs share the same secret.
     #
     # Registered BEFORE CORS so CORS ends up the outer layer (Starlette applies
     # the last-added middleware outermost): a 401 from the auth layer still
@@ -1298,28 +1303,46 @@ def create_app() -> FastAPI:
         else:
             logger.info("storage: org-keyed shared root at %s", settings.storage.shared_root)
 
-    if settings.require_auth:
-        # The token is mirrored into cowork_home()/.env so a desktop user can
-        # read it back. On an org deployment cowork_home() is shared storage
-        # that every organization's agent pod can read and write, so mirroring
-        # a bearer token there would publish it to every tenant and let any of
-        # them overwrite it. Inert today only because require_auth defaults off
-        # and no values file sets it; guarded so turning it on is not a trap.
+    handoff = app_secret.held_handoff()
+    if settings.require_auth or handoff is not None:
+        # Outside a launch hand-off the token is mirrored into
+        # cowork_home()/.env so a desktop app that predates the hand-off, or a
+        # client started from a terminal, can read it back. On an org
+        # deployment cowork_home() is shared storage that every
+        # organization's agent pod can read and write, so mirroring a bearer
+        # token there would publish it to every tenant and let any of them
+        # overwrite it. Inert today only because require_auth defaults off and
+        # no values file sets it; guarded so turning it on is not a trap. A
+        # desktop launch that holds the hand-off is refused too: only the
+        # .env file, which agent code can write, could have named org tenancy
+        # there. cowork.cli.main refuses that launch first, with a line the
+        # desktop shows; this covers a caller that builds the app directly.
         if settings.tenancy_mode == "org":
             raise RuntimeError(
-                "COWORK_REQUIRE_AUTH is not supported in org tenancy mode: the bearer token "
-                "would be mirrored into shared storage readable by every organization. "
+                "COWORK_REQUIRE_AUTH is not supported in org tenancy mode, nor is the desktop "
+                "app's launch hand-off: the bearer token would be mirrored into shared storage "
+                "readable by every organization, and the desktop always runs local tenancy. "
                 "Org deployments authenticate at the ingress instead."
             )
         env_path = cowork_home() / ".env"
-        if settings.trust_identity_headers or os.environ.get(file_variable(name="COWORK_AUTH_TOKEN")):
+        if handoff is not None:
+            # The desktop app handed this launch its token on stdin
+            # (cowork.app_secret.read_handoff_from_stdin). It stays in memory:
+            # nothing generates, mirrors or reads a token from cowork-home's
+            # .env, which agent code can read and write, and a copy an
+            # earlier launch wrote there is removed.
+            token = handoff.auth_token
+            remove_auth_token(env_path)
+        elif settings.trust_identity_headers or launch_value(file_variable(name="COWORK_AUTH_TOKEN")):
             # With identity headers on, the token acts as any person, and the
             # desktop app, which reads the copy in cowork-home's .env, never
             # runs here. A token in the file COWORK_AUTH_TOKEN_FILE names is
             # kept off the disk the same way, with identity headers on or off.
             # The token comes from the process environment alone, or that
             # file, never settings.auth_token, which cowork-home's .env also
-            # fills, and a copy an earlier start wrote there is removed.
+            # fills, and a copy an earlier start wrote there is removed. A
+            # local launch has moved both variables out of os.environ by now,
+            # so both reads go through launch_value.
             token = process_secret(name="COWORK_AUTH_TOKEN")
             if not token:
                 raise RuntimeError(
@@ -1332,10 +1355,12 @@ def create_app() -> FastAPI:
         else:
             token = settings.auth_token or ensure_auth_token(env_path)
             sync_auth_token(env_path, token)
-        # Codex has a separate, process-local inference credential, not the
-        # desktop's API token. These exact routes retain their own constant-time
-        # credential check and LoopbackDesktopOnly guard. Do not exempt the
-        # coding prefix: that would expose task/filesystem APIs to the agent.
+        # Codex has a separate inference credential, not the desktop's API
+        # token: each engine session's own `inference` capability token
+        # (cowork.capability_tokens). These exact routes check it themselves
+        # (coding._require_inference_client) behind the LoopbackDesktopOnly
+        # guard. Do not exempt the coding prefix: that would expose
+        # task/filesystem APIs to the agent.
         channel_webhook_paths.update(
             f"/api/v1/coding/inference/{path}" for path in INFERENCE_PATHS
         )

@@ -397,7 +397,9 @@ def main() -> None:
             body = publish_markdown_body(text=source.decode("utf-8"))
             conversion = Conversion(data=body.encode("utf-8"), omitted_count=0, scripts_dropped=False)
         elif isinstance(request, PublishFileRequest):
-            body = file_page_body(data=source, suffix=request.suffix, name=request.name)
+            body = file_page_body(
+                data=source, suffix=request.suffix, name=request.name, viewer_base=request.viewer_base
+            )
             conversion = Conversion(data=body.encode("utf-8"), omitted_count=0, scripts_dropped=False)
         else:
             conversion = convert(

@@ -15,7 +15,7 @@ from typing import Self
 from fastapi import APIRouter, Depends
 from pydantic import BaseModel, ConfigDict, SecretStr, field_validator, model_validator
 
-from cowork.api.v1.permissions import LoopbackDesktopOnly, require
+from cowork.api.v1.permissions import LoopbackDesktopOnly, WindowProof, require
 from cowork.common.settings.runtime_credential import (
     LocalBrowserHost,
     clear_browser_host,
@@ -45,7 +45,7 @@ class MindsCredentialBody(BaseModel):
     value: str = ""
 
 
-@router.put("/minds")
+@router.put("/minds", dependencies=[Depends(require(WindowProof))])
 def put_minds_credential(body: MindsCredentialBody) -> dict[str, bool]:
     if body.value:
         set_minds_credential(body.value)
@@ -117,7 +117,7 @@ class BrowserHostBody(BaseModel):
         return self
 
 
-@router.put("/browser")
+@router.put("/browser", dependencies=[Depends(require(WindowProof))])
 async def put_browser_host(body: BrowserHostBody) -> dict[str, bool]:
     if body.url:
         set_browser_host(LocalBrowserHost(url=body.url, token=body.token))

@@ -443,7 +443,7 @@ def _hand_over_error(reason: str) -> str:
 
 
 _WRITES_REFUSED_ERROR = (
-    "Run stopped short: a change needed approval, and a scheduled run has nobody to approve it, "
+    "Run stopped short: a change needed approval, and nobody approved it while the run waited, "
     "so it wasn't made. Open the run to see the change, then run the task now and approve it there."
 )
 
