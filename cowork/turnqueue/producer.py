@@ -45,6 +45,7 @@ from cowork.services import decisions_proxy, product_permissions
 from cowork.services.connectors.custom_connectors import MemberTurnTemplate, member_turn_templates
 from cowork.services.connectors.notion_pages import describe_project_pages
 from cowork.services.connectors.specs._registry import registry
+from cowork.services.mindshub_teams import ZdrState
 from cowork.services.product_permissions import require_product_permission
 from cowork.turnqueue.auth_keys import (
     CUSTOM_GRANTS_ROUTE,
@@ -86,6 +87,8 @@ from cowork.turnqueue.redis_client import (
 from cowork.common.settings.app_settings import TurnQueueSettings, default_turn_minds_api_host
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from cowork.common.settings.user_settings import UserSettings
 
 logger = logging.getLogger(__name__)
@@ -1192,7 +1195,8 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
                                 preview_checks: bool = False,
                                 ui_locale: str | None = None,
                                 reasoning_effort: str | None = None,
-                                zdr_on: bool | None = None):
+                                zdr: ZdrState | None = None,
+                                note_zdr: Callable[[ZdrState], None] | None = None):
     """Mint, enqueue, then yield this turn's replies as (kind, data) tuples.
 
     Yields turn_delta / turn_step / turn_memory in arrival order and ends with
@@ -1225,7 +1229,8 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
     (cowork.handlers.responses.remote_turn_skills).
     `reasoning_effort` is the composer's pick for this turn; None leaves the
     pod's configured default.
-    `zdr_on` is the caller's ZDR answer when the handler already has it; None reads it here."""
+    `zdr` is the caller's ZDR state when the handler already has it; None reads it here.
+    `note_zdr` is handed the state the turn ran with, for its push."""
     settings = TurnQueueSettings()
     scope = scope_for_identity(org_id=org_id, user_id=user_id)
     try:
@@ -1360,7 +1365,8 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
         connectors_block = await _with_custom_usage_notes(connectors_block, scope, custom_api_block)
     browser_block = await _scoped_browser_block(
         scope=scope, conversation_id=conversation_id, turn_key=llm_block.get("api_key", ""),
-        project_id=workspace.project_id if workspace is not None else None, zdr_on=zdr_on,
+        project_id=workspace.project_id if workspace is not None else None,
+        zdr_on=None if zdr is None else zdr is not ZdrState.OFF,
     )
     browser_block = await _admit_decisions_proxy(
         r, browser_block, turn_key=llm_block.get("api_key", ""), turn_key_ttl_seconds=key_ttl_seconds,
@@ -1395,15 +1401,18 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
     jev_classify = getattr(turn_settings, "jev_classify_enabled", True) is not False
     # Under ZDR MindsHub refuses Jev and drops native web search, so the pod neither checks
     # completion nor classifies with Jev, and its scratchpad has no web_search(). Read even with Jev off.
-    if zdr_on is None:
-        from cowork.services.mindshub_zdr import zdr_on_for
+    if zdr is None:
+        from cowork.services.mindshub_zdr import zdr_state_for
 
         try:
-            zdr_on = await zdr_on_for(scope=scope, settings=turn_settings, turn_key=llm_block.get("api_key", ""))
+            zdr = await zdr_state_for(scope=scope, settings=turn_settings, turn_key=llm_block.get("api_key", ""))
         except Exception:
-            # Unknown counts as on: it only skips Jev and web_search(), which ZDR drops anyway.
             logger.warning("Could not read ZDR for the remote turn", exc_info=True)
-            zdr_on = True
+            zdr = ZdrState.UNKNOWN
+    if note_zdr is not None:
+        note_zdr(zdr)
+    # Unknown counts as on: it only skips Jev and the browser's MindsHub steps.
+    zdr_on = zdr is not ZdrState.OFF
     jev_decisions = jev_decisions and not zdr_on
     jev_classify = jev_classify and not zdr_on
     # A key shorter than the time-limited window comes from an auth that

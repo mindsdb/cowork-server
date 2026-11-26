@@ -23,6 +23,7 @@ from cowork.handlers.response_routing import (
     decide_route,
 )
 from cowork.handlers.responses import ResponsesHandler
+from cowork.services.mindshub_teams import ZdrState
 from cowork.streaming.registry import TurnLifecycle
 from cowork.turnqueue.producer import TurnLlm
 
@@ -292,11 +293,11 @@ def _zdr(monkeypatch, on: bool) -> list[str]:
 
     asked = []
 
-    async def zdr_on(*, bearer_token, org_id, user_id):
+    async def zdr_state(*, bearer_token, org_id, user_id):
         asked.append(bearer_token)
-        return on
+        return ZdrState.ON if on else ZdrState.OFF
 
-    monkeypatch.setattr(responses.mindshub_zdr, "zdr_on", zdr_on)
+    monkeypatch.setattr(responses.mindshub_zdr, "zdr_state", zdr_state)
     return asked
 
 
@@ -1636,11 +1637,11 @@ async def test_the_remote_turns_zdr_read_never_fails_the_turn(monkeypatch):
     handler = ResponsesHandler()
     handler.scope = TenantScope(org_mode=True, org_id="o", user_id="u")
     handler.mindshub_bearer = ""
-    assert await handler._zdr_on_quietly(None) is None
+    assert await handler._zdr_state_quietly(None) is None
 
     async def broken(*_args, **_kwargs):
         raise RuntimeError("auth down")
 
-    monkeypatch.setattr(handler, "zdr_on", broken)
+    monkeypatch.setattr(handler, "zdr_state", broken)
     handler.mindshub_bearer = "jwt"
-    assert await handler._zdr_on_quietly(None) is None
+    assert await handler._zdr_state_quietly(None) is None

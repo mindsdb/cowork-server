@@ -13,6 +13,7 @@ from cowork.turnqueue.redis_client import cancel_flag_key
 
 from cowork.handlers import turn_errors as te
 from cowork.services import providers as pv
+from cowork.services.mindshub_teams import ZdrState
 from cowork.turnqueue import producer as prod
 from cowork.turnqueue.auth_keys import DATASOURCE_CONNECTIONS_ROUTE, DATASOURCE_GRANTS_ROUTE, MintedTurnKey
 
@@ -3041,16 +3042,16 @@ async def test_the_job_carries_the_organizations_jev_opt_out(monkeypatch, enable
     monkeypatch.setattr(prod, "get_redis", lambda: fake)
     monkeypatch.setattr(prod, "_new_correlation_id", lambda: "r")
     await _drain(prod.stream_remote_replies(
-        conversation_id="conv-1", org_id=None, user_id=None, input_text="hi", model="m", zdr_on=False))
+        conversation_id="conv-1", org_id=None, user_id=None, input_text="hi", model="m", zdr=ZdrState.OFF))
 
     assert json.loads(fake.added[0][1]["payload"])["params"]["jev_decisions"] is enabled
 
 
 @pytest.mark.parametrize(("handed", "read", "sent"), [
-    (True, None, False),
-    (False, None, True),
-    (None, True, False),
-    (None, False, True),
+    (ZdrState.ON, None, False),
+    (ZdrState.OFF, None, True),
+    (None, ZdrState.ON, False),
+    (None, ZdrState.OFF, True),
 ])
 @pytest.mark.asyncio
 async def test_zdr_keeps_the_pods_completion_check_and_classify_off_jev(monkeypatch, handed, read, sent):
@@ -3065,25 +3066,31 @@ async def test_zdr_keeps_the_pods_completion_check_and_classify_off_jev(monkeypa
     )
     asked = []
 
-    async def zdr_on_for(**kwargs):
+    async def zdr_state_for(**kwargs):
         asked.append(kwargs["turn_key"])
         return read
 
-    monkeypatch.setattr(mindshub_zdr, "zdr_on_for", zdr_on_for)
+    monkeypatch.setattr(mindshub_zdr, "zdr_state_for", zdr_state_for)
     fake = FakeRedis(replies=[("scratchpad:reply:conv-1", _reply("turn_completed", {}))])
     monkeypatch.setattr(prod, "get_redis", lambda: fake)
     monkeypatch.setattr(prod, "_new_correlation_id", lambda: "r")
+    noted = []
     await _drain(prod.stream_remote_replies(
-        conversation_id="conv-1", org_id=None, user_id=None, input_text="hi", model="m", zdr_on=handed))
+        conversation_id="conv-1", org_id=None, user_id=None, input_text="hi", model="m", zdr=handed,
+        note_zdr=noted.append))
 
     params = json.loads(fake.added[0][1]["payload"])["params"]
     assert params["jev_decisions"] is sent
     assert params["jev_classify"] is sent
     assert params["web_search"] is sent
     assert asked == ([] if handed is not None else ["mdb_turnkey"])
+    # The state the turn ran with is handed back for its push.
+    assert noted == [handed or read]
 
 
-@pytest.mark.parametrize(("read", "sent"), [(True, False), (False, True), (RuntimeError("down"), False)])
+@pytest.mark.parametrize(("read", "sent"), [
+    (ZdrState.ON, False), (ZdrState.OFF, True), (ZdrState.UNKNOWN, False), (RuntimeError("down"), False),
+])
 @pytest.mark.asyncio
 async def test_zdr_turns_off_the_pods_web_search_even_with_jev_opted_out(monkeypatch, read, sent):
     # web_search() follows ZDR alone, so ZDR is read even when Jev is already off; unknown counts as on.
@@ -3096,12 +3103,12 @@ async def test_zdr_turns_off_the_pods_web_search_even_with_jev_opted_out(monkeyp
                                       jev_decisions_enabled=False, jev_classify_enabled=False),
     )
 
-    async def zdr_on_for(**kwargs):
+    async def zdr_state_for(**kwargs):
         if isinstance(read, Exception):
             raise read
         return read
 
-    monkeypatch.setattr(mindshub_zdr, "zdr_on_for", zdr_on_for)
+    monkeypatch.setattr(mindshub_zdr, "zdr_state_for", zdr_state_for)
     fake = FakeRedis(replies=[("scratchpad:reply:conv-1", _reply("turn_completed", {}))])
     monkeypatch.setattr(prod, "get_redis", lambda: fake)
     monkeypatch.setattr(prod, "_new_correlation_id", lambda: "r")
@@ -3126,7 +3133,7 @@ async def test_the_job_carries_the_organizations_classify_switch(monkeypatch, en
     monkeypatch.setattr(prod, "get_redis", lambda: fake)
     monkeypatch.setattr(prod, "_new_correlation_id", lambda: "r")
     await _drain(prod.stream_remote_replies(
-        conversation_id="conv-1", org_id=None, user_id=None, input_text="hi", model="m", zdr_on=False))
+        conversation_id="conv-1", org_id=None, user_id=None, input_text="hi", model="m", zdr=ZdrState.OFF))
 
     params = json.loads(fake.added[0][1]["payload"])["params"]
     assert params["jev_classify"] is enabled

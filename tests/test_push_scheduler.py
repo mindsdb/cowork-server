@@ -92,9 +92,20 @@ async def test_a_run_pushes_how_it_ended(schedule_id, turns, pushes, reason, suc
     await _run(slot)
     assert pushes == [{
         "org_id": ORG, "user_id": OWNER, "schedule_name": _schedule(schedule_id).title,
-        "conversation_id": _conversation_of_last_run(schedule_id), "succeeded": succeeded,
+        "conversation_id": _conversation_of_last_run(schedule_id), "succeeded": succeeded, "zdr": None,
     }]
     assert pushes[0]["conversation_id"] is not None
+
+
+async def test_a_run_pushes_with_the_zdr_its_turn_read(schedule_id, turns, pushes, monkeypatch):
+    # The turn's own read at its start decides, not a recent read elsewhere in the process.
+    from cowork.services.mindshub_teams import ZdrState
+
+    lifecycle = SimpleNamespace(zdr=ZdrState.ON)
+    monkeypatch.setattr(scheduler, "registry", SimpleNamespace(get=lambda _cid: SimpleNamespace(lifecycle=lifecycle)))
+    (slot,) = _poll(schedule_id)
+    await _run(slot)
+    assert [push["zdr"] for push in pushes] == [ZdrState.ON]
 
 
 async def test_a_cancelled_run_pushes_nothing(schedule_id, turns, pushes):

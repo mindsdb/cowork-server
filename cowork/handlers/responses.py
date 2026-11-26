@@ -171,6 +171,7 @@ from cowork.services.product_permissions import (
     ProductPermissionDenied, ProductPermissionUnavailable, require_product_permission,
 )
 from cowork.services import mindshub_zdr
+from cowork.services.mindshub_teams import ZdrState
 from cowork.services.memory import apply_turn_memory, build_turn_memory
 from cowork.services.projects import ProjectNotFoundError, ProjectService, is_comparison_sandbox
 from cowork.services.queued_repairs import QueuedRepairs
@@ -871,6 +872,8 @@ class ResponsesHandler:
         self.first_take: FirstTake | None = None
         # The gate's scrubbed history, set by _route_request for a direct answer.
         self.routing_history: list[dict] | None = None
+        # The org's ZDR state read once the turn is routed, recorded on its lifecycle for the push.
+        self.turn_zdr: ZdrState | None = None
 
     def _get_harness(self):
         if self.harness is None:
@@ -994,6 +997,7 @@ class ResponsesHandler:
                     trace_metadata=trace_metadata,
                     first_take=bool(request.stream) and self.interactive,
                 )
+                self.turn_zdr = await self._zdr_state_quietly(turn_llm)
             except BaseException:
                 # A refused or cancelled request must not leave the take's model call running.
                 if getattr(self, "first_take", None) is not None:
@@ -1056,7 +1060,7 @@ class ResponsesHandler:
                     model=request.model, reasoning_effort=request.reasoning_effort, turn_llm=turn_llm,
                     web=not has_files,
                     # Under ZDR MindsHub drops native web tools; only a known answer turns them off.
-                    zdr_on=not has_files and await self._zdr_on_quietly(turn_llm) is True,
+                    zdr_on=not has_files and self.turn_zdr is ZdrState.ON,
                 )
                 answer_history = self.routing_history or _routing_history(
                     start.gate_rows or [], start.harness_input,
@@ -1122,6 +1126,7 @@ class ResponsesHandler:
                         remote=TurnQueueSettings().is_remote,
                     ),
                     interactive=self.interactive,
+                    zdr=self.turn_zdr,
                 )
 
                 def delegated(buffer: StreamBuffer, metadata: dict[str, str]):
@@ -1705,14 +1710,14 @@ class ResponsesHandler:
             return True
         return not await self.zdr_on(turn_llm, settings)
 
-    async def _zdr_on_quietly(self, turn_llm: dict | None) -> bool | None:
-        """``zdr_on`` for a path that must not fail the turn: None when it can't be asked
+    async def _zdr_state_quietly(self, turn_llm: dict | None) -> ZdrState | None:
+        """``zdr_state`` for a path that must not fail the turn: None when it can't be asked
         without a settings read, which the producer then makes from the turn's snapshot."""
         has_credential = (self.scope.org_mode and self.mindshub_bearer) or ((turn_llm or {}).get("llm") or {}).get("api_key")
         if not has_credential:
             return None
         try:
-            return await self.zdr_on(turn_llm)
+            return await self.zdr_state(turn_llm)
         except PoolTimeoutError:
             raise
         except Exception:
@@ -1720,7 +1725,11 @@ class ResponsesHandler:
             return None
 
     async def zdr_on(self, turn_llm: dict | None = None, settings: UserSettings | None = None) -> bool:
-        """Whether ZDR is on for this turn's organization (unknown counts as on).
+        """Whether ZDR is on for this turn's organization (unknown counts as on)."""
+        return await self.zdr_state(turn_llm, settings) is not ZdrState.OFF
+
+    async def zdr_state(self, turn_llm: dict | None = None, settings: UserSettings | None = None) -> ZdrState:
+        """ZDR for this turn's organization.
         Asks as the caller on the web, else on the MindsHub key the turn uses."""
         if self.scope.org_mode and self.mindshub_bearer:
             bearer = self.mindshub_bearer
@@ -1731,7 +1740,7 @@ class ResponsesHandler:
                 if settings is None:
                     settings = await run_on_unit_threads(partial(get_user_settings, self.scope))
                 bearer = provider_api_key_str(settings, Provider.MINDS_CLOUD)
-        return await mindshub_zdr.zdr_on(
+        return await mindshub_zdr.zdr_state(
             bearer_token=bearer or "", org_id=self.scope.org_id or "", user_id=self.scope.user_id or "",
         )
 
@@ -1928,7 +1937,9 @@ class ResponsesHandler:
             )
 
         # turn_id comes from handle(): same numbering as the delegated path.
-        lifecycle = TurnLifecycle(identity=RunIdentity(correlation_id=corr), interactive=self.interactive)
+        lifecycle = TurnLifecycle(
+            identity=RunIdentity(correlation_id=corr), interactive=self.interactive, zdr=self.turn_zdr,
+        )
         handle = await registry.start(
             conversation_id=str(conversation_id),
             turn_id=turn_id,
@@ -3345,8 +3356,9 @@ class ResponsesHandler:
                 conversation_id=str(conv_id),
                 org_id=self.scope.org_id,
                 user_id=self.scope.user_id,
-                # Asked as the caller, so the gate's cached answer is reused.
-                zdr_on=await self._zdr_on_quietly(turn_llm),
+                # Read at the turn's start; None reads it there, recording it for the push.
+                zdr=lifecycle.zdr if lifecycle.zdr is not None else await self._zdr_state_quietly(turn_llm),
+                note_zdr=lifecycle.note_zdr,
                 input_text=input_text,
                 model=model,
                 reasoning_effort=reasoning_effort,

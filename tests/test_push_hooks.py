@@ -324,6 +324,67 @@ async def test_under_zdr_a_share_leaves_the_artifact_title_out(pushes, zdr):
     assert "Q3" not in str(payload.apns_body()) + str(payload.fcm_message("device"))
 
 
+# The state a push read for itself wins over the process's last answer, which is only a fallback.
+
+async def test_a_turn_longer_than_the_fallback_window_keeps_its_title_with_zdr_off(tmp_path, pushes, monkeypatch):
+    _seen_zdr(ZdrState.OFF, age_s=PUSH_ZDR_ANSWER_MAX_AGE_S + 1)
+    monkeypatch.setattr(hooks, "_conversation_title", lambda session, conversation_id: "Plan the offsite")
+    hooks.turn_ended(await _handle(tmp_path, "completed", zdr=ZdrState.OFF))
+    await _drained()
+    ((_, _, payload),) = pushes
+    assert payload.title == "Plan the offsite"
+
+
+@pytest.mark.parametrize("state", [ZdrState.ON, ZdrState.UNKNOWN])
+async def test_a_turn_that_read_zdr_on_is_generic_whatever_was_read_since(tmp_path, pushes, monkeypatch, state):
+    _seen_zdr(ZdrState.OFF)
+    monkeypatch.setattr(hooks, "_conversation_title", lambda session, conversation_id: "Plan the offsite")
+    hooks.turn_ended(await _handle(tmp_path, "completed", zdr=state))
+    await _drained()
+    ((_, _, payload),) = pushes
+    assert (payload.title, payload.body) == ("Your task", "Finished.")
+
+
+async def test_a_share_that_read_zdr_off_keeps_its_title_with_no_earlier_read(pushes):
+    _seen_zdr(None)
+    hooks.artifact_shared(
+        org_id=ORG, sharer_id=OWNER, sharer_name="owner@example.com",
+        recipient_ids=[OTHER], artifact_title="Q3", url="https://view.example/r/1", zdr=ZdrState.OFF,
+    )
+    await _drained()
+    ((_, _, payload),) = pushes
+    assert payload.title == "owner@example.com shared “Q3” with you"
+
+
+@pytest.mark.parametrize("state", [ZdrState.ON, ZdrState.UNKNOWN])
+async def test_a_share_that_read_zdr_on_is_generic(pushes, state):
+    hooks.artifact_shared(
+        org_id=ORG, sharer_id=OWNER, sharer_name="owner@example.com",
+        recipient_ids=[OTHER], artifact_title="Q3 layoffs", url="https://view.example/r/1", zdr=state,
+    )
+    await _drained()
+    ((_, _, payload),) = pushes
+    assert payload.title == "owner@example.com shared an artifact with you"
+
+
+async def test_a_scheduled_run_that_read_zdr_off_keeps_its_name_with_no_earlier_read(pushes):
+    _seen_zdr(None)
+    hooks.scheduled_run_ended(
+        org_id=ORG, user_id=OWNER, schedule_name="Daily report", conversation_id="c1", succeeded=True,
+        zdr=ZdrState.OFF,
+    )
+    await _drained()
+    ((_, _, payload),) = pushes
+    assert payload.title == "Daily report"
+
+
+def test_a_turn_keeps_the_first_zdr_state_it_read():
+    lifecycle = TurnLifecycle()
+    lifecycle.note_zdr(ZdrState.OFF)
+    lifecycle.note_zdr(ZdrState.ON)
+    assert lifecycle.zdr is ZdrState.OFF
+
+
 async def test_a_permissions_read_records_the_orgs_zdr_for_pushes(monkeypatch):
     from cowork.services.mindshub_client import MindsHubAnswer, MindsHubReply
 
