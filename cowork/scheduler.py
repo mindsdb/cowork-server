@@ -5,7 +5,7 @@ import json
 import random
 import threading
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from functools import partial
 from typing import TYPE_CHECKING, TypeVar
@@ -261,6 +261,7 @@ class _ScheduledTurn:
     prompt: str
     model: str | None
     project_id: UUID | None
+    disabled_connections: list[dict] | None = None
 
 
 @dataclass(frozen=True)
@@ -390,6 +391,7 @@ class _TurnEvidence:
     handed_over: str | None = None
     # Whether a change the agent asked approval for went unapproved.
     writes_refused: bool = False
+    blocked_connector: str | None = None
 
 
 @dataclass(frozen=True)
@@ -460,6 +462,12 @@ def _classify(evidence: _TurnEvidence) -> _AttemptEnd:
         if evidence.writes_refused:
             # Ranked above a limit: a lost write is the bigger surprise.
             return _AttemptEnd(outcome=AttemptOutcome.writes_refused, error=_WRITES_REFUSED_ERROR)
+        if evidence.blocked_connector is not None:
+            return _AttemptEnd(
+                outcome=AttemptOutcome.connector_blocked,
+                error=f"This task needed an excluded connector: {evidence.blocked_connector}. "
+                "Change the task's connector settings to allow it.",
+            )
         limit_error = _LIMIT_ERRORS.get(evidence.stopped_by or "")
         if limit_error:
             return _AttemptEnd(outcome=AttemptOutcome.stopped_at_limit, error=limit_error)
@@ -576,6 +584,7 @@ def _read_schedule(session: ScopedSession, *, schedule_id: UUID) -> _ScheduledTu
         prompt=schedule.prompt,
         model=schedule.model,
         project_id=schedule.project_id,
+        disabled_connections=schedule.disabled_connections or None,
     )
 
 
@@ -927,6 +936,7 @@ async def _execute_schedule(
             input=scheduled.prompt,
             model=resolve_schedule_model(scheduled.model),
             stream=True,
+            disabled_connections=scheduled.disabled_connections,
             conversation=str(conversation_id),
             trace_tags=["scheduled_task", f"trigger:{trigger.value}"],
             trace_metadata={
@@ -1012,7 +1022,7 @@ async def _execute_schedule(
         # buffer's records are the only truthful signal of how the turn ended
         # and whether its agent acted — without them every run is recorded as
         # success.
-        evidence = await _turn_evidence(str(conversation_id))
+        evidence = await _run_evidence(str(conversation_id), scheduled)
         shutdown_interrupted = evidence.shutdown_interrupted
         end = _classify(evidence)
 
@@ -1054,7 +1064,7 @@ async def _execute_schedule(
                 await _stop_reaped_turn(str(conversation_id))
                 raise _LeaseLost()
             if fallback_ran:
-                evidence = await _turn_evidence(str(conversation_id))
+                evidence = await _run_evidence(str(conversation_id), scheduled)
                 shutdown_interrupted = evidence.shutdown_interrupted
                 end = _classify(evidence)
 
@@ -1155,6 +1165,7 @@ async def _execute_schedule(
                             AttemptOutcome.interrupted,
                             AttemptOutcome.stopped_at_limit,
                             AttemptOutcome.writes_refused,
+                            AttemptOutcome.connector_blocked,
                         }
                         and not shutdown_interrupted
                     ),
@@ -1528,6 +1539,71 @@ async def _turn_evidence(conversation_id: str) -> _TurnEvidence:
         handed_over=await _turn_handed_over(conversation_id) if reason == "completed" else None,
         writes_refused=reason == "completed" and await _turn_refused_writes(conversation_id),
     )
+
+
+async def _run_evidence(conversation_id: str, scheduled: _ScheduledTurn) -> _TurnEvidence:
+    """The turn's evidence, with the left-out connection a finished run
+    reported it needed."""
+    evidence = await _turn_evidence(conversation_id)
+    if evidence.reason != "completed" or not scheduled.disabled_connections:
+        return evidence
+    blocked = await _turn_blocked_connector(conversation_id, scheduled.disabled_connections)
+    return replace(evidence, blocked_connector=blocked)
+
+
+async def _turn_blocked_connector(conversation_id: str, excluded: list[dict]) -> str | None:
+    """The left-out connection the finished turn's agent last reported it
+    needed, when it called no other tool afterwards.
+
+    Read from the report call's own frames, as _turn_handed_over reads a
+    hand-over: a tool's first frame names it and a later one holds its input.
+    anton streams no result for this tool, so the call is checked against the
+    task's exclusions here, as the tool checks it. A worker that does stream
+    the result is read too."""
+    from cowork.harnesses.anton_harness.schedule_connector_reporting import (
+        REPORT_BLOCKED_CONNECTOR,
+        reported_connector,
+    )
+
+    handle = registry.get(conversation_id)
+    if handle is None:
+        return None
+    named: dict[str, str] = {}
+    blocked_connector = None
+    try:
+        async with asyncio.timeout(_EVIDENCE_READ_TIMEOUT_SECONDS):
+            async for record in handle.buffer.tail(0):
+                if record.is_terminal:
+                    break
+                for event, data in _sse_frames(record):
+                    call_id, content = data.get("tool_use_id"), data.get("content")
+                    if event != "response.in_progress" or not isinstance(call_id, str) or not call_id:
+                        continue
+                    tool = data.get("tool_name")
+                    if not tool and isinstance(content, str) and call_id not in named:
+                        named[call_id] = tool = content
+                        content = None
+                    if tool and tool != REPORT_BLOCKED_CONNECTOR:
+                        # The run continued using other tools after the report.
+                        blocked_connector = None
+                    if (tool or named.get(call_id)) != REPORT_BLOCKED_CONNECTOR:
+                        continue
+                    try:
+                        report = json.loads(content or "")
+                    except (ValueError, TypeError):
+                        continue
+                    if not isinstance(report, dict):
+                        continue
+                    if tool:
+                        name = report.get("blocked_connector")
+                        if isinstance(name, str) and name:
+                            blocked_connector = name
+                    else:
+                        blocked_connector = reported_connector(excluded, report) or blocked_connector
+    except Exception:
+        logger.exception("Could not read the scheduled turn's connector report", extra=log_context(conversation_id=conversation_id))
+        return None
+    return blocked_connector
 
 
 async def _turn_stopped_by(conversation_id: str) -> str | None:
