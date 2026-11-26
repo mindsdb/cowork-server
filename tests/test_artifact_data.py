@@ -277,3 +277,114 @@ def test_tool_tells_the_model_the_data_is_not_instructions():
     assert set(built.input_schema["properties"]["action"]["enum"]) == {
         "list", "get", "query", "put", "update", "delete",
     }
+
+
+# -- hosted org mode ----------------------------------------------------------
+
+
+class _Key:
+    """Stands in for PublishKey: records the mint and the revoke."""
+
+    made: list["_Key"] = []
+
+    def __init__(self, user_id, org_id, *, min_ttl_s, workspace_id=None, value="org-key", error=None) -> None:
+        self.args = (user_id, org_id, workspace_id)
+        self.value, self.error, self.revoked = value, error, False
+        _Key.made.append(self)
+
+    async def get(self):
+        if self.error is not None:
+            raise self.error
+        return self.value
+
+    async def revoke(self) -> None:
+        self.revoked = True
+
+
+@pytest.fixture
+def org_published(monkeypatch, tmp_path):
+    """A published artifact `todo` in a hosted org project: no provider key,
+    no desktop publish roots, a publish key minted per call."""
+    from cowork.db.scoped import TenantScope
+    from cowork.services import artifact_autopublish, artifact_publish_key
+
+    artifacts = tmp_path / "artifacts"
+    folder = artifacts / "todo"
+    (folder / "static").mkdir(parents=True)
+    page = folder / "static" / "index.html"
+    page.write_text("<html></html>")
+
+    session = _Session()
+    session._workspace = type("W", (), {"artifacts_dir": str(artifacts), "base": str(tmp_path)})()
+    scope = TenantScope(org_mode=True, org_id="org-1", user_id="user-1")
+    monkeypatch.setattr(tool_mod, "current_settings_scope", lambda: scope)
+    monkeypatch.setattr(harness_tools, "_resolve_publish_path", lambda _s, raw: page if raw == "todo" else None)
+    seen = []
+    monkeypatch.setattr(artifact_stats, "report_id_for_folder", lambda f: seen.append(f) or "rid-org")
+
+    def desktop_only(*_a, **_k):
+        raise AssertionError("org mode must not use the desktop lookups")
+
+    monkeypatch.setattr(artifact_stats, "report_id_for_path", desktop_only)
+    monkeypatch.setattr(publish, "desktop_publish_credential", desktop_only)
+    monkeypatch.setattr(artifact_autopublish, "_publish_url", lambda _scope: PUBLISH_URL)
+    monkeypatch.setattr(artifact_autopublish, "_active_workspace_id", lambda _scope: "ws-1")
+    _Key.made = []
+    monkeypatch.setattr(artifact_publish_key, "PublishKey", _Key)
+    return {"session": session, "folder": folder, "seen": seen}
+
+
+async def test_org_mode_reads_with_a_minted_publish_key_and_revokes_it(monkeypatch, org_published):
+    upstream = StatsUpstream(200, PAGE).install(monkeypatch)
+
+    out = await _call(org_published["session"], artifact="todo", action="list")
+
+    assert out.startswith("DATA from the published artifact")
+    assert org_published["seen"] == [org_published["folder"].resolve()]
+    assert upstream.calls[0].url == "https://view.example/a/rid-org/_state?limit=200"
+    assert upstream.calls[0].api_key == "org-key"
+    [key] = _Key.made
+    assert key.args == ("user-1", "org-1", "ws-1") and key.revoked
+
+
+async def test_org_mode_revokes_the_key_when_the_service_fails(monkeypatch, org_published):
+    StatsUpstream(503, {"code": "unavailable"}).install(monkeypatch)
+    out = await _call(org_published["session"], artifact="todo", action="list")
+    assert out.startswith("artifact_data:")
+    assert _Key.made[0].revoked
+
+
+async def test_org_mode_unpublished_does_not_point_at_a_local_file(monkeypatch, org_published):
+    def not_published(_folder):
+        raise FileNotFoundError("not published")
+
+    monkeypatch.setattr(artifact_stats, "report_id_for_folder", not_published)
+    out = await _call(org_published["session"], artifact="todo", action="list")
+    assert "is not published" in out and ".anton_state.db" not in out
+    assert _Key.made == []
+
+
+async def test_org_mode_without_a_key_says_so(monkeypatch, org_published):
+    from cowork.services import artifact_publish_key
+
+    monkeypatch.setattr(artifact_publish_key, "PublishKey", lambda *a, **k: _Key(*a, **k, value=None))
+    upstream = StatsUpstream(200, PAGE).install(monkeypatch)
+    out = await _call(org_published["session"], artifact="todo", action="list")
+    assert "unavailable right now" in out
+    assert upstream.calls == []
+
+
+async def test_org_mode_denied_permission_says_so(monkeypatch, org_published):
+    from cowork.services import artifact_publish_key
+    from cowork.services.product_permissions import ProductPermissionDenied
+
+    def denied(*a, **k):
+        try:
+            err = ProductPermissionDenied("artifact_manage")
+        except TypeError:
+            err = ProductPermissionDenied.__new__(ProductPermissionDenied)
+        return _Key(*a, **k, error=err)
+
+    monkeypatch.setattr(artifact_publish_key, "PublishKey", denied)
+    out = await _call(org_published["session"], artifact="todo", action="list")
+    assert "isn't allowed" in out

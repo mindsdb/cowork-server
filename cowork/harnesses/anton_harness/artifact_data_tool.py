@@ -173,7 +173,7 @@ def _confirm_prompt(slug: str, body: dict) -> str:
 async def handle_artifact_data(session: Any, tc_input: dict) -> str:
     from cowork.services import artifact_data as data
     from cowork.services.artifact_stats import StatsUnavailable, report_id_for_path
-    from cowork.services.publish import PublisherUnavailable, desktop_publish_credential
+    from cowork.services.publish import desktop_publish_credential
 
     from .tools import _resolve_publish_path
 
@@ -197,19 +197,34 @@ async def handle_artifact_data(session: Any, tc_input: dict) -> str:
         body = built
 
     scope = current_settings_scope()
+    org_mode = bool(scope is not None and scope.org_mode)
+    # Hosted org mode keeps no provider key and no desktop publish roots: the
+    # report id comes from the artifact folder and the call goes out with a
+    # publish key minted for this user, then revoked, as the stats route does.
+    publish_key = None
 
-    def target() -> tuple[str, str, str]:
-        report_id = report_id_for_path(str(path), scope=scope)
-        key, publish_url = desktop_publish_credential()
-        return report_id, key, publish_url
+    def target() -> tuple[str, str | None, str]:
+        if not org_mode:
+            report_id = report_id_for_path(str(path), scope=scope)
+            key, publish_url = desktop_publish_credential()
+            return report_id, key, publish_url
+        from cowork.services.artifact_autopublish import _publish_url
+        from cowork.services.artifact_stats import report_id_for_folder
+
+        folder = _artifact_folder(session, path)
+        if folder is None:
+            raise FileNotFoundError(raw)
+        return report_id_for_folder(folder), None, _publish_url(scope)
 
     try:
         report_id, key, publish_url = await asyncio.to_thread(target)
     except (FileNotFoundError, StatsUnavailable):
-        return (
-            f"{raw} is not published, so it has no live data to read. An unpublished app keeps its data "
-            "next to its code (.anton_state.db in the artifact folder): read that in the scratchpad."
+        local = (
+            "" if org_mode else
+            " An unpublished app keeps its data next to its code (.anton_state.db in the artifact "
+            "folder): read that in the scratchpad."
         )
+        return f"{raw} is not published, so it has no live data to read.{local}"
     except ValueError as exc:
         return f"artifact_data: {exc}"
 
@@ -225,6 +240,34 @@ async def handle_artifact_data(session: Any, tc_input: dict) -> str:
         )
         if outcome != "confirmed":
             return _NOT_CONFIRMED[outcome]
+
+    if org_mode:
+        from cowork.services.artifact_autopublish import _active_workspace_id
+        from cowork.services.artifact_publish_key import PublishKey
+        from cowork.services.product_permissions import ProductPermissionDenied, ProductPermissionUnavailable
+
+        workspace_id = await asyncio.to_thread(_active_workspace_id, scope)
+        publish_key = PublishKey(str(scope.user_id), str(scope.org_id), min_ttl_s=120.0, workspace_id=workspace_id)
+        try:
+            key = await publish_key.get()
+        except ProductPermissionDenied:
+            return "artifact_data: this account isn't allowed to manage published artifacts."
+        except ProductPermissionUnavailable:
+            key = None
+        if not key:
+            return "artifact_data: publishing is unavailable right now, so the data can't be read. Try again shortly."
+
+    try:
+        return await _call(action, raw, body, tc_input, publish_url=publish_url, key=key, report_id=report_id)
+    finally:
+        if publish_key is not None:
+            await asyncio.shield(publish_key.revoke())
+
+
+async def _call(action: str, raw: str, body: dict | None, tc_input: dict, *, publish_url: str, key: str,
+                report_id: str) -> str:
+    from cowork.services import artifact_data as data
+    from cowork.services.publish import PublisherUnavailable
 
     try:
         if body is None:
@@ -246,6 +289,23 @@ async def handle_artifact_data(session: Any, tc_input: dict) -> str:
     if action in data.WRITE_OPS:
         return f"Done: the {action} is saved in {raw}'s live data, and the page shows it on its next read."
     return _render(result)
+
+
+def _artifact_folder(session: Any, path: Any):
+    """The artifact folder `path` is in: the child of the project's artifacts
+    folder that holds it, or None when it lies outside that folder."""
+    from pathlib import Path
+
+    workspace = getattr(session, "_workspace", None)
+    artifacts_dir = getattr(workspace, "artifacts_dir", None)
+    if not artifacts_dir:
+        return None
+    try:
+        root = Path(artifacts_dir).resolve()
+        rel = Path(path).resolve().relative_to(root)
+    except (OSError, RuntimeError, ValueError):
+        return None
+    return root / rel.parts[0] if rel.parts else None
 
 
 def build_artifact_data_tool():
