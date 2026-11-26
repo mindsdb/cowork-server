@@ -62,6 +62,9 @@ def client_environment(
     environment.update({
         "CODEX_HOME": str(codex_home),
         "MINDSHUB_CODEX_API_KEY": inference_api_key,
+        # Blank (Codex reads empty as unset): an inherited Codex login would turn on its analytics.
+        "CODEX_API_KEY": "",
+        "CODEX_ACCESS_TOKEN": "",
     })
     return environment
 
@@ -256,6 +259,12 @@ def prepare_launch(config: EngineSessionConfig, workspace: Path, endpoint: str) 
         f"approval_policy={toml_string(resolved_approval)}",
         f"sandbox_mode={toml_string(resolved_sandbox)}",
         f"web_search={toml_string('live' if config.web_search else 'disabled')}",
+        # Nothing leaves outside the MindsHub proxy: no analytics, feedback or telemetry.
+        "analytics.enabled=false",
+        "feedback.enabled=false",
+        'otel.exporter="none"',
+        'otel.trace_exporter="none"',
+        'otel.metrics_exporter="none"',
     ]
     if config.reasoning_effort:
         overrides.append(f"model_reasoning_effort={toml_string(config.reasoning_effort)}")

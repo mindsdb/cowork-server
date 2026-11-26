@@ -68,6 +68,32 @@ def test_codex_retry_budget_is_bounded_on_the_mindshub_provider() -> None:
     assert (codex_config.REQUEST_MAX_RETRIES + 1) * (codex_config.STREAM_MAX_RETRIES + 1) <= 6
 
 
+def test_codex_sends_no_analytics_feedback_or_telemetry() -> None:
+    launch = codex_config.prepare_launch(
+        EngineSessionConfig(model="gpt", permission_mode=PermissionMode.supervised),
+        Path("/tmp/workspace"),
+        "http://127.0.0.1:1/api/v1/coding/inference",
+    )
+
+    for override in (
+        "analytics.enabled=false",
+        "feedback.enabled=false",
+        'otel.exporter="none"',
+        'otel.trace_exporter="none"',
+        'otel.metrics_exporter="none"',
+    ):
+        assert override in launch.config_overrides
+
+
+def test_the_child_env_blanks_an_inherited_codex_login() -> None:
+    environment = codex_config.client_environment(
+        Path("/tmp/codex-home"), (("CODEX_API_KEY", "project-key"), ("CODEX_ACCESS_TOKEN", "token"))
+    )
+
+    assert environment["CODEX_API_KEY"] == ""
+    assert environment["CODEX_ACCESS_TOKEN"] == ""
+
+
 def _launch(permission_mode: PermissionMode, *, writes_allowed: bool, task_mode: str = "build"):
     return codex_config.prepare_launch(
         EngineSessionConfig(
