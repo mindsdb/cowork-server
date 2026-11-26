@@ -169,3 +169,28 @@ async def test_the_browsers_zdr_state_marks_a_failed_read_unknown(monkeypatch, n
 
     monkeypatch.setattr(mindshub_zdr, "zdr_state_for", zdr_state_for)
     assert await mindshub_zdr.browser_zdr_state(scope=None, settings=None, org_bearer="tok") is expected
+
+
+def test_a_blocking_read_is_true_only_for_a_known_on(monkeypatch):
+    from cowork.services import mindshub_zdr
+    from cowork.services.mindshub_teams import ZdrState
+
+    states = iter([ZdrState.ON, ZdrState.UNKNOWN])
+
+    async def zdr_state_quietly(**_kwargs):
+        return next(states)
+
+    monkeypatch.setattr(mindshub_zdr, "zdr_state_quietly", zdr_state_quietly)
+    assert mindshub_zdr.zdr_known_on_blocking(bearer_token="k") is True
+    assert mindshub_zdr.zdr_known_on_blocking(bearer_token="k") is False
+    assert mindshub_zdr.zdr_known_on_blocking(bearer_token="") is False
+
+
+async def test_a_blocking_read_never_runs_on_the_event_loop(monkeypatch):
+    from cowork.services import mindshub_zdr
+
+    async def zdr_state_quietly(**_kwargs):
+        raise AssertionError("read on the event loop")
+
+    monkeypatch.setattr(mindshub_zdr, "zdr_state_quietly", zdr_state_quietly)
+    assert mindshub_zdr.zdr_known_on_blocking(bearer_token="k") is False

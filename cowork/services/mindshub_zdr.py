@@ -94,3 +94,21 @@ async def zdr_state_quietly(*, bearer_token: str, org_id: str, user_id: str) -> 
     except Exception:
         logger.warning("Could not read ZDR", exc_info=True)
         return ZdrState.UNKNOWN
+
+
+def zdr_known_on_blocking(*, bearer_token: str, org_id: str = "", user_id: str = "") -> bool:
+    """For code mode's worker threads: True only when MindsHub says ZDR is on.
+    False when it can't be read, and on an event loop thread, which must not block."""
+    import asyncio
+
+    if not bearer_token:
+        return False
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        pass
+    else:
+        logger.warning("Skipped a blocking ZDR read on the event loop")
+        return False
+    state = asyncio.run(zdr_state_quietly(bearer_token=bearer_token, org_id=org_id, user_id=user_id))
+    return state is ZdrState.ON

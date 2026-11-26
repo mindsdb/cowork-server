@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import hmac
+import logging
 import time
 
 from fastapi import APIRouter, Depends, HTTPException, Request
@@ -44,6 +45,7 @@ from cowork.services.settings import SettingService
 # Declared on the router because it refuses: a route added here inherits the
 # desktop-only refusal rather than a marker saying it is open.
 router = APIRouter(dependencies=[Depends(require(DesktopOnly)), Depends(refuse_code_mode_in_sandbox)])
+logger = logging.getLogger(__name__)
 
 
 def _control():
@@ -104,6 +106,7 @@ async def acquire_runtime_lease(
     computer_id: str,
     body: RuntimeLeaseRequest,
     request: Request,
+    scope: TenantScope = Depends(get_tenant_scope),
 ):
     def authenticated_attempt() -> RuntimeLease | None:
         _require_protocol(body.protocol_version)
@@ -115,7 +118,27 @@ async def acquire_runtime_lease(
     while lease is None and time.monotonic() < deadline:
         await asyncio.sleep(0.25)
         lease = await asyncio.to_thread(get_coding_service().remote.acquire_lease, computer_id)
-    return lease
+    return await _without_zdr_web_search(lease, scope)
+
+
+async def _without_zdr_web_search(lease: RuntimeLease | None, scope: TenantScope) -> RuntimeLease | None:
+    """Codex runs on MindsHub, which drops web search under ZDR: a run loses it when ZDR is known on."""
+    if lease is None or not lease.execution.web_search:
+        return lease
+    from functools import partial
+
+    from cowork.common.settings.user_settings import get_user_settings
+    from cowork.db.units import run_on_unit_threads
+    from cowork.services.mindshub_zdr import ZdrState, zdr_state_for
+
+    try:
+        settings = await run_on_unit_threads(partial(get_user_settings, scope))
+        if await zdr_state_for(scope=scope, settings=settings) is not ZdrState.ON:
+            return lease
+    except Exception:
+        logger.warning("Could not read ZDR for a remote coding run; keeping its web search", exc_info=True)
+        return lease
+    return lease.model_copy(update={"execution": lease.execution.model_copy(update={"web_search": False})})
 
 
 @router.post("/runs/{run_id}/events")
