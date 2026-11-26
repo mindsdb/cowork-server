@@ -48,6 +48,7 @@ from cowork.services.channel_bindings import ChannelBindingService
 from cowork.services.channels import ChannelConfigService, resolve_installation_by_external_account
 from cowork.services.conversations import ConversationService
 from cowork.services.files import store_file, upload_basename
+from cowork.services.model_list_refresh import refresh_saved_model_list_if_stale
 from cowork.services.settings import unit_setting_service
 from cowork.services.skills import SkillService
 from cowork.streaming.answer_text import accumulate_answer_text
@@ -480,6 +481,8 @@ class AntonChannelRuntime:
                 display_name=binding.display_name,
                 instructions=binding.instructions,
             )
+            # The turn's model resolves from the saved model list; refresh it if stale. Never raises.
+            await refresh_saved_model_list_if_stale(scope)
             # Nested get_user_settings() reads (model/provider) must resolve
             # against this org, not fall back to local/global.
             with use_settings_scope(scope):

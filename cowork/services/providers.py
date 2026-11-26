@@ -1157,7 +1157,8 @@ def persist_org_model_availability(
     changed = persist_image_model_map(
         session, scope, prior.minds_image_model_enabled, listing, member_restricted=restricted,
     ) or changed
-    if not listing.enabled:
+    # No member in scope (a channel turn's refresh): only the org rows are written.
+    if not listing.enabled or not scope.user_id:
         return changed
     if restricted == sorted(prior._minds_restricted_ids()):
         return changed

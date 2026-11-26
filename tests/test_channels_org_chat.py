@@ -123,6 +123,12 @@ def org_mode(monkeypatch):
 def test_slack_message_in_org_mode_gets_a_reply(monkeypatch, org_mode):
     fake_harness = FakeHarness()
     monkeypatch.setattr(runtime_mod, "get_harness", lambda _id: fake_harness)
+    refreshed: list = []
+
+    async def refresh(scope):
+        refreshed.append((scope.org_id, scope.user_id))
+
+    monkeypatch.setattr(runtime_mod, "refresh_saved_model_list_if_stale", refresh)
 
     posted: list[tuple[str, dict | None]] = []
     real_post = httpx.AsyncClient.post
@@ -171,6 +177,8 @@ def test_slack_message_in_org_mode_gets_a_reply(monkeypatch, org_mode):
 
         # The turn actually ran — the old bug died before this, every time.
         assert len(fake_harness.calls) == 1, "the turn must run, not fail closed on scope"
+        # The org's saved model list was checked for staleness before the turn resolved its model.
+        assert refreshed == [(ORG_A, None)]
 
         # The reply actually went out, to the right org's adapter.
         sends = [p for (m, p) in posted if m == "chat.postMessage"]

@@ -537,6 +537,53 @@ def test_execute_schedule_resolves_default_sentinel_to_none(monkeypatch):
         s.close()
 
 
+def test_execute_schedule_refreshes_a_stale_model_list_before_its_turn(monkeypatch):
+    """The run resolves its model from the saved list, so a stale one is refreshed first."""
+    import asyncio
+
+    import cowork.handlers.responses as responses_mod
+    from cowork.db.session import get_open_session
+    from cowork.scheduler import execute_schedule
+    from cowork.services import model_list_refresh
+
+    order: list = []
+
+    async def refreshed(scope):
+        order.append("refresh")
+
+    class FakeHandler:
+        def __init__(self, *, principal=None, interactive=True, schedule_id=None):
+            pass
+
+        async def handle(self, request):
+            order.append("turn")
+
+            async def _gen():
+                if False:
+                    yield
+
+            return _gen()
+
+    monkeypatch.setattr(model_list_refresh, "refresh_saved_model_list_if_stale", refreshed)
+    monkeypatch.setattr(responses_mod, "ResponsesHandler", FakeHandler)
+
+    session = get_open_session()
+    schedule_id = ScheduleService(ScopedSession(session, SYSTEM_SCOPE)).create_schedule(
+        title="refresh test", prompt="hi", cadence="daily",
+        next_run_at=datetime(2026, 6, 25, 9, 0, tzinfo=timezone.utc), model="default",
+        timezone="UTC", project_id=GENERAL_PROJECT_ID, enabled=True,
+    ).id
+    session.close()
+
+    try:
+        asyncio.run(execute_schedule(schedule_id, is_manual=False))
+        assert order[:2] == ["refresh", "turn"]
+    finally:
+        s = get_open_session()
+        ScheduleService(ScopedSession(s, SYSTEM_SCOPE)).delete_schedule(schedule_id)
+        s.close()
+
+
 def test_execute_schedule_passes_pinned_model_through(monkeypatch):
     """A schedule that pinned a concrete id (legacy rows, or a future picker)
     still runs on that id — the sentinel resolution must not flatten real picks."""
