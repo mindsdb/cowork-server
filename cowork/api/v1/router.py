@@ -34,6 +34,7 @@ from cowork.api.v1.endpoints import (
     mindshub_workspaces,
     live_apps,
     memory,
+    notices,
     org_branding,
     pins,
     project_files,
@@ -107,6 +108,7 @@ api_router.include_router(conversations.router, prefix="/tasks", tags=["tasks"])
 api_router.include_router(responses.router, prefix="/responses", tags=["responses"])
 api_router.include_router(files.router, prefix="/files", tags=["files"])
 api_router.include_router(schedules.router, prefix="/schedules", tags=["schedules"])
+api_router.include_router(notices.router, prefix="/notices", tags=["notices"])
 api_router.include_router(pins.router, prefix="/pins", tags=["pins"])
 api_router.include_router(content_reports.router, prefix="/content-reports", tags=["content-reports"])
 api_router.include_router(push.router, prefix="/push", tags=["push"])
