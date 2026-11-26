@@ -1060,7 +1060,7 @@ class ResponsesHandler:
                     model=request.model, reasoning_effort=request.reasoning_effort, turn_llm=turn_llm,
                     web=not has_files,
                     # Under ZDR MindsHub drops native web tools; only a known answer turns them off.
-                    zdr_on=not has_files and self.turn_zdr is ZdrState.ON,
+                    zdr_on=not has_files and await self._direct_answer_zdr() is ZdrState.ON,
                 )
                 answer_history = self.routing_history or _routing_history(
                     start.gate_rows or [], start.harness_input,
@@ -1723,6 +1723,22 @@ class ResponsesHandler:
         except Exception:
             logger.warning("Could not read ZDR for the turn", exc_info=True)
             return None
+
+    async def _direct_answer_zdr(self) -> ZdrState | None:
+        """ZDR for a direct answer's web tools: the turn's read, else, on the desktop, one on the
+        stored MindsHub key when the answer runs there. None when it can't be read."""
+        if self.turn_zdr is not None:
+            return self.turn_zdr
+        settings = await run_on_unit_threads(partial(get_user_settings, self.scope))
+        if settings.resolved_planning_provider is not Provider.MINDS_CLOUD:
+            return None
+        try:
+            self.turn_zdr = await self.zdr_state(None, settings)
+        except PoolTimeoutError:
+            raise
+        except Exception:
+            logger.warning("Could not read ZDR for the direct answer", exc_info=True)
+        return self.turn_zdr
 
     async def zdr_on(self, turn_llm: dict | None = None, settings: UserSettings | None = None) -> bool:
         """Whether ZDR is on for this turn's organization (unknown counts as on)."""

@@ -1662,3 +1662,42 @@ async def test_the_remote_turns_zdr_read_never_fails_the_turn(monkeypatch):
     monkeypatch.setattr(handler, "zdr_state", broken)
     handler.mindshub_bearer = "jwt"
     assert await handler._zdr_state_quietly(None) is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("on", "tools"), [(True, frozenset()), (False, {"web_search", "web_fetch"})])
+async def test_a_desktop_direct_answer_reads_zdr_with_the_stored_key(monkeypatch, on, tools):
+    # The desktop has no caller bearer or minted key, so it asks on its stored MindsHub key.
+    from cowork.db.scoped import LOCAL_SCOPE
+    from cowork.handlers.responses import _allowed_web_tools
+
+    handler = _gate(monkeypatch, _settings(), stored_key="stored")
+    handler.scope = LOCAL_SCOPE
+    asked = _zdr(monkeypatch, on)
+
+    state = await handler._direct_answer_zdr()
+
+    assert asked == ["stored"]
+    assert _allowed_web_tools(Provider.MINDS_CLOUD, zdr_on=state is ZdrState.ON) == tools
+
+
+@pytest.mark.asyncio
+async def test_a_direct_answer_off_mindshub_reads_no_zdr(monkeypatch):
+    from cowork.db.scoped import LOCAL_SCOPE
+
+    handler = _gate(monkeypatch, _settings(planning=Provider.ANTHROPIC), stored_key="stored")
+    handler.scope = LOCAL_SCOPE
+    asked = _zdr(monkeypatch, True)
+
+    assert await handler._direct_answer_zdr() is None
+    assert asked == []
+
+
+@pytest.mark.asyncio
+async def test_a_direct_answer_reuses_the_turns_zdr_read(monkeypatch):
+    handler = _gate(monkeypatch, _settings(), stored_key="stored")
+    handler.turn_zdr = ZdrState.OFF
+    asked = _zdr(monkeypatch, True)
+
+    assert await handler._direct_answer_zdr() is ZdrState.OFF
+    assert asked == []
