@@ -52,7 +52,7 @@ from cowork.services.artifact_permissions import (
 from cowork.services import artifact_files
 from cowork.services.artifact_autopublish import job_budget_for, lock_ttl_for
 from cowork.services.preview_html import prepare_preview_html
-from cowork.services.quick_edit import direct_edit_available, quick_edit_available
+from cowork.services.quick_edit import direct_edit_available, edits_in_place, quick_edit_available
 from cowork.services.artifact_identity import opened_artifact_folder
 from cowork.services.artifact_metadata import ArtifactMetadata
 from cowork.schemas.artifact_export import ExportRequest, ExportResult
@@ -86,8 +86,11 @@ from cowork.services.artifact_revisions import (
     current_source,
     current_workspace,
     finalize_agent_repair,
+    is_document,
     list_revisions,
     release_repairs_for_comment,
+    restore_revision,
+    revision_content,
     revision_with_content,
     save_source,
 )
@@ -642,7 +645,9 @@ async def _acquire_live_publish_lock(
         await asyncio.sleep(0.1)
 
 
-async def _current_capabilities(scope: TenantScope, capabilities: dict) -> dict:
+async def _current_capabilities(
+    scope: TenantScope, capabilities: dict, *, source_path: str | None = None
+) -> dict:
     """*capabilities* narrowed by the caller's current product permissions.
 
     ``canQuickEdit`` (ENG-4227): the viewer's chat bar is offered. It needs
@@ -651,6 +656,11 @@ async def _current_capabilities(scope: TenantScope, capabilities: dict) -> dict:
     anton predates it. ``quickEditDirect``: the bar can also edit directly,
     because a decisions model serves the caller's provider; without one the
     bar still shows and hands every message to the chat.
+
+    ``source_path`` is the tracked source the viewer has open. A document the
+    quick editor can't change itself (a PDF, or an OOXML package on an anton
+    without ``OOXML_EDITS``, ``quick_edit.edits_in_place``) keeps the bar,
+    as a shortcut into the chat, so ``quickEditDirect`` is false for it.
     """
     if not capabilities["canEdit"]:
         return {**capabilities, "canQuickEdit": False, "quickEditDirect": False}
@@ -665,7 +675,9 @@ async def _current_capabilities(scope: TenantScope, capabilities: dict) -> dict:
     }
     can_quick_edit = bool(can_address and quick_edit_available())
     current["canQuickEdit"] = can_quick_edit
-    current["quickEditDirect"] = can_quick_edit and await direct_edit_available(scope)
+    current["quickEditDirect"] = (
+        can_quick_edit and edits_in_place(source_path) and await direct_edit_available(scope)
+    )
     # The export route needs `artifact.manage` too, so it offers nothing here.
     if not can_edit and "exportFormats" in capabilities:
         current["exportFormats"] = []
@@ -789,7 +801,9 @@ async def artifact_source(
             scope=scope,
         )
         capabilities = await _current_capabilities(
-            scope, with_export_formats(scope, owner_capabilities, export_source)
+            scope,
+            with_export_formats(scope, owner_capabilities, export_source),
+            source_path=result.get("path"),
         )
         return {**result, "capabilities": capabilities, "repair": repair}
     except FileNotFoundError as exc:
@@ -975,6 +989,7 @@ async def artifact_review_entry(
             lambda unit: artifact_capabilities(unit, artifact.source, artifact.folder.name),
             scope=scope,
         ),
+        source_path=(current_revision or {}).get("path"),
     )
     return {
         "artifactKey": artifact_key(artifact_id),
@@ -1929,6 +1944,14 @@ async def enable_artifact_comments(
     )
 
 
+def _revision_content_url(project_ref: str, artifact_id: str, revision_id: str) -> str:
+    """Where the app fetches a document revision's bytes (the route below)."""
+    return (
+        f"/api/v1/artifacts/workspace/{quote(project_ref, safe='')}/{quote(artifact_id, safe='')}"
+        f"/revisions/{quote(revision_id, safe='')}/content"
+    )
+
+
 @router.get("/workspace/{project_ref}/{artifact_id}/revisions/{revision_id}")
 async def artifact_revision(
     project_ref: str,
@@ -1936,40 +1959,44 @@ async def artifact_revision(
     revision_id: str,
     scope: ScopeDep,
 ):
+    """One revision with its text. A document's revision has no text: it
+    answers with its metadata and ``contentUrl``, where the viewer's document
+    preview fetches the bytes of that version."""
     _source, folder, _metadata, _capabilities = await _owner_workspace(
         scope, project_ref, artifact_id
     )
     try:
-        return await run_efs(partial(revision_with_content, folder, revision_id), scope=scope)
+        revision = await run_efs(partial(revision_with_content, folder, revision_id), scope=scope)
     except FileNotFoundError as exc:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=_not_found_detail(exc)) from exc
     except RevisionValidationError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
+    if is_document(revision.get("path")):
+        return {**revision, "contentUrl": _revision_content_url(project_ref, artifact_id, revision["id"])}
+    return revision
 
 
-def _restore_revision(
-    folder: Path,
-    metadata: ArtifactMetadata,
-    artifact_id: str,
+@router.get("/workspace/{project_ref}/{artifact_id}/revisions/{revision_id}/content")
+async def artifact_revision_content(
+    project_ref: str,
+    artifact_id: ArtifactIdDep,
     revision_id: str,
-    *,
-    expected_revision_id: str,
-    actor_id: str | None,
-) -> dict:
-    """A restore's file store work, in one hop: the old revision's content,
-    then its save as the new head."""
-    restored = revision_with_content(folder, revision_id)
-    return save_source(
-        folder,
-        metadata,
-        artifact_id,
-        content=restored["content"],
-        expected_revision_id=expected_revision_id,
-        rel_path=restored["path"],
-        actor_kind="manual",
-        actor_id=actor_id,
-        summary=f"Restored revision {restored['number']}",
+    scope: ScopeDep,
+):
+    """The saved bytes of a document revision, owner-authorized as the
+    revision GET is, with the file's Content-Type. Never cached: the bytes
+    are a private draft. A text revision answers 422 (its text is in the
+    revision GET)."""
+    _source, folder, _metadata, _capabilities = await _owner_workspace(
+        scope, project_ref, artifact_id
     )
+    try:
+        found = await run_efs(partial(revision_content, folder, revision_id), scope=scope)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=_not_found_detail(exc)) from exc
+    except RevisionValidationError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return Response(content=found.data, media_type=found.content_type, headers=_DRAFT_RESPONSE_HEADERS)
 
 
 @router.post("/workspace/{project_ref}/{artifact_id}/revisions/{revision_id}/restore")
@@ -1988,7 +2015,7 @@ async def restore_artifact_revision(
         actor_id = str(scope.user_id) if scope and scope.user_id else None
         saved = await run_efs(
             partial(
-                _restore_revision,
+                restore_revision,
                 folder,
                 metadata,
                 artifact_id,
