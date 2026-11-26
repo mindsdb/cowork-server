@@ -42,7 +42,7 @@ def _error_code(resp: httpx.Response) -> str | None:
     """The ``code`` field of an error body, or None if it has none."""
     try:
         error = resp.json()
-    except ValueError:
+    except (ValueError, RecursionError):
         return None
     return error.get("code") if isinstance(error, dict) else None
 
@@ -68,7 +68,7 @@ def _refuses_the_lifetime(*, resp: httpx.Response) -> bool:
         return False
     try:
         body = resp.json()
-    except ValueError:
+    except (ValueError, RecursionError):
         return False
     detail = body.get("detail") if isinstance(body, dict) else None
     return isinstance(detail, str) and detail.startswith(TTL_REFUSAL_PREFIX)
@@ -143,7 +143,7 @@ async def _request_turn_key(*, user_id: str, org_id: str, correlation_id: str,
                 raise ProductPermissionDenied()
             resp.raise_for_status()
             result = resp.json()
-    except (httpx.HTTPError, TimeoutError, ValueError) as exc:
+    except (httpx.HTTPError, TimeoutError, ValueError, RecursionError) as exc:
         raise permission_unavailable(route=TURN_KEYS_ROUTE, cause=exc) from exc
     if not isinstance(result, dict) or not isinstance(result.get("key"), str) or not result["key"].strip():
         raise permission_unavailable(route=TURN_KEYS_ROUTE, cause="answer_without_key")
@@ -226,7 +226,7 @@ async def list_verified_datasource_connections(*, org_id: str, user_id: str, tur
             resp = await client.get(url, params=params, headers=headers)
             resp.raise_for_status()
             result = resp.json()
-    except (httpx.HTTPError, TimeoutError, ValueError) as exc:
+    except (httpx.HTTPError, TimeoutError, ValueError, RecursionError) as exc:
         raise permission_unavailable(route=DATASOURCE_CONNECTIONS_ROUTE, cause=exc) from exc
     if not isinstance(result, dict) or not isinstance(result.get("items"), list):
         raise permission_unavailable(route=DATASOURCE_CONNECTIONS_ROUTE, cause="answer_without_items")
@@ -264,7 +264,7 @@ async def register_datasource_grants(
             resp = await client.post(url, json=body, headers=headers)
             resp.raise_for_status()
             result = resp.json()
-    except (httpx.HTTPError, TimeoutError, ValueError) as exc:
+    except (httpx.HTTPError, TimeoutError, ValueError, RecursionError) as exc:
         raise permission_unavailable(route=DATASOURCE_GRANTS_ROUTE, cause=exc) from exc
     if not isinstance(result, dict):
         raise permission_unavailable(route=DATASOURCE_GRANTS_ROUTE, cause="answer_not_an_object")
@@ -295,7 +295,7 @@ async def list_custom_api_connections(*, org_id: str, user_id: str, turn_key_id:
             resp = await client.get(url, params=params, headers=_producer_headers(settings))
             resp.raise_for_status()
             result = resp.json()
-    except (httpx.HTTPError, TimeoutError, ValueError) as exc:
+    except (httpx.HTTPError, TimeoutError, ValueError, RecursionError) as exc:
         raise permission_unavailable(route=CUSTOM_CONNECTIONS_ROUTE, cause=exc) from exc
     if not isinstance(result, dict) or not isinstance(result.get("items"), list):
         raise permission_unavailable(route=CUSTOM_CONNECTIONS_ROUTE, cause="answer_without_items")
@@ -332,7 +332,7 @@ async def register_custom_api_grants(
             resp = await client.post(url, json=body, headers=_producer_headers(settings))
             resp.raise_for_status()
             result = resp.json()
-    except (httpx.HTTPError, TimeoutError, ValueError) as exc:
+    except (httpx.HTTPError, TimeoutError, ValueError, RecursionError) as exc:
         raise permission_unavailable(route=CUSTOM_GRANTS_ROUTE, cause=exc) from exc
     if not isinstance(result, dict):
         raise permission_unavailable(route=CUSTOM_GRANTS_ROUTE, cause="answer_not_an_object")

@@ -163,6 +163,43 @@ async def test_workspace_refusal_without_a_workspace_sent_is_not_retried(monkeyp
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("status_code", [201, 400, 403, 404, 503])
+async def test_an_error_body_nested_too_deep_to_parse_fails_the_mint_as_unavailable(monkeypatch, forgotten, status_code):
+    """Every org turn mints a key; an answer the parser cannot read must fail as auth being unavailable."""
+    from cowork.services.product_permissions import ProductPermissionUnavailable
+
+    deep = b'{"code":' + b"[" * 10_000 + b"]" * 10_000 + b"}"
+    request = httpx.Request("POST", "http://auth.internal/internal/turn-keys/")
+    _sequenced_client(monkeypatch, [httpx.Response(status_code, content=deep, request=request)] * 2)
+
+    with pytest.raises(ProductPermissionUnavailable):
+        await mint_turn_key(
+            user_id="u1", org_id="o1", correlation_id="corr-1",
+            ttl_seconds=1200, settings=_Settings(), workspace_id="ws-1",
+        )
+
+    assert forgotten == []
+
+
+@pytest.mark.asyncio
+async def test_an_extend_refusal_nested_too_deep_to_parse_is_a_failed_extend(monkeypatch):
+    from cowork.turnqueue.auth_keys import extend_turn_key
+
+    deep = b'{"code":' + b"[" * 10_000 + b"]" * 10_000 + b"}"
+
+    class _Client:
+        def __init__(self, *a, **k): pass
+        async def __aenter__(self): return self
+        async def __aexit__(self, *a): return False
+        async def patch(self, url, json, headers):
+            return httpx.Response(409, content=deep)
+
+    monkeypatch.setattr(httpx, "AsyncClient", _Client)
+
+    assert await extend_turn_key(instance_id="i1", ttl_seconds=1200, settings=_Settings()) is False
+
+
+@pytest.mark.asyncio
 async def test_revoke_turn_key_uses_cluster_only_route(monkeypatch):
     captured = {}
 

@@ -230,6 +230,15 @@ async def test_the_block_carries_the_grants_versions_and_the_served_strings_minu
     assert [c["engine"] for c in params["oauth"]["connections"]] == ["hubspot"]
 
 
+async def test_a_member_at_the_server_cap_gets_every_server(auth):
+    auth["listing"] = [httpx.Response(200, json=_listing(*_more_servers(24)))]
+
+    params, items = await _run(auth)
+
+    assert items[-1][0] == "turn_completed"
+    assert [c["connection_id"] for c in params["custom_mcp"]["connections"]] == list(range(1, 26))
+
+
 async def test_a_member_with_no_server_gets_no_block_and_no_event(auth):
     auth["listing"] = [httpx.Response(200, json={"items": []})]
 

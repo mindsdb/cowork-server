@@ -404,7 +404,7 @@ def _purpose_not_supported(exc: BaseException) -> bool:
         return False
     try:
         body = cause.response.json()
-    except ValueError:
+    except (ValueError, RecursionError):
         return False
     return isinstance(body, dict) and "purpose" in body
 
