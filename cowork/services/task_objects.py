@@ -18,7 +18,7 @@ from cowork.models.conversation import Conversation
 from cowork.models.project import Project
 from cowork.models.task_object import TaskObject
 from cowork.services.artifact_identity import ArtifactListing, ListedIds
-from cowork.services.artifact_metadata import ArtifactMetadata
+from cowork.services.artifact_metadata import ArtifactMetadata, is_widget, shows_inline
 from cowork.turnqueue.models import TurnCompleted
 
 if TYPE_CHECKING:
@@ -640,6 +640,11 @@ class ArtifactChanges:
     # the time they had until the project's location check reads them again
     # (request_self_heal_for_untimed_folders).
     untimed: frozenset[str] = frozenset()
+    # The revision the turn end captured for each folder it touched: the page
+    # as this turn left it. An inline chat card names it (cards_for_slugs), so
+    # an earlier reply's card opens its own version, not the latest (ENG-4684).
+    # A folder whose capture failed is left out.
+    revisions: dict[str, str] = field(default_factory=dict)
 
     @property
     def needs_record(self) -> bool:
@@ -826,11 +831,14 @@ def turn_artifact_changes(
                 touched.add(slug)
         except OSError:
             continue
+    revisions: dict[str, str] = {}
     for slug in touched:
-        capture_agent_revision(
+        captured = capture_agent_revision(
             base / slug, conversation_id=conversation_key, schedule_id=schedule_id, scope=scope,
             summary=summaries.summary_for(slug) if summaries is not None else None,
         )
+        if captured and captured.get("id"):
+            revisions[slug] = captured["id"]
     # A repair turn that makes no source change must still leave the
     # polling state. Check only artifacts with a handoff explicitly bound
     # to this conversation; unrelated queued work is never consumed.
@@ -893,6 +901,7 @@ def turn_artifact_changes(
     return ArtifactChanges(
         created=new, touched=touched, created_ids=created.ids,
         checked_repairs=checked_repairs,
+        revisions=revisions,
         sort_times=timed.times,
         untimed=timed.unreadable,
         listed_ids=listed_ids,
@@ -907,6 +916,7 @@ def cards_for_slugs(
     project_id: str | None = None,
     project_name: str = "",
     project_label: str = "",
+    revisions: Mapping[str, str] | None = None,
 ) -> list[ArtifactCard]:
     """Inline-chat card payloads for the given slugs, order preserved.
 
@@ -925,6 +935,11 @@ def cards_for_slugs(
     card shows instead, when the caller has one
     (`services.projects.display_label`). `scope` is the turn's; it only finds
     the serve URL's project by scanning when no `project_name` is given.
+
+    `revisions` are the turn end's captures (ArtifactChanges.revisions). An
+    inline card names its slug's capture as its `revisionId`, the page as the
+    turn left it, rather than whatever is head when the card is built; the
+    card is stored with the reply, so that id is what the reply keeps.
     """
     from cowork.services.artifacts import card_for_folder
 
@@ -949,6 +964,9 @@ def cards_for_slugs(
             logger.warning("Could not build inline card for artifact %r", slug, exc_info=True)
             continue
         if card is not None:
+            captured = (revisions or {}).get(slug)
+            if captured and shows_inline(card.display):
+                card.revision_id = captured
             cards.append(card)
     return cards
 
@@ -963,6 +981,7 @@ async def publish_and_card_turn_artifacts(
     project_name: str = "",
     project_label: str = "",
     only_touched: bool = False,
+    revisions: Mapping[str, str] | None = None,
 ) -> list[ArtifactCard]:
     """Reconcile publishes for this turn, then build the cards to emit.
 
@@ -1007,20 +1026,31 @@ async def publish_and_card_turn_artifacts(
     )
     if getattr(scope, "org_mode", False):
         carded = set(new_slugs) | (republished & set(touched_slugs))
+        # A widget is never published, so an edit of one never comes back in
+        # `republished`: it cards whenever this turn touched it (ENG-4684).
+        maybe_widgets = set(touched_slugs) - carded
     else:
         carded = set(touched_slugs)
+        maybe_widgets = set()
     from cowork.db.units import run_efs
 
-    return await run_efs(
+    cards = await run_efs(
         partial(
             cards_for_slugs,
-            artifacts_base, sorted(carded),
+            artifacts_base, sorted(carded | maybe_widgets),
             scope=scope,
             project_id=project_id, project_name=project_name, project_label=project_label,
+            revisions=revisions,
         ),
         scope=scope or LOCAL_SCOPE,
         deadline=False,
     )
+    if not maybe_widgets:
+        return cards
+    return [
+        card for card in cards
+        if Path(card.folder).name not in maybe_widgets or is_widget(card.display)
+    ]
 
 
 # ── skill-draft attribution ────────────────────────────────────────────────

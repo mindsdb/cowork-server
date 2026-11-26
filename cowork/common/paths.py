@@ -21,6 +21,8 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
+from cowork.common.launch_environment import launch_value
+
 _DEFAULT_HOME = Path.home() / ".cowork"
 
 _IS_WINDOWS = os.name == "nt"
@@ -54,11 +56,13 @@ def cowork_home() -> Path:
     """Root directory for all cowork state (default ``~/.cowork``).
 
     Overridable via the ``COWORK_HOME`` env var, which desktop preview/stable
-    builds set to isolate their data. Read from the environment on each call so
-    tests can monkeypatch it; the desktop app sets it before the server process
-    starts, so it is stable for the lifetime of a real run.
+    builds set to isolate their data. Read on each call, from the live
+    environment first so tests can monkeypatch it, then from the value a local
+    launch captured before it removed the variable from the environment
+    (``cowork.common.launch_environment``). The desktop app sets it before the
+    server process starts, so it is stable for the lifetime of a real run.
     """
-    raw = os.environ.get("COWORK_HOME")
+    raw = launch_value("COWORK_HOME")
     return Path(raw).expanduser() if raw else _DEFAULT_HOME
 
 

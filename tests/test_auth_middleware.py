@@ -114,6 +114,21 @@ def test_generated_token_file_is_private(tmp_path):
     assert stat.S_IMODE(env.stat().st_mode) == 0o600
 
 
+@pytest.mark.parametrize("empty_line", ["COWORK_AUTH_TOKEN=\n", "COWORK_AUTH_TOKEN = \t\n"], ids=["bare", "spaces"])
+def test_an_empty_token_line_never_reads_the_next_line(tmp_path, empty_line):
+    """An empty value is no token: the next line is never read as one, and the
+    token written in its place keeps that line."""
+    env = tmp_path / ".env"
+    env.write_text(f"{empty_line}ANTHROPIC_API_KEY=sk-example\n", encoding="utf-8")
+    assert _read_token(env) == ""
+
+    token = ensure_auth_token(env)
+
+    assert token and "ANTHROPIC_API_KEY" not in token
+    assert _read_token(env) == token
+    assert "ANTHROPIC_API_KEY=sk-example\n" in env.read_text(encoding="utf-8")
+
+
 def test_sync_auth_token_mirrors_and_is_idempotent(tmp_path):
     env = tmp_path / ".env"
     sync_auth_token(env, "fixed-123")
