@@ -158,10 +158,14 @@ def needs_publish(folder: Path, artifacts_base: Path) -> PublishDecision:
         _resolve_publish_target,
         compute_publish_md5,
         is_publishable_static,
+        is_widget_folder,
     )
 
     if not _user_files(folder):
         return PublishDecision(None, REASON_NO_CONTENT)
+    if is_widget_folder(folder):
+        # A widget is never published (publish.WidgetPublishRefused).
+        return PublishDecision(None, REASON_NOT_PUBLISHABLE)
 
     try:
         publish_target, published_dir, published_key, is_fullstack = _resolve_publish_target(

@@ -1299,6 +1299,9 @@ class AntonHarness:
         skill_drafts: list[dict] = []
         new_slugs: list[str] = []
         touched_slugs: set[str] = set()
+        # The revision the turn end captured per touched folder; the inline
+        # cards name it (ENG-4684).
+        turn_revisions: dict[str, str] = {}
         turn_scope = None
         turn_history: TurnHistory | None = None
         memory_read: TurnMemoryRead | None = None
@@ -1316,7 +1319,7 @@ class AntonHarness:
         turn_seed_len: int | None = None
 
         async def record_turn_cleanup():
-            nonlocal new_slugs, touched_slugs, turn_scope, skill_drafts
+            nonlocal new_slugs, touched_slugs, turn_scope, skill_drafts, turn_revisions
             # The live-app stops the turn's prompt told go back unless the
             # turn finished, so the person's next turn tells them. Here, so
             # the same shield covers it and its failure skips nothing.
@@ -1364,6 +1367,7 @@ class AntonHarness:
                     deadline=False,
                 )
                 new_slugs, touched_slugs, turn_scope = changes.created, changes.touched, _units_scope()
+                turn_revisions = changes.revisions
                 if new_slugs:
                     await run_db(
                         partial(
@@ -1517,6 +1521,7 @@ class AntonHarness:
             artifacts_base,
             new_slugs=new_slugs,
             touched_slugs=touched_slugs,
+            revisions=turn_revisions,
             scope=turn_scope,
             project_id=str(conv_project_id) if conv_project_id else None,
             project_name=conv_project_name,
