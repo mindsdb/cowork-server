@@ -124,7 +124,7 @@ _notice_retries: set[asyncio.Task] = set()
 
 _RECURRING_CADENCES = {
     Cadence.every_15_minutes, Cadence.every_30_minutes, Cadence.hourly,
-    Cadence.daily, Cadence.weekly, Cadence.weekdays,
+    Cadence.daily, Cadence.weekly, Cadence.weekdays, Cadence.monthly,
 }
 
 # A one-off may start up to this late on its own. At this lateness or more
@@ -149,6 +149,7 @@ def _advance_next_run_at(schedule: Schedule, session) -> None:
         schedule.cadence,
         schedule.next_run_at,
         schedule.timezone,
+        recurrence=schedule.recurrence,
     )
     session.add(schedule)
 
@@ -215,6 +216,7 @@ def _catch_up(session: ScopedSession, schedule: Schedule, now: datetime) -> None
     elif schedule.cadence in _RECURRING_CADENCES:
         missed = missed_slots(
             schedule.cadence, next_run, schedule.timezone, now=now, lookback=_MISSED_RUN_LOOKBACK,
+            recurrence=schedule.recurrence,
         )
         if not missed.skipped:
             # At most one slot is overdue, and it is recent: the due-check runs it.

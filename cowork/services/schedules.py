@@ -14,8 +14,8 @@ from cowork.db.scoped import ScopedSession, unsafe_unscoped_session
 from cowork.models.conversation import Conversation
 from cowork.models.project import Project
 from cowork.models.schedule import Schedule, ScheduleRun
-from cowork.schedule_timing import advance_occurrence, normalize_next_run
-from cowork.schemas.schedules import AttemptOutcome, Cadence, RunStatus
+from cowork.schedule_timing import advance_occurrence, align_to_rule, normalize_next_run, resolve_timezone
+from cowork.schemas.schedules import AttemptOutcome, Cadence, Recurrence, RunStatus, check_recurrence
 
 logger = get_logger(__name__)
 
@@ -26,6 +26,73 @@ MAX_FAILED_SLOTS = 3
 
 class ScheduleConflict(Exception):
     """An action the schedule's state does not allow; the message says why."""
+
+
+class InvalidSchedule(Exception):
+    """An edit that leaves the schedule's days not fitting its cadence."""
+
+
+_RULE_CADENCES = {Cadence.weekly, Cadence.monthly}
+_INFERRED_DAY = "_inferred_day"
+
+
+def settled_timing(
+    cadence: str, recurrence: dict | None, next_run_at: datetime, timezone_name: str,
+) -> tuple[dict | None, datetime]:
+    """The rule and first run a schedule is saved with.
+
+    Only weekly and monthly tasks hold a rule. A monthly task saved without
+    one runs on its first run's day of the month, which is stored so a short
+    month can't move it for good. The first run moves to the first day the
+    rule allows, at the same time of day. Raises InvalidSchedule when the rule
+    doesn't fit the cadence.
+    """
+    if cadence == Cadence.monthly and not recurrence:
+        local = _utc(next_run_at).astimezone(resolve_timezone(timezone_name))
+        recurrence = {"month_day": local.day, _INFERRED_DAY: True}
+    try:
+        check_recurrence(cadence, Recurrence.model_validate(recurrence) if recurrence else None)
+    except ValueError as exc:
+        raise InvalidSchedule(str(exc)) from exc
+    if cadence not in _RULE_CADENCES:
+        return None, next_run_at
+    return recurrence, align_to_rule(cadence, next_run_at, timezone_name, recurrence)
+
+
+def edited_timing(
+    *, cadence: str, recurrence: dict | None, next_run_at: datetime, timezone_name: str,
+    changes: dict, now: datetime,
+) -> tuple[dict | None, datetime]:
+    """Use the same timing decision for edits and their confirmation cards."""
+    new_cadence = changes.get("cadence", cadence)
+    new_zone = changes.get("timezone", timezone_name)
+    new_start = changes.get("next_run_at", next_run_at)
+    new_rule = changes.get("recurrence", recurrence)
+    if "recurrence" not in changes:
+        if new_cadence != cadence:
+            new_rule = None
+        elif "next_run_at" in changes and recurrence and recurrence.get(_INFERRED_DAY):
+            old_date = _utc(next_run_at).astimezone(resolve_timezone(timezone_name)).date()
+            new_date = _utc(new_start).astimezone(resolve_timezone(new_zone)).date()
+            if new_date != old_date:
+                new_rule = None
+
+    old_rule = {key: value for key, value in recurrence.items() if key != _INFERRED_DAY} if recurrence else None
+    if "next_run_at" not in changes and changes.get("recurrence") and new_rule != old_rule:
+        zone = resolve_timezone(new_zone)
+        local_time = _utc(next_run_at).astimezone(resolve_timezone(timezone_name)).time()
+        today = now.astimezone(zone).date()
+        new_start = datetime.combine(today, local_time, tzinfo=zone)
+        if _utc(new_start) <= now:
+            new_start = datetime.combine(today + timedelta(days=1), local_time, tzinfo=zone)
+
+    return settled_timing(new_cadence, new_rule, new_start, new_zone)
+
+
+def _settle_rule(schedule: Schedule) -> None:
+    schedule.recurrence, schedule.next_run_at = settled_timing(
+        schedule.cadence, schedule.recurrence, schedule.next_run_at, schedule.timezone,
+    )
 
 
 class ScheduleService:
@@ -101,6 +168,7 @@ class ScheduleService:
         timezone: str = "UTC",
         project_id: UUID | None = None,
         enabled: bool = True,
+        recurrence: dict | None = None,
         disabled_connections: list[dict] | None = None,
     ) -> Schedule:
         # Anchor the parent (same as conversations): the target project must be
@@ -112,6 +180,7 @@ class ScheduleService:
             title=title,
             prompt=prompt,
             cadence=cadence,
+            recurrence=recurrence,
             next_run_at=next_run_at,
             model=model,
             timezone=timezone,
@@ -121,15 +190,17 @@ class ScheduleService:
             # `timezone` is this method's zone-name argument here.
             paused_at=None if enabled else datetime.now(timezone_.utc),
         )
+        _settle_rule(schedule)
         self.session.add(schedule)
         self.session.commit()
         self.session.refresh(schedule)
         return schedule
 
-    def update_schedule(self, schedule_id: UUID, **kwargs) -> Schedule:
+    def update_schedule(self, schedule_id: UUID, *, now: datetime | None = None, **kwargs) -> Schedule:
         """Apply an edit. ``enabled`` pauses or resumes, as those actions do;
         the editor sends the current value with every save, which changes
-        nothing."""
+        nothing. ``now`` is when the edit was shown for approval, so a card
+        answered a little later saves the first run it showed."""
         schedule = self.get_schedule(schedule_id)
         if "project_id" in kwargs and kwargs["project_id"] is None:
             # No project: the caller's default, as at create.
@@ -142,9 +213,20 @@ class ScheduleService:
         # missed one-off back on, and the `enabled` the editor sent with the
         # old state must not pause it again.
         was_on = _runs_on_its_own(schedule)
+        timing_changed = any(
+            field in kwargs for field in ("cadence", "recurrence", "next_run_at", "timezone")
+        )
+        if timing_changed:
+            recurrence, next_run_at = edited_timing(
+                cadence=schedule.cadence, recurrence=schedule.recurrence,
+                next_run_at=schedule.next_run_at, timezone_name=schedule.timezone,
+                changes=kwargs, now=now or datetime.now(timezone.utc),
+            )
         for field, value in kwargs.items():
             if value is not None and hasattr(schedule, field):
                 setattr(schedule, field, value)
+        if timing_changed:
+            schedule.recurrence, schedule.next_run_at = recurrence, next_run_at
         if (
             schedule.missed_at is not None
             and _utc(schedule.next_run_at) > datetime.now(timezone.utc)
@@ -262,7 +344,9 @@ class ScheduleService:
     def _resumed_next_run(self, schedule: Schedule, now: datetime) -> tuple[datetime, bool]:
         if self._slot_left_due(schedule, now):
             return _utc(schedule.next_run_at), True
-        return normalize_next_run(schedule.cadence, schedule.next_run_at, schedule.timezone, now=now), False
+        return normalize_next_run(
+            schedule.cadence, schedule.next_run_at, schedule.timezone, now=now, recurrence=schedule.recurrence,
+        ), False
 
     def _slot_left_due(self, schedule: Schedule, now: datetime) -> bool:
         """Whether a resumed recurring schedule keeps its due slot: the last
@@ -274,7 +358,7 @@ class ScheduleService:
         if schedule.cadence == Cadence.once:
             return False
         slot = _utc(schedule.next_run_at)
-        if slot > now or advance_occurrence(schedule.cadence, slot, schedule.timezone) <= now:
+        if slot > now or advance_occurrence(schedule.cadence, slot, schedule.timezone, schedule.recurrence) <= now:
             return False
         # While the slot is still due, a cron run that started at or after it
         # was a run at it.
