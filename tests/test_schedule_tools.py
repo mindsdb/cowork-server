@@ -236,6 +236,69 @@ async def test_a_confirmed_update_changes_the_task_and_the_card_shows_the_result
     assert page_task["prompt"] == PROMPT
 
 
+async def test_a_monthly_task_made_in_chat_saves_the_day_its_card_showed():
+    start = datetime(datetime.now(timezone.utc).year + 1, 1, 31, 9, 0, tzinfo=timezone.utc)
+    card = _Card(CONFIRM)
+    result = await _call(MANAGE_TOOL_NAME, _Session(card), _create_input(
+        cadence="monthly", recurrence={"monthDay": 31}, next_run_at=start.isoformat(),
+    ))
+
+    (shown,) = card.shown
+    assert "The 31st of every month, or the last day of a shorter month, at 09:00 (UTC)" in shown.prompt
+    assert result["task"]["recurrence"] == {"month_day": 31}
+    (page_task,) = await _page_schedules()
+    assert page_task["cadence"] == "monthly"
+    assert page_task["recurrence"]["monthDay"] == 31
+    assert ensure_utc(datetime.fromisoformat(page_task["nextRunAt"])) == start
+
+
+async def test_a_change_to_the_days_alone_saves_the_rule_and_first_run_its_card_showed():
+    monday = _next_weekday_9am(0)
+    task = await _create_confirmed(cadence="weekly", next_run_at=monday.isoformat())
+    card = _Card(CONFIRM)
+    result = await _call(MANAGE_TOOL_NAME, _Session(card), {
+        "action": "update", "schedule_id": task["schedule_id"], "recurrence": {"days": ["wed", "fri"]},
+    })
+
+    (shown,) = card.shown
+    assert "Changing: which days, start time." in shown.prompt
+    assert "Every Wednesday and Friday at 09:00 (UTC)" in shown.prompt
+    assert result["task"]["recurrence"] == {"days": ["wed", "fri"]}
+    (page_task,) = await _page_schedules()
+    assert page_task["recurrence"]["days"] == ["wed", "fri"]
+    first = ensure_utc(datetime.fromisoformat(page_task["nextRunAt"]))
+    assert first.weekday() in (2, 4) and (first.hour, first.minute) == (9, 0)
+    assert timedelta(0) < first - datetime.now(timezone.utc) <= timedelta(days=5)
+
+
+async def test_a_card_answered_after_its_first_run_was_due_saves_the_run_it_showed(monkeypatch):
+    """The card shows a first run an hour away. Its answer comes after that
+    time has passed, and the task is saved with the run the person approved
+    rather than one worked out again from the later clock."""
+    import cowork.services.schedules as schedules_service
+
+    soon = datetime.now(timezone.utc).replace(second=0, microsecond=0) + timedelta(hours=1)
+    task = await _create_confirmed(cadence="weekly", next_run_at=(soon + timedelta(days=3)).isoformat())
+    names = ("mon", "tue", "wed", "thu", "fri", "sat", "sun")
+
+    class ADayLater(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return datetime.now(tz) + timedelta(days=1)
+
+    class AnsweredLate(_Card):
+        async def ask(self, question_id, request):
+            monkeypatch.setattr(schedules_service, "datetime", ADayLater)
+            return await super().ask(question_id, request)
+
+    result = await _call(MANAGE_TOOL_NAME, _Session(AnsweredLate(CONFIRM)), {
+        "action": "update", "schedule_id": task["schedule_id"],
+        "recurrence": {"days": [names[soon.weekday()], names[(soon.weekday() + 3) % 7]]},
+    })
+
+    assert ensure_utc(datetime.fromisoformat(result["task"]["next_run_at"])) == soon
+
+
 @pytest.mark.parametrize(
     "action, tc_input",
     [

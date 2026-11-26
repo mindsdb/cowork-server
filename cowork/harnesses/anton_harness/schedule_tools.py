@@ -186,8 +186,8 @@ def _create_unit(session: ScopedSession, *, body: ScheduleCreateRequest, project
     ))
 
 
-def _update_unit(session: ScopedSession, *, schedule_id: UUID, changes: dict) -> dict:
-    return _summary(ScheduleService(session).update_schedule(schedule_id, **changes))
+def _update_unit(session: ScopedSession, *, schedule_id: UUID, changes: dict, shown_at: datetime) -> dict:
+    return _summary(ScheduleService(session).update_schedule(schedule_id, now=shown_at, **changes))
 
 
 def _pause_unit(session: ScopedSession, *, schedule_id: UUID) -> dict:
@@ -597,19 +597,22 @@ async def _manage_task(session: Any, tc_input: dict, *, project_id: UUID | None)
                 _check_weekday_start(
                     preview["cadence"], datetime.fromisoformat(preview["next_run_at"]), preview["timezone"],
                 )
+                # The save works the first run out from this same moment, so
+                # a card answered after that run's time still saves it.
+                shown_at = datetime.now(timezone.utc)
                 if any(field in changes for field in ("cadence", "recurrence", "next_run_at", "timezone")):
                     try:
                         preview["recurrence"], first = edited_timing(
                             cadence=before["cadence"], recurrence=before.get("recurrence"),
                             next_run_at=datetime.fromisoformat(before["next_run_at"]),
-                            timezone_name=before["timezone"], changes=changes, now=datetime.now(timezone.utc),
+                            timezone_name=before["timezone"], changes=changes, now=shown_at,
                         )
                     except InvalidSchedule as exc:
                         raise _Invalid(f"`recurrence`: {exc}.") from exc
                     preview["next_run_at"] = ensure_utc(first).isoformat()
                 if preview == before:
                     return _result("Those values are what the task already has, so there's nothing to change.", before)
-                apply = partial(_update_unit, schedule_id=schedule_id, changes=changes)
+                apply = partial(_update_unit, schedule_id=schedule_id, changes=changes, shown_at=shown_at)
             elif action == "pause":
                 if before["paused"]:
                     return _result("This task is already paused.", before)

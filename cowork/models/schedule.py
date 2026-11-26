@@ -19,7 +19,8 @@ class Schedule(BaseSQLModel, table=True):
         description=(
             "Weekly or monthly days to run on: {days: [mon..sun]}, {month_day: 1-31} "
             "or {week: 1-4|-1, weekday: mon..sun}. NULL on other cadences, and on "
-            "a weekly task that runs on its next run's weekday"
+            "a weekly task that runs on its next run's weekday. A monthly day "
+            "taken from the first run, not chosen, also holds _inferred_day: true"
         ),
     )
     timezone: str = Field(default="UTC", description="IANA timezone name")

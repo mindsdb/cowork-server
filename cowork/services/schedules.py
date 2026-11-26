@@ -194,10 +194,11 @@ class ScheduleService:
         self.session.refresh(schedule)
         return schedule
 
-    def update_schedule(self, schedule_id: UUID, **kwargs) -> Schedule:
+    def update_schedule(self, schedule_id: UUID, *, now: datetime | None = None, **kwargs) -> Schedule:
         """Apply an edit. ``enabled`` pauses or resumes, as those actions do;
         the editor sends the current value with every save, which changes
-        nothing."""
+        nothing. ``now`` is when the edit was shown for approval, so a card
+        answered a little later saves the first run it showed."""
         schedule = self.get_schedule(schedule_id)
         if "project_id" in kwargs and kwargs["project_id"] is None:
             # No project: the caller's default, as at create.
@@ -217,7 +218,7 @@ class ScheduleService:
             recurrence, next_run_at = edited_timing(
                 cadence=schedule.cadence, recurrence=schedule.recurrence,
                 next_run_at=schedule.next_run_at, timezone_name=schedule.timezone,
-                changes=kwargs, now=datetime.now(timezone.utc),
+                changes=kwargs, now=now or datetime.now(timezone.utc),
             )
         for field, value in kwargs.items():
             if value is not None and hasattr(schedule, field):
