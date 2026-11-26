@@ -54,6 +54,9 @@ The NetworkPolicy decides who may reach the pod. dev, staging and prod each
 turn it on and set nothing else in it, the base keeps it off, and every
 rendering admits only the labeled ingress controller pods in
 ``infrastructure``.
+
+The ingress's body limit is the server's largest body cap, so the ingress
+never refuses a body the server would take.
 """
 
 from __future__ import annotations
@@ -592,3 +595,19 @@ def test_every_named_environment_admits_only_the_ingress_controllers():
         assert policy["nodeCidrs"] == [], path.name
         assert (policy["port"], policy["podSelectorLabels"]) == ("", {}), path.name
         assert policy["extraIngress"] == [], path.name
+
+
+def test_the_ingress_body_limit_is_the_servers_largest_body_cap():
+    """The ingress and the server cap request bodies together (README.md,
+    "Request size limits"). A smaller ingress limit refuses an upload the
+    server accepts, with nginx's own page in place of the server's sentence,
+    and every rendering keeps the base's annotation."""
+    from cowork.api import body_limits
+
+    largest = max(body_limits.DEFAULT_BODY_MAX_BYTES, *(route.max_bytes for route in body_limits.UPLOAD_ROUTES))
+    assert largest == body_limits.UPLOAD_MAX_BYTES
+    for path in RENDERED:
+        size = _rendered(path)["ingress"]["annotations"]["nginx.ingress.kubernetes.io/proxy-body-size"]
+        match = re.fullmatch(r"(\d+)m", size)
+        assert match, (path.name, size)
+        assert int(match.group(1)) * 1024 * 1024 == largest, path.name

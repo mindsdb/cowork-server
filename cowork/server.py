@@ -26,6 +26,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.exc import TimeoutError as PoolTimeoutError
 from starlette.datastructures import MutableHeaders
 
+from cowork.api.body_limits import BodyLimitMiddleware
 from cowork.api.v1.route_walker import contradictory_routes, route_key, undeclared_routes
 from cowork.api.v1.router import api_router as v1_router
 from starlette.responses import JSONResponse
@@ -1260,6 +1261,16 @@ def create_app() -> FastAPI:
         ask_user_enabled=settings.ask_user_enabled,
         remote_turns=TurnQueueSettings().is_remote,
     )
+
+    # Org mode: refuse a request body past its route's cap before FastAPI reads
+    # it (cowork.api.body_limits). Added before the identity layer so it runs
+    # inside it: outside a BaseHTTPMiddleware, the 413 it raises while the app
+    # reads a chunked body comes back as a 400 (BodyLimitMiddleware's docstring
+    # says why). The identity layer never reads the body. Inside CORS too, so
+    # the app can read a 413's sentence. The desktop takes no cap: there one
+    # person's large file harms no one else.
+    if settings.tenancy_mode == "org":
+        app.add_middleware(BodyLimitMiddleware)
 
     # Org mode, or local tenancy that trusts identity headers: build a
     # per-request Principal from the identity headers. Added first so it sits

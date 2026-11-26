@@ -309,6 +309,9 @@ deployment:
       nginx.ingress.kubernetes.io/proxy-connect-timeout: "1200"
       nginx.ingress.kubernetes.io/proxy-read-timeout: "1200"
       nginx.ingress.kubernetes.io/proxy-send-timeout: "1200"
+      # The server's largest body cap, UPLOAD_MAX_BYTES in
+      # cowork/api/body_limits.py, which the server applies per route; the two
+      # change together (README.md, "Request size limits").
       nginx.ingress.kubernetes.io/proxy-body-size: 500m
       nginx.ingress.kubernetes.io/enable-cors: "true"
       nginx.ingress.kubernetes.io/cors-allow-credentials: "true"

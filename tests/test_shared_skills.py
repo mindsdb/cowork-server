@@ -252,8 +252,12 @@ def _every_change_is_refused(scoped, scope: TenantScope, slug: str) -> None:
     _create_refused(lambda: skills_ep._create_skill(
         session, body=SkillCreateRequest(label=slug, instructions="x"), principal=None, viewer=None
     ), slug)
-    _create_refused(lambda: skills_ep._upload_skill_bytes(_skill_md(slug, "x").encode(), "SKILL.md", session, None), slug)
-    _create_refused(lambda: skills_ep._upload_skill_bytes(_zip(slug, "x"), "skill.zip", session, None), slug)
+    _create_refused(lambda: skills_ep._upload_skill_file(
+        session, source=io.BytesIO(_skill_md(slug, "x").encode()), filename="SKILL.md", principal=None
+    ), slug)
+    _create_refused(lambda: skills_ep._upload_skill_file(
+        session, source=io.BytesIO(_zip(slug, "x")), filename="skill.zip", principal=None
+    ), slug)
     _refused(lambda: skills_ep._delete_skill(session, skill_id=slug, principal=None, viewer=None))
     with pytest.raises(SkillImmutableError, match="shared with you"):
         service.update_skill(slug, instructions="x")
@@ -284,7 +288,7 @@ def test_an_upload_stamps_the_person_and_never_the_files_value(trusted, scoped, 
         else _skill_md("uploaded", "Mine.", created_by=SUB_B).encode()
     )
 
-    skills_ep._upload_skill_bytes(raw, filename, scoped(ALICE), None)
+    skills_ep._upload_skill_file(scoped(ALICE), source=io.BytesIO(raw), filename=filename, principal=None)
 
     assert _stored(ALICE, "uploaded")[META_CREATED_BY] == SUB_A
 
@@ -312,8 +316,11 @@ def test_the_operator_view_never_stamps_a_creator(trusted, scoped):
     skills_ep._create_skill(
         scoped(LOCAL_SCOPE), body=SkillCreateRequest(label="ops-notes", instructions="Ours."), principal=None, viewer=None
     )
-    skills_ep._upload_skill_bytes(
-        _skill_md("ops-upload", "Ours.", created_by=SUB_A).encode(), "SKILL.md", scoped(LOCAL_SCOPE), None
+    skills_ep._upload_skill_file(
+        scoped(LOCAL_SCOPE),
+        source=io.BytesIO(_skill_md("ops-upload", "Ours.", created_by=SUB_A).encode()),
+        filename="SKILL.md",
+        principal=None,
     )
 
     assert META_CREATED_BY not in _stored(LOCAL_SCOPE, "ops-notes")
@@ -602,8 +609,12 @@ def test_a_new_skill_under_a_gone_shared_name_clears_the_leftover_entry(sharing,
         "create": lambda: skills_ep._create_skill(
             alice, body=SkillCreateRequest(label=SHARED, instructions="x"), principal=None, viewer=None
         ),
-        "upload": lambda: skills_ep._upload_skill_bytes(_skill_md(SHARED, "x").encode(), "SKILL.md", alice, None),
-        "upload-zip": lambda: skills_ep._upload_skill_bytes(_zip(SHARED, "x"), "skill.zip", alice, None),
+        "upload": lambda: skills_ep._upload_skill_file(
+            alice, source=io.BytesIO(_skill_md(SHARED, "x").encode()), filename="SKILL.md", principal=None
+        ),
+        "upload-zip": lambda: skills_ep._upload_skill_file(
+            alice, source=io.BytesIO(_zip(SHARED, "x")), filename="skill.zip", principal=None
+        ),
         "rename": lambda: skills_ep._update_skill(
             alice, skill_id="private-notes", body=SkillUpdateRequest(label=SHARED), principal=None, viewer=None
         ),
@@ -783,8 +794,12 @@ def test_only_a_scope_with_personal_skills_reads_the_list(sharing):
 
 def _upload(scoped, scope: TenantScope, slug: str, body: str, *, zipped: bool, shared: bool) -> dict:
     raw = _zip(slug, body) if zipped else _skill_md(slug, body).encode()
-    return skills_ep._upload_skill_bytes(
-        raw, "skill.zip" if zipped else "SKILL.md", scoped(scope), None, shared=shared
+    return skills_ep._upload_skill_file(
+        scoped(scope),
+        source=io.BytesIO(raw),
+        filename="skill.zip" if zipped else "SKILL.md",
+        principal=None,
+        shared=shared,
     )
 
 
@@ -1214,8 +1229,11 @@ def test_where_all_are_shared_only_the_creator_changes_a_skill(all_shared, scope
     skills_ep._create_skill(
         scoped(ALICE_SHARED), body=SkillCreateRequest(label="team-notes", instructions="Alice's."), principal=None, viewer=None
     )
-    skills_ep._upload_skill_bytes(
-        _skill_md("bob-upload", "Bob's.", created_by=SUB_A).encode(), "SKILL.md", scoped(BOB_SHARED), None
+    skills_ep._upload_skill_file(
+        scoped(BOB_SHARED),
+        source=io.BytesIO(_skill_md("bob-upload", "Bob's.", created_by=SUB_A).encode()),
+        filename="SKILL.md",
+        principal=None,
     )
     assert _stored(LOCAL_SCOPE, "team-notes")[META_CREATED_BY] == SUB_A
     assert _stored(LOCAL_SCOPE, "bob-upload")[META_CREATED_BY] == SUB_B
@@ -1301,8 +1319,11 @@ def _every_route_works(session, principal, *, upload_creator: str | None) -> Non
         session, body=SkillCreateRequest(label="my-notes", instructions="Mine."), principal=principal, viewer=None
     )
     assert (created["shared"], created["capabilities"]) == (False, CHANGE_CAPABILITY)
-    uploaded = skills_ep._upload_skill_bytes(
-        _skill_md("uploaded", "Mine.", created_by=SUB_B).encode(), "SKILL.md", session, principal
+    uploaded = skills_ep._upload_skill_file(
+        session,
+        source=io.BytesIO(_skill_md("uploaded", "Mine.", created_by=SUB_B).encode()),
+        filename="SKILL.md",
+        principal=principal,
     )
     assert uploaded["shared"] is False
     service = SkillService(session.scope)
@@ -1391,14 +1412,18 @@ def test_hosted_org_tenancy_shares_no_skill(hosted):
         SKILL_SHARING_UNAVAILABLE,
     )
     _answers(
-        lambda: skills_ep._upload_skill_bytes(_zip("new-upload", "x"), "skill.zip", hosted, principal, shared=True),
+        lambda: skills_ep._upload_skill_file(
+            hosted, source=io.BytesIO(_zip("new-upload", "x")), filename="skill.zip", principal=principal, shared=True
+        ),
         409,
         SKILL_SHARING_UNAVAILABLE,
     )
     root = SkillService(hosted.scope).root
     assert not (root / "new-shared").exists() and not (root / "new-upload").exists()
     # The refused upload reserved no claim: the name is still free.
-    uploaded = skills_ep._upload_skill_bytes(_zip("new-upload", "x"), "skill.zip", hosted, principal)
+    uploaded = skills_ep._upload_skill_file(
+        hosted, source=io.BytesIO(_zip("new-upload", "x")), filename="skill.zip", principal=principal
+    )
     assert (uploaded["id"], uploaded["shared"]) == ("new-upload", False)
 
 

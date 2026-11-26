@@ -20,6 +20,7 @@ get_mindshub_reply.
 from __future__ import annotations
 
 import asyncio
+import io
 import json
 import logging
 from contextlib import contextmanager
@@ -369,8 +370,12 @@ def test_an_upload_gets_a_row_shared_with_nobody_whatever_its_file_claims(org):
         name="uploaded", description="u", instructions="x",
         metadata={"share_org": "true", META_CREATED_BY: DAVE, "share_teams": TEAM_OPS, "always_on": "true"},
     )
-    uploaded = skills_ep._upload_skill_bytes(
-        dump_skill(skill).encode(), "SKILL.md", org.as_(ALICE), _principal(ALICE), viewer=_viewer(ALICE),
+    uploaded = skills_ep._upload_skill_file(
+        org.as_(ALICE),
+        source=io.BytesIO(dump_skill(skill).encode()),
+        filename="SKILL.md",
+        principal=_principal(ALICE),
+        viewer=_viewer(ALICE),
     )
     assert (uploaded["section"], uploaded["access"]) == ("mine", NOTHING_SHARED)
     # The file's claimed creator is dropped, not kept as a second owner.

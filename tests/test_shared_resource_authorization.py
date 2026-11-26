@@ -2666,13 +2666,21 @@ async def test_skill_upload_endpoint_runs_the_import_as_a_file_store_unit(monkey
         return {"worker": True}
 
     monkeypatch.setattr(skills, "run_efs_unit", fake_run_efs_unit)
-    monkeypatch.setattr(skills, "_upload_skill_bytes", recorded_upload)
+    monkeypatch.setattr(skills, "_upload_skill_file", recorded_upload)
 
     result = await skills.upload_skill(upload, scope, principal)
 
     assert result == {"worker": True}
-    assert captured["args"] == (b"skill bytes", "worker.md", "the unit's session", principal)
-    assert captured["kwargs"] == {"shared": False, "viewer": None}
+    assert captured["args"] == ("the unit's session",)
+    # The upload's own spool, unread: the worker reads it, not the event loop.
+    assert captured["kwargs"]["source"] is upload.file
+    assert upload.file.tell() == 0
+    assert {key: value for key, value in captured["kwargs"].items() if key != "source"} == {
+        "filename": "worker.md",
+        "principal": principal,
+        "shared": False,
+        "viewer": None,
+    }
     assert captured["scope"] == scope
 
 
@@ -2691,7 +2699,7 @@ async def test_skill_upload_worker_keeps_the_event_loop_responsive(monkeypatch):
         release.wait(timeout=5)
         return {"worker": True}
 
-    monkeypatch.setattr(skills, "_upload_skill_bytes", blocking_worker)
+    monkeypatch.setattr(skills, "_upload_skill_file", blocking_worker)
     upload = UploadFile(filename="worker.md", file=io.BytesIO(b"skill bytes"))
     task = asyncio.create_task(
         skills.upload_skill(
