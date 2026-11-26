@@ -18,7 +18,7 @@ from cowork.docs import highlight as hl
 
 _CONTRACT_BYTES = (Path(__file__).parent / "fixtures" / "docs_code_highlight" / "contract.json").read_bytes()
 # The same digest is pinned in cowork's components/markdown/hljs.test.js.
-_CONTRACT_SHA256 = "727358beaa992a4df007fa34334fa52877b73e63c5c500c97331d96f73dc06cd"
+_CONTRACT_SHA256 = "49bff234452131da4bbf58257056fbd66bb75e9e078cf047bb3dd34a09ba0f17"
 _CONTRACT = json.loads(_CONTRACT_BYTES)
 _PIECE = re.compile(r'<span class="hljs-([\w-]+)">|</span>|[^<]+')
 

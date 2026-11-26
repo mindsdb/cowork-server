@@ -77,9 +77,9 @@ _BASE: list[tuple[_TokenType, str]] = [
 # Per lexer, ahead of the base: where hljs marks a token otherwise.
 _BY_LEXER: dict[str, list[tuple[_TokenType, str]]] = {
     "json": [(Name.Tag, "attr"), (Keyword.Constant, "keyword")],
-    "yaml": [(Name.Tag, "attr")],
+    "yaml": [(Name.Tag, "attr"), (Name.Constant, "string")],  # Name.Constant: a block scalar's body
     "diff": [(Generic.Heading, "comment"), (Generic.Subheading, "meta")],
-    "css": [(Keyword.Constant, ""), (Keyword, "attribute"), (Name.Tag, "selector-tag")],
+    "css": [(Keyword.Constant, ""), (Keyword, "attribute"), (Name.Tag, "selector-tag"), (Name.Class, "selector-class")],
     "typescript": [(Keyword.Type, "built_in")],
     "tsx": [(Keyword.Type, "built_in")],
     "rust": [(String.Doc, "comment")],

@@ -269,7 +269,7 @@
       ]
     },
     "yaml": {
-      "code": "# config\nname: anton\nport: 8080\nenabled: true\nquoted: \"two\"",
+      "code": "# config\nname: anton\nport: 8080\nenabled: true\nquoted: \"two\"\nrun: |\n  make test",
       "expect": [
         [
           "# config",
@@ -294,11 +294,15 @@
         [
           "\"two\"",
           "string"
+        ],
+        [
+          "make",
+          "string"
         ]
       ]
     },
     "css": {
-      "code": "/* c */\n@media print {\n  div > p { margin: 4px; color: #fff }\n}",
+      "code": "/* c */\n@media print {\n  div > p { margin: 4px; color: #fff }\n  .box { top: 0 }\n}",
       "expect": [
         [
           "/* c */",
@@ -323,6 +327,10 @@
         [
           "#fff",
           "number"
+        ],
+        [
+          "box",
+          "selector-class"
         ]
       ]
     },
