@@ -28,6 +28,7 @@ DATASOURCE_CONNECTIONS_ROUTE = "/internal/datasources/connections/"
 DATASOURCE_GRANTS_ROUTE = "/internal/datasources/turn-grants/"
 CUSTOM_CONNECTIONS_ROUTE = "/internal/custom-connections/"
 CUSTOM_GRANTS_ROUTE = "/internal/custom-connections/turn-grants/"
+CUSTOM_MCP_GRANTS_ROUTE = "/internal/custom-mcp/turn-grants/"
 
 # auth's turn-key mint refuses an expiry past its cap with a 400 whose detail
 # starts with this text, and with no error code. The text is the only sign of
@@ -433,7 +434,7 @@ async def register_custom_mcp_grants(
         "turn_key_id": turn_key_id,
         "connection_ids": connection_ids,
     }
-    return await _custom_mcp_call("POST", "/internal/custom-mcp/turn-grants/", settings=settings, json_body=body)
+    return await _custom_mcp_call("POST", CUSTOM_MCP_GRANTS_ROUTE, settings=settings, json_body=body)
 
 
 async def revoke_turn_key(*, instance_id: str, settings) -> None:

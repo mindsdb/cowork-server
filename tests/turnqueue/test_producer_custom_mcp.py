@@ -7,6 +7,7 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import logging
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
@@ -305,11 +306,40 @@ async def test_a_grant_answer_bound_to_anything_else_fails_the_turn(auth, field,
     assert items[-1][0] == "turn_failed"
 
 
+async def test_a_refused_grant_answer_logs_its_route_and_reason(auth, caplog, owned_logger):
+    """The line the console prints for a grant answer that fails the turn, as for a custom API grant."""
+    logged = owned_logger("cowork.services.product_permissions", level=logging.WARNING)
+    auth["grant"] = [lambda request: httpx.Response(
+        200, json=_grant_answer(json.loads(request.content), turn_key_id="other"))]
+
+    params, items = await _run(auth)
+
+    assert params is None and items[-1][0] == "turn_failed"
+    reason = "grant response binding does not match this turn"
+    [record] = [
+        r for r in caplog.records
+        if r.name == "cowork.services.product_permissions" and getattr(r, "event", None) == "permission_unavailable"
+    ]
+    assert (record.route, record.reason) == (auth_keys.CUSTOM_MCP_GRANTS_ROUTE, reason)
+    line = json.loads(logged.output().strip())
+    assert (line["event"], line["route"], line["reason"]) == ("permission_unavailable", _GRANT_PATH, reason)
+
+
 # ── leave-outs: the turn runs, one event names why ───────────────────────────
 
 
 def _deep(depth: int) -> bytes:
     return b'{"items":' + b"[" * depth + b"]" * depth + b"}"
+
+
+def _deep_error(depth: int) -> bytes:
+    """An error body whose code nests ``depth`` arrays deep, past what the JSON parser can read."""
+    return b'{"code":' + b"[" * depth + b"]" * depth + b"}"
+
+
+def _more_servers(count: int) -> list[dict]:
+    """``count`` more servers shaped like the contract's item, at ids 2 and up."""
+    return [_second_server(id=index, name=f"cm-{index:032x}") for index in range(2, count + 2)]
 
 
 def _over_backstop() -> dict:
@@ -330,6 +360,9 @@ def _over_backstop() -> dict:
         _second_server(tools=["LONE"]))).replace("LONE", "\\ud800").encode())], None,
      "listing_malformed", 1),
     ("listing nested 100,000 deep", [httpx.Response(200, content=_deep(100_000))], None, "listing_failed", 1),
+    ("listing's 503 nested too deep", [httpx.Response(503, content=_deep_error(10_000))] * 2, None,
+     "listing_failed", 2),
+    ("26 servers", [httpx.Response(200, json=_listing(*_more_servers(25)))], None, "listing_malformed", 1),
     ("listing answers a list", [httpx.Response(200, json=[])], None, "listing_failed", 1),
     ("a 503 from a proxy is retried", [httpx.Response(503, text="<html>"), httpx.Response(503, text="<html>")], None,
      "listing_failed", 2),
@@ -340,6 +373,7 @@ def _over_backstop() -> dict:
     ("grant answers 409", None, [httpx.Response(409, json={"code": "conflict"})], "grant_conflict", 1),
     ("grant answers 404", None, [httpx.Response(404, json={"code": "capability_denied"})], "grant_refused", 1),
     ("grant answers a list", None, [httpx.Response(200, json=[])], "grant_refused", 1),
+    ("grant's 404 nested too deep", None, [httpx.Response(404, content=_deep_error(10_000))], "grant_refused", 1),
 ])
 async def test_a_turn_runs_without_the_block_and_logs_why(auth, case, listing, grant, reason, listing_calls):
     if listing is not None:

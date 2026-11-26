@@ -48,6 +48,7 @@ from cowork.services.connectors.specs._registry import registry
 from cowork.services.product_permissions import require_product_permission
 from cowork.turnqueue.auth_keys import (
     CUSTOM_GRANTS_ROUTE,
+    CUSTOM_MCP_GRANTS_ROUTE,
     DATASOURCE_CONNECTIONS_ROUTE,
     DATASOURCE_GRANTS_ROUTE,
     auth_switched_off,
@@ -932,9 +933,8 @@ def _custom_mcp_grant_reason(exc: product_permissions.ProductPermissionUnavailab
 
 
 def _refuse_custom_mcp(reason: str) -> product_permissions.ProductPermissionUnavailable:
-    """Name the failed check for the operator; a fixed phrase, never a key, a row or a definition."""
-    logger.warning("[producer] custom MCP grants refused: %s", reason)
-    return product_permissions.ProductPermissionUnavailable()
+    """Name the failed check of auth's grant answer for the operator; a fixed phrase, never a key, a row or a definition."""
+    return product_permissions.permission_unavailable(route=CUSTOM_MCP_GRANTS_ROUTE, cause=reason)
 
 
 async def _mint_custom_mcp_block(*, scope: TenantScope, conversation_id: str, correlation_id: str,

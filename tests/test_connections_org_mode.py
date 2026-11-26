@@ -351,7 +351,9 @@ async def test_list_connections_adds_the_members_custom_mcp_servers(monkeypatch)
 @pytest.mark.parametrize("answer", [
     httpx.Response(404, json={"detail": "Not found."}), httpx.Response(500, text="boom"),
     httpx.Response(200, text="<html>proxy</html>"), httpx.Response(200, json=[]),
-], ids=["404", "500", "an HTML 200", "a list 200"])
+    httpx.Response(200, content=b"[" * 10_000 + b"]" * 10_000),
+    httpx.Response(400, content=b'{"detail":' + b"[" * 10_000 + b"]" * 10_000 + b"}"),
+], ids=["404", "500", "an HTML 200", "a list 200", "a 200 nested too deep", "a 400 nested too deep"])
 async def test_list_connections_keeps_the_catalogue_when_auths_custom_mcp_list_fails(monkeypatch, answer):
     monkeypatch.setenv("COWORK_TURN_CUSTOM_MCP_ENABLED", "true")
     monkeypatch.setenv("AUTH_SERVICE_BASE_URL", "https://auth.internal")

@@ -86,7 +86,7 @@ def auth_refusal_reason(*, response: httpx.Response) -> str | None:
     """
     try:
         body = response.json()
-    except ValueError:
+    except (ValueError, RecursionError):
         return None
     if not isinstance(body, dict):
         return None

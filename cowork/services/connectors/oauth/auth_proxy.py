@@ -80,7 +80,7 @@ async def _relay(
         try:
             body = resp.json()
             detail = body.get("detail", resp.text) if isinstance(body, dict) else resp.text
-        except ValueError:
+        except (ValueError, RecursionError):
             body, detail = None, resp.text
         # Datasource callers pass keep_code so auth's machine-readable code
         # (invalid_connection, stale_version) survives the hop; OAuth callers
@@ -96,7 +96,7 @@ async def _relay(
         return {}
     try:
         body = resp.json()
-    except ValueError:
+    except (ValueError, RecursionError):
         body = None
     if not isinstance(body, dict):
         raise HTTPException(
