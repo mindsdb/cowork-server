@@ -14,6 +14,8 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from cowork.schemas.artifact_export import ExportFormat, InlineLimits, OmittedReason
 
+from cowork.services.file_page import VIEWER_BASE_PATTERN
+
 # The most items a conversion can report left out: far past what one
 # document's node and reference caps allow, so only a broken process passes it.
 MAX_OMITTED = 1_000_000
@@ -52,9 +54,10 @@ class PublishFileRequest(_Message):
     suffix: Literal[".pdf", ".docx", ".xlsx", ".pptx", ".csv", ".txt"]
     # Its name, for the page's heading and download link.
     name: str = Field(min_length=1, max_length=255)
-    # Where the shared document viewer's scripts are, an https URL ending in
-    # "/" (file_page.document_viewer_base), or "" for a page of text alone.
-    viewer_base: str = Field(default="", max_length=512, pattern=r"^(https://[^\s\"'<>]+/)?$")
+    # Where the shared document viewer's scripts are
+    # (file_page.VIEWER_BASE_PATTERN, from publish.document_viewer_base), or ""
+    # for a page of text alone.
+    viewer_base: str = Field(default="", max_length=512, pattern=f"^$|{VIEWER_BASE_PATTERN}")
 
 
 class AssetRequest(_Message):

@@ -373,6 +373,10 @@ def test_a_page_without_a_usable_viewer_is_text_alone(viewer_base):
         ("", "https://publish.customer.example", "", ""),
         ("http://cowork.example.com", "https://publish.customer.example", "", ""),
         ("", "", "", ""),
+        # A saved setting on the retired publish host means the prod one.
+        ("", "https://4nton.ai", "", "https://cowork.mindshub.ai/document-viewer/v1/"),
+        # A MindsHub host with no Cowork web app of its own: the server's.
+        ("https://cowork.example.com", "https://mdb.ai", "", "https://cowork.example.com/document-viewer/v1/"),
         # Not a MindsHub host, whatever its name says.
         ("", "https://view.mindshub.ai.evil.example", "", ""),
         # An operator's override wins, and must be https.
@@ -384,7 +388,7 @@ def test_where_shared_pages_load_the_viewer_from(
     web_origin, publish_url, override, expected
 ):
     assert (
-        file_page.document_viewer_base(
+        publish.document_viewer_base(
             web_origin=web_origin, publish_url=publish_url, override=override
         )
         == expected
@@ -417,3 +421,15 @@ def test_a_new_viewer_location_renders_the_page_again(tmp_path, monkeypatch):
 
     monkeypatch.setattr(publish, "_document_viewer_base", lambda: VIEWER)
     assert f"{VIEWER}pptx.js" in publish._render_to_page(source, out).read_text()
+
+
+@pytest.mark.parametrize("viewer_base", ['https://x.example/"><script>/', "http://x.example/", "https://x.example/v1"])
+def test_the_conversion_request_refuses_a_viewer_location_the_page_cant_hold(viewer_base):
+    from pydantic import ValidationError
+
+    from cowork.schemas.export_child import PublishFileRequest
+
+    with pytest.raises(ValidationError):
+        PublishFileRequest(suffix=".pptx", name="deck.pptx", viewer_base=viewer_base)
+    assert PublishFileRequest(suffix=".pptx", name="deck.pptx", viewer_base=VIEWER).viewer_base == VIEWER
+    assert PublishFileRequest(suffix=".pptx", name="deck.pptx").viewer_base == ""

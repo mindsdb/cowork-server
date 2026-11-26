@@ -91,8 +91,9 @@ from anton.publish_access import resolve_publish_target as _anton_resolve_publis
 from cowork.docs.store import DOC_HTML, is_doc_folder, is_doc_primary
 from cowork.schemas.export_child import PublishFileRequest, PublishMarkdownRequest
 from cowork.services.file_page import (
+    DOCUMENT_VIEWER_PATH,
     PUBLISHABLE_FILE_SUFFIXES,
-    document_viewer_base,
+    VIEWER_BASE_PATTERN,
     published_file_name,
 )
 from cowork.services.artifacts import (
@@ -1133,6 +1134,41 @@ def _render_file_to_html(path: Path, out_dir: Path, *, background: bool = False)
     out_path.write_text(page.decode("utf-8"), encoding="utf-8")
     (out_dir / published_file_name(path.name)).write_bytes(data)
     return out_path
+
+
+# A MindsHub publish host's first label, `api` or `view`, becomes `cowork` for
+# the Cowork web app beside it: view.mindshub.ai is beside cowork.mindshub.ai,
+# api.staging.mindshub.ai beside cowork.staging.mindshub.ai, and a PR
+# environment's view-pr-cowork-<n>.dev.mindshub.ai beside
+# cowork-pr-cowork-<n>.dev.mindshub.ai.
+_PUBLISH_HOST_LABEL = re.compile(r"^(?:api|view)((?:[.-][a-z0-9-]+)*)\.mindshub\.ai$")
+
+
+def document_viewer_base(*, web_origin: str, publish_url: str, override: str = "") -> str:
+    """Where a shared document page loads the viewer's scripts from, or "" (ENG-4687).
+
+    *override* (``COWORK_DOCUMENT_VIEWER_URL``) wins. A page published to
+    MindsHub's own service (``is_mindshub_publish_url``) loads it from the
+    Cowork web app of that host's environment, so the page and the viewer
+    always come from the same environment, whatever the server's own settings
+    name. Otherwise the server's Cowork web app (``COWORK_WEB_ORIGIN``,
+    *web_origin*); with neither, pages of the file's text alone.
+    """
+    if override:
+        base = override if override.endswith("/") else override + "/"
+    else:
+        beside = None
+        if is_mindshub_publish_url(publish_url):
+            host = (urlparse(normalize_publish_url(publish_url)).hostname or "").lower()
+            beside = _PUBLISH_HOST_LABEL.match(host)
+        if beside:
+            origin = f"https://cowork{beside.group(1)}.mindshub.ai"
+        elif web_origin.startswith("https://"):
+            origin = web_origin.rstrip("/")
+        else:
+            return ""
+        base = origin + DOCUMENT_VIEWER_PATH
+    return base if re.match(VIEWER_BASE_PATTERN, base) else ""
 
 
 def _document_viewer_base() -> str:
