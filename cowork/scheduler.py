@@ -1250,8 +1250,9 @@ async def _post_run_notice(run_id: UUID, *, schedule_id: UUID) -> None:
     """Put the run's ending in its owner's inbox, if they asked to hear
     about it. Never holds up or fails a run.
 
-    Same callers as _push_run_ending, but on every deployment: the inbox is
-    how the desktop and self-hosted hear about a run, where there is no push.
+    Same callers as _push_run_ending, and a run a shutdown cut mid-turn,
+    which push skips. On every deployment: the inbox is how the desktop and
+    self-hosted hear about a run, where there is no push.
     """
     try:
         from cowork.services.notices import post_scheduled_run_notice

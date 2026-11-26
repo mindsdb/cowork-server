@@ -331,6 +331,43 @@ async def test_a_run_whose_turn_claim_redis_cannot_answer_leaves_its_slot_due_an
     assert [r.levelno for r in records] == [logging.WARNING]
 
 
+async def test_a_run_a_shutdown_cancels_before_its_turn_starts_tells_its_owner_nothing(monkeypatch, due_schedule):
+    """A shutdown that lands while the run is still starting its turn cut a
+    run that did nothing. Its slot stays due and it runs again, so its
+    owner's inbox hears nothing."""
+    import cowork.handlers.responses as responses_mod
+    from cowork.db.session import get_open_session
+    from cowork.models.notice import Notice
+    from cowork.schemas.schedules import AttemptOutcome, RunStatus
+    from sqlmodel import select
+
+    starting = asyncio.Event()
+
+    class StartingHandler:
+        def __init__(self, *, principal=None, interactive=True, schedule_id=None):
+            pass
+
+        async def handle(self, request):
+            starting.set()
+            await asyncio.Event().wait()
+
+    monkeypatch.setattr(responses_mod, "ResponsesHandler", StartingHandler)
+    run = asyncio.create_task(scheduler.execute_schedule(due_schedule.id, is_manual=False))
+    await asyncio.wait_for(starting.wait(), timeout=5)
+    run.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await run
+
+    _, finished, _ = due_schedule.state()
+    assert finished.status == RunStatus.failed
+    assert finished.outcome == AttemptOutcome.failed_before_execution
+    session = get_open_session()
+    try:
+        assert session.exec(select(Notice).where(Notice.source_id == str(finished.id))).all() == []
+    finally:
+        session.close()
+
+
 @pytest.mark.parametrize("is_manual", [False, True], ids=["cron", "run-now"])
 async def test_a_run_a_shutdown_cancels_mid_turn_is_saved_failed_and_its_slot_stays_due(
     monkeypatch, due_schedule, is_manual,

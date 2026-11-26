@@ -2,6 +2,8 @@ from datetime import datetime
 from typing import Any, Literal
 from uuid import UUID
 
+from pydantic import ValidationError, ValidatorFunctionWrapHandler, field_validator
+
 from cowork.schemas.base import CamelResponse
 
 
@@ -27,6 +29,16 @@ class NoticeResponse(CamelResponse):
     fallback: NoticeFallback | None = None
     created_at: datetime | None = None
     read_at: datetime | None = None
+
+    @field_validator("fallback", mode="wrap")
+    @classmethod
+    def _unreadable_fallback_is_none(cls, value: Any, handler: ValidatorFunctionWrapHandler) -> NoticeFallback | None:
+        """A fallback a later build wrote, with a destination this one does
+        not know, is dropped: one unreadable notice must not fail the inbox."""
+        try:
+            return handler(value)
+        except ValidationError:
+            return None
 
 
 class NoticeListResponse(CamelResponse):

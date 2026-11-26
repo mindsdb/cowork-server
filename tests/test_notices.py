@@ -236,6 +236,25 @@ def test_the_app_mounts_the_notices_routes():
     } <= paths
 
 
+async def test_a_notice_whose_fallback_this_build_cannot_read_still_lists():
+    """A later build's notice can point somewhere this one does not know.
+    The inbox still lists, and that notice comes without a fallback."""
+    subject = f"newer {uuid4()}"
+    try:
+        with get_open_session() as session:
+            posted = _post(session, org_id=None, user_id=None, subject=subject)
+            posted.fallback = {"summary": "From a later build.", "destination": {"kind": "report", "id": str(uuid4())}}
+            session.add(posted)
+            session.commit()
+        async with _notices_client() as client:
+            response = await client.get("/api/v1/notices/")
+            assert response.status_code == 200
+            (shown,) = [n for n in response.json()["notices"] if n["subject"] == subject]
+            assert shown["fallback"] is None
+    finally:
+        _delete_notices(subject=subject)
+
+
 async def test_the_api_lists_counts_and_marks_notices_read():
     subject = f"api {uuid4()}"
     destination = uuid4()
