@@ -178,6 +178,19 @@ class ProbeOutcome:
 class CredentialProbe:
     """Orchestrates one headless Anton turn to test a set of credentials."""
 
+    def _session_settings(self) -> dict:
+        """Settings with the scratchpad's web_search() off, when asked; none otherwise,
+        and none for an anton that predates the switch."""
+        if not self.scratchpad_web_search_off:
+            return {}
+        from anton.core.settings import CoreSettings
+
+        settings = CoreSettings()
+        if not hasattr(settings, "scratchpad_web_search"):
+            return {}
+        settings.scratchpad_web_search = "off"
+        return {"settings": settings}
+
     def __init__(
         self,
         *,
@@ -193,6 +206,7 @@ class CredentialProbe:
         web_tool_kwargs: WebToolKwargs | None = None,
         saved_fields: list[str] | None = None,
         cell_sandbox: CellSandbox | None = None,
+        scratchpad_web_search_off: bool = False,
     ) -> None:
         self.engine = engine
         self.credentials = credentials
@@ -210,6 +224,8 @@ class CredentialProbe:
         # The caller captures this alongside llm_client. Never re-read settings
         # here: the provider may have changed since the client was constructed.
         self.web_tool_kwargs: WebToolKwargs = {**(web_tool_kwargs or {})}
+        # True under known-on ZDR with the coding model on MindsHub, which drops web search.
+        self.scratchpad_web_search_off = scratchpad_web_search_off
         # Fields an earlier step saved on the connection being extended: in the
         # .env with the rest, but not in this step's form.
         self.saved_fields = list(saved_fields or [])
@@ -670,6 +686,7 @@ class CredentialProbe:
             # search stays off when COWORK_OPENAI_COMPATIBLE_API puts planning
             # on the Responses API.
             **self.web_tool_kwargs,
+            **self._session_settings(),
             # Passed directly, as the turn passes it: a dropped policy would
             # run the probe's cells unlocked.
             **({"cell_sandbox": self.cell_sandbox} if self.cell_sandbox is not None else {}),

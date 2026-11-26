@@ -244,6 +244,36 @@ async def _probe_session_config(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("known_on", [True, False])
+async def test_a_probe_under_zdr_drops_the_scratchpads_web_search(
+    monkeypatch, openai_compatible_api, anton_responses_ready, known_on
+):
+    import anton.core.settings as anton_settings
+
+    from cowork.handlers import probe as handler_module
+
+    class CoreSettings:
+        # Stands in for an anton that has the switch.
+        scratchpad_web_search = "on"
+
+    async def zdr_known_on(_self, _settings):
+        return known_on
+
+    monkeypatch.setattr(anton_settings, "CoreSettings", CoreSettings)
+    monkeypatch.setattr(handler_module.ProbeHandler, "_zdr_known_on", zdr_known_on)
+    openai_compatible_api(None)
+    anton_responses_ready()
+
+    config = await _probe_session_config(monkeypatch, _settings(Provider.MINDS_CLOUD))
+
+    assert (config.web_search_enabled, config.web_fetch_enabled) == (not known_on,) * 2
+    if known_on:
+        assert config.settings.scratchpad_web_search == "off"
+    else:
+        assert config.settings is None
+
+
+@pytest.mark.asyncio
 async def test_switched_probe_session_runs_without_web_tools(
     monkeypatch, openai_compatible_api, anton_responses_ready
 ):
