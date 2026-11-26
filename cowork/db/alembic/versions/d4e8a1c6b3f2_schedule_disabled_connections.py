@@ -4,7 +4,7 @@ A scheduled task can leave out connections it doesn't need, so an unattended
 run can't use them: the same {engine, name} list a chat turn mutes them with.
 
 Revision ID: d4e8a1c6b3f2
-Revises: a8d3f6c1e924
+Revises: c271568dc904
 Create Date: 2026-11-23 00:00:00.000000
 
 """
@@ -16,7 +16,7 @@ from alembic import op
 
 # revision identifiers, used by Alembic.
 revision: str = "d4e8a1c6b3f2"
-down_revision: Union[str, Sequence[str], None] = "a8d3f6c1e924"
+down_revision: Union[str, Sequence[str], None] = "c271568dc904"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 

@@ -120,6 +120,7 @@ _INTERRUPTED_RUN_ERROR = "Run was interrupted: the server shut down before it fi
 # waits for that request only up to --timeout-graceful-shutdown, then cancels
 # it, and the run is saved as interrupted (_INTERRUPTED_RUN_ERROR).
 _scheduled_runs: set[asyncio.Task] = set()
+_notice_retries: set[asyncio.Task] = set()
 
 _RECURRING_CADENCES = {
     Cadence.every_15_minutes, Cadence.every_30_minutes, Cadence.hourly,
@@ -909,6 +910,7 @@ async def _execute_schedule(
     timed_out = False
     end: _AttemptEnd | None = None
     shutdown_interrupted = False
+    shutdown_failed = False
     scheduled: _ScheduledTurn | None = None
     # Set once the run's ending is recorded: True finished, False didn't, and
     # None sends no push (_push_run_ending).
@@ -1102,6 +1104,9 @@ async def _execute_schedule(
         # cron run still going. The finally saves it as failed.
         error = _INTERRUPTED_RUN_ERROR
         outcome = AttemptOutcome.interrupted if turn_started else AttemptOutcome.failed_before_execution
+        # A run cut before its turn started did nothing, and its slot stays
+        # due: nothing to tell its owner, as when a start is refused.
+        shutdown_failed = turn_started
         raise
     except Exception as exc:
         # The ids travel as record attributes: a database error's sanitized
@@ -1205,8 +1210,11 @@ async def _execute_schedule(
         finally:
             with _active_run_lock:
                 _active_run_ids.discard(run_id)
-            if push_succeeded is not None and not lease_lost.is_set() and trigger != RunTrigger.trial:
-                _push_run_ending(scheduled, conversation_id=conversation_id, succeeded=push_succeeded)
+            if not lease_lost.is_set() and trigger != RunTrigger.trial:
+                if push_succeeded is not None:
+                    _push_run_ending(scheduled, conversation_id=conversation_id, succeeded=push_succeeded)
+                if push_succeeded is not None or shutdown_failed:
+                    await _post_run_notice(run_id, schedule_id=schedule_id)
 
 
 def _push_run_ending(
@@ -1247,6 +1255,55 @@ def _push_reaped_run(push: ReapedRunPush) -> None:
         )
     except Exception:
         logger.warning("Could not push a reaped run's ending", exc_info=True, extra={"event": "push_schedule_failed"})
+
+
+async def _post_run_notice(run_id: UUID, *, schedule_id: UUID) -> None:
+    """Put the run's ending in its owner's inbox, if they asked to hear
+    about it. Never holds up or fails a run.
+
+    Same callers as _push_run_ending, and a run a shutdown cut mid-turn,
+    which push skips. On every deployment: the inbox is how the desktop and
+    self-hosted hear about a run, where there is no push.
+    """
+    try:
+        from cowork.services.notices import post_scheduled_run_notice
+
+        unit = partial(post_scheduled_run_notice, run_id=run_id)
+        await run_db(unit, scope=SYSTEM_SCOPE)
+    except PoolTimeoutError:
+        # The run is already recorded. Let it release its scheduler slot
+        # while the inbox write waits for a connection independently.
+        retry = asyncio.create_task(_retry_run_notice(unit, schedule_id=schedule_id))
+        _notice_retries.add(retry)
+        retry.add_done_callback(_notice_retries.discard)
+    except Exception:
+        logger.warning("Could not post a scheduled run's notice", exc_info=True, extra={"event": "schedule_notice_failed"})
+
+
+async def _retry_run_notice(unit: Callable[[ScopedSession], object], *, schedule_id: UUID) -> None:
+    try:
+        await _until_it_lands(unit, schedule_id=schedule_id)
+    except Exception:
+        logger.warning("Could not post a scheduled run's notice", exc_info=True, extra={"event": "schedule_notice_failed"})
+
+
+async def wait_for_scheduled_notices(*, timeout_seconds: float) -> None:
+    pending = [task for task in _notice_retries if not task.done()]
+    if pending:
+        await asyncio.wait(pending, timeout=timeout_seconds)
+
+
+def post_reaped_run_notices(session: ScopedSession, run_ids: list[UUID]) -> None:
+    """Post the notices for runs a reaper failed, inside its database unit.
+    One run's failure to post never stops the others, or the reap."""
+    from cowork.services.notices import post_scheduled_run_notice
+
+    for run_id in run_ids:
+        try:
+            post_scheduled_run_notice(session, run_id=run_id)
+        except Exception:
+            session.rollback()
+            logger.warning("Could not post a reaped run's notice", exc_info=True, extra={"event": "schedule_notice_failed"})
 
 
 class _LeaseLost(Exception):
@@ -1849,6 +1906,7 @@ def _reap_lapsed_runs(
                 conversation_id=str(run.conversation_id) if run.conversation_id else None,
             ))
     session.commit()
+    post_reaped_run_notices(session, [run.id for run in executed if not run.trial])
     if abandoned is not None:
         abandoned.extend(committed_abandoned)
     if pushes is not None:
