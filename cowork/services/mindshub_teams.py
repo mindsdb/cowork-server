@@ -37,6 +37,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from collections.abc import Callable
+from enum import StrEnum
 from typing import Any, NamedTuple, TypeVar
 
 from pydantic import BaseModel, Field, ValidationError
@@ -96,6 +97,14 @@ class MindsHubTeamListing(BaseModel):
 ZDR_OFF = "off"
 
 
+class ZdrState(StrEnum):
+    """Whether ZDR is on, off, or couldn't be read (which callers treat as on)."""
+
+    OFF = "off"
+    ON = "on"
+    UNKNOWN = "unknown"
+
+
 class MindsHubPermissions(BaseModel):
     """The caller's resolved permissions in the active organization.
 
@@ -124,9 +133,16 @@ class MindsHubPermissions(BaseModel):
         return self.reachable and self.browser is None and not self.permissions
 
     @property
+    def zdr_state(self) -> ZdrState:
+        """The ZDR mode as read; no mode, or auth's outage answer, is unknown."""
+        if self.zdr_mode is None or self.is_outage_answer():
+            return ZdrState.UNKNOWN
+        return ZdrState.OFF if self.zdr_mode == ZDR_OFF else ZdrState.ON
+
+    @property
     def zdr_on(self) -> bool:
         """Whether ZDR is on; an unknown mode, or auth's outage answer, counts as on."""
-        return self.zdr_mode != ZDR_OFF or self.is_outage_answer()
+        return self.zdr_state is not ZdrState.OFF
 
 
 def _refused_permissions(status_code: int | None) -> MindsHubPermissions:

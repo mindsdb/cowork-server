@@ -223,12 +223,18 @@ def zdr_off(monkeypatch):
     state = SimpleNamespace(on=False)
 
     async def _browser_zdr_on(**kwargs):
-        return state.on
+        return bool(state.on)
+
+    async def _browser_zdr_state(**kwargs):
+        if isinstance(state.on, mindshub_zdr.ZdrState):
+            return state.on
+        return mindshub_zdr.ZdrState.ON if state.on else mindshub_zdr.ZdrState.OFF
 
     async def _turn_zdr_on(user):
-        return state.on
+        return bool(state.on)
 
     monkeypatch.setattr(mindshub_zdr, "browser_zdr_on", _browser_zdr_on)
+    monkeypatch.setattr(mindshub_zdr, "browser_zdr_state", _browser_zdr_state)
     monkeypatch.setattr(harness, "_turn_zdr_on", _turn_zdr_on)
     return state
 
@@ -875,6 +881,16 @@ def test_under_zdr_the_browser_cant_be_turned_on_with_only_jev(client, decisions
     response = client.put("/api/v1/settings/browser_enabled", json={"value": "true"})
     assert response.status_code == 400
     assert "zero data retention" in response.json()["detail"]
+
+
+def test_an_unreadable_zdr_keeps_the_browser_off_without_naming_zdr(client, decisions, zdr_off):
+    from cowork.services.mindshub_zdr import ZdrState
+
+    runtime_credential.set_browser_host(APP_BROWSER)
+    zdr_off.on = ZdrState.UNKNOWN
+    response = client.put("/api/v1/settings/browser_enabled", json={"value": "true"})
+    assert response.status_code == 400
+    assert "zero data retention" not in response.json()["detail"]
 
 
 def test_on_the_web_only_an_organization_admin_may_set_up_a_decisions_model(web_client, router, mindshub):

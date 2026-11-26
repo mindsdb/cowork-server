@@ -269,16 +269,23 @@ async def _reject_browser_that_cant_run(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="The browser needs MindsHub as the model provider.",
         )
-    from cowork.services.mindshub_zdr import browser_zdr_on
+    from cowork.services.mindshub_zdr import ZdrState, browser_zdr_state
 
     if decisions_available(settings):
-        if await browser_zdr_on(scope=scope, settings=settings, org_bearer=caller_bearer(request)):
+        zdr = await browser_zdr_state(scope=scope, settings=settings, org_bearer=caller_bearer(request))
+        if zdr is ZdrState.ON:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail=(
                     "The browser can't use Jev on MindsHub while zero data retention is on. "
                     "It needs a decision model of the organization's own."
                 ),
+            )
+        if zdr is ZdrState.UNKNOWN:
+            # Unknown still counts as on, without saying ZDR is on.
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="The browser can't be turned on right now. Try again shortly.",
             )
         return
     if browser.own_decisions_unused(settings):

@@ -13,7 +13,8 @@ failure is 424.
 
 Under zero data retention voice is off: its models (GPT-Live, the operator's)
 aren't ZDR, so status answers unavailable and session and operate answer 403
-``zdr_restricted`` without sending MindsHub anything.
+``zdr_restricted`` without sending MindsHub anything. A ZDR status that can't
+be read counts as on, with a neutral sentence rather than the ZDR one.
 """
 
 from __future__ import annotations
@@ -31,7 +32,7 @@ from cowork.harnesses.memory.policy import resolve_memory_policy
 from cowork.principal import mindshub_credential
 from cowork.services import voice, voice_operator
 from cowork.services.memory import build_turn_memory
-from cowork.services.mindshub_zdr import zdr_on
+from cowork.services.mindshub_zdr import ZdrState, zdr_state
 
 logger = logging.getLogger(__name__)
 
@@ -39,21 +40,24 @@ router = APIRouter()
 
 
 _ZDR_MESSAGE = "Voice calls aren't available while zero data retention is on."
+# When ZDR couldn't be read: voice stays off, but nothing says ZDR is on.
+_ZDR_UNKNOWN_MESSAGE = "Voice calls are unavailable right now. Try again shortly."
 
 
-async def _zdr_on(request: Request, scope: TenantScope) -> bool:
-    """Whether the caller's org has ZDR on, read with their own credential; unknown counts as on."""
+async def _zdr_state(request: Request, scope: TenantScope) -> ZdrState:
+    """The caller's org's ZDR, read with their own credential; any voice use goes ahead only on OFF."""
     try:
-        return await zdr_on(
+        return await zdr_state(
             bearer_token=mindshub_credential(request), org_id=scope.org_id or "", user_id=scope.user_id or "",
         )
     except Exception:
         logger.warning("voice: couldn't read ZDR, so voice is off", exc_info=True)
-        return True
+        return ZdrState.UNKNOWN
 
 
-def _refuse_under_zdr() -> HTTPException:
-    return HTTPException(status_code=403, detail={"code": "zdr_restricted", "message": _ZDR_MESSAGE})
+def _refuse_under_zdr(state: ZdrState) -> HTTPException:
+    message = _ZDR_MESSAGE if state is ZdrState.ON else _ZDR_UNKNOWN_MESSAGE
+    return HTTPException(status_code=403, detail={"code": "zdr_restricted", "message": message})
 
 
 class VoiceSessionRequest(BaseModel):
@@ -84,7 +88,7 @@ class VoiceOperateRequest(BaseModel):
 
 @router.get("/status", response_model=voice.VoiceStatus, dependencies=[Depends(require(AuthenticatedInOrgMode))])
 async def voice_status(request: Request, scope: TenantScope = Depends(get_tenant_scope)) -> voice.VoiceStatus:
-    if await _zdr_on(request, scope):
+    if await _zdr_state(request, scope) is not ZdrState.OFF:
         return voice.VoiceStatus(available=False)
     return voice.VoiceStatus(available=await voice.available(mindshub_credential(request)))
 
@@ -93,8 +97,8 @@ async def voice_status(request: Request, scope: TenantScope = Depends(get_tenant
 async def voice_session(
     body: VoiceSessionRequest, request: Request, scope: TenantScope = Depends(get_tenant_scope)
 ) -> dict:
-    if await _zdr_on(request, scope):
-        raise _refuse_under_zdr()
+    if (zdr := await _zdr_state(request, scope)) is not ZdrState.OFF:
+        raise _refuse_under_zdr(zdr)
     # Memory lives on the shared file store: read it in run_efs's slots and the
     # person's share of them. A busy store starts the call without memory.
     try:
@@ -113,8 +117,8 @@ async def voice_session(
 async def voice_operate(
     body: VoiceOperateRequest, request: Request, scope: TenantScope = Depends(get_tenant_scope)
 ) -> dict:
-    if await _zdr_on(request, scope):
-        raise _refuse_under_zdr()
+    if (zdr := await _zdr_state(request, scope)) is not ZdrState.OFF:
+        raise _refuse_under_zdr(zdr)
     try:
         return await voice_operator.operate(mindshub_credential(request), body.messages, body.snapshot, body.timezone)
     except voice_operator.OperatorError as exc:

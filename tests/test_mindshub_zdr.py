@@ -9,7 +9,7 @@ import pytest
 
 from cowork.services import mindshub_teams, mindshub_zdr
 from cowork.services.mindshub_client import MindsHubAnswer, MindsHubReply
-from cowork.services.mindshub_zdr import zdr_on, zdr_on_for
+from cowork.services.mindshub_zdr import ZdrState, zdr_on, zdr_on_for, zdr_state
 
 _BROWSER = {"permitted": True, "enabled": True, "daily_bytes": 1073741824, "disabled_reason": None}
 
@@ -129,3 +129,43 @@ async def test_the_browser_asks_zdr_only_when_jev_would_pick_its_steps(monkeypat
     monkeypatch.setattr(mindshub_zdr, "zdr_on_for", zdr_on_for)
     assert await mindshub_zdr.browser_zdr_on(scope=None, settings=None, org_bearer="tok") is expected
     assert bool(calls) is asked
+
+
+@pytest.mark.parametrize(("reply", "state"), [
+    (MindsHubReply(MindsHubAnswer.OK, payload=_entitlements(zdr_mode="off")), ZdrState.OFF),
+    (MindsHubReply(MindsHubAnswer.OK, payload=_entitlements(zdr_mode="strict")), ZdrState.ON),
+    (MindsHubReply(MindsHubAnswer.OK, payload=_entitlements(zdr_mode=None)), ZdrState.UNKNOWN),
+    (MindsHubReply(MindsHubAnswer.OK, payload={"permissions": [], "browser": None}), ZdrState.UNKNOWN),
+    (MindsHubReply(MindsHubAnswer.UNREACHABLE), ZdrState.UNKNOWN),
+    (MindsHubReply(MindsHubAnswer.REFUSED, status_code=401), ZdrState.UNKNOWN),
+])
+def test_zdr_state_tells_an_unreadable_answer_from_zdr_on(mindshub, reply, state):
+    mindshub.reply = reply
+
+    assert asyncio.run(zdr_state(bearer_token="jwt-alice", org_id="o", user_id="u")) is state
+
+
+def test_zdr_state_is_unknown_without_a_credential(mindshub):
+    assert asyncio.run(zdr_state(bearer_token="", org_id="o", user_id="u")) is ZdrState.UNKNOWN
+    assert mindshub.asked == []
+
+
+@pytest.mark.parametrize(("needs", "read", "expected"), [
+    (False, ZdrState.ON, ZdrState.OFF),
+    (True, ZdrState.ON, ZdrState.ON),
+    (True, ZdrState.UNKNOWN, ZdrState.UNKNOWN),
+    (True, RuntimeError("auth down"), ZdrState.UNKNOWN),
+])
+@pytest.mark.asyncio
+async def test_the_browsers_zdr_state_marks_a_failed_read_unknown(monkeypatch, needs, read, expected):
+    from cowork.handlers import jev_route
+
+    monkeypatch.setattr(jev_route, "browser_needs_zdr", lambda settings: needs)
+
+    async def zdr_state_for(**kwargs):
+        if isinstance(read, Exception):
+            raise read
+        return read
+
+    monkeypatch.setattr(mindshub_zdr, "zdr_state_for", zdr_state_for)
+    assert await mindshub_zdr.browser_zdr_state(scope=None, settings=None, org_bearer="tok") is expected

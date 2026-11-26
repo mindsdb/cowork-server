@@ -25,13 +25,13 @@ def zdr(monkeypatch):
 
     state = SimpleNamespace(on=False, asked=[])
 
-    async def _zdr_on(*, bearer_token, org_id, user_id):
+    async def _zdr_state(*, bearer_token, org_id, user_id):
         state.asked.append(bearer_token)
         if isinstance(state.on, Exception):
             raise state.on
-        return state.on
+        return voice_ep.ZdrState.ON if state.on else voice_ep.ZdrState.OFF
 
-    monkeypatch.setattr(voice_ep, "zdr_on", _zdr_on)
+    monkeypatch.setattr(voice_ep, "zdr_state", _zdr_state)
     return state
 
 

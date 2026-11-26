@@ -27,15 +27,19 @@ def zdr(monkeypatch):
 
     from cowork.api.v1.endpoints import voice as voice_ep
 
+    from cowork.services.mindshub_zdr import ZdrState
+
     state = SimpleNamespace(on=False, asked=[])
 
-    async def _zdr_on(*, bearer_token, org_id, user_id):
+    async def _zdr_state(*, bearer_token, org_id, user_id):
         state.asked.append(bearer_token)
         if isinstance(state.on, Exception):
             raise state.on
-        return state.on
+        if isinstance(state.on, ZdrState):
+            return state.on
+        return ZdrState.ON if state.on else ZdrState.OFF
 
-    monkeypatch.setattr(voice_ep, "zdr_on", _zdr_on)
+    monkeypatch.setattr(voice_ep, "zdr_state", _zdr_state)
     return state
 
 
@@ -245,4 +249,22 @@ async def test_under_zdr_a_session_is_refused_before_mindshub_hears_anything(inf
     response = await _call("POST", "/session", json={"sdp": "v=0"})
     assert response.status_code == 403
     assert response.json()["detail"]["code"] == "zdr_restricted"
+    assert inference.seen == []
+
+
+@pytest.mark.parametrize(("on", "says_zdr"), [
+    (True, True),
+    (RuntimeError("auth down"), False),
+    ("unknown", False),
+])
+@pytest.mark.parametrize("path", ["/session", "/operate"])
+async def test_only_a_known_zdr_names_zdr_in_the_refusal(inference, zdr, on, says_zdr, path):
+    from cowork.services.mindshub_zdr import ZdrState
+
+    zdr.on = ZdrState.UNKNOWN if on == "unknown" else on
+    body = {"sdp": "v=0"} if path == "/session" else {"messages": [{"role": "user", "content": "hi"}]}
+    response = await _call("POST", path, json=body)
+    assert response.status_code == 403
+    message = response.json()["detail"]["message"]
+    assert ("zero data retention" in message) is says_zdr
     assert inference.seen == []
