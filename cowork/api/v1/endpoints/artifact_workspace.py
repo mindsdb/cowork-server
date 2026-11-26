@@ -1418,28 +1418,46 @@ async def artifact_audience(
     )
 
 
-async def _push_share(
+def _push_share(
     scope, principal: Principal | None, notices: list, *, artifact_ref: str, bearer_token: str,
 ) -> None:
     """Push the people the save asked to notify, the ones MindsHub emails:
     individuals by id only. People named by address alone, and the members
     of a team or the whole organization a share opens to, get no push, as
-    they get no email. ZDR is read with the sharer's bearer first; unknown
-    leaves the title out. Never raises."""
+    they get no email. Returns at once: the ZDR read and the pushes run on a
+    detached task, so they never hold the publish lock or the response.
+    Never raises."""
     try:
-        from cowork.services.mindshub_zdr import zdr_state_quietly
-        from cowork.services.push.dispatch import push_enabled
-        from cowork.services.push.hooks import artifact_shared
+        from cowork.services.push.dispatch import push_enabled, spawn
 
         org_id = scope.org_id if scope.org_mode else None
         if not org_id or not any(notice.recipients.user_ids for notice in notices) or not push_enabled():
             return
-        zdr = await zdr_state_quietly(bearer_token=bearer_token, org_id=org_id, user_id=scope.user_id or "")
+        spawn(_send_share_push(
+            org_id=org_id, user_id=scope.user_id or "",
+            sharer_id=principal.user_id if principal else None,
+            sharer_name=principal.email if principal else None,
+            notices=list(notices), artifact_ref=artifact_ref, bearer_token=bearer_token,
+        ))
+    except Exception:
+        logger.warning("Could not push an artifact share", exc_info=True, extra={"event": "push_share_failed"})
+
+
+async def _send_share_push(
+    *, org_id: str, user_id: str, sharer_id: str | None, sharer_name: str | None,
+    notices: list, artifact_ref: str, bearer_token: str,
+) -> None:
+    """Read ZDR as the sharer (unknown leaves the title out), then push. Never raises."""
+    try:
+        from cowork.services.mindshub_zdr import zdr_state_quietly
+        from cowork.services.push.hooks import artifact_shared
+
+        zdr = await zdr_state_quietly(bearer_token=bearer_token, org_id=org_id, user_id=user_id)
         for notice in notices:
             artifact_shared(
                 org_id=org_id,
-                sharer_id=principal.user_id if principal else None,
-                sharer_name=principal.email if principal else None,
+                sharer_id=sharer_id,
+                sharer_name=sharer_name,
                 recipient_ids=notice.recipients.user_ids,
                 artifact_title=notice.artifact_title,
                 url=notice.artifact_url,
@@ -1575,7 +1593,7 @@ async def _publish_live(
                 ),
                 timeout=_LIVE_PUBLISH_TIMEOUT_S,
             )
-            await _push_share(
+            _push_share(
                 scope, principal, notices, artifact_ref=f"{source.project_id}/{artifact_id}",
                 bearer_token=bearer_token,
             )

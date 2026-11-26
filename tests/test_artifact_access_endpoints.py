@@ -1154,6 +1154,13 @@ def zdr_reads(monkeypatch):
     return reads
 
 
+async def _share_push_sent() -> None:
+    """Wait for the share's detached push task."""
+    from cowork.services.push import dispatch
+
+    await asyncio.gather(*list(dispatch._background_tasks))
+
+
 @pytest.fixture
 def share_pushes(monkeypatch, zdr_reads):
     """What the access route hands the push hook (cowork.services.push.hooks)."""
@@ -1181,6 +1188,7 @@ async def test_a_save_that_notifies_people_pushes_exactly_those_people(
 
     artifact_id = await aw._artifact_id_from_path(UUID(ARTIFACT_ID))
     await aw.set_artifact_access("proj", artifact_id, aw._AccessBody(access=access), ORG_SCOPE, request, principal=sharer)
+    await _share_push_sent()
 
     assert share_pushes == [{
         "org_id": ORG_SCOPE.org_id,
@@ -1201,6 +1209,7 @@ async def test_a_save_without_notify_pushes_no_one(
 ):
     access = {"mode": "restricted", "allowed_emails": ["a@example.com"], "org_allowed": False}
     await aw.set_artifact_access("proj", ARTIFACT_ID, aw._AccessBody(access=access), ORG_SCOPE, _REQUEST, principal=None)
+    await _share_push_sent()
     assert share_pushes == []
     assert zdr_reads == []
 
@@ -1215,7 +1224,42 @@ async def test_a_failing_push_never_fails_the_save(as_owner, publish_calls, publ
         "notify": {"user_ids": ["aaaaaaaa-1111-1111-1111-111111111111"]},
     }
     out = await aw.set_artifact_access("proj", ARTIFACT_ID, aw._AccessBody(access=access), ORG_SCOPE, _REQUEST, principal=None)
+    await _share_push_sent()
     assert out["url"] == "https://view.example/r/1"
+
+
+async def test_a_slow_zdr_read_neither_holds_the_share_nor_its_lock(
+    as_owner, publish_calls, publish_context, share_pushes, monkeypatch,
+):
+    """The push's ZDR read runs detached: the save answers, frees the lock and
+    revokes its key before the read ends."""
+    from cowork.services.mindshub_teams import ZdrState
+
+    read_started, read_may_end = asyncio.Event(), asyncio.Event()
+
+    async def slow_zdr(**_kwargs):
+        read_started.set()
+        await read_may_end.wait()
+        return ZdrState.ON
+
+    monkeypatch.setattr("cowork.services.mindshub_zdr.zdr_state_quietly", slow_zdr)
+    access = {
+        "mode": "restricted", "allowed_emails": ["a@example.com"], "org_allowed": False,
+        "notify": {"user_ids": ["aaaaaaaa-1111-1111-1111-111111111111"]},
+    }
+    out = await asyncio.wait_for(
+        aw.set_artifact_access("proj", ARTIFACT_ID, aw._AccessBody(access=access), ORG_SCOPE, _REQUEST, principal=None),
+        timeout=2,
+    )
+    assert out["url"] == "https://view.example/r/1"
+    assert _lock_is_free(as_owner)
+    assert publish_context == [True]
+    await asyncio.wait_for(read_started.wait(), timeout=2)
+    assert share_pushes == []
+
+    read_may_end.set()
+    await _share_push_sent()
+    assert [push["zdr"] for push in share_pushes] == [ZdrState.ON]
 
 
 # GET .../audience: who the artifact is shared with, for anyone who may
