@@ -791,3 +791,39 @@ def test_publish_answer_names_its_page_only_under_result(tmp_path: Path):
     assert answer["result"]["report_id"] == "rid-top"
     assert "reportId" not in answer
     assert "report_id" not in answer
+
+
+def test_content_clock_ignores_inline_state_json(tmp_path: Path):
+    """ENG-4684: saving an inline page's picks must not look like a page edit,
+    or every open frame reloads, saves again and reloads again."""
+    from cowork.services.artifacts import content_mtime_ns
+
+    (tmp_path / "metadata.json").write_text(
+        json.dumps({"slug": "picks", "type": "html-app", "display": "inline"})
+    )
+    page = tmp_path / "index.html"
+    page.write_text("<p>hi</p>")
+    _touch(page, 1000)
+    state = tmp_path / "state.json"
+    state.write_text('{"picked": ["a"]}')
+    _touch(state, 5000)
+    assert _content_mtime(tmp_path) == 1000
+    assert content_mtime_ns(tmp_path) == 1000 * 1_000_000_000
+
+
+def test_content_clock_ignores_inline_snapshot_json(tmp_path: Path):
+    """ENG-4684: the form snapshot the shim reports is saved on every change,
+    like state.json, and is no page edit either."""
+    from cowork.services.artifacts import content_mtime_ns
+
+    (tmp_path / "metadata.json").write_text(
+        json.dumps({"slug": "picks", "type": "html-app", "display": "inline"})
+    )
+    page = tmp_path / "index.html"
+    page.write_text("<p>hi</p>")
+    _touch(page, 1000)
+    snapshot = tmp_path / "snapshot.json"
+    snapshot.write_text('{"controls": [], "text": ""}')
+    _touch(snapshot, 6000)
+    assert _content_mtime(tmp_path) == 1000
+    assert content_mtime_ns(tmp_path) == 1000 * 1_000_000_000

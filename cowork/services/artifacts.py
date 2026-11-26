@@ -52,13 +52,14 @@ from cowork.db.personal_resources import PersonalResource
 from cowork.models.artifact_owner_choice import AccessMode
 from cowork.schemas.artifact_access import ArtifactAccessView, ArtifactStatusView
 from cowork.schemas.artifact_card import ArtifactCard
-from cowork.services.artifact_metadata import ArtifactMetadata, lenient_text
+from cowork.services.artifact_metadata import ArtifactMetadata, is_widget, lenient_text, shows_inline
 from anton.core.artifacts.internal_files import (
     NON_CONTENT_NAMES,
     REVISIONS_DIRNAME,
     is_bytecode_name,
 )
 from anton.core.artifacts.store import iter_content_files
+from cowork.services.artifact_revisions import INLINE_PAGE_FILES
 
 if TYPE_CHECKING:
     from cowork.db.scoped import ScopedSession, TenantScope
@@ -358,6 +359,19 @@ def _user_files_with_mtimes(folder: Path) -> list[tuple[Path, int]]:
     return out
 
 
+def _content_clock_ns(folder: Path) -> int:
+    """Newest mtime (ns) across the files that make up the artifact's page.
+
+    An inline html-app's top-level `state.json` and `snapshot.json`
+    (INLINE_PAGE_FILES) are left out: they are the viewer's picks (ENG-4684),
+    saved on every change. Counting it would bump
+    the card's cache-bust token on each save, so every open frame of the
+    artifact reloads, saves its state again and reloads again.
+    """
+    own = {folder / name for name in INLINE_PAGE_FILES}
+    return max((ns for path, ns in _user_files_with_mtimes(folder) if path not in own), default=0)
+
+
 def _user_files(folder: Path) -> list[Path]:
     """All non-housekeeping files inside an artifact folder, sorted by mtime desc."""
     return [p for p, _ in _user_files_with_mtimes(folder)]
@@ -400,7 +414,9 @@ def _pick_primary(
     html = next((f for f in files if f.suffix.lower() == ".html"), None)
     if html is not None:
         return html
-    return files[0]
+    # An inline page's own files (artifact_revisions.INLINE_PAGE_FILES) are
+    # its data, not what opens, unless they are all the folder holds.
+    return next((f for f in files if f.name not in INLINE_PAGE_FILES), files[0])
 
 
 def _load_published_map(folder: Path) -> dict:
@@ -475,8 +491,7 @@ def _content_mtime(folder: Path) -> int:
     since publish" gate for the `modified` badge.
     """
     try:
-        max_ns = max((ns for _, ns in _user_files_with_mtimes(folder)), default=0)
-        return max_ns // 1_000_000_000
+        return _content_clock_ns(folder) // 1_000_000_000
     except OSError:
         return 0
 
@@ -496,7 +511,7 @@ def content_mtime_ns(folder: Path) -> int:
     to notice two edits that landed in the same second.
     """
     try:
-        return max((ns for _, ns in _user_files_with_mtimes(folder)), default=0)
+        return _content_clock_ns(folder)
     except OSError:
         return 0
 
@@ -1706,6 +1721,8 @@ def _prepare_artifact_card(
         folder=str(logical_folder),
         path=primary_path,
         primary=meta.primary or None,
+        # Only when metadata.json asks for it, so other cards keep their keys.
+        **({"display": meta.display} if shows_inline(meta.display) else {}),
         project_id=project_id,
         # What the card shows. The serve URL below carries `project_name`
         # instead, because serve_artifact_file resolves that segment by name
@@ -1754,6 +1771,18 @@ def _prepare_artifact_card(
             card.draft_url = draft_url_for(
                 project_id=project_id, artifact_id=artifact_id, rel_path=rel
             )
+            if shows_inline(card.display):
+                from cowork.services.artifact_revisions import head_revision_id
+
+                # The version this card shows, so a chat card from an earlier
+                # turn can open that one (ENG-4684). Inline cards only: it
+                # reads the revision journal and hashes the page. Through the
+                # logical folder, where capture_agent_revision writes it: on
+                # Linux `io_folder` is a /proc/self/fd link, which the
+                # journal's no-follow reads refuse (no revisionId at all).
+                revision_id = head_revision_id(logical_folder, rel)
+                if revision_id:
+                    card.revision_id = revision_id
     return _PreparedArtifactCard(
         card=card,
         io_folder=io_folder,
@@ -2314,6 +2343,9 @@ def preview_mount_for(token: str, *, scope: TenantScope | None) -> Path | None:
 # `.html` is served as-is; `.md` is rendered to a styled HTML page first
 # (see `publish._render_markdown_to_html`). Fullstack artifacts bypass this —
 # they publish their directory regardless of the primary file's suffix.
+# Files that aren't web pages (PDF, Word, ...) publish too, as a page of their
+# own (`file_page.PUBLISHABLE_FILE_SUFFIXES`, ENG-4687), but aren't listed by
+# `html_artifacts`: in a page's folder they are its supporting files.
 PUBLISHABLE_STATIC_SUFFIXES = (".html", ".md")
 _PUBLISHABLE_LIST_LIMIT = 40
 
@@ -2365,6 +2397,9 @@ def _publishable_in_folder(
     ]
     meta = _load_metadata(folder) if (folder / "metadata.json").is_file() else None
     meta = meta or ArtifactMetadata.empty()
+    if is_widget(meta.display):
+        # A widget is never published (publish.WidgetPublishRefused).
+        return []
     if meta.type not in fullstack_types:
         return [
             _PublishableCandidate(st.st_mtime_ns, path, st.st_size, path.parent, _humanize(path.stem))
