@@ -275,6 +275,7 @@ async def remote_turn_events(
             artifacts.base,
             new_slugs=recorded.created,
             touched_slugs=recorded.touched,
+            revisions=recorded.revisions,
             scope=scope,
             project_id=artifacts.project_id,
             project_name=artifacts.project_name,

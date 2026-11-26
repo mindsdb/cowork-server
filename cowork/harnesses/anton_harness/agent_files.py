@@ -200,6 +200,20 @@ class AgentFiles:
             literal = self.pod_artifacts_dir.joinpath(*seen.parts[len(artifacts):]).as_posix()
         return self.named_file(literal)
 
+    def pod_project_parts(self, literal: str) -> tuple[str, ...] | None:
+        """Where a path the pod names lands in the project, as path parts below
+        ``project_root``, for a server that opens it one component at a time
+        without following links. None for a turn this server runs, for a place
+        where the pod sees nothing of the project, and for a path with a ``..``,
+        which only a link-following walk could place, and for a NUL byte, which no
+        path holds."""
+        if not self.pod_working_dirs or not literal or "\0" in literal:
+            return None
+        place = self._place_in_pod(literal)
+        if place is None or not place.parts or any(part in ("", ".", "..") for part in place.parts):
+            return None
+        return (*place.folder.parts, *place.parts)
+
     def _named_file(self, literal: str) -> NamedFile | None:
         """named_file, letting a failed lookup raise."""
         root = Path(os.path.realpath(self.project_root))

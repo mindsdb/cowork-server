@@ -17,9 +17,10 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from cowork import app_secret
+from cowork.api.v1.endpoints.connectors.connections import require_app_secret
 from cowork.api.v1.endpoints.connectors.custom_mcp import _record_file_present
-from cowork.api.v1.permissions import LoopbackDesktopOnly
-from cowork.api.v1.route_walker import declared_permissions, route_key
+from cowork.api.v1.permissions import LoopbackDesktopOnly, WindowProof, require
+from cowork.api.v1.route_walker import route_key
 from cowork.api.v1.router import api_router
 from cowork.db.scoped import LOCAL_SCOPE, TenantScope, get_tenant_scope
 from cowork.services.connectors import app_held
@@ -104,12 +105,42 @@ class TestCheckUrl:
         assert response.json()["detail"]["error"] == "invalid_url"
 
 
-def test_every_custom_route_declares_loopback_desktop_only():
-    """The router's guard is what refuses a non-loopback peer, a hostile Host
-    or Origin, and org mode, before the app secret is checked."""
-    routes = [route for route in api_router.routes if route_key(route)[0].startswith("/api/v1/connectors/connections/custom_mcp")]
-    assert len(routes) == 6
-    assert all(declared_permissions(route) == [LoopbackDesktopOnly] for route in routes)
+#: The guards a custom MCP route may declare, by the name the test reads.
+_GUARD_NAMES = {
+    require(LoopbackDesktopOnly): "loopback",
+    require(WindowProof): "window proof",
+    require_app_secret: "app secret",
+}
+
+
+def _guards(route) -> list[str]:
+    """The route's guards, in the order they run."""
+    return [_GUARD_NAMES[dep.call] for dep in route.dependant.dependencies if dep.call in _GUARD_NAMES]
+
+
+def test_every_custom_route_declares_its_guards_in_order():
+    """The router's LoopbackDesktopOnly is what refuses a non-loopback peer, a
+    hostile Host or Origin, and org mode, before any other check. The router
+    adds nothing else, so each route declares the app secret itself, and a
+    route added later without it fails here. The three writes ask for the
+    window proof before the app secret (tests/test_window_proof_pin.py), so a
+    caller holding the bearer token alone is told the proof is what it lacks."""
+    guards = {
+        (path, tuple(m for m in methods if m != "HEAD")): _guards(route)
+        for route in api_router.routes
+        for path, methods in [route_key(route)]
+        if path.startswith(ROUTES)
+    }
+    read = ["loopback", "app secret"]
+    write = ["loopback", "window proof", "app secret"]
+    assert guards == {
+        (f"{ROUTES}/check-url", ("POST",)): read,
+        (f"{ROUTES}/{{name}}/held-summary", ("GET",)): read,
+        (f"{ROUTES}/{{name}}/tools", ("GET",)): read,
+        (ROUTES, ("POST",)): write,
+        (f"{ROUTES}/{{name}}/held", ("PUT",)): write,
+        (f"{ROUTES}/{{name}}/allowed-tools", ("PUT",)): write,
+    }
 
 
 @pytest.mark.parametrize("name", ["../custom_mcp-x", "cm-" + "0" * 31, "cm-" + "0" * 32 + "/x", ""])

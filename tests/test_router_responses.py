@@ -75,7 +75,8 @@ class _Endpoint:
         def client(**kwargs):
             http_client = httpx.AsyncClient(transport=httpx.MockTransport(self.handle))
             self.clients.append(http_client)
-            return real_client(http_client=http_client, max_retries=0, **kwargs)
+            # anton hands the SDK its own http_client; the mock transport replaces it.
+            return real_client(**{**kwargs, "http_client": http_client, "max_retries": 0})
 
         monkeypatch.setattr(openai, "AsyncOpenAI", client)
 
