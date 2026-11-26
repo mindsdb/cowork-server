@@ -5,7 +5,7 @@ import json
 import random
 import threading
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from functools import partial
 from typing import TYPE_CHECKING, TypeVar
@@ -120,6 +120,7 @@ _INTERRUPTED_RUN_ERROR = "Run was interrupted: the server shut down before it fi
 # waits for that request only up to --timeout-graceful-shutdown, then cancels
 # it, and the run is saved as interrupted (_INTERRUPTED_RUN_ERROR).
 _scheduled_runs: set[asyncio.Task] = set()
+_notice_retries: set[asyncio.Task] = set()
 
 _RECURRING_CADENCES = {
     Cadence.every_15_minutes, Cadence.every_30_minutes, Cadence.hourly,
@@ -260,6 +261,7 @@ class _ScheduledTurn:
     prompt: str
     model: str | None
     project_id: UUID | None
+    disabled_connections: list[dict] | None = None
 
 
 @dataclass(frozen=True)
@@ -389,6 +391,7 @@ class _TurnEvidence:
     handed_over: str | None = None
     # Whether a change the agent asked approval for went unapproved.
     writes_refused: bool = False
+    blocked_connector: str | None = None
 
 
 @dataclass(frozen=True)
@@ -441,7 +444,7 @@ def _hand_over_error(reason: str) -> str:
 
 
 _WRITES_REFUSED_ERROR = (
-    "Run stopped short: a change needed approval, and a scheduled run has nobody to approve it, "
+    "Run stopped short: a change needed approval, and nobody approved it while the run waited, "
     "so it wasn't made. Open the run to see the change, then run the task now and approve it there."
 )
 
@@ -459,6 +462,12 @@ def _classify(evidence: _TurnEvidence) -> _AttemptEnd:
         if evidence.writes_refused:
             # Ranked above a limit: a lost write is the bigger surprise.
             return _AttemptEnd(outcome=AttemptOutcome.writes_refused, error=_WRITES_REFUSED_ERROR)
+        if evidence.blocked_connector is not None:
+            return _AttemptEnd(
+                outcome=AttemptOutcome.connector_blocked,
+                error=f"This task needed an excluded connector: {evidence.blocked_connector}. "
+                "Change the task's connector settings to allow it.",
+            )
         limit_error = _LIMIT_ERRORS.get(evidence.stopped_by or "")
         if limit_error:
             return _AttemptEnd(outcome=AttemptOutcome.stopped_at_limit, error=limit_error)
@@ -575,6 +584,7 @@ def _read_schedule(session: ScopedSession, *, schedule_id: UUID) -> _ScheduledTu
         prompt=schedule.prompt,
         model=schedule.model,
         project_id=schedule.project_id,
+        disabled_connections=schedule.disabled_connections or None,
     )
 
 
@@ -900,6 +910,7 @@ async def _execute_schedule(
     timed_out = False
     end: _AttemptEnd | None = None
     shutdown_interrupted = False
+    shutdown_failed = False
     scheduled: _ScheduledTurn | None = None
     # Set once the run's ending is recorded: True finished, False didn't, and
     # None sends no push (_push_run_ending).
@@ -925,6 +936,7 @@ async def _execute_schedule(
             input=scheduled.prompt,
             model=resolve_schedule_model(scheduled.model),
             stream=True,
+            disabled_connections=scheduled.disabled_connections,
             conversation=str(conversation_id),
             trace_tags=["scheduled_task", f"trigger:{trigger.value}"],
             trace_metadata={
@@ -1010,7 +1022,7 @@ async def _execute_schedule(
         # buffer's records are the only truthful signal of how the turn ended
         # and whether its agent acted — without them every run is recorded as
         # success.
-        evidence = await _turn_evidence(str(conversation_id))
+        evidence = await _run_evidence(str(conversation_id), scheduled)
         shutdown_interrupted = evidence.shutdown_interrupted
         end = _classify(evidence)
 
@@ -1052,7 +1064,7 @@ async def _execute_schedule(
                 await _stop_reaped_turn(str(conversation_id))
                 raise _LeaseLost()
             if fallback_ran:
-                evidence = await _turn_evidence(str(conversation_id))
+                evidence = await _run_evidence(str(conversation_id), scheduled)
                 shutdown_interrupted = evidence.shutdown_interrupted
                 end = _classify(evidence)
 
@@ -1092,6 +1104,9 @@ async def _execute_schedule(
         # cron run still going. The finally saves it as failed.
         error = _INTERRUPTED_RUN_ERROR
         outcome = AttemptOutcome.interrupted if turn_started else AttemptOutcome.failed_before_execution
+        # A run cut before its turn started did nothing, and its slot stays
+        # due: nothing to tell its owner, as when a start is refused.
+        shutdown_failed = turn_started
         raise
     except Exception as exc:
         # The ids travel as record attributes: a database error's sanitized
@@ -1150,6 +1165,7 @@ async def _execute_schedule(
                             AttemptOutcome.interrupted,
                             AttemptOutcome.stopped_at_limit,
                             AttemptOutcome.writes_refused,
+                            AttemptOutcome.connector_blocked,
                         }
                         and not shutdown_interrupted
                     ),
@@ -1194,8 +1210,11 @@ async def _execute_schedule(
         finally:
             with _active_run_lock:
                 _active_run_ids.discard(run_id)
-            if push_succeeded is not None and not lease_lost.is_set() and trigger != RunTrigger.trial:
-                _push_run_ending(scheduled, conversation_id=conversation_id, succeeded=push_succeeded)
+            if not lease_lost.is_set() and trigger != RunTrigger.trial:
+                if push_succeeded is not None:
+                    _push_run_ending(scheduled, conversation_id=conversation_id, succeeded=push_succeeded)
+                if push_succeeded is not None or shutdown_failed:
+                    await _post_run_notice(run_id, schedule_id=schedule_id)
 
 
 def _push_run_ending(
@@ -1236,6 +1255,55 @@ def _push_reaped_run(push: ReapedRunPush) -> None:
         )
     except Exception:
         logger.warning("Could not push a reaped run's ending", exc_info=True, extra={"event": "push_schedule_failed"})
+
+
+async def _post_run_notice(run_id: UUID, *, schedule_id: UUID) -> None:
+    """Put the run's ending in its owner's inbox, if they asked to hear
+    about it. Never holds up or fails a run.
+
+    Same callers as _push_run_ending, and a run a shutdown cut mid-turn,
+    which push skips. On every deployment: the inbox is how the desktop and
+    self-hosted hear about a run, where there is no push.
+    """
+    try:
+        from cowork.services.notices import post_scheduled_run_notice
+
+        unit = partial(post_scheduled_run_notice, run_id=run_id)
+        await run_db(unit, scope=SYSTEM_SCOPE)
+    except PoolTimeoutError:
+        # The run is already recorded. Let it release its scheduler slot
+        # while the inbox write waits for a connection independently.
+        retry = asyncio.create_task(_retry_run_notice(unit, schedule_id=schedule_id))
+        _notice_retries.add(retry)
+        retry.add_done_callback(_notice_retries.discard)
+    except Exception:
+        logger.warning("Could not post a scheduled run's notice", exc_info=True, extra={"event": "schedule_notice_failed"})
+
+
+async def _retry_run_notice(unit: Callable[[ScopedSession], object], *, schedule_id: UUID) -> None:
+    try:
+        await _until_it_lands(unit, schedule_id=schedule_id)
+    except Exception:
+        logger.warning("Could not post a scheduled run's notice", exc_info=True, extra={"event": "schedule_notice_failed"})
+
+
+async def wait_for_scheduled_notices(*, timeout_seconds: float) -> None:
+    pending = [task for task in _notice_retries if not task.done()]
+    if pending:
+        await asyncio.wait(pending, timeout=timeout_seconds)
+
+
+def post_reaped_run_notices(session: ScopedSession, run_ids: list[UUID]) -> None:
+    """Post the notices for runs a reaper failed, inside its database unit.
+    One run's failure to post never stops the others, or the reap."""
+    from cowork.services.notices import post_scheduled_run_notice
+
+    for run_id in run_ids:
+        try:
+            post_scheduled_run_notice(session, run_id=run_id)
+        except Exception:
+            session.rollback()
+            logger.warning("Could not post a reaped run's notice", exc_info=True, extra={"event": "schedule_notice_failed"})
 
 
 class _LeaseLost(Exception):
@@ -1471,6 +1539,71 @@ async def _turn_evidence(conversation_id: str) -> _TurnEvidence:
         handed_over=await _turn_handed_over(conversation_id) if reason == "completed" else None,
         writes_refused=reason == "completed" and await _turn_refused_writes(conversation_id),
     )
+
+
+async def _run_evidence(conversation_id: str, scheduled: _ScheduledTurn) -> _TurnEvidence:
+    """The turn's evidence, with the left-out connection a finished run
+    reported it needed."""
+    evidence = await _turn_evidence(conversation_id)
+    if evidence.reason != "completed" or not scheduled.disabled_connections:
+        return evidence
+    blocked = await _turn_blocked_connector(conversation_id, scheduled.disabled_connections)
+    return replace(evidence, blocked_connector=blocked)
+
+
+async def _turn_blocked_connector(conversation_id: str, excluded: list[dict]) -> str | None:
+    """The left-out connection the finished turn's agent last reported it
+    needed, when it called no other tool afterwards.
+
+    Read from the report call's own frames, as _turn_handed_over reads a
+    hand-over: a tool's first frame names it and a later one holds its input.
+    anton streams no result for this tool, so the call is checked against the
+    task's exclusions here, as the tool checks it. A worker that does stream
+    the result is read too."""
+    from cowork.harnesses.anton_harness.schedule_connector_reporting import (
+        REPORT_BLOCKED_CONNECTOR,
+        reported_connector,
+    )
+
+    handle = registry.get(conversation_id)
+    if handle is None:
+        return None
+    named: dict[str, str] = {}
+    blocked_connector = None
+    try:
+        async with asyncio.timeout(_EVIDENCE_READ_TIMEOUT_SECONDS):
+            async for record in handle.buffer.tail(0):
+                if record.is_terminal:
+                    break
+                for event, data in _sse_frames(record):
+                    call_id, content = data.get("tool_use_id"), data.get("content")
+                    if event != "response.in_progress" or not isinstance(call_id, str) or not call_id:
+                        continue
+                    tool = data.get("tool_name")
+                    if not tool and isinstance(content, str) and call_id not in named:
+                        named[call_id] = tool = content
+                        content = None
+                    if tool and tool != REPORT_BLOCKED_CONNECTOR:
+                        # The run continued using other tools after the report.
+                        blocked_connector = None
+                    if (tool or named.get(call_id)) != REPORT_BLOCKED_CONNECTOR:
+                        continue
+                    try:
+                        report = json.loads(content or "")
+                    except (ValueError, TypeError):
+                        continue
+                    if not isinstance(report, dict):
+                        continue
+                    if tool:
+                        name = report.get("blocked_connector")
+                        if isinstance(name, str) and name:
+                            blocked_connector = name
+                    else:
+                        blocked_connector = reported_connector(excluded, report) or blocked_connector
+    except Exception:
+        logger.exception("Could not read the scheduled turn's connector report", extra=log_context(conversation_id=conversation_id))
+        return None
+    return blocked_connector
 
 
 async def _turn_stopped_by(conversation_id: str) -> str | None:
@@ -1773,6 +1906,7 @@ def _reap_lapsed_runs(
                 conversation_id=str(run.conversation_id) if run.conversation_id else None,
             ))
     session.commit()
+    post_reaped_run_notices(session, [run.id for run in executed if not run.trial])
     if abandoned is not None:
         abandoned.extend(committed_abandoned)
     if pushes is not None:

@@ -19,8 +19,10 @@ from pydantic import (
     field_validator,
     model_validator,
 )
-from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
+from pydantic_settings import BaseSettings, EnvSettingsSource, NoDecode, SettingsConfigDict
+from pydantic_settings.sources.utils import parse_env_vars
 
+from cowork.common.launch_environment import captured_environment, launch_value
 from cowork.common.paths import cowork_home
 from cowork.common.settings.secret_files import SecretFileSettingsSource, require_process_secrets
 from cowork.db.personal_resources import ALL_PERSONAL_RESOURCES, PersonalResource
@@ -314,7 +316,11 @@ def default_minds_auth_host() -> str:
 
     This is the PUBLIC host. It is not ``TurnQueueSettings.auth_internal_base_url``,
     which is a ClusterIP address for the secret-authenticated mint routes and is
-    unreachable from a desktop install.
+    unreachable from a desktop install. A desktop install, and any deployment
+    that sets no internal auth base, reads MindsHub here. A hosted deployment
+    reads it at ``OAuthSettings.auth_service_base_url``
+    (cowork.services.mindshub_client.mindshub_v1) and keeps this host only for
+    the URLs a browser loads, such as brand images (org_branding.absolute_auth_url).
     """
     return re.sub(r"^(https?://)api([.-])", r"\1auth\2", default_turn_minds_api_host())
 
@@ -331,8 +337,8 @@ def _launched_by_pre_token_desktop() -> bool:
     # host 127.0.0.1 and no COWORK_SERVER_OWNER; every token-aware build sets the
     # owner, and the Docker image binds 0.0.0.0.
     return (
-        os.environ.get("COWORK_SERVER_HOST") == "127.0.0.1"
-        and not os.environ.get("COWORK_SERVER_OWNER")
+        launch_value("COWORK_SERVER_HOST") == "127.0.0.1"
+        and not launch_value("COWORK_SERVER_OWNER")
     )
 
 
@@ -358,10 +364,10 @@ def _env_file_chain() -> list[str]:
     file server about a missing file, and a slow file server would slow every
     one of them.
     """
-    if os.environ.get("COWORK_TENANCY_MODE") == "org":
+    if launch_value("COWORK_TENANCY_MODE") == "org":
         return [".env"]
     files = [str(cowork_home() / ".env"), ".env"]
-    if not os.environ.get("COWORK_HOME"):
+    if not launch_value("COWORK_HOME"):
         # Prod (default home) still consults the legacy file, ordered BEFORE
         # <COWORK_HOME>/.env so the migrated file wins (fresh over stale).
         files.insert(0, str(Path.home() / ".anton" / ".env"))
@@ -376,7 +382,7 @@ def _dev_oauth_env_path() -> Path | None:
     pointer. Reject every other path rather than turning an environment
     variable into an arbitrary dotenv-file loader.
     """
-    raw = os.environ.get("COWORK_DEV_OAUTH_ENV_FILE", "").strip()
+    raw = (launch_value("COWORK_DEV_OAUTH_ENV_FILE") or "").strip()
     if not raw:
         return None
 
@@ -414,6 +420,18 @@ def _dev_oauth_settings_source() -> dict[str, str]:
     }
 
 
+class LaunchEnvironmentSource(EnvSettingsSource):
+    """The ``COWORK_*`` and ``MINDSHUB_*`` variables a local launch moved out of
+    the environment (cowork.common.launch_environment), read as the
+    environment is. Ranked just under the live environment, so a settings
+    object built after the scrub reads what it read before."""
+
+    def _load_env_vars(self) -> Mapping[str, str | None]:
+        return parse_env_vars(
+            captured_environment(), self.case_sensitive, self.env_ignore_empty, self.env_parse_none_str
+        )
+
+
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
         env_file=_env_file_chain(),
@@ -421,6 +439,18 @@ class Settings(BaseSettings):
         env_nested_delimiter="_",
         extra="ignore",
     )
+
+    @classmethod
+    def settings_customise_sources(
+        cls, settings_cls, init_settings, env_settings, dotenv_settings, file_secret_settings
+    ):
+        return (
+            init_settings,
+            env_settings,
+            LaunchEnvironmentSource(settings_cls),
+            dotenv_settings,
+            file_secret_settings,
+        )
 
 
 class DatabaseSettings(Settings):
@@ -602,12 +632,14 @@ class OAuthSettings(Settings):
     def settings_customise_sources(
         cls, settings_cls, init_settings, env_settings, dotenv_settings, file_secret_settings
     ):
-        # Explicit values, process env, and the isolated COWORK_HOME dotenv all
-        # win. The fixed developer file is a narrow fallback and returns only
-        # the validation aliases for the two coding connectors.
+        # Explicit values, process env (live, then as captured at launch), and
+        # the isolated COWORK_HOME dotenv all win. The fixed developer file is
+        # a narrow fallback and returns only the validation aliases for the
+        # two coding connectors.
         return (
             init_settings,
             env_settings,
+            LaunchEnvironmentSource(settings_cls),
             dotenv_settings,
             _dev_oauth_settings_source,
             file_secret_settings,
@@ -674,7 +706,9 @@ class OAuthSettings(Settings):
         description=(
             "Base URL of the auth service's public API, used in org/cloud mode to proxy the "
             "OAuth Connector Lifecycle (start/status/catalogue), the Google Drive Picker token "
-            "mint, and the turn-key oauth-token base URL anton calls directly. This is the same "
+            "mint, the turn-key oauth-token base URL anton calls directly, and every MindsHub "
+            "read made for a caller (mindshub_client.mindshub_v1, which falls back to the "
+            "public default_minds_auth_host when this is unset). This is the same "
             "auth service TurnQueueSettings.auth_internal_base_url reaches (just different, "
             "public /v1/... routes instead of /internal/...) — accepts that env var as a "
             "fallback so a single k8s config value covers both."
@@ -1028,10 +1062,13 @@ class AppSettings(Settings):
     ):
         # A credential whose file the process environment names wins over the
         # environment and every .env (cowork.common.settings.secret_files).
+        # The values a local launch moved out of the environment rank just
+        # under it, as for every other settings class (Settings).
         return (
             init_settings,
             SecretFileSettingsSource(settings_cls),
             env_settings,
+            LaunchEnvironmentSource(settings_cls),
             dotenv_settings,
             file_secret_settings,
         )

@@ -196,11 +196,13 @@ def absolute_auth_url(value: Any) -> str | None:
     """An image URL from auth as one a browser can load, or None.
 
     auth answers root-relative URLs (``/v1/organizations/{id}/branding/icon?v=…``)
-    wherever it doesn't trust the request's Host (PR envs). Those are joined
-    to the public auth origin this deployment is configured with
+    wherever it has no public origin of its own (PR envs) and doesn't trust
+    the request's Host, which a read inside the cluster never offers. Those are
+    joined to the public auth origin this deployment is configured with
     (cowork.common.settings.app_settings.default_minds_auth_host, derived
-    from ENV or the pod's namespace, never from a request): the same origin
-    cowork-server reads auth on. An absolute ``https`` URL is kept as it is.
+    from ENV or the pod's namespace, never from a request). That is the
+    origin a browser reaches, not always the one cowork-server reads auth on
+    (mindshub_client.mindshub_v1). An absolute ``https`` URL is kept as it is.
     Anything else is refused: another scheme, a protocol-relative ``//host``,
     a backslash (which browsers read as a slash), whitespace or a control
     character."""

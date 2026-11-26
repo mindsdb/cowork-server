@@ -7,6 +7,7 @@ from uuid import UUID
 from pydantic import computed_field, field_validator
 
 from cowork.schemas.base import CamelRequest, CamelResponse
+from cowork.schemas.connectors import DisabledConnection
 
 
 # The `model` value a schedule stores when it should run on the account's
@@ -63,8 +64,9 @@ class AttemptOutcome(str, Enum):
     # automatic continuations) with nobody there to say "keep going".
     stopped_at_limit = "stopped_at_limit"
     # The turn ended on its own, but a change it asked approval for was
-    # refused: a scheduled run has nobody to approve it, so it wasn't made.
+    # refused: nobody approved it while the run waited, so it wasn't made.
     writes_refused = "writes_refused"
+    connector_blocked = "connector_blocked"
     # Failed before the agent could act: setup or permission, or a turn whose
     # stream shows nothing but its start, its memory read and its failure.
     failed_before_execution = "failed_before_execution"
@@ -125,6 +127,8 @@ class ScheduleCreateRequest(CamelRequest):
     timezone: str = "UTC"
     project_id: UUID | None = None
     enabled: bool = True
+    # Connections the task's runs leave out; none means every connection.
+    disabled_connections: list[DisabledConnection] | None = None
 
     _next_run_utc = field_validator("next_run_at")(_utc_next_run)
 
@@ -138,6 +142,8 @@ class ScheduleUpdateRequest(CamelRequest):
     timezone: str | None = None
     project_id: UUID | None = None
     enabled: bool | None = None
+    # Replaces the list; [] gives the task every connection again.
+    disabled_connections: list[DisabledConnection] | None = None
 
     _next_run_utc = field_validator("next_run_at")(_utc_next_run)
 
@@ -152,6 +158,7 @@ class ScheduleResponse(CamelResponse):
     enabled: bool
     project_id: UUID
     model: str
+    disabled_connections: list[DisabledConnection] | None = None
     last_run_at: datetime | None
     last_result_conversation_id: UUID | None
     last_error: str | None

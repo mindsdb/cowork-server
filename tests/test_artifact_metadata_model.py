@@ -170,3 +170,13 @@ def test_model_copy_with_an_update_is_refused():
     with pytest.raises(TypeError):
         meta.model_copy(update={"name": "b"})
     assert meta.model_copy().to_document() == {"name": "a"}
+
+
+def test_display_inline_reads():
+    assert _meta({"display": "inline"}).display == "inline"
+
+
+@pytest.mark.parametrize("value", ["Inline", " inline", "card", "", 1, True, None, ["inline"], {"inline": 1}])
+def test_any_other_display_reads_as_missing(value):
+    assert _meta({"display": value}).display is None
+    assert _meta({}).display is None

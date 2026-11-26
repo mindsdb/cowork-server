@@ -28,6 +28,14 @@ class Schedule(BaseSQLModel, table=True):
         description="Project context for execution",
     )
     model: str = Field(description="Model identifier to use for execution")
+    disabled_connections: list[dict] | None = Field(
+        default=None,
+        sa_type=sa.JSON,  # type: ignore
+        description=(
+            "Connections the task's runs can't use, as [{engine, name}], the shape a chat "
+            "turn mutes them in. NULL or empty: every connection, as a new task has"
+        ),
+    )
     last_run_at: datetime | None = Field(
         default=None,
         sa_type=sa.DateTime(timezone=True),  # type: ignore
