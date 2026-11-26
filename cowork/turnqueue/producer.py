@@ -1445,9 +1445,9 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
               # Jev: the pod's scratchpad then has no classify(). A controller
               # that predates the field drops it, and the pod keeps it on.
               "jev_classify": jev_classify,
-              # False under ZDR: the pod's scratchpad then has no web_search().
+              # False when ZDR is known on: the pod's scratchpad then has no web_search().
               # A controller that doesn't relay it yet, or an older pod, keeps the helper.
-              "web_search": not zdr_on,
+              "web_search": zdr is not ZdrState.ON,
               # The app's language (ENG-4149), read by anton's TurnRequestV1.
               # Absent without one. scratchpad-controller relays it to the pod
               # (mindsdb/scratchpad-controller#124, which merges first).

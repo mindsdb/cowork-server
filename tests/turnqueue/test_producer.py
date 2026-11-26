@@ -3089,11 +3089,11 @@ async def test_zdr_keeps_the_pods_completion_check_and_classify_off_jev(monkeypa
 
 
 @pytest.mark.parametrize(("read", "sent"), [
-    (ZdrState.ON, False), (ZdrState.OFF, True), (ZdrState.UNKNOWN, False), (RuntimeError("down"), False),
+    (ZdrState.ON, False), (ZdrState.OFF, True), (ZdrState.UNKNOWN, True), (RuntimeError("down"), True),
 ])
 @pytest.mark.asyncio
 async def test_zdr_turns_off_the_pods_web_search_even_with_jev_opted_out(monkeypatch, read, sent):
-    # web_search() follows ZDR alone, so ZDR is read even when Jev is already off; unknown counts as on.
+    # web_search() follows ZDR alone, so ZDR is read even when Jev is already off; only a known on turns it off.
     from cowork.common.settings import user_settings
     from cowork.services import mindshub_zdr
 
@@ -3118,6 +3118,25 @@ async def test_zdr_turns_off_the_pods_web_search_even_with_jev_opted_out(monkeyp
     params = json.loads(fake.added[0][1]["payload"])["params"]
     assert params["web_search"] is sent
     assert params["jev_classify"] is False and params["jev_decisions"] is False
+
+
+@pytest.mark.asyncio
+async def test_an_unknown_zdr_keeps_jev_off_but_web_search_on(monkeypatch):
+    from cowork.common.settings import user_settings
+
+    monkeypatch.setattr(
+        user_settings, "get_user_settings",
+        lambda scope: SimpleNamespace(limits_enabled=False, resolved_planning_model="m", hub_workspace_id="",
+                                      jev_decisions_enabled=True, jev_classify_enabled=True),
+    )
+    fake = FakeRedis(replies=[("scratchpad:reply:conv-1", _reply("turn_completed", {}))])
+    monkeypatch.setattr(prod, "get_redis", lambda: fake)
+    monkeypatch.setattr(prod, "_new_correlation_id", lambda: "r")
+    await _drain(prod.stream_remote_replies(
+        conversation_id="conv-1", org_id=None, user_id=None, input_text="hi", model="m", zdr=ZdrState.UNKNOWN))
+
+    params = json.loads(fake.added[0][1]["payload"])["params"]
+    assert (params["jev_decisions"], params["jev_classify"], params["web_search"]) == (False, False, True)
 
 
 @pytest.mark.parametrize("enabled", [True, False])

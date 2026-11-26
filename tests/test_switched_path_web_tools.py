@@ -16,6 +16,7 @@ from pydantic import SecretStr
 
 from cowork.common.settings.user_settings import Provider, UserSettings
 from cowork.harnesses.anton_harness import harness
+from cowork.services.mindshub_teams import ZdrState
 
 # A local address, so a request that escapes the stubs below is refused at
 # once rather than sent anywhere.
@@ -54,17 +55,18 @@ def _settings(provider: Provider) -> UserSettings:
 
 
 async def _session_config(
-    monkeypatch, settings: UserSettings, *, changed_settings: UserSettings | None = None, zdr_on: bool = False,
+    monkeypatch, settings: UserSettings, *, changed_settings: UserSettings | None = None,
+    zdr: ZdrState = ZdrState.OFF,
 ):
     """One turn's ChatSessionConfig, built by the real harness."""
     from cowork.db.scoped import LOCAL_SCOPE, ScopedSession
     from cowork.db.session import get_open_session
     from cowork.services.conversations import ConversationService
 
-    async def _turn_zdr_on(_user):
-        return zdr_on
+    async def _turn_zdr_state(_user):
+        return zdr
 
-    monkeypatch.setattr(harness, "_turn_zdr_on", _turn_zdr_on)
+    monkeypatch.setattr(harness, "_turn_zdr_state", _turn_zdr_state)
 
     monkeypatch.setattr(
         "cowork.common.settings.user_settings.get_user_settings", lambda: settings
@@ -177,10 +179,22 @@ async def test_zdr_turns_off_mindshubs_web_tools(monkeypatch, openai_compatible_
     openai_compatible_api(None)
     anton_responses_ready()
 
-    config = await _session_config(monkeypatch, _settings(Provider.MINDS_CLOUD), zdr_on=True)
+    config = await _session_config(monkeypatch, _settings(Provider.MINDS_CLOUD), zdr=ZdrState.ON)
     await config.llm_client.aclose()
 
     assert (config.web_search_enabled, config.web_fetch_enabled) == (False, False)
+
+
+@pytest.mark.asyncio
+async def test_an_unreadable_zdr_keeps_mindshubs_web_tools(monkeypatch, openai_compatible_api, anton_responses_ready):
+    # Only a known ZDR turns them off; a failed read doesn't cost a non-ZDR user web search.
+    openai_compatible_api(None)
+    anton_responses_ready()
+
+    config = await _session_config(monkeypatch, _settings(Provider.MINDS_CLOUD), zdr=ZdrState.UNKNOWN)
+    await config.llm_client.aclose()
+
+    assert (config.web_search_enabled, config.web_fetch_enabled) == (True, True)
 
 
 async def _probe_session_config(

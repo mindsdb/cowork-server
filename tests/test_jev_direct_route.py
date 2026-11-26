@@ -975,7 +975,7 @@ def test_zdr_turns_off_antons_completion_check_whatever_the_switch():
     from cowork.harnesses.anton_harness.harness import _overlay_user_settings
 
     anton = AntonSettings(_env_file=None)
-    applied = _overlay_user_settings(anton, UserSettings.model_validate({"jev_decisions_enabled": True}), zdr_on=True)
+    applied = _overlay_user_settings(anton, UserSettings.model_validate({"jev_decisions_enabled": True}), zdr=ZdrState.UNKNOWN)
 
     assert anton.verifier_jev == "off"
     assert "verifier_jev" in applied
@@ -988,16 +988,31 @@ async def test_an_in_process_turn_asks_zdr_with_the_stored_key(monkeypatch):
 
     asked = {}
 
-    async def zdr_on_for(**kwargs):
+    async def zdr_state_for(**kwargs):
         asked.update(kwargs)
-        return True
+        return ZdrState.ON
 
-    monkeypatch.setattr(mindshub_zdr, "zdr_on_for", zdr_on_for)
+    monkeypatch.setattr(mindshub_zdr, "zdr_state_for", zdr_state_for)
     user = object()
 
-    assert await harness._turn_zdr_on(user) is True
+    assert await harness._turn_zdr_state(user) is ZdrState.ON
     assert asked["settings"] is user
     assert "org_bearer" not in asked and "turn_key" not in asked
+
+
+@pytest.mark.asyncio
+async def test_an_in_process_turns_failed_zdr_read_is_unknown(monkeypatch):
+    # Unknown, not on: the browser still treats it as on, web search doesn't.
+    from cowork.harnesses.anton_harness import harness
+    from cowork.services import mindshub_zdr
+
+    async def zdr_state_for(**kwargs):
+        raise RuntimeError("auth down")
+
+    monkeypatch.setattr(mindshub_zdr, "zdr_state_for", zdr_state_for)
+
+    assert await harness._turn_zdr_state(object()) is ZdrState.UNKNOWN
+    assert await harness._turn_zdr_on(object()) is True
 
 
 @pytest.mark.parametrize(("enabled", "classify_jev"), [(False, "off"), (True, "on")])
@@ -1024,19 +1039,21 @@ def test_zdr_turns_off_classify_whatever_the_switch():
     from cowork.harnesses.anton_harness.harness import _overlay_user_settings
 
     anton = SimpleNamespace(classify_jev="on", verifier_jev="on")
-    applied = _overlay_user_settings(anton, UserSettings.model_validate({"jev_classify_enabled": True}), zdr_on=True)
+    applied = _overlay_user_settings(anton, UserSettings.model_validate({"jev_classify_enabled": True}), zdr=ZdrState.UNKNOWN)
 
     assert anton.classify_jev == "off"
     assert "classify_jev" in applied
 
 
-@pytest.mark.parametrize(("zdr_on", "coding", "web_search"), [
-    (True, "minds_cloud", "off"),
-    (False, "minds_cloud", "on"),
+@pytest.mark.parametrize(("zdr", "coding", "web_search"), [
+    (ZdrState.ON, "minds_cloud", "off"),
+    (ZdrState.OFF, "minds_cloud", "on"),
+    # A failed read keeps web search: only a known ZDR turns it off.
+    (ZdrState.UNKNOWN, "minds_cloud", "on"),
     # BYOK coding: MindsHub's ZDR doesn't drop that provider's web search.
-    (True, "anthropic", "on"),
+    (ZdrState.ON, "anthropic", "on"),
 ])
-def test_zdr_turns_off_the_scratchpads_web_search(zdr_on, coding, web_search):
+def test_zdr_turns_off_the_scratchpads_web_search(zdr, coding, web_search):
     from types import SimpleNamespace
 
     from cowork.common.settings.user_settings import UserSettings
@@ -1044,7 +1061,7 @@ def test_zdr_turns_off_the_scratchpads_web_search(zdr_on, coding, web_search):
 
     anton = SimpleNamespace(scratchpad_web_search="on", classify_jev="on", verifier_jev="on")
     user = UserSettings.model_validate({"coding_provider": coding, "minds_cloud_api_key": "k"})
-    applied = _overlay_user_settings(anton, user, zdr_on=zdr_on)
+    applied = _overlay_user_settings(anton, user, zdr=zdr)
 
     assert anton.scratchpad_web_search == web_search
     assert ("scratchpad_web_search" in applied) is (web_search == "off")
@@ -1058,7 +1075,7 @@ def test_an_anton_without_the_web_search_switch_is_left_alone():
 
     anton = SimpleNamespace(classify_jev="on", verifier_jev="on")
     user = UserSettings.model_validate({"coding_provider": "minds_cloud", "minds_cloud_api_key": "k"})
-    applied = _overlay_user_settings(anton, user, zdr_on=True)
+    applied = _overlay_user_settings(anton, user, zdr=ZdrState.ON)
 
     assert not hasattr(anton, "scratchpad_web_search")
     assert "scratchpad_web_search" not in applied
