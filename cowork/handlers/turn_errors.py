@@ -141,15 +141,17 @@ TOKEN_LIMIT_CODE = "token_limit"
 # Curated copy + wire code for a spent or absent FREE allowance (gateway 429
 # `included_allowance_exhausted`). Kept apart from `token_limit` and its
 # out-of-credits card: they are different situations.
-# MindsHub decides it, and the logic is exact. This reason fires
-# ONLY for a free-bucket model on an org that has NEVER topped up ("a non-free
-# model always needs the wallet"). So the person seeing this card has not spent
-# money. Credits genuinely unlock the rest of the catalogue for them, because
-# non-free models need a wallet they do not have.
+# MindsHub decides it, and the logic is exact. This reason fires ONLY for a
+# model the Free tier covers (`covered_by_tier` "free") on an org that has
+# NEVER topped up, because a model Free does not cover always needs the
+# wallet. So the person seeing this card has not spent money. Credits
+# genuinely unlock the rest of the catalog for them, because the models
+# Free does not cover need a wallet they do not have.
 # The same reason also fires for an org with NO free grant at all: MindsHub zeroes
 # the allowance of an org that is not `free_grant_eligible`, so its first
-# free-bucket request lands here and nothing ever refills. The denial does not
-# say which case it is. The card learns that from the MindsHub usage read instead:
+# request for a model the Free tier covers lands here and nothing ever
+# refills. The denial does not say which case it is.
+# The card learns that from the MindsHub usage read instead:
 # `cowork/services/mindshub_usage.py` relays MindsHub's `free_grant_eligible: false` as
 # `freeTokens.limit` 0, and the card says there is no grant when it reads that.
 # The failure frame's `reset_at` only supplies the refill time. This string is

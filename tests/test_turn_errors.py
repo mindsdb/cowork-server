@@ -15,6 +15,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 import sys
 from contextlib import contextmanager
 from types import ModuleType
@@ -1135,10 +1136,11 @@ def test_reason_header_wallet_empty_maps_to_out_of_credits():
 
 def test_spent_free_allowance_is_its_own_card_not_out_of_credits():
     # ENG-1537. These used to share the credits card, but they are different
-    # situations: `access.py` only issues this reason for a free-bucket model on
-    # an org that has NEVER topped up, so the user has not spent money — they
-    # used the free grant, which resets. Telling them "you're out of credits"
-    # both misdescribes it and hides the free way forward.
+    # situations: `access.py` only issues this reason for a model the Free tier
+    # covers (`covered_by_tier` "free") on an org that has NEVER topped up, so
+    # the user has not spent money — they used the free grant, which resets.
+    # Telling them "you're out of credits" both misdescribes it and hides the
+    # free way forward.
     code, message = te.friendly_turn_error(
         _gateway_failure(429, reason="included_allowance_exhausted")
     )
@@ -1513,6 +1515,11 @@ def test_fuse_copy_names_the_shared_pause_and_the_way_out():
     assert "—" not in te.FREE_SERVING_PAUSED_USER_MESSAGE
 
 
+# A model or model family named as a whole word, so "Air" alone or "DeepSeek
+# Flash" matches and "repair" or "flashing" does not.
+_MODEL_NAME = re.compile(r"\b(mindshub|air|jev|glm|deepseek|gemini|flash)\b")
+
+
 @pytest.mark.parametrize(
     "message",
     [
@@ -1526,16 +1533,18 @@ def test_the_free_stop_copy_names_no_model(message):
     # name would tell a user on another free model that the stop is not theirs.
     lowered = message.lower()
     assert "free" in lowered
-    assert "mindshub" not in lowered
+    assert _MODEL_NAME.search(lowered) is None
 
 
 def test_the_free_allowance_is_never_called_monthly():
     # The free allowance is not monthly. Copy that calls it
     # monthly tells a user who hit it to wait weeks for something that comes
-    # back much sooner. Both strings reach users: the allowance message is the
-    # channel reply on Slack and Discord, and the description is the settings
-    # help text. The allowance message makes no refill claim at all, because an
-    # org with no free grant hits the same stop and nothing refills for it.
+    # back much sooner. Both strings reach callers: the allowance message is the
+    # channel reply on Slack and Discord, and the description is what
+    # `GET /settings/` serves for the field. The allowance message makes no
+    # refill claim at all, because an org with no free grant hits the same stop
+    # and nothing refills for it. The description names no model, because the
+    # free allowance covers more than one.
     from cowork.common.settings.user_settings import UserSettings
 
     allowance = te.ALLOWANCE_EXHAUSTED_USER_MESSAGE
@@ -1546,6 +1555,10 @@ def test_the_free_allowance_is_never_called_monthly():
 
     description = UserSettings.model_fields["max_turn_tokens"].description
     assert "month" not in description.lower()
+    assert (
+        re.search(r"\b(air|jev|glm|deepseek|gemini|flash)\b", description.lower())
+        is None
+    )
 
 
 # Words that would claim the free allowance comes back, or say when. An org
