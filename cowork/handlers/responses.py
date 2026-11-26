@@ -966,9 +966,8 @@ class ResponsesHandler:
         if request.browser == "off":
             off["browser_enabled"] = False
         turn_settings = start.settings.model_copy(update=off) if off else start.settings
-        # Read here, once, from the resolved snapshot above, not re-read from
-        # the scope inside the remote producer: a direct call to that
-        # producer (tests included) carries no ambient settings to read.
+        # Read once, here, and threaded through: a direct call to the
+        # remote producer (tests included) has no ambient settings to read.
         memory_off = memory_reads_off(
             memory_enabled=turn_settings.memory_enabled, memory_mode=turn_settings.memory_mode,
         )

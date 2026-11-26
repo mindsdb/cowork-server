@@ -246,6 +246,22 @@ def test_remote_backend_selected(monkeypatch):
     assert called["buffer"] is kwargs["buffer"]
 
 
+def test_memory_off_reaches_the_remote_producer_through_select_producer(monkeypatch):
+    """handle() computes memory_off once and must thread it through
+    _select_producer into _produce_remote: a dropped kwarg here would bring
+    back project memory and the pod's global mount with every other test
+    (which pass it directly to stream_remote_replies) still green."""
+    monkeypatch.setenv("COWORK_TURN_BACKEND", "remote")
+    handler = _handler()
+    handler._produce = lambda **kwargs: (_ for _ in ()).throw(AssertionError("must route remote"))
+    called = {}
+    handler._produce_remote = lambda **kwargs: called.update(kwargs)
+
+    handler._select_producer(**_kwargs(memory_off=True))
+
+    assert called["memory_off"] is True
+
+
 async def _no_earlier_answers(*, conversation_id, scope):
     """The earlier answers' read, finding none, so a turn's figures keep the
     origins this turn gives them."""

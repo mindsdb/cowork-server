@@ -145,9 +145,11 @@ async def test_no_question_turns_memory_on_where_the_operator_turned_it_off(trus
 
 
 async def test_the_desktop_answers_a_question_with_memory_off(monkeypatch):
-    """Without trusted identity headers, memory off now stops reads too
-    (memory_reads_off), so the question is answered instead of refused, and
-    its conversation is saved."""
+    """Without trusted identity headers, the request no longer gets refused
+    for "memory": "off": it runs with memory_enabled copied to False, same
+    as a trusted turn, and its conversation is saved. Whether the harness
+    actually reads nothing with that setting is test_harness_turn_memory's
+    own coverage, not this handler-level one."""
     harness = _SeesMemory()
     conversation = uuid4()
 

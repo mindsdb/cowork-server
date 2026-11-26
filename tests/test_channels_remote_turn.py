@@ -96,7 +96,7 @@ def test_turn_stream_uses_the_remote_worker_when_backend_is_remote(monkeypatch):
         conversation = type("C", (), {"id": conv_id})()
         stream = await runtime._turn_stream(
             harness, "anton", scope, conversation, [{"type": "text", "text": "hi"}],
-            "hi", None, turn_rows, UserSettings(_env_file=None),
+            "hi", None, turn_rows, UserSettings(_env_file=None, memory_enabled=True, memory_mode="off"),
         )
         with pytest.raises(StopAsyncIteration):
             await stream.__anext__()
@@ -109,6 +109,8 @@ def test_turn_stream_uses_the_remote_worker_when_backend_is_remote(monkeypatch):
     assert captured["org_id"] == "org-a"
     assert captured["input_text"] == "hi"
     assert captured["turn_rows"] is turn_rows
+    # memory_mode "off" alone (settings above), read through to the job flag.
+    assert captured["memory_off"] is True
 
 
 def _remote_turn_whose_staging_unit(monkeypatch, *, unit_session) -> list:
