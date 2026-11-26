@@ -20,6 +20,11 @@ _REFUSAL_REASONS = frozenset(
         "expected_organization_missing",
         "expected_organization_invalid",
         "organization_mismatch",
+        # A desktop-launched server's refusals of a caller that holds the
+        # bearer token but not the app's own secrets (cowork.api.v1.permissions.
+        # WindowProof and connections.require_app_secret).
+        "window_proof_required",
+        "app_secret_required",
         # The draft-preview host (cowork/draft_host/app.py): why a signed link
         # was refused, never the link itself.
         "draft_links_disabled",

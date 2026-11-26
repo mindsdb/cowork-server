@@ -14,6 +14,7 @@ import yaml
 from pydantic import BaseModel
 
 from cowork import cli
+from cowork.common.launch_environment import launch_value
 from cowork.common.settings.app_settings import (
     EXPORT_PDF_ENGINE_VAR,
     EXPORT_RENDER_URL_VAR,
@@ -38,6 +39,10 @@ CASES = RenderUrlCases.model_validate(
 )
 
 PDF_LINES = f"{EXPORT_PDF_ENGINE_VAR}=render\n{EXPORT_RENDER_URL_VAR}=http://127.0.0.1:9000\n"
+
+# Several tests run cowork.cli.main in this process, which moves the
+# server's own variables out of the environment.
+pytestmark = pytest.mark.usefixtures("launch_environment_restored")
 
 
 @pytest.fixture(autouse=True)
@@ -221,7 +226,10 @@ def test_a_dotenv_that_sets_web_concurrency_still_serves_in_one_process(monkeypa
     assert [config.workers for config in configs] == [1]
 
 
-def test_pdf_settings_the_server_started_with_stay_in_the_environment(monkeypatch, tmp_path):
+def test_pdf_settings_the_server_started_with_are_the_ones_it_keeps(monkeypatch, tmp_path):
+    """The .env's render URL never replaces the one the server started with:
+    not in the cached settings, and not in the launch values the server reads
+    once the launch has moved its own variables out of the environment."""
     env_path = tmp_path / ".env"
     env_path.write_text(f"{EXPORT_RENDER_URL_VAR}=http://127.0.0.1:9999\n", encoding="utf-8")
     monkeypatch.setenv(EXPORT_PDF_ENGINE_VAR, "render")
@@ -231,7 +239,9 @@ def test_pdf_settings_the_server_started_with_stay_in_the_environment(monkeypatc
 
     cli.main()
 
-    assert (os.environ[EXPORT_PDF_ENGINE_VAR], os.environ[EXPORT_RENDER_URL_VAR]) == (
+    assert EXPORT_PDF_ENGINE_VAR not in os.environ
+    assert EXPORT_RENDER_URL_VAR not in os.environ
+    assert (launch_value(EXPORT_PDF_ENGINE_VAR), launch_value(EXPORT_RENDER_URL_VAR)) == (
         "render",
         "http://127.0.0.1:9000",
     )

@@ -11,7 +11,7 @@ from fastapi.routing import APIRoute
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
 from cowork.api.v1.endpoints.guards import refuse_code_mode_in_sandbox
-from cowork.api.v1.permissions import LoopbackDesktopOnly, require
+from cowork.api.v1.permissions import LoopbackDesktopOnly, WindowProof, require
 from cowork.db.scoped import TenantScope, get_tenant_scope
 from cowork.models.skill import Skill
 from cowork.services.skills import (
@@ -51,6 +51,8 @@ class _PersonalSkillRoute(APIRoute):
         return handle
 
 
+# Every write route declares WindowProof, as Code mode's other write routes do
+# (coding.py): a personal skill is instructions a Code task loads.
 router = APIRouter(
     route_class=_PersonalSkillRoute,
     dependencies=[Depends(require(LoopbackDesktopOnly)), Depends(refuse_code_mode_in_sandbox)],
@@ -179,7 +181,7 @@ def _validate_imported_skill(skill: Skill) -> None:
         raise RequestValidationError(exc.errors()) from exc
 
 
-@router.post("", response_model=PersonalSkillResponse, status_code=201)
+@router.post("", response_model=PersonalSkillResponse, status_code=201, dependencies=[Depends(require(WindowProof))])
 def create_personal_skill(body: PersonalSkillWrite, store: StoreDep):
     skill = store.create_skill(
         label=body.name,
@@ -191,7 +193,12 @@ def create_personal_skill(body: PersonalSkillWrite, store: StoreDep):
     return _skill_response(skill)
 
 
-@router.post("/import", response_model=PersonalSkillResponse, status_code=201)
+@router.post(
+    "/import",
+    response_model=PersonalSkillResponse,
+    status_code=201,
+    dependencies=[Depends(require(WindowProof))],
+)
 def import_personal_skill(body: PersonalSkillImport, store: StoreDep):
     skill = store.import_skill(
         body.content.encode("utf-8"),
@@ -206,7 +213,7 @@ def get_personal_skill(skill_id: str, store: StoreDep):
     return _skill_response(store.get_skill(skill_id))
 
 
-@router.put("/{skill_id}", response_model=PersonalSkillResponse)
+@router.put("/{skill_id}", response_model=PersonalSkillResponse, dependencies=[Depends(require(WindowProof))])
 def update_personal_skill(skill_id: str, body: PersonalSkillWrite, store: StoreDep):
     # Keep the stable directory id, project restrictions and supporting files.
     skill = store.update_skill(
@@ -219,7 +226,7 @@ def update_personal_skill(skill_id: str, body: PersonalSkillWrite, store: StoreD
     return _skill_response(skill)
 
 
-@router.delete("/{skill_id}", status_code=204)
+@router.delete("/{skill_id}", status_code=204, dependencies=[Depends(require(WindowProof))])
 def delete_personal_skill(skill_id: str, store: StoreDep):
     if not store.delete_skill(skill_id):
         raise HTTPException(404, "This personal skill no longer exists.")

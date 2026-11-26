@@ -405,7 +405,7 @@ class El {
     this.classes = opts.classes || []; this.classes.forEach((c) => this.sel.push('.' + c));
     this.text = opts.text || ''; this.rect = opts.rect || null; this.visible = opts.visible !== false;
     this.children = []; this.parentElement = null; this.isConnected = true;
-    this.scrollTop = 0; this.scrollLeft = 0;
+    this.scrollTop = 0; this.scrollLeft = 0; this.dataset = {}; this.style = {};
     this.classList = { contains: (c) => this.classes.includes(c) };
   }
   add(child) { child.parentElement = this; this.children.push(child); return child; }
@@ -477,7 +477,10 @@ __SHIM__
 })(fakeWindow, fakeDocument, fakeSetTimeout, fakeClearTimeout, FakeMutationObserver);
 __SCENARIO__
 advance(20000);
-process.stdout.write(JSON.stringify({ posted, reloads: reloads.length }));
+process.stdout.write(JSON.stringify({
+  posted, reloads: reloads.length,
+  theme: { dataset: html.dataset.theme || null, colorScheme: html.style.colorScheme || null },
+}));
 """
 
 
@@ -756,3 +759,559 @@ def test_the_shim_reports_the_page_height_and_whether_it_scrolls():
     assert "var locked = hidesOverflow(root) || hidesOverflow(body);" in js
     assert "window.addEventListener('load', scheduleSize)" in js
     assert "window.addEventListener('resize', scheduleSize)" in js
+
+
+# The app's theme, for a page shown inside a chat reply (ENG-4684): the parent
+# posts `theme` on the restore's channel, as often as the app's theme changes.
+_THEME = """
+const theme = (mode, more = {}) => fire('message', Object.assign({
+  isTrusted: true, source: fakeWindow.parent,
+  data: { source: 'anton-preview-parent', type: 'theme', mode },
+}, more));
+"""
+
+
+def _run_theme(scenario: str) -> dict:
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("node is not installed")
+    script = _VIEW_HARNESS.replace("__SHIM__", SHIM_JS.replace("__LINE_OFFSET__", "0")).replace(
+        "__SCENARIO__", _THEME + scenario
+    )
+    done = subprocess.run([node, "-e", script], capture_output=True, text=True, timeout=30, check=True)
+    return json.loads(done.stdout)["theme"]
+
+
+def test_a_theme_sets_the_root_data_theme_and_color_scheme():
+    assert _run_theme("theme('dark');") == {"dataset": "dark", "colorScheme": "dark"}
+    assert _run_theme("theme('light');") == {"dataset": "light", "colorScheme": "light"}
+
+
+def test_a_theme_is_taken_every_time_it_changes():
+    assert _run_theme("theme('dark'); theme('light'); theme('dark');") == {
+        "dataset": "dark", "colorScheme": "dark",
+    }
+
+
+@pytest.mark.parametrize("mode", ["'Dark'", "' dark'", "'auto'", "'constructor'", "''", "1", "null", "{}"])
+def test_any_other_mode_is_ignored(mode):
+    assert _run_theme(f"theme({mode});") == {"dataset": None, "colorScheme": None}
+    # And it leaves a theme already set alone.
+    assert _run_theme(f"theme('dark'); theme({mode});") == {"dataset": "dark", "colorScheme": "dark"}
+
+
+def test_a_theme_is_taken_from_the_parent_only_with_its_tag():
+    out = _run_theme(
+        "theme('dark', { source: {} });\n"
+        "theme('dark', { isTrusted: false });\n"
+        "theme('dark', { data: { source: 'anton-preview', type: 'theme', mode: 'dark' } });\n"
+        "theme('dark', { data: { type: 'theme', mode: 'dark' } });\n"
+        "theme('dark', { data: 'dark' });"
+    )
+    assert out == {"dataset": None, "colorScheme": None}
+
+
+def test_a_theme_that_came_early_is_set_again_once_the_page_has_loaded():
+    # A theme before there is a root, and one the page's own script then
+    # overwrote: both hold once the document is parsed and loaded.
+    out = _run_theme(
+        "fakeDocument.documentElement = null; theme('dark'); fakeDocument.documentElement = html;\n"
+        "fire('doc:DOMContentLoaded', {});"
+    )
+    assert out == {"dataset": "dark", "colorScheme": "dark"}
+    out = _run_theme(
+        "theme('dark'); html.dataset.theme = 'light'; html.style.colorScheme = 'light';\n"
+        "fire('load', {});"
+    )
+    assert out == {"dataset": "dark", "colorScheme": "dark"}
+
+
+def test_a_theme_does_not_take_the_restore():
+    # The two share a channel: a theme is no restore, and a restore after it
+    # still replays.
+    out = _run_restore(_THEME + f"theme('dark'); restore({json.dumps({'inputs': [_KEY], 'heading': 'Two'})});")
+    assert out["restored"] == ["ok"]
+
+
+# The page's own state, for a page shown inside a chat reply (ENG-4684):
+# `window.anton` posts `state` and `submit`, and takes the app's `state` on
+# the restore's channel. A scenario reports what the page saw as a `probe`.
+_STATE = """
+const warnings = [];
+console.warn = (text) => warnings.push(String(text));
+const sendState = (state, more = {}) => fire('message', Object.assign({
+  isTrusted: true, source: fakeWindow.parent,
+  data: { source: 'anton-preview-parent', type: 'state', state },
+}, more));
+const probe = (what) => posted.push({ type: 'probe', what: JSON.parse(JSON.stringify(what === undefined ? null : what)) });
+"""
+
+
+def _run_state(scenario: str) -> dict:
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("node is not installed")
+    script = _VIEW_HARNESS.replace("__SHIM__", SHIM_JS.replace("__LINE_OFFSET__", "0")).replace(
+        "__SCENARIO__", _STATE + scenario + "\nprobe({ warnings });"
+    )
+    done = subprocess.run([node, "-e", script], capture_output=True, text=True, timeout=30, check=True)
+    posted = json.loads(done.stdout)["posted"]
+    *probes, last = [m["what"] for m in posted if m["type"] == "probe"]
+    sent = [m for m in posted if m["type"] in ("state", "submit")]
+    for message in sent:
+        assert message["source"] == "anton-preview"
+    return {"sent": sent, "probes": probes, "warnings": last["warnings"]}
+
+
+def test_set_state_posts_the_state_and_get_state_returns_a_copy():
+    out = _run_state(
+        "const list = { people: [{ name: 'Ana', contact: true }] };\n"
+        "probe(window.anton.getState());\n"
+        "probe(window.anton.setState(list));\n"
+        "list.people[0].contact = false;\n"
+        "const got = window.anton.getState(); got.people = [];\n"
+        "probe(window.anton.getState());"
+    )
+    assert out["sent"] == [
+        {
+            "type": "state", "state": {"people": [{"name": "Ana", "contact": True}]}, "handed": False,
+            "source": "anton-preview",
+        }
+    ]
+    assert out["probes"] == [None, True, {"people": [{"name": "Ana", "contact": True}]}]
+    assert out["warnings"] == []
+
+
+@pytest.mark.parametrize(
+    "value",
+    ["'x'.repeat(32 * 1024)", "'é'.repeat(16 * 1024)", "undefined", "() => 1", "(() => { const o = {}; o.o = o; return o; })()"],
+)
+def test_set_state_refuses_what_is_not_json_or_over_32_kb_with_a_warning(value):
+    out = _run_state(
+        "window.anton.setState({ kept: 1 });\n"
+        f"probe(window.anton.setState({value}));\n"
+        "probe(window.anton.getState());"
+    )
+    assert [m["state"] for m in out["sent"]] == [{"kept": 1}]
+    assert out["probes"] == [False, {"kept": 1}]
+    assert len(out["warnings"]) == 1 and out["warnings"][0].startswith("anton.setState:")
+
+
+def test_a_state_just_under_32_kb_is_sent():
+    # The serialized string, quotes included, is exactly 32 KB.
+    out = _run_state("probe(window.anton.setState('x'.repeat(32 * 1024 - 2)));")
+    assert out["probes"] == [True]
+    assert len(out["sent"]) == 1
+
+
+def test_the_apps_state_reaches_on_state_and_get_state():
+    out = _run_state(
+        "const seen = [];\n"
+        "window.anton.onState((s) => seen.push(s));\n"
+        "sendState({ people: ['Ana'] });\n"
+        "sendState({ people: ['Ana', 'Bo'] });\n"
+        "probe(seen); probe(window.anton.getState());"
+    )
+    assert out["probes"] == [[{"people": ["Ana"]}, {"people": ["Ana", "Bo"]}], {"people": ["Ana", "Bo"]}]
+    # Taking the app's state sends nothing back.
+    assert out["sent"] == []
+
+
+def test_a_state_the_app_sent_before_on_state_is_passed_on_the_next_tick():
+    out = _run_state(
+        "sendState({ saved: true });\n"
+        "const seen = [];\n"
+        "window.anton.onState((s) => seen.push(s));\n"
+        "const off = window.anton.onState((s) => seen.push('removed'));\n"
+        "off();\n"
+        "probe(seen.slice());\n"
+        "advance(1);\n"
+        "probe(seen);"
+    )
+    assert out["probes"] == [[], [{"saved": True}]]
+
+
+def test_a_state_is_taken_from_the_parent_only_with_its_tag():
+    out = _run_state(
+        "const seen = [];\n"
+        "window.anton.onState((s) => seen.push(s));\n"
+        "sendState({ a: 1 }, { source: {} });\n"
+        "sendState({ a: 1 }, { isTrusted: false });\n"
+        "sendState({ a: 1 }, { data: { source: 'anton-preview', type: 'state', state: { a: 1 } } });\n"
+        "sendState({ a: 1 }, { data: { type: 'state', state: { a: 1 } } });\n"
+        "sendState({ a: 1 }, { data: 'state' });\n"
+        "sendState(undefined);\n"
+        "sendState('x'.repeat(40000));\n"
+        "probe(seen); probe(window.anton.getState());"
+    )
+    assert out["probes"] == [[], None]
+
+
+def test_a_listeners_error_does_not_stop_the_others():
+    out = _run_state(
+        "const seen = [];\n"
+        "window.anton.onState(() => { throw new Error('page bug'); });\n"
+        "window.anton.onState((s) => seen.push(s));\n"
+        "sendState({ ok: 1 });\n"
+        "probe(seen);"
+    )
+    assert out["probes"] == [[{"ok": 1}]]
+
+
+def test_submit_sends_the_given_state_or_the_last_one_with_a_short_message():
+    out = _run_state(
+        "window.anton.setState({ people: ['Ana'] });\n"
+        "probe(window.anton.submit());\n"
+        "probe(window.anton.submit({ people: ['Ana', 'Bo'] }, 'Contact these two'));\n"
+        "probe(window.anton.getState());\n"
+        "window.anton.submit(undefined, 'y'.repeat(600));\n"
+        "window.anton.submit(undefined, 42);"
+    )
+    submits = [m for m in out["sent"] if m["type"] == "submit"]
+    assert submits[0] == {"type": "submit", "state": {"people": ["Ana"]}, "source": "anton-preview"}
+    assert submits[1] == {
+        "type": "submit", "state": {"people": ["Ana", "Bo"]}, "message": "Contact these two",
+        "source": "anton-preview",
+    }
+    assert submits[2]["message"] == "y" * 500
+    assert "message" not in submits[3]
+    assert out["probes"] == [True, True, {"people": ["Ana", "Bo"]}]
+
+
+def test_submit_refuses_a_state_over_32_kb():
+    out = _run_state("probe(window.anton.submit('x'.repeat(40000), 'done'));")
+    assert out["probes"] == [False]
+    assert out["sent"] == []
+    assert len(out["warnings"]) == 1 and out["warnings"][0].startswith("anton.submit:")
+
+
+def test_the_state_does_not_take_the_restore_or_the_theme():
+    out = _run_restore(
+        _THEME + _STATE
+        + "sendState({ a: 1 }); theme('dark');"
+        + f" restore({json.dumps({'inputs': [_KEY], 'heading': 'Two'})});"
+    )
+    assert out["restored"] == ["ok"]
+    assert out["theme"] == {"dataset": "dark", "colorScheme": "dark"}
+
+
+# ENG-4684: two frames of one artifact (the chat card's and the viewer's)
+# bounced a state between them without end: each page set again what it was
+# handed, and set a default before the app's state reached it.
+
+
+def test_a_state_set_before_the_apps_state_arrived_says_so():
+    out = _run_state(
+        "window.anton.setState({ picked: ['all'] });\n"
+        "sendState({ picked: ['li'] });\n"
+        "window.anton.setState({ picked: [] });"
+    )
+    assert [(m["state"], m["handed"]) for m in out["sent"]] == [({"picked": ["all"]}, False), ({"picked": []}, True)]
+
+
+def test_a_state_set_again_while_the_apps_state_is_taken_is_not_sent_back():
+    out = _run_state(
+        "window.anton.onState((s) => { window.anton.setState({ picked: s.picked, at: 1 }); });\n"
+        "sendState({ picked: ['li'] });\n"
+        "probe(window.anton.getState());\n"
+        "window.anton.setState({ picked: [] });"
+    )
+    # The echo stays in the page; the user's next change goes out.
+    assert out["probes"] == [{"picked": ["li"], "at": 1}]
+    assert [m["state"] for m in out["sent"]] == [{"picked": []}]
+
+
+def test_a_click_the_page_answered_with_a_state_is_not_kept_for_a_restore():
+    views = _views(
+        _STATE
+        + "click(next); mutate(h2); window.anton.setState({ picked: ['li'] }); advance(300);\n"
+        "click(prev); mutate(h1); advance(300);\n"
+    )
+    # The state brings the tick back; only the navigation is the place.
+    assert views[-1]["inputs"] == [{"type": "click", "path": "nav:0/button:0", "label": "Prev"}]
+
+
+def test_a_restore_replay_sets_no_state_for_the_app():
+    out = _run_restore(
+        _STATE
+        + "pageHandlers.push((ev) => { if (ev.type === 'click' && ev.target === next) window.anton.setState({ picked: ['x'] }); });\n"
+        + f"restore({json.dumps({'inputs': [_CLICK], 'heading': 'Two'})});\n"
+        + "advance(5000); window.anton.setState({ picked: ['y'] });"
+    )
+    assert out["restored"] == ["ok"]
+    assert [m["state"] for m in out["posted"] if m["type"] == "state"] == [{"picked": ["y"]}]
+
+
+# ENG-4684: a page that never calls setState still tells the app what its
+# form shows. The shim posts a `snapshot` of the page's controls and text,
+# which the app saves as snapshot.json, and puts a saved one back for a page
+# with no onState listener. The stand-in DOM below gains form controls, text
+# nodes and attributes; a scenario builds its form in `form`.
+_FORM = """
+class TextNode {
+  constructor(value, parent) { this.nodeType = 3; this.nodeValue = value; this.parentElement = parent; }
+  get previousSibling() { const k = this.parentElement.childNodes; const i = k.indexOf(this); return i > 0 ? k[i - 1] : null; }
+}
+Object.defineProperty(El.prototype, 'childNodes', { get() {
+  const head = this.text ? [this._t || (this._t = new TextNode(this.text, this))] : [];
+  return head.concat(this.nodes || this.children);
+} });
+Object.defineProperty(El.prototype, 'previousSibling', { get() {
+  const p = this.parentElement; if (!p) return null;
+  const k = p.childNodes; const i = k.indexOf(this); return i > 0 ? k[i - 1] : null;
+} });
+Object.defineProperty(El.prototype, 'textContent', { get() {
+  return this.childNodes.map((n) => n.nodeType === 3 ? n.nodeValue : n.textContent).join('');
+} });
+const baseAdd = El.prototype.add;
+El.prototype.add = function (child) {
+  if (!this.nodes) this.nodes = this.children.slice();
+  this.nodes.push(child);
+  return baseAdd.call(this, child);
+};
+El.prototype.addText = function (value) {
+  if (!this.nodes) this.nodes = this.children.slice();
+  this.nodes.push(new TextNode(value, this));
+  return this;
+};
+El.prototype.getAttribute = function (name) { return this.attrs && name in this.attrs ? this.attrs[name] : null; };
+El.prototype.querySelector = function (sel) { return all(this).slice(1).find((e) => e.matches(sel)) || null; };
+globalThis.Event = class extends FakeEvent {};
+const form = body.add(new El('form'));
+const field = (parent, tag, props = {}, opts = {}) => {
+  const el = parent.add(new El(tag, opts));
+  el.attrs = opts.attrs || {};
+  Object.assign(el, { name: '', value: '', checked: false, type: tag === 'input' ? 'text' : undefined }, props);
+  return el;
+};
+const option = (value, selected = false) => ({ value, selected });
+const user = (el, value) => {
+  if (value !== undefined) el.value = value;
+  fire('input', { isTrusted: true, type: 'input', target: el });
+};
+const sendSnapshot = (snapshot, more = {}) => fire('message', Object.assign({
+  isTrusted: true, source: fakeWindow.parent,
+  data: { source: 'anton-preview-parent', type: 'snapshot', snapshot },
+}, more));
+const pageEvents = [];
+pageHandlers.push((ev) => { if (ev.type === 'input' || ev.type === 'change') pageEvents.push(ev.type + ':' + (ev.target.name || ev.target.id)); });
+"""
+
+
+def _run_snapshot(scenario: str) -> dict:
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("node is not installed")
+    script = _VIEW_HARNESS.replace("__SHIM__", SHIM_JS.replace("__LINE_OFFSET__", "0")).replace(
+        "__SCENARIO__", _STATE + _FORM + scenario + "\nprobe({ pageEvents });"
+    )
+    done = subprocess.run([node, "-e", script], capture_output=True, text=True, timeout=30, check=True)
+    posted = json.loads(done.stdout)["posted"]
+    *probes, last = [m["what"] for m in posted if m["type"] == "probe"]
+    snapshots = [m for m in posted if m["type"] == "snapshot"]
+    for message in snapshots:
+        assert set(message) == {"type", "snapshot", "source"}
+        assert message["source"] == "anton-preview"
+    return {
+        "snapshots": [m["snapshot"] for m in snapshots], "probes": probes, "pageEvents": last["pageEvents"],
+        "states": [m for m in posted if m["type"] == "state"],
+    }
+
+
+_SLIDER = (
+    "form.add(new El('label', { text: 'Threshold', attrs: { for: 'thr' } })).attrs = { for: 'thr' };\n"
+    "const slider = field(form, 'input', { type: 'range', value: '0.5' }, { id: 'thr' });\n"
+)
+
+
+def test_a_moved_slider_is_reported_with_its_label_and_value():
+    out = _run_snapshot(
+        _SLIDER
+        + "advance(1100);\n"  # the one sent after load
+        + "user(slider, '0.40'); advance(100); user(slider, '0.45'); advance(100); user(slider, '0.47');\n"
+        + "advance(399); probe('before'); advance(1);"
+    )
+    first, moved = out["snapshots"]
+    assert first["controls"] == [{"label": "Threshold", "name": "thr", "type": "range", "value": "0.5"}]
+    # Debounced: three inputs inside 400 ms send one snapshot, with the last value.
+    assert moved["controls"] == [{"label": "Threshold", "name": "thr", "type": "range", "value": "0.47"}]
+    assert "Threshold" in moved["text"] and "Prev" in moved["text"]
+
+
+def test_change_events_count_too_and_nothing_is_sent_twice():
+    out = _run_snapshot(
+        _SLIDER
+        + "advance(1100);\n"
+        + "fire('change', { isTrusted: true, type: 'change', target: slider }); advance(500);\n"
+        + "slider.value = '0.9'; fire('change', { isTrusted: true, type: 'change', target: slider }); advance(500);\n"
+        + "user(slider); advance(500);"
+    )
+    # The unchanged change sends nothing, and neither does the repeated input.
+    assert [s["controls"][0]["value"] for s in out["snapshots"]] == ["0.5", "0.9"]
+
+
+def test_labels_come_from_for_wrapping_aria_placeholder_or_the_text_before():
+    out = _run_snapshot(
+        "const wrap = form.add(new El('label', { text: 'Your name ' }));\n"
+        "field(wrap, 'input', { name: 'who', value: 'Ana' });\n"
+        "field(form, 'input', { name: 'aria', value: 'a' }, { attrs: { 'aria-label': '  Aria   label ' } });\n"
+        "form.add(new El('span', { id: 'lb1', text: 'Labelled' })); form.add(new El('span', { id: 'lb2', text: 'by two' }));\n"
+        "field(form, 'input', { name: 'byid', value: 'b' }, { attrs: { 'aria-labelledby': 'lb1 lb2' } });\n"
+        "field(form, 'textarea', { name: 'notes', value: 'hi' }, { attrs: { placeholder: 'Notes here' } });\n"
+        "const row = form.add(new El('div')); row.add(new El('span', { text: 'Budget (USD)' }));\n"
+        "field(row, 'input', { type: 'number', name: 'budget', value: '120' });\n"
+        "const row2 = form.add(new El('div')); row2.addText('Speed: ');\n"
+        "field(row2, 'input', { type: 'range', name: 'speed', value: '3' });\n"
+        "form.add(new El('p', { text: 'L'.repeat(100) }));\n"
+        "field(form, 'input', { name: 'long', value: '' }, { attrs: { 'aria-label': 'x'.repeat(120) } });\n"
+        "advance(1100);"
+    )
+    labels = {c["name"]: c["label"] for c in out["snapshots"][0]["controls"]}
+    assert labels == {
+        "who": "Your name", "aria": "Aria label", "byid": "Labelled by two", "notes": "Notes here",
+        "budget": "Budget (USD)", "speed": "Speed:", "long": "x" * 80,
+    }
+
+
+def test_a_control_after_another_control_takes_no_label_from_it():
+    out = _run_snapshot(
+        "const row = form.add(new El('div')); row.add(new El('span', { text: 'First' }));\n"
+        "field(row, 'input', { name: 'a', value: '1' });\n"
+        "field(row, 'input', { name: 'b', value: '2' });\n"
+        "form.add(new El('p', { text: 'w'.repeat(250) }));\n"
+        "field(form, 'input', { name: 'c', value: '3' });\n"
+        "advance(1100);"
+    )
+    assert [(c["name"], c["label"]) for c in out["snapshots"][0]["controls"]] == [
+        ("a", "First"), ("b", ""), ("c", ""),
+    ]
+
+
+def test_radio_checkbox_and_select_shapes():
+    out = _run_snapshot(
+        "const set = form.add(new El('fieldset')); set.add(new El('legend', { text: 'Size' }));\n"
+        "for (const v of ['s', 'm', 'l']) field(set, 'input', { type: 'radio', name: 'size', value: v, checked: v === 'm' });\n"
+        "field(form, 'input', { type: 'radio', name: 'none', value: 'x' }, { attrs: { 'aria-label': 'Pick' } });\n"
+        "field(form, 'input', { type: 'checkbox', name: 'agree', value: 'on', checked: true }, { attrs: { 'aria-label': 'Agree' } });\n"
+        "field(form, 'input', { type: 'checkbox', name: 'spam', value: 'on' }, { attrs: { 'aria-label': 'Spam' } });\n"
+        "field(form, 'select', { name: 'one', value: 'b', options: [option('a'), option('b', true)] }, { attrs: { 'aria-label': 'One' } });\n"
+        "field(form, 'select', { name: 'many', multiple: true, options: [option('a', true), option('b'), option('c', true)] }, { attrs: { 'aria-label': 'Many' } });\n"
+        "advance(1100);"
+    )
+    assert out["snapshots"][0]["controls"] == [
+        {"label": "Size", "name": "size", "type": "radio", "value": "m"},
+        {"label": "Pick", "name": "none", "type": "radio", "value": ""},
+        {"label": "Agree", "name": "agree", "type": "checkbox", "value": True},
+        {"label": "Spam", "name": "spam", "type": "checkbox", "value": False},
+        {"label": "One", "name": "one", "type": "select-one", "value": "b"},
+        {"label": "Many", "name": "many", "type": "select-multiple", "value": ["a", "c"]},
+    ]
+
+
+def test_secrets_hidden_fields_files_and_the_comment_layer_are_left_out():
+    out = _run_snapshot(
+        "for (const t of ['password', 'hidden', 'file']) field(form, 'input', { type: t, name: t, value: 'secret' });\n"
+        "const layer = body.add(new El('div', { classes: ['act-pop'], text: 'Comment UI' }));\n"
+        "const note = field(layer, 'textarea', { name: 'comment', value: 'mine' });\n"
+        "field(form, 'input', { name: 'kept', value: 'k' });\n"
+        "advance(1100);\n"
+        "user(note, 'typed'); advance(500);\n"
+        "fire('input', { isTrusted: true, type: 'input', target: form.children[0] }); advance(500);"
+    )
+    assert len(out["snapshots"]) == 1
+    snap = out["snapshots"][0]
+    assert [c["name"] for c in snap["controls"]] == ["kept"]
+    assert "Comment UI" not in snap["text"]
+
+
+def test_a_control_with_no_name_or_id_is_named_by_its_path_and_at_most_60_are_kept():
+    out = _run_snapshot(
+        "field(form, 'input', { value: 'anon' });\n"
+        "for (let i = 0; i < 70; i++) field(form, 'input', { name: 'f' + i, value: String(i) });\n"
+        "body.add(new El('p', { text: 'z'.repeat(3000) }));\n"
+        "advance(1100);"
+    )
+    snap = out["snapshots"][0]
+    assert len(snap["controls"]) == 60
+    assert snap["controls"][0]["name"] == "form:0/input:0"
+    assert snap["controls"][-1]["name"] == "f58"
+    assert len(snap["text"]) == 2000
+
+
+def test_a_saved_snapshot_is_put_back_and_the_page_hears_it_once():
+    out = _run_snapshot(
+        _SLIDER
+        + "const box = field(form, 'input', { type: 'checkbox', name: 'agree' });\n"
+        "for (const v of ['s', 'm']) field(form, 'input', { type: 'radio', name: 'size', value: v, checked: v === 's' });\n"
+        "const many = field(form, 'select', { name: 'many', multiple: true, options: [option('a', true), option('b')] });\n"
+        "sendSnapshot({ controls: [\n"
+        "  { label: 'Threshold', name: 'thr', type: 'range', value: '0.47' },\n"
+        "  { label: '', name: 'agree', type: 'checkbox', value: true },\n"
+        "  { label: '', name: 'size', type: 'radio', value: 'm' },\n"
+        "  { label: '', name: 'many', type: 'select-multiple', value: ['b'] },\n"
+        "], text: 'ignored' });\n"
+        "probe([slider.value, box.checked, form.children.filter((e) => e.name === 'size').map((e) => e.checked), many.options.map((o) => o.selected)]);\n"
+        "advance(5000);"
+    )
+    assert out["probes"][0] == ["0.47", True, [False, True], [False, True]]
+    assert out["pageEvents"] == [
+        "input:thr", "change:thr", "input:agree", "change:agree", "input:size", "change:size",
+        "input:many", "change:many",
+    ]
+    # Not echoed: neither the restore's events nor the after-load send post it back.
+    assert out["snapshots"] == []
+
+
+def test_input_after_a_restore_is_reported_again():
+    out = _run_snapshot(
+        _SLIDER
+        + "sendSnapshot({ controls: [{ label: 'Threshold', name: 'thr', type: 'range', value: '0.47' }], text: '' });\n"
+        "advance(2000); user(slider, '0.2'); advance(500);"
+    )
+    assert [s["controls"][0]["value"] for s in out["snapshots"]] == ["0.2"]
+
+
+def test_a_page_with_on_state_restores_itself_and_the_snapshot_is_left_alone():
+    out = _run_snapshot(
+        _SLIDER
+        + "window.anton.onState(() => {});\n"
+        "sendSnapshot({ controls: [{ label: 'Threshold', name: 'thr', type: 'range', value: '0.47' }], text: '' });\n"
+        "advance(5000); probe(slider.value);"
+    )
+    assert out["probes"] == ["0.5"]
+    assert out["pageEvents"] == []
+    assert out["snapshots"] == []
+
+
+@pytest.mark.parametrize(
+    "more",
+    [
+        "{ source: {} }",
+        "{ isTrusted: false }",
+        "{ data: { source: 'anton-preview', type: 'snapshot', snapshot: good } }",
+        "{ data: { type: 'snapshot', snapshot: good } }",
+        "{ data: { source: 'anton-preview-parent', type: 'snapshot', snapshot: { controls: [{ name: 'thr', type: 'range', value: 4 }] } } }",
+        "{ data: { source: 'anton-preview-parent', type: 'snapshot', snapshot: { controls: 'thr' } } }",
+        "{ data: { source: 'anton-preview-parent', type: 'snapshot', snapshot: { controls: Array(61).fill({ name: 'thr', type: 'range', value: '1' }) } } }",
+    ],
+)
+def test_a_snapshot_is_taken_from_the_parent_only_with_its_tag_and_shape(more):
+    out = _run_snapshot(
+        _SLIDER
+        + "const good = { controls: [{ label: '', name: 'thr', type: 'range', value: '0.47' }], text: '' };\n"
+        + f"sendSnapshot(good, {more});\n"
+        "advance(5000); probe(slider.value);"
+    )
+    assert out["probes"] == ["0.5"]
+    assert out["pageEvents"] == []
+
+
+def test_the_snapshot_does_not_take_the_state_or_the_restore():
+    out = _run_snapshot(
+        _SLIDER
+        + "const seen = []; window.anton.onState((s) => seen.push(s));\n"
+        "sendSnapshot({ controls: [], text: '' });\n"
+        "advance(1); probe(seen); probe(window.anton.getState());"
+    )
+    assert out["probes"] == [[], None]
+    assert out["states"] == []
