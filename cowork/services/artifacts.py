@@ -1745,8 +1745,11 @@ def _prepare_artifact_card(
 
                 # The version this card shows, so a chat card from an earlier
                 # turn can open that one (ENG-4684). Inline cards only: it
-                # reads the revision journal and hashes the page.
-                revision_id = head_revision_id(io_folder, rel)
+                # reads the revision journal and hashes the page. Through the
+                # logical folder, where capture_agent_revision writes it: on
+                # Linux `io_folder` is a /proc/self/fd link, which the
+                # journal's no-follow reads refuse (no revisionId at all).
+                revision_id = head_revision_id(logical_folder, rel)
                 if revision_id:
                     card.revision_id = revision_id
     return _PreparedArtifactCard(
