@@ -137,3 +137,33 @@ async def test_the_request_tells_the_turn_whether_its_client_shows_docs(monkeypa
 
     assert answered.status_code == 200, answered.text
     assert stub.docs == [shows_docs]
+
+
+class _SeesZdr(_SeesDocs):
+    """Records the ZDR state each turn was handed."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.zdr: list = []
+
+    def stream_response(self, **kwargs):
+        self.zdr.append(kwargs.get("zdr"))
+        return super().stream_response(**kwargs)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stream", [True, False])
+async def test_an_in_process_turn_gets_the_handlers_zdr_read(monkeypatch, stream):
+    # The harness uses the handler's bearer read rather than the stored key's alone.
+    from cowork.services.mindshub_teams import ZdrState
+
+    async def read(self, turn_llm):
+        return ZdrState.OFF
+
+    monkeypatch.setattr(responses_mod.ResponsesHandler, "_zdr_state_quietly", read)
+    stub = _SeesZdr()
+
+    answered = await _ask(monkeypatch, stub, stream=stream)
+
+    assert answered.status_code == 200, answered.text
+    assert stub.zdr == [ZdrState.OFF]

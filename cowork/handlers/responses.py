@@ -1369,6 +1369,7 @@ class ResponsesHandler:
                     ui_locale=self.ui_locale,
                     schedule_id=self.schedule_id,
                     docs=_client_shows_docs(request),
+                    zdr=self.turn_zdr,
                 )
                 return await self._collect(stream, start.conversation_id, request.model, original_content)
 
@@ -4161,6 +4162,8 @@ class ResponsesHandler:
                 ui_locale=self.ui_locale,
                 schedule_id=self.schedule_id,
                 docs=docs,
+                # Read at the turn's start with the caller's bearer, as the remote producer gets it.
+                zdr=lifecycle.zdr if lifecycle is not None else None,
             )
             event_count = 0
             completed_frame: str | None = None

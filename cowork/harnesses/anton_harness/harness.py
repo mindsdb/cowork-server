@@ -1210,6 +1210,8 @@ class AntonHarness:
         # The scheduler's own turn (see HarnessProvider).
         schedule_id: str | None = None,
         docs: bool = False,
+        # The handler's ZDR read for this turn; None reads it here (_turn_zdr_state).
+        zdr: ZdrState | None = None,
     ) -> AsyncIterator[str]:
         if get_app_settings().tenancy_mode == "org":
             # Org-mode turns must run on the remote worker, never in this
@@ -1378,6 +1380,7 @@ class AntonHarness:
                 interactive=interactive,
                 ui_locale=ui_locale,
                 docs=docs,
+                zdr=zdr,
             )
             session, turn_scratch_dir, seed_info = built.session, built.turn_scratch_dir, built.seed_info
             if model_wait is not None:
@@ -1721,6 +1724,7 @@ class AntonHarness:
         interactive: bool = True,
         ui_locale: str | None = None,
         docs: bool = False,
+        zdr: ZdrState | None = None,
     ) -> BuiltChatSession:
         """Build the same core runtime the Anton CLI uses, scoped to one project
         (_build_turn_session). The live-app stops its prompt tells ride on the
@@ -1744,6 +1748,7 @@ class AntonHarness:
                 ui_locale=ui_locale,
                 live_app_notices=notices,
                 docs=docs,
+                zdr=zdr,
             )
         except BaseException:
             if notices:
@@ -1774,6 +1779,7 @@ class AntonHarness:
         live_app_notices: list[UUID],
         ui_locale: str | None = None,
         docs: bool,
+        zdr: ZdrState | None = None,
     ) -> BuiltChatSession:
         """_build_chat_session's work. ``live_app_notices`` gets the launch
         records whose stop the turn's prompt tells, which the turn claimed
@@ -1862,7 +1868,9 @@ class AntonHarness:
             anton_settings.skills_extra_roots.append(DOC_SKILLS_ROOT)
 
         user = await run_on_unit_threads(get_user_settings)
-        zdr = await _turn_zdr_state(user)
+        # The handler's read (made with the caller's bearer) wins; the stored key's is the fallback.
+        if zdr is None:
+            zdr = await _turn_zdr_state(user)
         _overlay_user_settings(anton_settings, user, zdr=zdr)
 
         RECALL_HISTORY_TOOL = self._recall_history_tool(conversation, user)
@@ -1993,7 +2001,7 @@ class AntonHarness:
         # only then. Never for a channel turn.
         turn_browser = await _browser_config(
             user, channel_context=channel_context,
-            conversation_id=str(conversation.id), project_id=conversation.project_id,
+            conversation_id=str(conversation.id), project_id=conversation.project_id, zdr=zdr,
         )
         project_context = (
             # Conversational only. The next line hands the agent the real path,
@@ -2489,6 +2497,7 @@ class AntonHarness:
 
 async def _browser_config(
     user, *, channel_context: ChannelContext | None, conversation_id: str, project_id,
+    zdr: ZdrState | None = None,
 ) -> "BrowserConfig | None":
     """anton's browser for an in-process turn: the desktop app's own browser,
     with the task's own session, or None.
@@ -2516,7 +2525,8 @@ async def _browser_config(
     from cowork.handlers.jev_route import browser_needs_zdr
 
     # Under ZDR MindsHub refuses Jev, so a browser whose steps it would pick doesn't run.
-    if browser_needs_zdr(user) and await _turn_zdr_on(user):
+    # *zdr*: the turn's read, when it has one; else read here.
+    if browser_needs_zdr(user) and (zdr is not ZdrState.OFF if zdr is not None else await _turn_zdr_on(user)):
         return None
     from cowork.common.settings.app_settings import TurnQueueSettings
     from cowork.handlers.jev_route import own_decision_target

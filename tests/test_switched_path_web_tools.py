@@ -56,9 +56,10 @@ def _settings(provider: Provider) -> UserSettings:
 
 async def _session_config(
     monkeypatch, settings: UserSettings, *, changed_settings: UserSettings | None = None,
-    zdr: ZdrState = ZdrState.OFF,
+    zdr: ZdrState = ZdrState.OFF, handler_zdr: ZdrState | None = None,
 ):
-    """One turn's ChatSessionConfig, built by the real harness."""
+    """One turn's ChatSessionConfig, built by the real harness. *zdr*: the stored key's
+    read; *handler_zdr*: the handler's read passed to the harness."""
     from cowork.db.scoped import LOCAL_SCOPE, ScopedSession
     from cowork.db.session import get_open_session
     from cowork.services.conversations import ConversationService
@@ -92,7 +93,7 @@ async def _session_config(
         conversation = ConversationService(
             ScopedSession(db, LOCAL_SCOPE)
         ).create_conversation(topic="web tools")
-        config = (await harness.AntonHarness()._build_chat_session(conversation)).session
+        config = (await harness.AntonHarness()._build_chat_session(conversation, zdr=handler_zdr)).session
     return config
 
 
@@ -195,6 +196,32 @@ async def test_an_unreadable_zdr_keeps_mindshubs_web_tools(monkeypatch, openai_c
     await config.llm_client.aclose()
 
     assert (config.web_search_enabled, config.web_fetch_enabled) == (True, True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("handler_zdr", [ZdrState.OFF, ZdrState.ON])
+async def test_the_handlers_zdr_read_wins_over_the_stored_keys(
+    monkeypatch, openai_compatible_api, anton_responses_ready, handler_zdr,
+):
+    # The stored key can't read the org (UNKNOWN); the handler's bearer read is what the turn uses.
+    openai_compatible_api(None)
+    anton_responses_ready()
+    overlaid: list[ZdrState] = []
+    overlay = harness._overlay_user_settings
+
+    def _overlay(anton_settings, user, *, zdr=ZdrState.OFF):
+        overlaid.append(zdr)
+        return overlay(anton_settings, user, zdr=zdr)
+
+    monkeypatch.setattr(harness, "_overlay_user_settings", _overlay)
+    config = await _session_config(
+        monkeypatch, _settings(Provider.MINDS_CLOUD), zdr=ZdrState.UNKNOWN, handler_zdr=handler_zdr,
+    )
+    await config.llm_client.aclose()
+
+    assert overlaid == [handler_zdr]
+    on = handler_zdr is ZdrState.ON
+    assert (config.web_search_enabled, config.web_fetch_enabled) == (not on, not on)
 
 
 async def _probe_session_config(

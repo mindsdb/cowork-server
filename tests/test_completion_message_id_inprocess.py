@@ -32,7 +32,7 @@ def _handler_with_formatter(turn_formatter) -> ResponsesHandler:
     async def _stream_response(*, conversation, input, model=None, reasoning_effort=None,
                                 disabled_connections=None, trace_tags=None, trace_metadata=None,
                                 tool_messages=False, model_wait=None, interactive=True,
-                                ui_locale=None, schedule_id=None, docs=False):
+                                ui_locale=None, schedule_id=None, docs=False, zdr=None):
         if False:
             yield
 

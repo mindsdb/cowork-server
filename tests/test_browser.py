@@ -925,11 +925,30 @@ def test_a_channel_turn_gets_no_browser(app_browser):
     assert asyncio.run(_browser_config(on, channel_context=None, conversation_id="c", project_id=None)).in_app
 
 
+@pytest.mark.parametrize(
+    ("turn_zdr", "runs"), [("off", True), ("on", False), ("unknown", False)],
+)
+def test_the_turns_zdr_read_decides_the_browser_over_a_fresh_read(zdr_off, turn_zdr, runs):
+    """The handler's read wins: a fresh stored-key read that says ON (or can't tell) doesn't
+    turn the browser off for a non-ZDR org."""
+    from cowork.harnesses.anton_harness.harness import _browser_config
+    from cowork.services.mindshub_teams import ZdrState
+
+    zdr_off.on = True
+    runtime_credential.set_browser_host(APP_BROWSER)
+    on = SimpleNamespace(browser_enabled=True)
+    config = asyncio.run(_browser_config(
+        on, channel_context=None, conversation_id="c", project_id=None, zdr=ZdrState(turn_zdr),
+    ))
+    assert (config is not None) is runs
+
+
 def test_the_session_builder_passes_the_channel_to_the_browser():
     from cowork.harnesses.anton_harness import harness
 
     source = inspect.getsource(harness.AntonHarness._build_turn_session)
     assert re.search(r"turn_browser = await _browser_config\(\s*user, channel_context=channel_context,", source)
+    assert "project_id=conversation.project_id, zdr=zdr," in source
     assert "browser=turn_browser," in source
     assert "supported_kwargs(ChatSessionConfig, browser=" not in source
 
