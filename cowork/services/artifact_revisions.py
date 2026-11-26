@@ -62,11 +62,18 @@ logger = logging.getLogger(__name__)
 EDITABLE_EXTENSIONS = frozenset({".md", ".txt", ".html", ".htm"})
 # An inline html-app's saved state (ENG-4684): what the page's
 # `anton.setState` holds, which the renderer saves through the source routes.
-# The one name those routes take that isn't an editable source, only at the
-# folder's top level, only for an html-app, and the one they may create: a
+# The names those routes take that aren't editable sources, only at the
+# folder's top level, only for an html-app, and the ones they may create: a
 # save with no expected revision writes the first one. Until then a read
 # answers 404, as for any missing source.
 INLINE_STATE_FILE = "state.json"
+# What the page's form controls show, which the preview shim reports for every
+# page (one that never calls setState too), saved under the same rules.
+INLINE_SNAPSHOT_FILE = "snapshot.json"
+# The page's own files: never the page, never published, left out of the
+# content clock, pruned first, capped at INLINE_STATE_MAX_BYTES, and saving
+# one re-publishes nothing.
+INLINE_PAGE_FILES = frozenset({INLINE_STATE_FILE, INLINE_SNAPSHOT_FILE})
 INLINE_STATE_TYPE = "html-app"
 try:  # anton's own limit, where the installed anton has it
     from anton.core.artifacts.internal_files import INLINE_STATE_MAX_BYTES
@@ -369,8 +376,8 @@ def _finish_queued_repairs(
 
 
 def _names_inline_state(metadata: ArtifactMetadata, rel_path: str | None) -> bool:
-    """Whether a source route addresses an html-app's inline state.json."""
-    return metadata.type == INLINE_STATE_TYPE and (rel_path or "").strip() == INLINE_STATE_FILE
+    """Whether a source route addresses one of an html-app's INLINE_PAGE_FILES."""
+    return metadata.type == INLINE_STATE_TYPE and (rel_path or "").strip() in INLINE_PAGE_FILES
 
 
 def resolve_source(
@@ -382,8 +389,8 @@ def resolve_source(
 ) -> tuple[Path, str]:
     """Resolve an editable source without accepting an absolute/client path.
 
-    ``inline_state`` lets ``rel_path`` name INLINE_STATE_FILE, which may not
-    exist yet; by default only an html-app's explicit request does.
+    ``inline_state`` lets ``rel_path`` name one of INLINE_PAGE_FILES, which
+    may not exist yet; by default only an html-app's explicit request does.
     """
     if inline_state is None:
         inline_state = _names_inline_state(metadata, rel_path)
@@ -413,12 +420,12 @@ def resolve_source(
             target.relative_to(canonical_folder)
         except ValueError as exc:
             raise RevisionValidationError("Invalid artifact source path") from exc
-        if inline_state and candidate_rel == INLINE_STATE_FILE and not os.path.lexists(
-            canonical_folder / INLINE_STATE_FILE
+        if inline_state and candidate_rel in INLINE_PAGE_FILES and not os.path.lexists(
+            canonical_folder / candidate_rel
         ):
             # Not saved yet: a read of it is refused (_read_source), and the
             # first save creates it.
-            return canonical_folder / INLINE_STATE_FILE, INLINE_STATE_FILE
+            return canonical_folder / candidate_rel, candidate_rel
     from cowork.services.artifacts import _is_the_projects_secrets
 
     # The source route reads and writes the file in place, so the project's
@@ -432,7 +439,7 @@ def resolve_source(
         raise FileNotFoundError("Artifact source not found")
     relative = target.resolve(strict=False).relative_to(canonical_folder).as_posix()
     if target.suffix.lower() not in EDITABLE_EXTENSIONS and not (
-        inline_state and relative == INLINE_STATE_FILE
+        inline_state and relative in INLINE_PAGE_FILES
     ):
         raise RevisionValidationError("This artifact type is not source-editable")
     return target, relative
@@ -454,17 +461,17 @@ def _read_source(target: Path) -> bytes:
 
 
 def _read_source_at(target: Path, relative: str) -> bytes:
-    """``_read_source`` for a write, where an inline state.json not saved yet
-    is empty (resolve_source only hands one back that way for that name)."""
-    if relative == INLINE_STATE_FILE and not os.path.lexists(target):
+    """``_read_source`` for a write, where an inline page file not saved yet
+    is empty (resolve_source only hands one back that way for those names)."""
+    if relative in INLINE_PAGE_FILES and not os.path.lexists(target):
         return b""
     return _read_source(target)
 
 
 def _source_mode(target: Path, relative: str) -> int | None:
     """The permissions a source write keeps: the file's own, or the default
-    for an inline state.json the write is about to create."""
-    if relative == INLINE_STATE_FILE and not os.path.lexists(target):
+    for an inline page file the write is about to create."""
+    if relative in INLINE_PAGE_FILES and not os.path.lexists(target):
         return None
     return target.stat().st_mode & 0o777
 
@@ -568,18 +575,22 @@ def _prune_orphan_blobs(folder: Path, revisions: list[RevisionEntry]) -> None:
 def _prune_revisions(revisions: list[RevisionEntry]) -> None:
     """Cut *revisions* to MAX_REVISIONS, oldest first.
 
-    An inline page's saved state (state.json) goes before anything else, and
-    never its newest entry: a page that saves on every click would otherwise
-    push out the page revisions earlier chat cards name (ENG-4684).
+    An inline page's own files (INLINE_PAGE_FILES: its state and its form
+    snapshot) go before anything else, and never the newest entry of each: a
+    page that saves on every click would otherwise push out the page
+    revisions earlier chat cards name (ENG-4684).
     """
     excess = len(revisions) - MAX_REVISIONS
     if excess <= 0:
         return
-    newest_state = next(
-        (item.id for item in reversed(revisions) if item.path == INLINE_STATE_FILE), None
-    )
+    newest = {
+        name: next((item.id for item in reversed(revisions) if item.path == name), None)
+        for name in INLINE_PAGE_FILES
+    }
     stale_state = {
-        item.id for item in revisions if item.path == INLINE_STATE_FILE and item.id != newest_state
+        item.id
+        for item in revisions
+        if item.path in INLINE_PAGE_FILES and item.id != newest[item.path]
     }
     if stale_state:
         dropped = set(
@@ -774,7 +785,7 @@ def _recover_pending_source_write(folder: Path) -> None:
             folder,
             ArtifactMetadata.empty(),
             pending.path,
-            inline_state=pending.path == INLINE_STATE_FILE,
+            inline_state=pending.path in INLINE_PAGE_FILES,
         )
         current = _read_source_at(target, relative)
     except (FileNotFoundError, ValueError):
@@ -958,10 +969,10 @@ def save_source(
     with artifact_lock(folder):
         _recover_pending_source_write(folder)
         target, relative = resolve_source(folder, metadata, rel_path)
-        if relative == INLINE_STATE_FILE and len(encoded) > INLINE_STATE_MAX_BYTES:
+        if relative in INLINE_PAGE_FILES and len(encoded) > INLINE_STATE_MAX_BYTES:
             raise RevisionValidationError("Inline state is too large to save")
-        if relative == INLINE_STATE_FILE and not os.path.lexists(target):
-            # The first save of an inline page's state: it creates the file,
+        if relative in INLINE_PAGE_FILES and not os.path.lexists(target):
+            # The first save of an inline page's state or snapshot: it creates the file,
             # and only a save that expects no revision may.
             manifest = _read_manifest(folder)
             head = manifest.head(relative)

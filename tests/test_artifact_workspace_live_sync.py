@@ -701,3 +701,87 @@ async def test_a_state_json_link_is_refused(owned, tmp_path):
         await _save_state(folder, metadata, '{"x": 1}', None)
     assert refused.value.status_code == 404
     assert outside.read_text(encoding="utf-8") == "{}"
+
+
+# The page's form snapshot (ENG-4684): the preview shim reports every page's
+# controls, and the app saves them as snapshot.json beside state.json, under
+# the very same rules.
+_SNAPSHOT = json.dumps({
+    "controls": [{"label": "Threshold", "name": "thr", "type": "range", "value": "0.47"}],
+    "text": "Threshold 0.47",
+})
+
+
+@pytest.mark.asyncio
+async def test_the_put_creates_an_html_apps_snapshot_json_beside_its_state(owned):
+    folder, metadata = owned
+    with pytest.raises(FileNotFoundError):
+        _read_state(folder, metadata, path="snapshot.json")
+
+    snap = await _save_state(folder, metadata, _SNAPSHOT, None, path="snapshot.json")
+    state = await _save_state(folder, metadata, '{"a": 1}', None)
+
+    assert (folder / "snapshot.json").read_text(encoding="utf-8") == _SNAPSHOT
+    assert snap["path"] == "snapshot.json" and state["path"] == "state.json"
+    again = _read_state(folder, metadata, path="snapshot.json")
+    assert (again["content"], again["contentType"]) == (_SNAPSHOT, "json")
+    # Each file keeps its own head: a second "first" save conflicts.
+    with pytest.raises(workspace.HTTPException) as stale:
+        await _save_state(folder, metadata, "{}", None, path="snapshot.json")
+    assert stale.value.status_code == 409
+    assert stale.value.detail["currentRevision"]["id"] == snap["revision"]["id"]
+    newer = await _save_state(folder, metadata, "{}", snap["revision"]["id"], path="snapshot.json")
+    assert newer["revision"]["id"] != snap["revision"]["id"]
+
+    # Neither is what opens or publishes.
+    from cowork.services.artifacts import _pick_primary, _user_files
+
+    assert _pick_primary(folder, _user_files(folder)).name == "report.html"
+
+
+@pytest.mark.asyncio
+async def test_a_snapshot_over_32_kb_is_refused(owned):
+    folder, metadata = owned
+    with pytest.raises(workspace.HTTPException) as refused:
+        await _save_state(folder, metadata, json.dumps("x" * (32 * 1024)), None, path="snapshot.json")
+    assert refused.value.status_code == 422
+    assert not (folder / "snapshot.json").exists()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("path", ["sub/snapshot.json", "Snapshot.json", "snapshot.json.html", "snapshots.json"])
+async def test_only_a_top_level_snapshot_json_may_be_created(owned, path):
+    folder, metadata = owned
+    (folder / "sub").mkdir()
+    with pytest.raises(workspace.HTTPException) as refused:
+        await _save_state(folder, metadata, "{}", None, path=path)
+    assert refused.value.status_code == 404
+    assert sorted(p.name for p in folder.iterdir() if not p.name.startswith(".")) == [
+        "metadata.json", "report.html", "sub",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_a_snapshot_json_is_refused_for_any_other_artifact_type(owned, monkeypatch):
+    folder, _metadata = owned
+    document = ArtifactMetadata.model_validate({"slug": "report", "type": "document", "primary": "report.html"})
+    monkeypatch.setattr(
+        workspace,
+        "_owner_workspace",
+        awaitable(lambda *_args: (_source_for(folder), folder, document, {})),
+    )
+    with pytest.raises(workspace.HTTPException) as refused:
+        await _save_state(folder, document, "{}", None, path="snapshot.json")
+    assert refused.value.status_code == 404
+    assert not (folder / "snapshot.json").exists()
+
+
+def test_with_no_html_page_snapshot_json_is_still_not_the_primary(tmp_path):
+    from cowork.services.artifacts import _pick_primary, _user_files
+
+    (tmp_path / "page.htm").write_text("<p>page</p>", encoding="utf-8")
+    time.sleep(0.01)
+    (tmp_path / "state.json").write_text("{}", encoding="utf-8")
+    (tmp_path / "snapshot.json").write_text("{}", encoding="utf-8")
+
+    assert _pick_primary(tmp_path, _user_files(tmp_path)).name == "page.htm"

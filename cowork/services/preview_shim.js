@@ -28,7 +28,7 @@
   // later and silently swallow every diagnostic this shim reports.
   var PARENT = window.parent, IS_TOP = window.parent === window;
   var TAG = 'anton-preview';
-  /* The tag on what the parent window sends in: a `restore`, a `theme` and a `state`. */
+  /* The tag on what the parent window sends in: a `restore`, a `theme`, a `state` and a `snapshot`. */
   var PARENT_TAG = 'anton-preview-parent';
   /* Shared by the view and state halves below. While a restore replays a
      view, the page's setState calls are the replay's, not the user's, and
@@ -913,6 +913,318 @@
       } catch (inner) { /* never break the page */ }
     });
   } catch (e) { /* no page state: the page still runs */ }
+
+  /* What the page's form shows, for a page that never calls setState
+     (ENG-4684): a slider the user moved to 0.47 must still be something the
+     agent can read. Every page reports its controls and its text as a
+     `snapshot`, which the app saves beside state.json as snapshot.json:
+       { type: 'snapshot', snapshot: {
+           controls: [{ label, name, type, value }],  at most MAX_CONTROLS
+           text } }                                   body text, MAX_PAGE_TEXT
+     `value` is a string, a checkbox's a boolean, a multi-select's an array of
+     strings; a radio group is one entry with the checked value ('' for none).
+     `name` is the control's name, else its id, else its path (pathOf above).
+     Sent MAX_WAIT ms after the user's last input or change, and once
+     FIRST_SEND_MS after load; never twice the same, and nothing inside the
+     comment layer counts.
+     The app sends the saved one back as {source: PARENT_TAG, type:
+     'snapshot', snapshot}. A page with an onState listener restores itself
+     from its state, so only one without puts the values back, by name, and
+     fires input and change so it reacts. Those events are not the user's:
+     nothing is sent for them. */
+  try {
+    var MAX_CONTROLS = 60, MAX_PAGE_TEXT = 2000, MAX_CONTROL_LABEL = 80;
+    var MAX_VALUE = 1000, MAX_NAME = 300, MAX_OPTIONS = 60, SHORT_TEXT = 200;
+    var SNAPSHOT_WAIT = 400, FIRST_SEND_MS = 1000;
+    /* The save's cap, as for state.json (INLINE_STATE_MAX_BYTES). */
+    var MAX_SNAPSHOT = 32 * 1024;
+    var SNAPSHOT_FIELDS = 'input, select, textarea';
+    var SKIPPED_TYPES = { password: 1, hidden: 1, file: 1 };
+    var snapshotLayer = '#act-mk, .act-hl, .act-pop, .act-menu';
+    var lastSnapshot = '', snapshotTimer = 0, applyingSnapshot = false, snapshotTaken = false;
+
+    var underLayer = function (el) {
+      return !!(el && el.closest && el.closest(snapshotLayer));
+    };
+    var isLayerNode = function (el) {
+      return !!(el && el.matches && el.matches(snapshotLayer));
+    };
+    var tracked = function (el) {
+      if (!el || el.nodeType !== 1 || !el.matches || !el.matches(SNAPSHOT_FIELDS)) return false;
+      if (el.localName === 'input' && SKIPPED_TYPES[String(el.type || 'text').toLowerCase()]) return false;
+      return !underLayer(el);
+    };
+    var controlType = function (el) {
+      if (el.localName === 'select') return el.multiple ? 'select-multiple' : 'select-one';
+      if (el.localName === 'textarea') return 'textarea';
+      return String(el.type || 'text').toLowerCase();
+    };
+    var controlName = function (el) {
+      var name = typeof el.name === 'string' && el.name ? el.name : (el.id || '');
+      if (!name && typeof pathOf === 'function') name = pathOf(el);
+      return String(name || '').slice(0, MAX_NAME);
+    };
+    /* A label's own words: the controls inside it (a select's options) left out. */
+    var wordsOf = function (node) {
+      if (!node) return '';
+      if (node.nodeType === 3) return String(node.nodeValue || '');
+      if (node.nodeType !== 1 || isLayerNode(node)) return '';
+      var tag = node.localName;
+      if (tag === 'input' || tag === 'select' || tag === 'textarea' || tag === 'script' || tag === 'style') return '';
+      var kids = node.childNodes;
+      if (!kids) return String(node.textContent || '');
+      var out = '';
+      for (var i = 0; i < kids.length; i++) out += ' ' + wordsOf(kids[i]);
+      return out;
+    };
+    var hasField = function (node) {
+      if (!node || node.nodeType !== 1) return false;
+      if (node.matches && node.matches(SNAPSHOT_FIELDS)) return true;
+      return !!(node.querySelector && node.querySelector(SNAPSHOT_FIELDS));
+    };
+    var before = function (node) {
+      return node.previousSibling !== undefined ? node.previousSibling : node.previousElementSibling;
+    };
+    /* The nearest short text before the control: a sibling, or one of its
+       parents' (three levels up). Another control on the way, or a long
+       passage, ends the search: what lies before it labels something else. */
+    var precedingText = function (el) {
+      var node = el;
+      for (var level = 0; level < 4 && node && node !== document.body; level++) {
+        for (var prev = before(node); prev; prev = before(prev)) {
+          if (prev.nodeType === 1 && (isLayerNode(prev) || prev.localName === 'script' || prev.localName === 'style')) continue;
+          if (hasField(prev)) return '';
+          var text = clip(wordsOf(prev), SHORT_TEXT + 1);
+          if (!text) continue;
+          return text.length > SHORT_TEXT ? '' : text;
+        }
+        node = node.parentElement;
+      }
+      return '';
+    };
+    var attr = function (el, name) {
+      var value = el.getAttribute ? el.getAttribute(name) : null;
+      return typeof value === 'string' ? value : '';
+    };
+    var labelOf = function (el) {
+      var text = '';
+      var id = el.id;
+      if (id) {
+        var labels = document.querySelectorAll('label');
+        for (var i = 0; i < labels.length && !text; i++) {
+          if (attr(labels[i], 'for') === id && !underLayer(labels[i])) text = clip(wordsOf(labels[i]), MAX_CONTROL_LABEL);
+        }
+      }
+      if (!text && el.parentElement && el.parentElement.closest) {
+        var wrap = el.parentElement.closest('label');
+        if (wrap) text = clip(wordsOf(wrap), MAX_CONTROL_LABEL);
+      }
+      if (!text) text = clip(attr(el, 'aria-label'), MAX_CONTROL_LABEL);
+      if (!text && attr(el, 'aria-labelledby')) {
+        var ids = attr(el, 'aria-labelledby').split(/\s+/), parts = [];
+        for (var j = 0; j < ids.length; j++) {
+          var named = ids[j] ? document.getElementById(ids[j]) : null;
+          if (named) parts.push(wordsOf(named));
+        }
+        text = clip(parts.join(' '), MAX_CONTROL_LABEL);
+      }
+      if (!text) text = clip(attr(el, 'placeholder'), MAX_CONTROL_LABEL);
+      if (!text) text = clip(precedingText(el), MAX_CONTROL_LABEL);
+      return text;
+    };
+    /* A radio group is named for its fieldset's legend or its radiogroup,
+       not for the first choice's own label. */
+    var groupLabel = function (el) {
+      var set = el.closest ? el.closest('fieldset') : null;
+      if (set && set.querySelector) {
+        var legend = set.querySelector('legend');
+        if (legend) {
+          var said = clip(wordsOf(legend), MAX_CONTROL_LABEL);
+          if (said) return said;
+        }
+      }
+      var group = el.closest ? el.closest('[role="radiogroup"]') : null;
+      if (group) {
+        var named = clip(attr(group, 'aria-label'), MAX_CONTROL_LABEL);
+        if (named) return named;
+      }
+      return labelOf(el);
+    };
+    var selectedValues = function (el) {
+      var out = [], options = el.options || [];
+      for (var i = 0; i < options.length && out.length < MAX_OPTIONS; i++) {
+        if (options[i].selected) out.push(String(options[i].value).slice(0, MAX_VALUE));
+      }
+      return out;
+    };
+    var fields = function () {
+      var nodes = document.querySelectorAll(SNAPSHOT_FIELDS), out = [];
+      for (var i = 0; i < nodes.length; i++) if (tracked(nodes[i])) out.push(nodes[i]);
+      return out;
+    };
+    var pageText = function () {
+      var body = document.body;
+      if (!body) return '';
+      var kids = body.childNodes, out = '';
+      if (!kids) return clip(body.innerText != null ? body.innerText : body.textContent, MAX_PAGE_TEXT);
+      for (var i = 0; i < kids.length && out.length <= MAX_PAGE_TEXT; i++) {
+        var kid = kids[i];
+        if (kid.nodeType === 3) out += ' ' + kid.nodeValue;
+        else if (kid.nodeType === 1 && !isLayerNode(kid) && kid.localName !== 'script' && kid.localName !== 'style') {
+          out += ' ' + (kid.innerText != null ? kid.innerText : kid.textContent);
+        }
+      }
+      return clip(out, MAX_PAGE_TEXT);
+    };
+    var buildSnapshot = function () {
+      var controls = [], groups = Object.create(null), list = fields();
+      for (var i = 0; i < list.length && controls.length < MAX_CONTROLS; i++) {
+        var el = list[i], type = controlType(el), name = controlName(el);
+        if (type === 'radio') {
+          var group = el.name ? 'n|' + el.name : 'p|' + name;
+          var entry = groups[group];
+          if (!entry) {
+            entry = groups[group] = { label: groupLabel(el), name: name, type: 'radio', value: '' };
+            controls.push(entry);
+          }
+          if (el.checked) entry.value = String(el.value).slice(0, MAX_VALUE);
+          continue;
+        }
+        var value;
+        if (type === 'checkbox') value = !!el.checked;
+        else if (type === 'select-multiple') value = selectedValues(el);
+        else value = String(el.value == null ? '' : el.value).slice(0, MAX_VALUE);
+        controls.push({ label: labelOf(el), name: name, type: type, value: value });
+      }
+      return { controls: controls, text: pageText() };
+    };
+    var bytesOf = function (text) {
+      return typeof TextEncoder === 'function' ? new TextEncoder().encode(text).length : text.length;
+    };
+    /* Over the save's cap the text goes first. */
+    var snapshotJson = function (snapshot) {
+      var text = JSON.stringify(snapshot);
+      if (bytesOf(text) > MAX_SNAPSHOT) { snapshot.text = ''; text = JSON.stringify(snapshot); }
+      return bytesOf(text) > MAX_SNAPSHOT ? null : text;
+    };
+    var sendSnapshot = function () {
+      try {
+        var text = snapshotJson(buildSnapshot());
+        if (text === null || text === lastSnapshot) return;
+        lastSnapshot = text;
+        post({ type: 'snapshot', snapshot: JSON.parse(text) });
+      } catch (inner) { /* never break the page */ }
+    };
+    var scheduleSnapshot = function () {
+      clearTimeout(snapshotTimer);
+      snapshotTimer = setTimeout(sendSnapshot, SNAPSHOT_WAIT);
+    };
+    var onField = function (ev) {
+      try {
+        if (applyingSnapshot || !tracked(ev.target)) return;
+        scheduleSnapshot();
+      } catch (inner) { /* never break the page */ }
+    };
+    window.addEventListener('input', onField, true);
+    window.addEventListener('change', onField, true);
+
+    var afterLoad = function (next) {
+      if (document.readyState === 'complete') { next(); return; }
+      var done = false;
+      var go = function () { if (!done) { done = true; next(); } };
+      window.addEventListener('load', go);
+    };
+    afterLoad(function () {
+      setTimeout(function () { if (!snapshotTaken) sendSnapshot(); }, FIRST_SEND_MS);
+    });
+
+    /* The app's snapshot, rebuilt from known fields; null when any part is off. */
+    var cleanSnapshot = function (raw) {
+      if (!raw || typeof raw !== 'object' || !Array.isArray(raw.controls)) return null;
+      if (raw.controls.length > MAX_CONTROLS) return null;
+      var out = [];
+      for (var i = 0; i < raw.controls.length; i++) {
+        var item = raw.controls[i];
+        if (!item || typeof item !== 'object' || typeof item.name !== 'string' || !item.name ||
+          item.name.length > MAX_NAME || typeof item.type !== 'string') return null;
+        var value = item.value;
+        if (Array.isArray(value)) {
+          if (value.length > MAX_OPTIONS) return null;
+          for (var v = 0; v < value.length; v++) if (typeof value[v] !== 'string') return null;
+        } else if (typeof value !== 'string' && typeof value !== 'boolean') {
+          return null;
+        }
+        out.push({ name: item.name, type: item.type, value: value });
+      }
+      return out;
+    };
+    var dispatchField = function (el, type) {
+      var ev;
+      if (typeof Event === 'function') ev = new Event(type, { bubbles: true });
+      else { ev = document.createEvent('Event'); ev.initEvent(type, true, false); }
+      el.dispatchEvent(ev);
+    };
+    /* Sets one saved control on the page; the elements it changed. */
+    var applyControl = function (saved, list) {
+      var changed = [];
+      for (var i = 0; i < list.length; i++) {
+        var el = list[i], type = controlType(el);
+        if (el.name !== saved.name && el.id !== saved.name && controlName(el) !== saved.name) continue;
+        if (type === 'radio') {
+          if (typeof saved.value !== 'string') continue;
+          var on = String(el.value) === saved.value;
+          if (!!el.checked !== on) { el.checked = on; if (on) changed.push(el); }
+        } else if (type === 'checkbox') {
+          if (typeof saved.value !== 'boolean' || !!el.checked === saved.value) continue;
+          el.checked = saved.value;
+          changed.push(el);
+        } else if (type === 'select-multiple') {
+          if (!Array.isArray(saved.value)) continue;
+          var options = el.options || [], moved = false;
+          for (var o = 0; o < options.length; o++) {
+            var pick = saved.value.indexOf(String(options[o].value)) >= 0;
+            if (!!options[o].selected !== pick) { options[o].selected = pick; moved = true; }
+          }
+          if (moved) changed.push(el);
+        } else {
+          if (typeof saved.value !== 'string' || String(el.value) === saved.value) continue;
+          el.value = saved.value;
+          changed.push(el);
+        }
+      }
+      return changed;
+    };
+    var restoreSnapshot = function (saved) {
+      afterLoad(function () {
+        try {
+          /* A page that takes its state restores itself from it. */
+          if (stateListeners && stateListeners.length > 0) return;
+          var list = fields(), changed = [];
+          for (var i = 0; i < saved.length; i++) changed = changed.concat(applyControl(saved[i], list));
+          applyingSnapshot = true;
+          try {
+            for (var c = 0; c < changed.length; c++) { dispatchField(changed[c], 'input'); dispatchField(changed[c], 'change'); }
+          } finally {
+            applyingSnapshot = false;
+          }
+          /* What the app just sent is what it has: not sent back. */
+          clearTimeout(snapshotTimer);
+          lastSnapshot = snapshotJson(buildSnapshot()) || '';
+        } catch (inner) { applyingSnapshot = false; }
+      });
+    };
+    window.addEventListener('message', function (ev) {
+      try {
+        var data = ev.data;
+        if (IS_TOP || !ev.isTrusted || ev.source !== PARENT || !data || typeof data !== 'object') return;
+        if (data.source !== PARENT_TAG || data.type !== 'snapshot') return;
+        var saved = cleanSnapshot(data.snapshot);
+        if (!saved) return;
+        snapshotTaken = true;
+        restoreSnapshot(saved);
+      } catch (inner) { /* never break the page */ }
+    });
+  } catch (e) { /* no snapshot: the page still runs */ }
 
   var nativeStorageWorks = true;
   try { void window.localStorage; } catch (e) { nativeStorageWorks = false; }

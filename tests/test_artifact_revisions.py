@@ -1980,3 +1980,36 @@ def test_without_state_saves_pruning_still_drops_the_oldest(inline_app, monkeypa
         captured.append(capture_agent_revision(folder, conversation_id="conversation-1")["id"])
 
     assert [r["id"] for r in list_revisions(folder)] == list(reversed(captured[-3:]))
+
+
+def test_snapshot_saves_never_push_out_the_page_revisions(inline_app, monkeypatch):
+    """ENG-4684: snapshot.json, saved on every slider move, prunes like
+    state.json: stale saves of either go first, and the newest of each stays."""
+    folder, metadata, artifact_id = inline_app
+    monkeypatch.setattr(revision_service, "MAX_REVISIONS", 5)
+    first_page = capture_agent_revision(folder, conversation_id="conversation-1")
+    (folder / "index.html").write_text("<ul><li>Ana</li></ul>", encoding="utf-8")
+    second_page = capture_agent_revision(folder, conversation_id="conversation-1")
+
+    state = save_source(
+        folder, metadata, artifact_id, content='{"s": 1}', expected_revision_id=None, rel_path="state.json",
+    )["revision"]["id"]
+    head = None
+    for n in range(8):
+        head = save_source(
+            folder, metadata, artifact_id, content=json.dumps({"controls": [], "text": str(n)}),
+            expected_revision_id=head, rel_path="snapshot.json",
+        )["revision"]["id"]
+
+    kept = {r["id"] for r in list_revisions(folder)}
+    assert len(kept) == 5
+    assert {first_page["id"], second_page["id"], state, head} <= kept
+    assert json.loads(current_source(folder, metadata, artifact_id, "snapshot.json")["content"])["text"] == "7"
+
+
+def test_the_turn_capture_never_takes_snapshot_json_for_the_page(inline_app):
+    folder, metadata, artifact_id = inline_app
+    save_source(folder, metadata, artifact_id, content="{}", expected_revision_id=None, rel_path="snapshot.json")
+    (folder / "index.html").write_text("<ul><li>Ana</li></ul>", encoding="utf-8")
+
+    assert capture_agent_revision(folder, conversation_id="conversation-1")["path"] == "index.html"

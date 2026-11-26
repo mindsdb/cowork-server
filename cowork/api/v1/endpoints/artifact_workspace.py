@@ -76,7 +76,7 @@ from cowork.services.artifact_export import (
 )
 from cowork.services.render_pdf_client import RenderPdfFailed
 from cowork.services.artifact_revisions import (
-    INLINE_STATE_FILE,
+    INLINE_PAGE_FILES,
     JOURNAL_DIRNAME,
     RepairAlreadyPending,
     RevisionConflict,
@@ -192,12 +192,12 @@ def _editable_source_selector(source, folder: Path, requested: str | None) -> st
                     current, parts[-1], native_case=True
                 )
             except FileNotFoundError:
-                # An inline html-app's state.json before its first save
-                # (ENG-4684): the service answers a read 404, lets a save
-                # create it, and refuses it for any other artifact type.
-                if parts != (INLINE_STATE_FILE,):
+                # An inline html-app's state.json or snapshot.json before its
+                # first save (ENG-4684): the service answers a read 404, lets
+                # a save create it, and refuses it for any other artifact type.
+                if len(parts) != 1 or parts[0] not in INLINE_PAGE_FILES:
                     raise
-                return INLINE_STATE_FILE
+                return parts[0]
             if not stat.S_ISREG(dir_lstat(current, disk_name).st_mode):
                 raise OSError("draft source is not a regular file")
             disk_parts.append(disk_name)
@@ -432,8 +432,8 @@ def _not_found_detail(exc: FileNotFoundError) -> str:
 
 class _SourceUpdateBody(BaseModel):
     content: str
-    # Null only for the save that creates an inline page's state.json
-    # (ENG-4684); for a file that exists it answers 409 like a stale token.
+    # Null only for the save that creates an inline page's state.json or
+    # snapshot.json (ENG-4684); for a file that exists it answers 409 like a stale token.
     expectedRevisionId: str | None = Field(min_length=1, max_length=80)
     path: str | None = Field(default=None, max_length=1000)
     summary: str = Field(default="Edited artifact", max_length=240)
@@ -838,7 +838,7 @@ async def update_artifact_source(
         )
         # An inline page's saved state is no part of its published page, so
         # saving it re-publishes nothing.
-        if saved["revision"]["id"] != body.expectedRevisionId and saved["path"] != INLINE_STATE_FILE:
+        if saved["revision"]["id"] != body.expectedRevisionId and saved["path"] not in INLINE_PAGE_FILES:
             await _sync_live_artifact(scope, folder, project_id=source.project_id)
         return saved
     except RevisionConflict as exc:
@@ -2020,7 +2020,7 @@ async def restore_artifact_revision(
             ),
             scope=scope,
         )
-        if saved["revision"]["id"] != body.expectedRevisionId and saved["path"] != INLINE_STATE_FILE:
+        if saved["revision"]["id"] != body.expectedRevisionId and saved["path"] not in INLINE_PAGE_FILES:
             await _sync_live_artifact(scope, folder, project_id=source.project_id)
         return saved
     except RevisionConflict as exc:

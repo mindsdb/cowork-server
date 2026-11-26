@@ -56,7 +56,7 @@ from anton.core.artifacts.internal_files import (
     is_bytecode_name,
 )
 from anton.core.artifacts.store import iter_content_files
-from cowork.services.artifact_revisions import INLINE_STATE_FILE
+from cowork.services.artifact_revisions import INLINE_PAGE_FILES
 
 if TYPE_CHECKING:
     from cowork.db.scoped import ScopedSession, TenantScope
@@ -359,13 +359,14 @@ def _user_files_with_mtimes(folder: Path) -> list[tuple[Path, int]]:
 def _content_clock_ns(folder: Path) -> int:
     """Newest mtime (ns) across the files that make up the artifact's page.
 
-    An inline html-app's top-level `state.json` is left out: it is the
-    viewer's picks (ENG-4684), saved on every change. Counting it would bump
+    An inline html-app's top-level `state.json` and `snapshot.json`
+    (INLINE_PAGE_FILES) are left out: they are the viewer's picks (ENG-4684),
+    saved on every change. Counting it would bump
     the card's cache-bust token on each save, so every open frame of the
     artifact reloads, saves its state again and reloads again.
     """
-    state = folder / INLINE_STATE_FILE
-    return max((ns for path, ns in _user_files_with_mtimes(folder) if path != state), default=0)
+    own = {folder / name for name in INLINE_PAGE_FILES}
+    return max((ns for path, ns in _user_files_with_mtimes(folder) if path not in own), default=0)
 
 
 def _user_files(folder: Path) -> list[Path]:
@@ -410,9 +411,9 @@ def _pick_primary(
     html = next((f for f in files if f.suffix.lower() == ".html"), None)
     if html is not None:
         return html
-    # An inline page's saved state (artifact_revisions.INLINE_STATE_FILE) is
-    # its data, not what opens, unless it is all the folder holds.
-    return next((f for f in files if f.name != "state.json"), files[0])
+    # An inline page's own files (artifact_revisions.INLINE_PAGE_FILES) are
+    # its data, not what opens, unless they are all the folder holds.
+    return next((f for f in files if f.name not in INLINE_PAGE_FILES), files[0])
 
 
 def _load_published_map(folder: Path) -> dict:
