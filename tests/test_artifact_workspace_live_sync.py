@@ -12,7 +12,7 @@ from cowork.api.v1.endpoints import artifact_workspace as workspace
 from cowork.db.scoped import LOCAL_SCOPE, TenantScope
 from cowork.services import artifact_locks
 from cowork.services.artifact_metadata import ArtifactMetadata
-from cowork.services.artifact_revisions import current_source
+from cowork.services.artifact_revisions import INLINE_PAGE_FILES, current_source
 from cowork.services.artifacts import ProjectArtifacts
 from _async_stub import awaitable
 
@@ -785,3 +785,28 @@ def test_with_no_html_page_snapshot_json_is_still_not_the_primary(tmp_path):
     (tmp_path / "snapshot.json").write_text("{}", encoding="utf-8")
 
     assert _pick_primary(tmp_path, _user_files(tmp_path)).name == "page.htm"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("path", sorted(INLINE_PAGE_FILES))
+async def test_only_the_owner_may_save_an_inline_pages_state_or_snapshot(artifact, monkeypatch, path):
+    """A reviewer the owner granted the draft to, or anyone in the org who can
+    see it, is refused before anything is written: the inline files go through
+    the same owner gate as every other source write."""
+    folder, metadata = artifact
+
+    def not_the_owner(*_args):
+        raise workspace.HTTPException(status_code=403, detail="Only the artifact owner can change this draft")
+
+    monkeypatch.setattr(
+        workspace,
+        "review_artifact_for_request",
+        awaitable(lambda *_args: (_source_for(folder), folder, metadata, False)),
+    )
+    monkeypatch.setattr(workspace, "require_artifact_owner", not_the_owner)
+    monkeypatch.setattr(workspace, "run_db", awaitable(lambda fn, **_kw: fn(_Session())))
+
+    with pytest.raises(workspace.HTTPException) as refused:
+        await _save_state(folder, metadata, "{}", None, path=path)
+    assert refused.value.status_code == 403
+    assert not (folder / path).exists()
