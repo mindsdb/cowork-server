@@ -40,9 +40,17 @@ logger = logging.getLogger(__name__)
 router = APIRouter()
 
 
-_ZDR_MESSAGE = "Voice calls aren't available while zero data retention is on."
-# When ZDR couldn't be read: voice stays off, but nothing says ZDR is on.
-_ZDR_UNKNOWN_MESSAGE = "Voice calls are unavailable right now. Try again shortly."
+# Per mode: (ZDR on, ZDR unreadable). The unreadable one keeps voice off without saying ZDR is on.
+_ZDR_MESSAGES = {
+    "call": (
+        "Voice calls aren't available while zero data retention is on.",
+        "Voice calls are unavailable right now. Try again shortly.",
+    ),
+    "dictation": (
+        "Dictation isn't available while zero data retention is on.",
+        "Dictation is unavailable right now. Try again shortly.",
+    ),
+}
 
 
 async def _zdr_state(request: Request, scope: TenantScope) -> ZdrState:
@@ -56,8 +64,9 @@ async def _zdr_state(request: Request, scope: TenantScope) -> ZdrState:
         return ZdrState.UNKNOWN
 
 
-def _refuse_under_zdr(state: ZdrState) -> HTTPException:
-    message = _ZDR_MESSAGE if state is ZdrState.ON else _ZDR_UNKNOWN_MESSAGE
+def _refuse_under_zdr(state: ZdrState, mode: Literal["call", "dictation"] = "call") -> HTTPException:
+    on_message, unknown_message = _ZDR_MESSAGES[mode]
+    message = on_message if state is ZdrState.ON else unknown_message
     return HTTPException(status_code=403, detail={"code": "zdr_restricted", "message": message})
 
 
@@ -101,7 +110,7 @@ async def voice_session(
     body: VoiceSessionRequest, request: Request, scope: TenantScope = Depends(get_tenant_scope)
 ) -> dict:
     if (zdr := await _zdr_state(request, scope)) is not ZdrState.OFF:
-        raise _refuse_under_zdr(zdr)
+        raise _refuse_under_zdr(zdr, body.mode)
     context = ""
     if body.mode == "call":
         # Memory lives on the shared file store: read it in run_efs's slots and the

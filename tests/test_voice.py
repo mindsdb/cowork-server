@@ -270,6 +270,22 @@ async def test_only_a_known_zdr_names_zdr_in_the_refusal(inference, zdr, on, say
     assert inference.seen == []
 
 
+@pytest.mark.parametrize(("on", "message"), [
+    (True, "Dictation isn't available while zero data retention is on."),
+    ("unknown", "Dictation is unavailable right now. Try again shortly."),
+    (RuntimeError("auth down"), "Dictation is unavailable right now. Try again shortly."),
+])
+async def test_under_zdr_dictation_is_refused_in_its_own_words(inference, zdr, on, message):
+    # Dictation's audio goes to the same non-ZDR voice model as a call.
+    from cowork.services.mindshub_zdr import ZdrState
+
+    zdr.on = ZdrState.UNKNOWN if on == "unknown" else on
+    response = await _call("POST", "/session", json={"sdp": "v=0", "mode": "dictation"})
+    assert response.status_code == 403
+    assert response.json()["detail"] == {"code": "zdr_restricted", "message": message}
+    assert inference.seen == []
+
+
 async def test_dictation_only_listens_and_reads_no_memory(inference, monkeypatch):
     """ENG-4630: the composer's mic starts a session that only transcribes."""
     import cowork.api.v1.endpoints.voice as endpoint
