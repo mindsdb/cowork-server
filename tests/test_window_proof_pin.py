@@ -582,9 +582,10 @@ WRITES_WITHOUT_THE_PROOF: dict[tuple[str, tuple[str, ...]], str] = {
     ("/api/v1/pins/", ("POST",)): CHANGES_THE_PERSONS_OWN_WORK,
     ("/api/v1/pins/{item_id}/visit", ("POST",)): CHANGES_THE_PERSONS_OWN_WORK,
     ("/api/v1/pins/{item_id}", ("DELETE",)): CHANGES_THE_PERSONS_OWN_WORK,
-    # Docs. A new doc isn't shared, so nothing publishes it. An image is named
-    # by its hash, never replaces a file, and shows in the doc only once an
-    # edit, which asks for the proof, puts it there.
+    # Docs. A new doc gets a fresh folder and isn't shared, so on the desktop
+    # its republish sends nothing. An image is named by its hash and never
+    # replaces a file; it shows in the doc only once an edit, which asks for
+    # the proof, puts it there.
     ("/api/v1/docs/", ("POST",)): CHANGES_THE_PERSONS_OWN_WORK,
     ("/api/v1/docs/{project_ref}/{artifact_id}/images", ("POST",)): CHANGES_THE_PERSONS_OWN_WORK,
     # Projects and their files. Upload writes only top-level names that don't
