@@ -86,13 +86,14 @@ def anton_access(monkeypatch):
 )
 def test_the_desktop_publish_route_hands_anton_each_mode(artifact, anton_access, monkeypatch, asked, handed):
     monkeypatch.setattr(
-        routes, "_desktop_context", lambda raw, *, scope: (artifact, artifact.parent, "desktop-key", PUBLISH_URL)
+        routes, "_desktop_context", lambda raw, *, scope, adopted=(): (artifact, artifact.parent, "desktop-key", PUBLISH_URL)
     )
 
     routes.publish_artifact(
         routes._PublishBody(path=str(artifact), access=asked),
         request=Request({"type": "http", "headers": []}),
         scope=LOCAL_SCOPE,
+        adopted=(),
     )
 
     assert anton_access == [handed]
@@ -102,13 +103,14 @@ def test_the_desktop_publish_route_without_access_hands_anton_none(artifact, ant
     """A bare top-level password publishes password-protected: anton reads
     it beside an access of None."""
     monkeypatch.setattr(
-        routes, "_desktop_context", lambda raw, *, scope: (artifact, artifact.parent, "desktop-key", PUBLISH_URL)
+        routes, "_desktop_context", lambda raw, *, scope, adopted=(): (artifact, artifact.parent, "desktop-key", PUBLISH_URL)
     )
 
     routes.publish_artifact(
         routes._PublishBody(path=str(artifact), password="pw"),
         request=Request({"type": "http", "headers": []}),
         scope=LOCAL_SCOPE,
+        adopted=(),
     )
 
     assert anton_access == [None]
@@ -149,7 +151,7 @@ def test_the_agents_publish_tool_hands_anton_each_mode(artifact, anton_access, m
     the service's default (owner-only)."""
     monkeypatch.setattr(
         publish, "desktop_publish_context",
-        lambda raw, *, scope: (artifact, artifact.parent, "desktop-key", PUBLISH_URL),
+        lambda raw, *, scope, adopted=(): (artifact, artifact.parent, "desktop-key", PUBLISH_URL),
     )
     session = mock.Mock()
     session._workspace.base = str(artifact.parent)

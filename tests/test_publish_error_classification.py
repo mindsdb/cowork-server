@@ -43,7 +43,7 @@ def _patch_context():
     exception-mapping tests below must get past that step to reach `_publish`."""
     return patch.object(
         publish_ep, "_desktop_context",
-        lambda raw, *, scope: (Path(raw), Path(raw).parent, "key", "https://4nton.ai"),
+        lambda raw, *, scope, adopted=(): (Path(raw), Path(raw).parent, "key", "https://4nton.ai"),
     )
 
 
@@ -117,7 +117,7 @@ def _wire_publish(monkeypatch, tmp_path, target: Path, key: str, *, publish_side
         ),
     )
     monkeypatch.setattr(
-        publish, "resolve_artifact_path", lambda raw, *, scope, allow_dir=True: target
+        publish, "resolve_artifact_path", lambda raw, *, scope, allow_dir=True, adopted=(): target
     )
     monkeypatch.setattr(
         publish, "_resolve_publish_target",

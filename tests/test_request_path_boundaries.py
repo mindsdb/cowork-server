@@ -181,10 +181,10 @@ async def test_status_path_only_selects_a_server_built_card(tmp_path, monkeypatc
     )
     monkeypatch.setattr(artifacts, "artifacts_sources_for_scan", lambda *, scope: [source])
 
-    result = artifacts.artifact_status(scope=LOCAL_SCOPE, path=str(primary))
-    outside = artifacts.artifact_status(scope=LOCAL_SCOPE, path=str(tmp_path / "outside"))
+    result = artifacts.artifact_status(scope=LOCAL_SCOPE, adopted=(), path=str(primary))
+    outside = artifacts.artifact_status(scope=LOCAL_SCOPE, adopted=(), path=str(tmp_path / "outside"))
     missing_child = artifacts.artifact_status(
-        scope=LOCAL_SCOPE, path=str(folder / "does-not-exist")
+        scope=LOCAL_SCOPE, adopted=(), path=str(folder / "does-not-exist")
     )
 
     assert result.published_url == "https://example.test/artifact"
@@ -223,7 +223,7 @@ async def test_status_lookup_preserves_published_loose_files(tmp_path, monkeypat
     )
     monkeypatch.setattr(artifacts, "artifacts_sources_for_scan", lambda *, scope: [source])
 
-    result = artifacts.artifact_status(scope=LOCAL_SCOPE, path=str(loose)).model_dump(
+    result = artifacts.artifact_status(scope=LOCAL_SCOPE, adopted=(), path=str(loose)).model_dump(
         by_alias=True, mode="json"
     )
 

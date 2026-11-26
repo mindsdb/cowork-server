@@ -38,7 +38,7 @@ def client(monkeypatch, tmp_path):
     app = FastAPI()
     app.include_router(publish_ep.router, prefix="/api/v1/publish")
     context = (tmp_path, tmp_path, "k", "https://api.mindshub.ai")
-    monkeypatch.setattr(publish_ep, "_desktop_context", lambda raw, *, scope: context)
+    monkeypatch.setattr(publish_ep, "_desktop_context", lambda raw, *, scope, adopted=(): context)
     return TestClient(app)
 
 
@@ -130,14 +130,14 @@ def real_app(monkeypatch, tmp_path: Path):
     (folder / "requirements.txt").write_text("fastapi\n")
     monkeypatch.setattr(publish, "vault_for_scope", lambda scope: _Vault())
     monkeypatch.setattr(
-        publish, "desktop_artifact_and_base", lambda raw, *, scope: publish.DesktopArtifact(folder, base)
+        publish, "desktop_artifact_and_base", lambda raw, *, scope, adopted=(): publish.DesktopArtifact(folder, base)
     )
     upload = mock.Mock(return_value={"view_url": "https://view.example/r/1", "report_id": "rid-1", "md5": "d"})
     monkeypatch.setattr("anton.publisher.publish", upload)
     app = FastAPI()
     app.include_router(publish_ep.router, prefix="/api/v1/publish")
     context = (folder, base, "k", "https://api.mindshub.ai")
-    monkeypatch.setattr(publish_ep, "_desktop_context", lambda raw, *, scope: context)
+    monkeypatch.setattr(publish_ep, "_desktop_context", lambda raw, *, scope, adopted=(): context)
     return SimpleNamespace(client=TestClient(app), path=str(folder), upload=upload)
 
 

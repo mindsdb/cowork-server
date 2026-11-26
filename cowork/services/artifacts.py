@@ -23,7 +23,7 @@ import subprocess
 import sys
 import time
 import uuid
-from collections.abc import Iterable
+from collections.abc import Collection, Iterable
 from contextlib import ExitStack
 from dataclasses import dataclass, field
 from functools import partial
@@ -61,6 +61,7 @@ from anton.core.artifacts.store import iter_content_files
 
 if TYPE_CHECKING:
     from cowork.db.scoped import ScopedSession, TenantScope
+    from cowork.services.artifact_roots import ProjectRow
 
 logger = logging.getLogger(__name__)
 
@@ -320,6 +321,33 @@ def _scan_artifact_dirs(*, scope: TenantScope | None) -> list[Path]:
         if candidate is not None:
             dirs[str(candidate.resolve())] = candidate
     return list(dirs.values())
+
+
+def _artifact_dirs_for(*, scope: TenantScope | None, adopted: Collection[ProjectRow] = ()) -> list[Path]:
+    """The scan's `.anton/artifacts` dirs plus those of `adopted`, the
+    caller's projects in a folder the user chose, which the scan cannot see.
+    With no rows this is the scan."""
+    # Imported here because `artifact_roots` imports this module at module level.
+    from cowork.services.artifact_roots import adopted_artifacts_sources
+
+    dirs = {str(d.resolve()): d for d in _scan_artifact_dirs(scope=scope)}
+    for source in adopted_artifacts_sources(adopted):
+        base = Path(source.base)
+        dirs.setdefault(str(base.resolve()), base)
+    return list(dirs.values())
+
+
+def _adopted_source_holding(path: Path, adopted: Collection[ProjectRow]) -> ProjectArtifacts | None:
+    """The source in `adopted` whose artifacts root holds `path`, for a serve
+    URL: its segment is the row's name, which the scan cannot rediscover."""
+    # Imported here because `artifact_roots` imports this module at module level.
+    from cowork.services.artifact_roots import adopted_artifacts_sources
+
+    resolved = path.resolve()
+    for source in adopted_artifacts_sources(adopted):
+        if resolved.is_relative_to(Path(source.base).resolve()):
+            return source
+    return None
 
 
 def _load_metadata(folder: Path) -> ArtifactMetadata | None:
@@ -950,7 +978,11 @@ def _candidate_relative_artifacts(raw_path: str, artifact_dirs: list[Path]) -> l
 
 
 def resolve_artifact_path(
-    raw_path: str, *, scope: TenantScope | None, allow_dir: bool = False
+    raw_path: str,
+    *,
+    scope: TenantScope | None,
+    allow_dir: bool = False,
+    adopted: Collection[ProjectRow] = (),
 ) -> Path | None:
     """Turn an artifact request path into an absolute path on disk.
 
@@ -966,6 +998,9 @@ def resolve_artifact_path(
     by publish/unpublish so a folder-based artifact can be addressed by its
     folder. The relative-path branch stays file-only (the client always
     sends absolute folder paths).
+
+    `adopted` adds the caller's projects in a folder the user chose
+    (`_artifact_dirs_for`).
     """
     if "\x00" in raw_path:
         raise ValueError("Invalid artifact path")
@@ -976,9 +1011,10 @@ def resolve_artifact_path(
     if not str(target).strip():
         raise ValueError("Invalid artifact path")
 
+    artifact_dirs = _artifact_dirs_for(scope=scope, adopted=adopted)
     if target.is_absolute():
         resolved = target.resolve()
-        for art_root in _scan_artifact_dirs(scope=scope):
+        for art_root in artifact_dirs:
             try:
                 resolved.relative_to(art_root.resolve())
             except ValueError:
@@ -989,7 +1025,7 @@ def resolve_artifact_path(
                 return resolved
         raise FileNotFoundError("Artifact is not in a known artifacts directory")
 
-    matches = _candidate_relative_artifacts(raw_path, _scan_artifact_dirs(scope=scope))
+    matches = _candidate_relative_artifacts(raw_path, artifact_dirs)
     if len(matches) == 1:
         return matches[0]
     if len(matches) > 1:
@@ -997,7 +1033,9 @@ def resolve_artifact_path(
     raise FileNotFoundError("Artifact is not in a known artifacts directory")
 
 
-def _artifact_root_for(path: Path, *, scope: TenantScope | None) -> Path:
+def _artifact_root_for(
+    path: Path, *, scope: TenantScope | None, adopted: Collection[ProjectRow] = ()
+) -> Path:
     """Climb from an artifact file to the folder that holds its
     `metadata.json` — the artifact root.
 
@@ -1011,7 +1049,7 @@ def _artifact_root_for(path: Path, *, scope: TenantScope | None) -> Path:
     (`<base>/.anton/artifacts/`) so a metadata-less tree can't send us
     climbing into the rest of the disk. Falls back to `path.parent`.
     """
-    containers = {str(d.resolve()) for d in _scan_artifact_dirs(scope=scope)}
+    containers = {str(d.resolve()) for d in _artifact_dirs_for(scope=scope, adopted=adopted)}
     current = path.parent.resolve()
     while True:
         if (current / "metadata.json").is_file():
@@ -2152,12 +2190,15 @@ def preview_artifact(path: Path) -> dict:
     return preview
 
 
-async def mount_preview(path: Path, *, scope: TenantScope | None) -> dict:
+async def mount_preview(
+    path: Path, *, scope: TenantScope | None, adopted: Collection[ProjectRow] = ()
+) -> dict:
     """Register an artifact for iframe preview.
 
     ``path`` is already resolved inside ``scope``'s artifacts roots; ``scope``
     bounds the climb to its artifact root and keys a live backend's
-    connections and launch.
+    connections and launch. `adopted` adds the caller's projects in a folder
+    the user chose to both.
 
     Two payload shapes share a `kind` discriminator:
       - `kind: "static"` (HTML asset bundles) — token + relUrl that
@@ -2171,7 +2212,7 @@ async def mount_preview(path: Path, *, scope: TenantScope | None) -> dict:
     # primary file's parent — fullstack apps keep their frontend in a
     # `static/` subdir. Resolve it explicitly for all backend lookups so
     # we read the `port` from the root, not from `static/`.
-    root = _artifact_root_for(path, scope=scope)
+    root = _artifact_root_for(path, scope=scope, adopted=adopted)
 
     # Backend+frontend artifacts: detect them by a `port` field in the
     # root's metadata.json. The iframe will load through our proxy
@@ -2212,7 +2253,7 @@ async def mount_preview(path: Path, *, scope: TenantScope | None) -> dict:
         # reach us.
         root_token = hashlib.sha256(str(root).encode("utf-8")).hexdigest()[:16]
         _PREVIEW_MOUNTS[root_token] = root
-        backend = await _ensure_backend_running(root, backend_port, scope=scope)
+        backend = await _ensure_backend_running(root, backend_port, scope=scope, adopted=adopted)
         return {
             "kind": "proxy",
             "token": root_token,
@@ -2233,13 +2274,19 @@ async def mount_preview(path: Path, *, scope: TenantScope | None) -> dict:
         raise ValueError("Preview mount is only available for HTML artifacts")
     token = hashlib.sha256(str(parent).encode("utf-8")).hexdigest()[:16]
     _PREVIEW_MOUNTS[token] = parent
+    adopted_source = _adopted_source_holding(path, adopted)
 
     return {
         "kind": "static",
         "token": token,
         "entry": path.name,
         "relUrl": f"/artifacts/preview-asset/{token}/{path.name}",
-        "serveUrl": serve_url_for(path, scope=scope),
+        "serveUrl": serve_url_for(
+            path,
+            scope=scope,
+            artifacts_base=Path(adopted_source.base) if adopted_source else None,
+            project_name=adopted_source.project_name if adopted_source else None,
+        ),
         # Route through _published_url_for so a soft-deleted (published=False)
         # record reports an empty URL — matching the artifact grid and the
         # fullstack branch, instead of surfacing a dead 4nton.ai link.
@@ -2248,7 +2295,9 @@ async def mount_preview(path: Path, *, scope: TenantScope | None) -> dict:
     }
 
 
-def preview_mount_for(token: str, *, scope: TenantScope | None) -> Path | None:
+def preview_mount_for(
+    token: str, *, scope: TenantScope | None, adopted: Collection[ProjectRow] = ()
+) -> Path | None:
     """The directory ``token`` mounts, only when it lies inside one of
     ``scope``'s artifacts roots; None otherwise, the same answer as an unknown
     token.
@@ -2270,7 +2319,7 @@ def preview_mount_for(token: str, *, scope: TenantScope | None) -> Path | None:
         resolved = mounted.resolve(strict=False)
     except OSError:
         return None
-    for container in _scan_artifact_dirs(scope=scope):
+    for container in _artifact_dirs_for(scope=scope, adopted=adopted):
         try:
             resolved.relative_to(container.resolve())
         except (ValueError, OSError):
@@ -2361,7 +2410,7 @@ def _publishable_in_folder(
     return [_PublishableCandidate(mtime_ns, entry_path, st.st_size, folder, title)]
 
 
-def html_artifacts(*, scope: TenantScope | None) -> list[dict]:
+def html_artifacts(*, scope: TenantScope | None, adopted: Collection[ProjectRow] = ()) -> list[dict]:
     """List the most recently changed publishable files (HTML + Markdown)
     across the artifacts tree of every project of ``scope``.
 
@@ -2373,7 +2422,7 @@ def html_artifacts(*, scope: TenantScope | None) -> list[dict]:
     """
     fullstack_types = _fullstack_types()
     candidates: list[_PublishableCandidate] = []
-    for container in _scan_artifact_dirs(scope=scope):
+    for container in _artifact_dirs_for(scope=scope, adopted=adopted):
         try:
             with os.scandir(container) as it:
                 entries = list(it)
@@ -2504,20 +2553,33 @@ def _backends_cross_people() -> bool:
     )
 
 
-def _resolve_project_root(artifact_dir: Path, *, scope: TenantScope | None) -> Path | None:
+def _resolve_project_root(
+    artifact_dir: Path, *, scope: TenantScope | None, adopted: Collection[ProjectRow] = ()
+) -> Path | None:
     """The registered project root of ``scope`` that owns this artifact dir.
 
     `artifact_dir` is the parent of the primary file (e.g.
     `<project>/.anton/artifacts/<slug>/`). We walk back to the registered
     project root by checking ancestors against `_registered_project_dirs`.
     Returns None when the dir isn't under any of the scope's projects — in
-    which case auto-launch is a non-starter anyway.
+    which case auto-launch is a non-starter anyway. `adopted` adds the
+    caller's projects in a folder the user chose.
     """
+    # Imported here because `artifact_roots` imports this module at module level.
+    from cowork.services.artifact_roots import adopted_artifacts_sources
+
     try:
         artifact_resolved = artifact_dir.resolve()
     except OSError:
         return None
     registered = _registered_project_dirs(scope=scope)
+    # Resolved like the scan's entries, or a /var temp folder on macOS never
+    # matches its /private/var ancestor.
+    registered += [
+        Path(source.trusted_anchor).resolve()
+        for source in adopted_artifacts_sources(adopted)
+        if source.trusted_anchor is not None
+    ]
     for parent in (artifact_resolved, *artifact_resolved.parents):
         if parent in registered:
             # The registered entry, equal to the ancestor: the caller hands it
@@ -2528,7 +2590,11 @@ def _resolve_project_root(artifact_dir: Path, *, scope: TenantScope | None) -> P
 
 
 async def _ensure_backend_running(
-    artifact_dir: Path, port: int, *, scope: TenantScope | None
+    artifact_dir: Path,
+    port: int,
+    *,
+    scope: TenantScope | None,
+    adopted: Collection[ProjectRow] = (),
 ) -> BackendStatus:
     """Bring up the artifact's backend if it isn't already listening.
 
@@ -2549,7 +2615,7 @@ async def _ensure_backend_running(
     slug = artifact_dir.name
     # The project root first, so nothing about the port is reported for an
     # artifact outside the caller's own projects.
-    project_root = _resolve_project_root(artifact_dir, scope=scope)
+    project_root = _resolve_project_root(artifact_dir, scope=scope, adopted=adopted)
     if project_root is None:
         return BackendStatus(running=False, detail="Artifact is not in a registered project.", port=0)
     if _backend_answers(project_root=project_root, slug=slug, port=port, scope=scope):

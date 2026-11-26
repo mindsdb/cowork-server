@@ -43,10 +43,11 @@ from cowork.api.v1.artifact_preview import (
     wants_html_preview,
 )
 from cowork.api.v1.artifact_scope import (
-    review_artifact_and_read, scoped_project_id_for_request,
+    AdoptedRowsDep, review_artifact_and_read, scoped_project_id_for_request,
 )
 from cowork.db.units import FilesystemBusy, run_db, run_efs, run_on_unit_threads
 from cowork.common.logger import log_context
+from cowork.common.settings.app_settings import get_app_settings
 from cowork.common.paths import dir_scandir, dir_stat, open_pinned_child
 from cowork.api.v1.endpoints.live_apps import LiveAppRoute
 from cowork.schemas.artifact_access import ArtifactStatusView
@@ -61,7 +62,10 @@ from cowork.schemas.live_apps import (
 from cowork.services.artifact_identity import canonical_artifact_id
 from cowork.services.artifact_locations import Location, forget_location
 from cowork.services.artifact_roots import (
+    ProjectRow,
     RootsPlan,
+    adopted_artifacts_sources,
+    adopted_rows_for,
     artifacts_sources_for_scan,
     held_root_of,
     plan_project_roots,
@@ -586,17 +590,19 @@ class _DesktopSourceCatalogEntry:
 
 
 def _desktop_registered_path_catalog(
-    *, scope: TenantScope | None
+    *, scope: TenantScope | None, adopted: tuple[ProjectRow, ...] = ()
 ) -> tuple[_DesktopSourceCatalogEntry, ...]:
-    """Build the complete legacy source catalog of ``scope``'s projects
-    without an HTTP selector."""
+    """Build the complete legacy source catalog of ``scope``'s projects, and
+    of `adopted`, its projects in a folder the user chose, without an HTTP
+    selector. `project_name` stays the folder's basename: it is the key the
+    request's own basename is compared with, not the name cards show."""
     return tuple(
         _DesktopSourceCatalogEntry(
             path_key=path_key,
             project_name=os.path.basename(str(Path(source.base).parent.parent)),
             source=source,
         )
-        for source in artifacts_sources_for_scan(scope=scope)
+        for source in artifacts_sources_for_scan(scope=scope) + adopted_artifacts_sources(adopted)
         for path_key in sorted(_desktop_source_path_keys(source))
     )
 
@@ -764,8 +770,11 @@ def _pinned_loose_match(
     return None
 
 
-def _desktop_artifact_status_for_path(path: str, *, scope: TenantScope | None) -> ArtifactStatusView:
-    """Match a legacy path only against entries scanned from ``scope``'s roots.
+def _desktop_artifact_status_for_path(
+    path: str, *, scope: TenantScope | None, adopted: tuple[ProjectRow, ...] = ()
+) -> ArtifactStatusView:
+    """Match a legacy path only against entries scanned from ``scope``'s roots
+    and the roots of `adopted`, the caller's projects in a folder they chose.
 
     The request is reduced to a string lookup key. Every card and folder key is
     built first from server-discovered ``ProjectArtifacts`` roots, so no
@@ -788,7 +797,7 @@ def _desktop_artifact_status_for_path(path: str, *, scope: TenantScope | None) -
     )
     from cowork.services.artifacts import card_for_folder
 
-    for source in artifacts_sources_for_scan(scope=scope):
+    for source in artifacts_sources_for_scan(scope=scope) + adopted_artifacts_sources(adopted):
         source_base = Path(source.base)
         try:
             with opened_artifact_root(source) as root:
@@ -926,8 +935,9 @@ async def list_artifacts(
         # Local requests that carry both parameters have always preferred the
         # UUID. Do not let the ignored compatibility field enter resolution.
         if project_id is None:
+            adopted = await adopted_rows_for(scope)
             catalog = await run_efs(
-                partial(_desktop_registered_path_catalog, scope=scope), scope=scope
+                partial(_desktop_registered_path_catalog, scope=scope, adopted=adopted), scope=scope
             )
             if not project_path or "\x00" in project_path:
                 return []
@@ -1229,20 +1239,20 @@ def _forget_deleted_folder(session, *, artifact_id: str, location: Location) -> 
     dependencies=[Depends(require(DesktopOnly))],
 )
 def artifact_status(
-    scope: ScopeDep, path: str = Query(..., min_length=1, max_length=4096)
+    scope: ScopeDep, adopted: AdoptedRowsDep, path: str = Query(..., min_length=1, max_length=4096)
 ) -> ArtifactStatusView:
     # Cheap published/modified/access read for the preview viewer's in-place
     # refresh. Never raises for an unknown path — returns the blank default.
     # Plain `def`: an edited Markdown artifact's modified check renders its
     # page in the conversion process, so it runs in FastAPI's threadpool.
-    status = _desktop_artifact_status_for_path(path, scope=scope)
+    status = _desktop_artifact_status_for_path(path, scope=scope, adopted=adopted)
     if status.published_url:
         from cowork.services.publish import published_link_owner_recorded
 
         # Resolved as Stop sharing and Update resolve the path, so False is
         # what they will do: Update shares a new link and Stop sharing leaves
         # this one live.
-        status.link_owner_recorded = published_link_owner_recorded(path, scope=scope)
+        status.link_owner_recorded = published_link_owner_recorded(path, scope=scope, adopted=adopted)
     # Never the plaintext password either: ArtifactStatusView has no field
     # for it.
     return status
@@ -1256,9 +1266,9 @@ def _refuse_a_second_name(artifact: Path) -> None:
 
 
 @router.get("/preview", dependencies=[Depends(require(DesktopOnly))])
-async def preview_artifact(scope: ScopeDep, path: str = Query(...)):
+async def preview_artifact(scope: ScopeDep, adopted: AdoptedRowsDep, path: str = Query(...)):
     try:
-        artifact = resolve_artifact_path(path, scope=scope)
+        artifact = resolve_artifact_path(path, scope=scope, adopted=adopted)
     except FileNotFoundError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
     except ValueError as e:
@@ -1274,16 +1284,18 @@ async def preview_artifact(scope: ScopeDep, path: str = Query(...)):
 
 
 @router.post("/preview-mount", dependencies=[Depends(require(DesktopOnly))])
-async def preview_mount_endpoint(req: _PathBody, request: Request, scope: ScopeDep):
+async def preview_mount_endpoint(
+    req: _PathBody, request: Request, scope: ScopeDep, adopted: AdoptedRowsDep
+):
     try:
-        artifact = resolve_artifact_path(req.path, scope=scope)
+        artifact = resolve_artifact_path(req.path, scope=scope, adopted=adopted)
     except FileNotFoundError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
     _refuse_a_second_name(artifact)
     try:
-        payload = await mount_preview(artifact, scope=scope)
+        payload = await mount_preview(artifact, scope=scope, adopted=adopted)
     except BackendPreviewRefused as e:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
     except ValueError as e:
@@ -1304,7 +1316,11 @@ async def preview_mount_endpoint(req: _PathBody, request: Request, scope: ScopeD
 
 @router.get("/preview-asset/{token}/{rel_path:path}", dependencies=[Depends(require(DesktopOnly))])
 async def preview_asset(token: str, rel_path: str, request: Request, scope: ScopeDep):
-    parent = preview_mount_for(token, scope=scope)
+    # Rows only where preview_mount_for checks containment at all, so a
+    # desktop preview's many asset requests add no database unit each.
+    trusted = get_app_settings().trust_identity_headers
+    adopted = await adopted_rows_for(scope) if trusted else ()
+    parent = preview_mount_for(token, scope=scope, adopted=adopted)
     if parent is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Preview mount has expired or is unknown")
     try:
@@ -1363,7 +1379,7 @@ def serve_artifact_file(
 
 
 @router.post("/open", dependencies=[Depends(require(DesktopOnly))])
-async def open_artifact(req: _PathBody, scope: ScopeDep):
+async def open_artifact(req: _PathBody, scope: ScopeDep, adopted: AdoptedRowsDep):
     from cowork.services.artifacts import _org_mode, _NO_EXEC_DETAIL
     # In org mode this always refuses; see _org_mode's docstring in services/artifacts.py.
     # A person's partition refuses too: the server is not that person's
@@ -1372,7 +1388,7 @@ async def open_artifact(req: _PathBody, scope: ScopeDep):
     if _org_mode() or scope.personal:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=_NO_EXEC_DETAIL)
     try:
-        artifact = resolve_artifact_path(req.path, scope=scope)
+        artifact = resolve_artifact_path(req.path, scope=scope, adopted=adopted)
     except FileNotFoundError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
     except ValueError as e:
@@ -1384,9 +1400,11 @@ async def open_artifact(req: _PathBody, scope: ScopeDep):
     return {"status": "ok", "path": str(artifact)}
 
 
-def _resolve_reveal_path(path: str, session: ScopedSession) -> Path:
+def _resolve_reveal_path(
+    path: str, session: ScopedSession, adopted: tuple[ProjectRow, ...] = ()
+) -> Path:
     try:
-        return resolve_artifact_path(path, scope=session.scope)
+        return resolve_artifact_path(path, scope=session.scope, adopted=adopted)
     except FileNotFoundError:
         pass
     except ValueError as e:
@@ -1427,14 +1445,14 @@ def _resolve_reveal_path(path: str, session: ScopedSession) -> Path:
 
 
 @router.post("/reveal", dependencies=[Depends(require(DesktopOnly))])
-async def reveal_artifact(req: _PathBody, session: ScopedSessionDep):
+async def reveal_artifact(req: _PathBody, session: ScopedSessionDep, adopted: AdoptedRowsDep):
     if session.scope.personal:
         # Same refusal as /open, before the path resolves: the server's file
         # manager is not on a person's machine.
         from cowork.services.artifacts import _NO_EXEC_DETAIL
 
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=_NO_EXEC_DETAIL)
-    target = _resolve_reveal_path(req.path, session)
+    target = _resolve_reveal_path(req.path, session, adopted)
     try:
         reveal_in_file_manager(target)
     except ExecutionRefused as exc:
@@ -1474,14 +1492,14 @@ async def proxy(token: str, rel_path: str, request: Request, scope: ScopeDep):
 
 
 @router.delete("/", status_code=status.HTTP_204_NO_CONTENT, dependencies=[Depends(require(DesktopOnly))])
-def delete_artifact_endpoint(scope: ScopeDep, path: str = Query(...)):
+def delete_artifact_endpoint(scope: ScopeDep, adopted: AdoptedRowsDep, path: str = Query(...)):
     try:
         from cowork.services.publish import (
             desktop_artifact_and_base,
             desktop_publish_credential,
         )
 
-        found = desktop_artifact_and_base(path, scope=scope)
+        found = desktop_artifact_and_base(path, scope=scope, adopted=adopted)
         # Credential resolved after the path so an unresolvable artifact still
         # reports 404 rather than "configure your API key". Only needed at all
         # because delete unpublishes first.

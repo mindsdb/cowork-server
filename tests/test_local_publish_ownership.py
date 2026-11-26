@@ -54,7 +54,7 @@ def publisher(personal_deployment, monkeypatch, tmp_path):
 
     monkeypatch.setattr("anton.publisher.publish", upload)
     monkeypatch.setattr("anton.publisher.unpublish", delete)
-    monkeypatch.setattr(routes, "_desktop_context", lambda path, *, scope: (Path(path), tmp_path, "test-key", endpoint))
+    monkeypatch.setattr(routes, "_desktop_context", lambda path, *, scope, adopted=(): (Path(path), tmp_path, "test-key", endpoint))
 
     class Publisher:
         def page(self, name="page"):
@@ -73,7 +73,7 @@ def publisher(personal_deployment, monkeypatch, tmp_path):
             )
 
         def remove(self, page, scope=ALICE):
-            return routes.unpublish_artifact(scope=scope, path=str(page))
+            return routes.unpublish_artifact(scope=scope, adopted=(), path=str(page))
 
         def entry(self, page):
             return json.loads((page.parent / ".published.json").read_text())[page.name]
@@ -231,7 +231,7 @@ def test_update_keeps_another_pages_record_written_after_its_publish(publisher, 
     publisher.send(page)
     other = page.with_name("other.html")
     other.write_text("<html><body>another tester's page</body></html>")
-    monkeypatch.setattr(publish, "desktop_artifact_and_base", lambda raw, *, scope: publish.DesktopArtifact(page, page.parent.parent))
+    monkeypatch.setattr(publish, "desktop_artifact_and_base", lambda raw, *, scope, adopted=(): publish.DesktopArtifact(page, page.parent.parent))
     monkeypatch.setattr(publish, "desktop_publish_credential", lambda: ("test-key", publisher.endpoint))
     content_mtime = publish._content_mtime
     ready, writer_finished = Event(), Event()
@@ -464,10 +464,10 @@ def test_the_path_delete_route_answers_the_owner_refusal(publisher, monkeypatch)
 
     page = publisher.page()
     publisher.send(page)
-    monkeypatch.setattr(publish, "desktop_artifact_and_base", lambda raw, *, scope: publish.DesktopArtifact(page.parent, publisher.root))
+    monkeypatch.setattr(publish, "desktop_artifact_and_base", lambda raw, *, scope, adopted=(): publish.DesktopArtifact(page.parent, publisher.root))
     monkeypatch.setattr(publish, "desktop_publish_credential", lambda: ("test-key", publisher.endpoint))
     with pytest.raises(HTTPException) as caught:
-        artifact_routes.delete_artifact_endpoint(scope=BOB, path=str(page.parent))
+        artifact_routes.delete_artifact_endpoint(scope=BOB, adopted=(), path=str(page.parent))
     assert caught.value.status_code == 409
     assert caught.value.detail["code"] == publish.OWNED_BY_OTHER_USER_CODE
     assert page.is_file() and publisher.deletes == []
@@ -483,8 +483,8 @@ def test_every_publish_path_refuses_another_testers_page(publisher, monkeypatch,
     publisher.send(page, access={"mode": "password", "password": "owner-password"})
     before = copy.deepcopy(publisher.pages)
     before_uploads = len(publisher.uploads)
-    monkeypatch.setattr(publish, "desktop_publish_context", lambda raw, *, scope: publish.PublishContext(page, publisher.root, "test-key", publisher.endpoint))
-    monkeypatch.setattr(publish, "desktop_artifact_and_base", lambda raw, *, scope: publish.DesktopArtifact(page, publisher.root))
+    monkeypatch.setattr(publish, "desktop_publish_context", lambda raw, *, scope, adopted=(): publish.PublishContext(page, publisher.root, "test-key", publisher.endpoint))
+    monkeypatch.setattr(publish, "desktop_artifact_and_base", lambda raw, *, scope, adopted=(): publish.DesktopArtifact(page, publisher.root))
     monkeypatch.setattr(publish, "desktop_publish_credential", lambda: ("test-key", publisher.endpoint))
     if path == "agent":
         with use_settings_scope(BOB), pytest.raises(publish.PublishOwnedByOtherUser):

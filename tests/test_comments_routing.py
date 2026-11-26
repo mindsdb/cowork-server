@@ -28,7 +28,7 @@ def artifact(tmp_path: Path, monkeypatch):
     monkeypatch.setattr(
         router, "resolve_artifact_folder", lambda _sources, _aid: (object(), folder, {})
     )
-    monkeypatch.setattr(publish, "published_owner_state", lambda _path, *, scope: state["entry"])
+    monkeypatch.setattr(publish, "published_owner_state_of_folder", lambda _folder: state["entry"])
     monkeypatch.setattr(router, "_org_mode", lambda: False)
     return state
 

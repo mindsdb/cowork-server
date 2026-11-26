@@ -24,9 +24,8 @@ against that rule, so a public or password-protected artifact answers 403.
 """
 from __future__ import annotations
 
+from pathlib import Path
 from urllib.parse import urlparse
-
-from cowork.db.scoped import TenantScope
 
 
 def cloud_key_from_url(url: str) -> str:
@@ -80,10 +79,12 @@ def cloud_comments_scope(entry: dict | None) -> str:
     return cloud_key_from_url(str(entry.get("url") or ""))
 
 
-def published_comments_route(folder: str, *, scope: TenantScope | None) -> tuple[str, str] | None:
-    """Cloud route for a local artifact, resolved in its owner's tenant scope."""
-    from cowork.services.publish import published_owner_state
+def published_comments_route(folder: Path) -> tuple[str, str] | None:
+    """Cloud route for a local artifact folder, read from its own publication
+    record. The caller has already found `folder` inside its own artifacts
+    roots, which is the access check."""
+    from cowork.services.publish import published_owner_state_of_folder
 
-    key = cloud_comments_scope(published_owner_state(folder, scope=scope))
+    key = cloud_comments_scope(published_owner_state_of_folder(folder))
     user_dir, _, report_id = key.partition("/")
     return (user_dir, report_id) if user_dir and report_id else None

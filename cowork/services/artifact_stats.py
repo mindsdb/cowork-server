@@ -10,6 +10,7 @@ import http.client
 import json
 import re
 import urllib.error
+from collections.abc import Collection
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 from urllib.parse import quote
@@ -23,6 +24,7 @@ from cowork.services.publish import PublisherUnavailable, _resolve_publish_targe
 
 if TYPE_CHECKING:
     from cowork.db.scoped import TenantScope
+    from cowork.services.artifact_roots import ProjectRow
 
 NOT_PUBLISHED_MESSAGE = "Artifact is not published"
 PUBLISH_CREDENTIAL_MISSING_CODE = "publish_credential_missing"
@@ -257,13 +259,16 @@ def _report_id_from_record(published_dir: Path, published_key: str) -> str:
     raise FileNotFoundError(NOT_PUBLISHED_MESSAGE)
 
 
-def report_id_for_path(raw_path: str, *, scope: TenantScope | None) -> str:
-    """Desktop: the report id of a published artifact path inside ``scope``'s roots."""
-    artifact = _artifacts.resolve_artifact_path(raw_path, scope=scope, allow_dir=True)
+def report_id_for_path(
+    raw_path: str, *, scope: TenantScope | None, adopted: Collection[ProjectRow] = ()
+) -> str:
+    """Desktop: the report id of a published artifact path inside ``scope``'s
+    roots and those of `adopted`, the caller's projects in a folder they chose."""
+    artifact = _artifacts.resolve_artifact_path(raw_path, scope=scope, allow_dir=True, adopted=adopted)
     if artifact is None:
         raise FileNotFoundError("Artifact not found")
     _target, published_dir, published_key, _is_fullstack = _resolve_publish_target(
-        artifact, container_dirs=_artifacts._scan_artifact_dirs(scope=scope)
+        artifact, container_dirs=_artifacts._artifact_dirs_for(scope=scope, adopted=adopted)
     )
     return _report_id_from_record(published_dir, published_key)
 

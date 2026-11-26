@@ -82,9 +82,9 @@ def _patch_scan(container: Path):
 
 
 def _patch_publish_scan(container: Path):
-    """publish.py binds `_scan_artifact_dirs` at import, so the artifacts-module
+    """publish.py binds `_artifact_dirs_for` at import, so the artifacts-module
     patch above does not reach its own reference."""
-    return patch.object(publish_mod, "_scan_artifact_dirs", lambda *, scope: [container])
+    return patch.object(publish_mod, "_artifact_dirs_for", lambda *, scope, adopted=(): [container])
 
 
 def _patched_publish(
@@ -250,7 +250,7 @@ def _run(coro):
 def test_tool_ask_reports_live_url(tmp_path: Path):
     root = _make_fullstack(tmp_path)
     with patch.object(tools_mod, "_published_state",
-                      lambda p: {"report_id": "uuid-1", "url": "https://4nton.ai/a/uuid-1", "published": True}):
+                      lambda p, adopted=(): {"report_id": "uuid-1", "url": "https://4nton.ai/a/uuid-1", "published": True}):
         out = _run(tools_mod._cowork_publish_or_preview(
             _FakeSession(tmp_path),
             {"file_path": str(root / "static" / "index.html"), "action": "ask", "title": "Dash"},
@@ -261,7 +261,7 @@ def test_tool_ask_reports_live_url(tmp_path: Path):
 def test_tool_ask_reports_not_published(tmp_path: Path):
     root = _make_fullstack(tmp_path)
     with patch.object(tools_mod, "_published_state",
-                      lambda p: {"report_id": "uuid-1", "url": "", "published": False}):
+                      lambda p, adopted=(): {"report_id": "uuid-1", "url": "", "published": False}):
         out = _run(tools_mod._cowork_publish_or_preview(
             _FakeSession(tmp_path),
             {"file_path": str(root / "static" / "index.html"), "action": "ask", "title": "Dash"},
@@ -273,7 +273,7 @@ def test_tool_publish_delegates_and_returns_url(tmp_path: Path):
     root = _make_fullstack(tmp_path)
     captured = {}
 
-    def _fake_publish_artifact(raw_path, access=None):
+    def _fake_publish_artifact(raw_path, access=None, adopted=()):
         captured["path"] = raw_path
         captured["access"] = access
         return {"status": "ok", "url": "https://4nton.ai/a/uuid-1"}
@@ -295,7 +295,7 @@ def test_tool_publish_falls_back_to_string_on_old_anton(tmp_path: Path):
 
     root = _make_fullstack(tmp_path)
     with patch.object(tools_mod, "_publish_artifact",
-                      lambda p, access=None: {"status": "ok", "url": "https://4nton.ai/a/uuid-1"}), \
+                      lambda p, access=None, adopted=(): {"status": "ok", "url": "https://4nton.ai/a/uuid-1"}), \
          patch.dict(sys.modules, {"anton.core.tools.side_effect": None}):
         out = _run(tools_mod._cowork_publish_or_preview(
             _FakeSession(tmp_path),
@@ -360,7 +360,7 @@ def test_tool_publish_returns_envelope_on_new_anton(tmp_path: Path):
     published = {"status": "ok", "url": "https://4nton.ai/a/uuid-1",
                  "result": {"report_id": "rep-1", "md5": "deadbeef"}}
     with patch.dict(sys.modules, {"anton.core.tools.side_effect": _side_effect_stub()}), \
-         patch.object(tools_mod, "_publish_artifact", lambda p, access=None: published):
+         patch.object(tools_mod, "_publish_artifact", lambda p, access=None, adopted=(): published):
         out = _run(tools_mod._cowork_publish_or_preview(
             _FakeSession(tmp_path),
             {"file_path": str(root / "static" / "index.html"), "action": "publish", "title": "Dash"},
@@ -382,7 +382,7 @@ def test_tool_publish_envelope_failure_is_ok_false(tmp_path: Path):
 
     root = _make_fullstack(tmp_path)
 
-    def _raise(raw_path, access=None):
+    def _raise(raw_path, access=None, adopted=()):
         raise ValueError("Configure your Minds API key in Settings before publishing")
 
     with patch.dict(sys.modules, {"anton.core.tools.side_effect": _side_effect_stub()}), \
@@ -406,7 +406,7 @@ def test_tool_publish_envelope_without_view_url_still_commits(tmp_path: Path):
     root = _make_fullstack(tmp_path)
     with patch.dict(sys.modules, {"anton.core.tools.side_effect": _side_effect_stub()}), \
          patch.object(tools_mod, "_publish_artifact",
-                      lambda p, access=None: {"status": "ok", "url": "",
+                      lambda p, access=None, adopted=(): {"status": "ok", "url": "",
                                               "result": {"report_id": "rep-2"}}):
         out = _run(tools_mod._cowork_publish_or_preview(
             _FakeSession(tmp_path),
@@ -423,7 +423,7 @@ def test_tool_publish_envelope_without_view_url_still_commits(tmp_path: Path):
 def test_tool_publish_no_api_key_returns_stop(tmp_path: Path):
     root = _make_fullstack(tmp_path)
 
-    def _raise(raw_path, access=None):
+    def _raise(raw_path, access=None, adopted=()):
         raise ValueError("Configure your Minds API key in Settings before publishing")
 
     with patch.object(tools_mod, "_publish_artifact", _raise):
@@ -438,7 +438,7 @@ def test_tool_publish_unsupported_type_is_not_treated_as_missing_key(tmp_path: P
     # Review #1: a non-key ValueError must not be reported as "no API key".
     root = _make_fullstack(tmp_path)
 
-    def _raise(raw_path, access=None):
+    def _raise(raw_path, access=None, adopted=()):
         raise ValueError("Only HTML and Markdown artifacts can be published")
 
     with patch.object(tools_mod, "_publish_artifact", _raise):

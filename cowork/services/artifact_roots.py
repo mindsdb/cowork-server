@@ -39,6 +39,7 @@ from uuid import UUID
 
 from cowork.db.personal_resources import PersonalResource
 from cowork.db.scoped import ScopedSession, TenantScope
+from cowork.db.units import run_db
 from cowork.services.artifact_identity import may_not_read
 from cowork.services.artifacts import (
     ProjectArtifacts,
@@ -382,15 +383,7 @@ def plan_scope_roots(session: ScopedSession) -> RootsPlan:
         # Desktop projects pointed at a folder the user chose. The scan only
         # sees direct children of the projects root, so an adopted folder is
         # invisible to it and has to come from its row.
-        return RootsPlan(
-            scan=True,
-            scan_scope=session.scope,
-            adopted=tuple(
-                _project_row(service, project)
-                for project in service.list_projects()
-                if service.directory_is_external(project)
-            ),
-        )
+        return RootsPlan(scan=True, scan_scope=session.scope, adopted=desktop_adopted_rows(session))
     partition = partition_of(session.scope)
     return RootsPlan(
         projects=_rows_in_partition(service=service, projects=service.list_projects(), partition=partition),
@@ -398,6 +391,48 @@ def plan_scope_roots(session: ScopedSession) -> RootsPlan:
         owner_filter=session.scope.org_mode,
         owned=owned_conversation_ids(session) if session.scope.org_mode else frozenset(),
     )
+
+
+def folders_can_be_adopted(scope: TenantScope) -> bool:
+    """Whether ``scope`` can hold a project in a folder the user chose: never
+    in org mode or where projects are partitioned (`directory_is_external`),
+    so callers skip the rows query there."""
+    return not (_org_mode() or scope.partitioned_for(PersonalResource.PROJECTS))
+
+
+def desktop_adopted_rows(session: ScopedSession) -> tuple[ProjectRow, ...]:
+    """The caller's desktop projects in a folder the user chose, as plain data.
+
+    A database step: the path-addressed artifact actions read these in a
+    database unit and hand them to file store work, which holds no session.
+    Empty wherever `folders_can_be_adopted` is false, though callers skip the
+    query there.
+    """
+    from cowork.services.projects import ProjectService
+
+    service = ProjectService(session)
+    return tuple(
+        _project_row(service, project)
+        for project in service.list_projects()
+        if service.directory_is_external(project)
+    )
+
+
+async def adopted_rows_for(scope: TenantScope) -> tuple[ProjectRow, ...]:
+    """The caller's projects in a folder the user chose, read in a database
+    unit, for the path-addressed artifact actions to hand to file store work.
+
+    No query where no folder can be adopted (`folders_can_be_adopted`).
+    """
+    if not folders_can_be_adopted(scope):
+        return ()
+    return await run_db(desktop_adopted_rows, scope=scope)
+
+
+def adopted_artifacts_sources(adopted: Collection[ProjectRow]) -> list[ProjectArtifacts]:
+    """The artifacts root of each project in `adopted` that `_adopted_root`
+    accepts. File store work only: it stats, and opens no database session."""
+    return [found.source for project in adopted if (found := _adopted_root(project)) is not None]
 
 
 def with_held_roots(session: ScopedSession, plan: RootsPlan) -> RootsPlan:

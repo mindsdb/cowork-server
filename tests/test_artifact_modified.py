@@ -148,10 +148,10 @@ def _patch_scan(container: Path):
 
 
 def _patch_publish_scan(container: Path):
-    """publish.py binds `_scan_artifact_dirs` at import, so patching only the
+    """publish.py binds `_artifact_dirs_for` at import, so patching only the
     artifacts module leaves its own reference pointing at the real projects
     root — which `desktop_publish_context` then scans and finds nothing in."""
-    return patch.object(publish_mod, "_scan_artifact_dirs", lambda *, scope: [container])
+    return patch.object(publish_mod, "_artifact_dirs_for", lambda *, scope, adopted=(): [container])
 
 
 def _publish(root: Path, container: Path, **kw):
@@ -413,7 +413,7 @@ def test_update_endpoint_delegates(tmp_path: Path):
 
     captured = {}
 
-    def _fake_update(path, *, scope, approved_datasources=None):
+    def _fake_update(path, *, scope, approved_datasources=None, adopted=()):
         captured["path"] = path
         captured["scope"] = scope
         captured["approved_datasources"] = approved_datasources
@@ -438,7 +438,7 @@ def test_update_endpoint_404_when_not_published(tmp_path: Path):
     app.include_router(publish_ep.router, prefix="/api/v1/publish")
     client = TestClient(app)
 
-    def _raise(path, *, scope, approved_datasources=None):
+    def _raise(path, *, scope, approved_datasources=None, adopted=()):
         raise FileNotFoundError("No published version to update")
 
     with patch.object(publish_ep, "_update", _raise):

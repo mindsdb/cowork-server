@@ -35,6 +35,7 @@ from cowork.db.scoped import LOCAL_SCOPE, MissingTenantScopeError, tenant_scope_
 from cowork.db.units import run_db
 from cowork.deployment_identity import identity_for_turn
 from cowork.schemas.connectors import InvalidConnectorIdError, validate_engine_id
+from cowork.services.artifact_roots import ProjectRow, adopted_rows_for
 from cowork.services.connectors.catalog import ConnectorCatalog
 from cowork.services.connectors.connections import ConnectionsService
 from cowork.services.connectors.custom_connectors import (
@@ -59,7 +60,20 @@ logger = logging.getLogger(__name__)
 T = TypeVar("T")
 
 
-def _published_state(raw_path: str) -> dict:
+async def _turn_adopted_rows() -> tuple[ProjectRow, ...]:
+    """The turn's projects in a folder the user chose, for the publish helpers
+    to resolve paths in. An unbound turn reads LOCAL_SCOPE's on a plain
+    desktop; where a scope is required LOCAL_SCOPE is the operator view, so it
+    reads none and publishing resolves as it did before."""
+    scope = current_settings_scope()
+    if scope is None:
+        if tenant_scope_required():
+            return ()
+        scope = LOCAL_SCOPE
+    return await adopted_rows_for(scope)
+
+
+def _published_state(raw_path: str, adopted: tuple[ProjectRow, ...] = ()) -> dict:
     """Delegate to the publish service so the tool and GUI agree on where
     `.published.json` lives. Imported lazily to avoid a startup import cycle.
 
@@ -69,13 +83,14 @@ def _published_state(raw_path: str) -> dict:
     """
     from cowork.common.settings.user_settings import current_settings_scope
     from cowork.services.publish import published_state
-    return published_state(raw_path, scope=current_settings_scope())
+    return published_state(raw_path, scope=current_settings_scope(), adopted=adopted)
 
 
 def _publish_artifact(
     raw_path: str,
     access: ArtifactAccessRequest | None = None,
     approved_datasources: frozenset[DatasourceKey] | None = None,
+    adopted: tuple[ProjectRow, ...] = (),
 ) -> dict:
     """Desktop publish for the agent's own `publish_or_preview` tool.
 
@@ -87,7 +102,7 @@ def _publish_artifact(
 
     scope = current_settings_scope()
     artifact, artifacts_base, api_key, publish_url = desktop_publish_context(
-        raw_path, scope=scope
+        raw_path, scope=scope, adopted=adopted
     )
     return publish_artifact(
         artifact, artifacts_base=artifacts_base,
@@ -96,13 +111,13 @@ def _publish_artifact(
     )
 
 
-def _published_owner_state(raw_path: str) -> dict:
+def _published_owner_state(raw_path: str, adopted: tuple[ProjectRow, ...] = ()) -> dict:
     """Raw owner-side `.published.json` entry (mode/access_password/…) so the
     tool can preserve prior access on re-publish. Lazily imported to avoid a
     startup import cycle."""
     from cowork.common.settings.user_settings import current_settings_scope
     from cowork.services.publish import published_owner_state
-    return published_owner_state(raw_path, scope=current_settings_scope())
+    return published_owner_state(raw_path, scope=current_settings_scope(), adopted=adopted)
 
 
 def _access_from_state(entry: dict) -> ArtifactAccessRequest:
@@ -312,6 +327,7 @@ async def _cowork_publish_or_preview(session: Any, tc_input: dict):
         )
 
     abs_path = str(file_path)
+    adopted = await _turn_adopted_rows()
 
     # 'ask'/'preview' are non-destructive: report current publish state so the
     # LLM can choose publish-vs-re-publish. State is resolved by the service so
@@ -324,7 +340,7 @@ async def _cowork_publish_or_preview(session: Any, tc_input: dict):
     # read as "publishing is the user's job" and never called action='publish'
     # even when explicitly asked. The wording below makes clear it CAN act.
     if action in ("ask", "preview"):
-        state = _published_state(abs_path)
+        state = _published_state(abs_path, adopted)
         if state.get("published") and state.get("url"):
             return (
                 f"{title} is already published at {state['url']}. "
@@ -385,7 +401,7 @@ async def _cowork_publish_or_preview(session: Any, tc_input: dict):
         # No access fields: preserve the artifact's previous access on re-publish.
         # NOTE: _published_owner_state (not _published_state): the latter drops
         # mode/access_password, which would silently reset to public.
-        prev = _published_owner_state(abs_path)
+        prev = _published_owner_state(abs_path, adopted)
         try:
             # None on a first publish: publish_artifact applies the default
             # (owner-only, or a refusal where a shared publish token can't
@@ -448,7 +464,7 @@ async def _cowork_publish_or_preview(session: Any, tc_input: dict):
         # process, for up to its 30 s, and the upload blocks too. This handler
         # runs on the server's event loop.
         try:
-            result = await asyncio.to_thread(_publish_artifact, abs_path, access=access)
+            result = await asyncio.to_thread(_publish_artifact, abs_path, access=access, adopted=adopted)
         except DatasourceApprovalRequired as exc:
             answer = await _confirm_datasources(session, _card_artifact_name(exc, file_path), exc.pending)
             if answer != "confirmed":
@@ -457,7 +473,7 @@ async def _cowork_publish_or_preview(session: Any, tc_input: dict):
             approved = frozenset(DatasourceKey(item["engine"], item["name"]) for item in exc.pending)
             try:
                 result = await asyncio.to_thread(
-                    _publish_artifact, abs_path, access=access, approved_datasources=approved
+                    _publish_artifact, abs_path, access=access, approved_datasources=approved, adopted=adopted
                 )
             except DatasourceApprovalRequired:
                 return _fail(

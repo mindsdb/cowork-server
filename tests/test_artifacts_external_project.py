@@ -6,6 +6,7 @@ folder and they then disappear from the artifact list and do not serve.
 """
 from __future__ import annotations
 
+import asyncio
 import os
 from pathlib import Path
 
@@ -14,8 +15,12 @@ from pydantic import BaseModel
 from sqlalchemy.pool import StaticPool
 from sqlmodel import Session, SQLModel, create_engine
 
-from cowork.db.scoped import LOCAL_SCOPE, ScopedSession
+from cowork.db.personal_resources import PersonalResource
+from cowork.db.scoped import LOCAL_SCOPE, ScopedSession, TenantScope
 from cowork.models.project import Project
+import cowork.services.artifact_roots as artifact_roots
+from cowork.services.artifact_roots import ProjectRow, adopted_rows_for, desktop_adopted_rows
+from cowork.services.artifacts import _resolve_project_root, resolve_artifact_path
 from cowork.services.projects import (
     GENERAL_PROJECT,
     GENERAL_PROJECT_ID,
@@ -132,6 +137,88 @@ def test_an_in_root_project_is_still_found_by_the_scan(engine):
     session = _scoped(engine)
     bases = {Path(s.base).resolve() for s in artifacts_sources_for_scope(session)}
     assert base.resolve() in bases
+
+
+def _adopted_page(engine, folder: Path, name: str) -> tuple[tuple[ProjectRow, ...], Path]:
+    """Adopt `folder` as project `name` with one artifact page in it, and
+    return the caller's adopted rows and that page."""
+    folder.mkdir(parents=True)
+    page = _artifacts_dir(folder) / "dash" / "index.html"
+    page.parent.mkdir()
+    page.write_text("<p>adopted</p>")
+    ProjectService(_scoped(engine)).create_project(name, path=folder)
+    return desktop_adopted_rows(_scoped(engine)), page
+
+
+def test_the_adopted_rows_name_only_folders_the_user_chose(engine, tmp_path):
+    ProjectService(_scoped(engine)).create_project("allocated")
+    rows, _page = _adopted_page(engine, tmp_path / "Documents" / "notes", "Reports")
+
+    assert [(row.name, row.external) for row in rows] == [("Reports", True)]
+
+
+def test_a_path_in_an_adopted_folder_resolves_only_with_its_row(engine, tmp_path):
+    rows, page = _adopted_page(engine, tmp_path / "Documents" / "notes", "notes")
+
+    with pytest.raises(FileNotFoundError):
+        resolve_artifact_path(str(page), scope=LOCAL_SCOPE)
+    assert resolve_artifact_path(str(page), scope=LOCAL_SCOPE, adopted=rows) == page.resolve()
+
+
+def test_a_relative_path_in_both_kinds_of_folder_is_ambiguous(engine, tmp_path):
+    """Accepted behavior change: a relative path that named one allocated
+    project's file is refused once a chosen folder holds the same path."""
+    svc = ProjectService(_scoped(engine))
+    allocated = svc.create_project("dashboards")
+    allocated_page = _artifacts_dir(Path(allocated.path)) / "dash" / "index.html"
+    allocated_page.parent.mkdir()
+    allocated_page.write_text("<p>allocated</p>")
+    rows, _page = _adopted_page(engine, tmp_path / "Documents" / "notes", "notes")
+
+    assert resolve_artifact_path("dash/index.html", scope=LOCAL_SCOPE) == allocated_page.resolve()
+    with pytest.raises(ValueError, match="multiple project artifact roots"):
+        resolve_artifact_path("dash/index.html", scope=LOCAL_SCOPE, adopted=rows)
+
+
+def test_an_adopted_folder_is_the_project_root_of_its_artifacts(engine, tmp_path):
+    folder = tmp_path / "Documents" / "notes"
+    rows, page = _adopted_page(engine, folder, "notes")
+
+    assert _resolve_project_root(page.parent, scope=LOCAL_SCOPE) is None
+    assert _resolve_project_root(page.parent, scope=LOCAL_SCOPE, adopted=rows) == folder.resolve()
+
+
+@pytest.mark.parametrize(
+    "scope",
+    [
+        TenantScope(org_mode=True, org_id="org-a", user_id="sub-a"),
+        TenantScope(
+            org_id="partition-a",
+            user_id="sub-a",
+            personal=True,
+            personal_resources=frozenset({PersonalResource.PROJECTS}),
+        ),
+    ],
+    ids=["org", "projects-partition"],
+)
+def test_no_rows_are_read_where_no_folder_can_be_adopted(scope, monkeypatch):
+    async def no_database(fn, *, scope):
+        raise AssertionError("adopted rows were read from the database")
+
+    monkeypatch.setattr(artifact_roots, "run_db", no_database)
+    assert asyncio.run(adopted_rows_for(scope)) == ()
+
+
+def test_the_desktop_reads_its_adopted_rows_in_a_database_unit(monkeypatch):
+    units = []
+
+    async def database_unit(fn, *, scope):
+        units.append((fn, scope))
+        return ()
+
+    monkeypatch.setattr(artifact_roots, "run_db", database_unit)
+    asyncio.run(adopted_rows_for(LOCAL_SCOPE))
+    assert units == [(desktop_adopted_rows, LOCAL_SCOPE)]
 
 
 # -- serving -----------------------------------------------------------------
