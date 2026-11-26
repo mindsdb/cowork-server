@@ -652,7 +652,7 @@ def test_the_desktop_still_adopts_a_folder(db, tmp_path):
 
 
 @pytest.mark.parametrize("resource", ["instructions", "memory"])
-@pytest.mark.parametrize("initial", ["new", "existing", "protection-fails"])
+@pytest.mark.parametrize("initial", ["new", "existing", "protection-fails", "keeps-no-modes"])
 def test_desktop_first_write_protects_adopted_project_data(db, tmp_path, monkeypatch, resource, initial):
     from fastapi import HTTPException
 
@@ -677,13 +677,22 @@ def test_desktop_first_write_protects_adopted_project_data(db, tmp_path, monkeyp
         if os.name != "nt":
             folder.chmod(0o755)
     repo_mode = stat.S_IMODE(repo.stat().st_mode)
+    def refused(*args, **kwargs):
+        raise PermissionError("cannot protect project data")
     if initial == "protection-fails":
-        def refused(*args, **kwargs):
-            raise PermissionError("cannot protect project data")
+        # Windows: the access list fails on a volume that keeps one. POSIX: another account owns the folder.
         if os.name == "nt":
             monkeypatch.setattr(private_project, "_protect_windows_directory", refused)
         else:
-            monkeypatch.setattr(os, "fchmod", refused)
+            other_uid = os.geteuid() + 1
+            monkeypatch.setattr(os, "geteuid", lambda: other_uid)
+    if initial == "keeps-no-modes":
+        # A FAT or exFAT drive on Windows; WSL's /mnt/c, exFAT or SMB elsewhere, which report success and keep the mode.
+        if os.name == "nt":
+            monkeypatch.setattr(private_project, "_volume_keeps_acls", lambda path: False)
+            monkeypatch.setattr(private_project, "_protect_windows_directory", refused)
+        else:
+            monkeypatch.setattr(os, "fchmod", lambda fd, mode: None)
     target = folder / "anton.md" if resource == "instructions" else folder / "memory" / SLOT_REGISTRY[MemorySlot.RULES].filename
     expected = pytest.raises((HTTPException, PermissionError)) if initial == "protection-fails" else nullcontext()
     with Session(db) as session, expected:
@@ -703,6 +712,10 @@ def test_desktop_first_write_protects_adopted_project_data(db, tmp_path, monkeyp
         return
     assert target.read_text(encoding="utf-8").strip() == "Only this user"
     assert stat.S_IMODE(repo.stat().st_mode) == repo_mode
+    if initial == "keeps-no-modes":
+        if os.name != "nt":
+            assert stat.S_IMODE(folder.stat().st_mode) == 0o755
+        return
     if os.name == "nt":
         import win32security as security
         def grants(path):
