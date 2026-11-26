@@ -171,17 +171,18 @@ def close_coding_services():
 
 @pytest.fixture(scope="session", autouse=True)
 def trust_test_client_host():
-    """Starlette's TestClient sends ``Host: testserver``; only tests trust it."""
-    from cowork import host_middleware
-    from cowork.api.v1.endpoints import guards
+    """Starlette's TestClient sends ``Host: testserver``; only tests trust it.
 
-    production = guards._TRUSTED_LOOPBACK_HOSTS
-    production_hosts = host_middleware._TRUSTED_HOSTS
-    guards._TRUSTED_LOOPBACK_HOSTS = production | {"testserver"}
-    host_middleware._TRUSTED_HOSTS = production_hosts | {"testserver"}
+    ``guards.require_local`` and ``host_middleware.RebindingHostMiddleware``
+    both read this one set (cowork.common.trusted_hosts), so patching it here
+    covers both.
+    """
+    from cowork.common import trusted_hosts
+
+    production = trusted_hosts.TRUSTED_HOSTS
+    trusted_hosts.TRUSTED_HOSTS = production | {"testserver"}
     yield
-    guards._TRUSTED_LOOPBACK_HOSTS = production
-    host_middleware._TRUSTED_HOSTS = production_hosts
+    trusted_hosts.TRUSTED_HOSTS = production
 
 
 @pytest.fixture(scope="session", autouse=True)

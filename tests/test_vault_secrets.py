@@ -182,7 +182,7 @@ async def test_a_web_turn_answers_409_naming_a_sealed_record_that_wont_open(monk
 
     monkeypatch.setattr(responses_mod.ResponsesHandler, "_route_request", route_request)
     transport = httpx.ASGITransport(app=create_app(), raise_app_exceptions=False)
-    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+    async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
         response = await client.post("/api/v1/responses/", json={"input": "hi", "stream": True})
 
     assert response.status_code == 409, response.text

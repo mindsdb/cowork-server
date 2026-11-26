@@ -119,6 +119,7 @@ def test_foreign_host_changes_no_setting(auth_off):
     resp = client.put("/api/v1/settings/openai_api_key", json={"value": "sk-attacker"}, headers={"host": FOREIGN_HOST})
 
     assert resp.status_code == 403
+    assert resp.json() == {"detail": "untrusted host"}
     assert client.get("/api/v1/settings/", headers=local).json() == before
 
 
@@ -174,6 +175,7 @@ def test_desktop_request_without_origin_is_accepted(auth_off):
         "127.0.0.1.nip.io",
         "2130706433",
         "[::1",
+        "cowork:9010",
     ],
 )
 def test_names_a_page_can_be_served_from_are_refused(auth_off, host):
@@ -228,6 +230,44 @@ def test_forwarded_host_does_not_override_host(auth_off):
         headers={"host": FOREIGN_HOST, "x-forwarded-host": "localhost", "x-forwarded-for": "127.0.0.1"},
     )
     assert resp.status_code == 403
+
+
+def test_forwarded_host_does_not_override_host_behind_the_image_proxy_stack(monkeypatch, tmp_path):
+    """The image runs uvicorn with ProxyHeadersMiddleware(trusted_hosts="*"),
+    so a LAN peer's forwarded headers are trusted for client and scheme. That
+    middleware never reads X-Forwarded-Host, but this proves the Host check
+    still sees the real Host once wrapped in the actual stack, not only on a
+    bare client where nothing could have rewritten it anyway."""
+    from uvicorn.middleware.proxy_headers import ProxyHeadersMiddleware
+
+    app = _app(monkeypatch, tmp_path, COWORK_REQUIRE_AUTH="false")
+    client = TestClient(
+        ProxyHeadersMiddleware(app, trusted_hosts="*"),
+        base_url=f"http://{FOREIGN_HOST}",
+        client=("10.0.0.5", 40000),
+    )
+
+    resp = client.get(
+        "/api/v1/conversations/",
+        headers={"x-forwarded-host": "localhost", "x-forwarded-for": "127.0.0.1"},
+    )
+
+    assert resp.status_code == 403
+    assert resp.json() == {"detail": "untrusted host"}
+
+
+@pytest.mark.parametrize(("method", "path", "body"), SENSITIVE_REQUESTS)
+def test_a_lan_bound_server_with_auth_off_still_refuses_a_foreign_host(monkeypatch, tmp_path, method, path, body):
+    """A self-host deployment bound to a LAN address, not just loopback, with
+    auth off: the Host check is the only boundary left on that socket, and a
+    foreign Host must still be refused, same as on loopback."""
+    app = _app(monkeypatch, tmp_path, COWORK_REQUIRE_AUTH="false")
+    client = TestClient(app, client=("192.168.1.20", 50000), base_url="http://192.168.1.5:26866")
+
+    resp = _send(client, method, path, body, host=FOREIGN_HOST)
+
+    assert resp.status_code == 403
+    assert resp.json() == {"detail": "untrusted host"}
 
 
 def test_token_auth_is_the_boundary_when_on(monkeypatch, tmp_path):

@@ -11,21 +11,13 @@ from __future__ import annotations
 
 import ipaddress
 from collections.abc import Collection, Iterable
-from urllib.parse import urlparse
 
 from starlette.datastructures import Headers
 from starlette.responses import JSONResponse
 from starlette.types import ASGIApp, Receive, Scope, Send
 from starlette.websockets import WebSocketClose
 
-_TRUSTED_HOSTS = frozenset({"localhost"})
-
-
-def _hostname(value: str) -> str:
-    try:
-        return (urlparse(f"//{value}").hostname or "").casefold()
-    except ValueError:
-        return ""
+from cowork.common import trusted_hosts
 
 
 def _is_ip_literal(hostname: str) -> bool:
@@ -50,7 +42,7 @@ class RebindingHostMiddleware:
         exempt_paths: Collection[str] = (),
     ) -> None:
         self.app = app
-        self._allowed_hosts = frozenset(_hostname(host) for host in allowed_hosts) - {""}
+        self._allowed_hosts = frozenset(trusted_hosts.hostname(host) for host in allowed_hosts) - {""}
         # Signed channel webhooks, the same set the bearer layer exempts.
         # create_app keeps filling it while mounting routes, before any request.
         self._exempt_paths = exempt_paths
@@ -67,15 +59,18 @@ class RebindingHostMiddleware:
         if scope["type"] == "websocket":
             await WebSocketClose(code=1008)(scope, receive, send)
             return
+        # Named for the final request log (request_logging.py), so an operator
+        # whose domain broke on upgrade sees why, not a generic "forbidden".
+        scope.setdefault("state", {})["_request_log_reason"] = "untrusted_host"
         await JSONResponse({"detail": "untrusted host"}, status_code=403)(scope, receive, send)
 
     def _trusted(self, host: str) -> bool:
         # Browsers always send Host, so a request without one is not a page's.
         if not host:
             return True
-        hostname = _hostname(host)
+        name = trusted_hosts.hostname(host)
         return (
-            hostname in _TRUSTED_HOSTS
-            or hostname in self._allowed_hosts
-            or _is_ip_literal(hostname)
+            name in trusted_hosts.TRUSTED_HOSTS
+            or name in self._allowed_hosts
+            or _is_ip_literal(name)
         )

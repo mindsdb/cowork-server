@@ -53,8 +53,9 @@ def test_require_local_rejects_dns_rebinding_and_cross_site_origins(monkeypatch)
 
 def test_require_local_trusts_the_test_client_host_only_through_the_fixture(monkeypatch):
     from cowork.api.v1.endpoints import guards
+    from cowork.common import trusted_hosts
 
-    monkeypatch.setattr(guards, "_TRUSTED_LOOPBACK_HOSTS", guards._TRUSTED_LOOPBACK_HOSTS - {"testserver"})
+    monkeypatch.setattr(trusted_hosts, "TRUSTED_HOSTS", trusted_hosts.TRUSTED_HOSTS - {"testserver"})
     with pytest.raises(HTTPException, match="local host"):
         guards.require_local(_request("127.0.0.1", headers={"host": "testserver"}))
 
@@ -78,35 +79,6 @@ def test_require_local_rejects_non_loopback(host):
     with pytest.raises(HTTPException) as exc:
         require_local(_request(host))
     assert exc.value.status_code == 403
-
-
-def _proxied_client(*, client, base_url):
-    # The Docker image runs uvicorn with --forwarded-allow-ips "*".
-    from fastapi.testclient import TestClient
-    from uvicorn.middleware.proxy_headers import ProxyHeadersMiddleware
-
-    app = _raw_client(local=True).app
-    return TestClient(ProxyHeadersMiddleware(app, trusted_hosts="*"), client=client, base_url=base_url)
-
-
-def test_forwarded_loopback_address_over_a_network_socket_is_refused():
-    client = _proxied_client(client=("192.168.1.20", 50000), base_url="http://192.168.1.5:26866")
-    resp = client.get(
-        "/api/v1/settings/raw",
-        headers={"host": "localhost:26866", "x-forwarded-for": "127.0.0.1"},
-    )
-    assert resp.status_code == 403
-
-
-def test_loopback_tunnel_forwarding_a_remote_address_is_refused():
-    client = _proxied_client(client=("127.0.0.1", 50000), base_url="http://127.0.0.1:26866")
-    resp = client.get("/api/v1/settings/raw", headers={"x-forwarded-for": "203.0.113.9"})
-    assert resp.status_code == 403
-
-
-def test_direct_loopback_request_through_the_proxy_middleware_is_allowed():
-    client = _proxied_client(client=("127.0.0.1", 50000), base_url="http://127.0.0.1:26866")
-    assert client.get("/api/v1/settings/raw").status_code == 200
 
 
 @pytest.mark.parametrize(

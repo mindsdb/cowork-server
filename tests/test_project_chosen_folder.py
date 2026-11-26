@@ -513,12 +513,12 @@ def test_a_request_that_did_not_arrive_over_loopback_is_refused(
         headers={"Host": "localhost"},
     )
     assert res.status_code == 403, res.text
-    assert res.json()["detail"] == "a chosen project folder needs a request over loopback"
+    assert res.json()["detail"] == "local requests only"
 
 
 def test_a_cross_site_origin_is_refused_with_its_own_reason(projects_root, tmp_path):
-    """Only the network-position refusal gets the folder wording; a loopback
-    request from a foreign page still says why it was refused."""
+    """A loopback request from a foreign page is refused for its own reason,
+    not the network-position one."""
     folder = _folder(tmp_path, "cross-site")
     res = _loopback_client().post(
         "/api/v1/projects/",

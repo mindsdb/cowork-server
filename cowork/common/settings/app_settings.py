@@ -1124,9 +1124,27 @@ class AppSettings(Settings):
     def _split_allowed_hosts(cls, v: object) -> object:
         if not isinstance(v, str):
             return v
+        # An IPv6 literal such as [::1] also starts with [ like a JSON array
+        # does, so only a value that actually parses as one is treated as one.
         if v.strip().startswith("["):
-            return json.loads(v)
+            try:
+                parsed = json.loads(v)
+            except ValueError:
+                parsed = None
+            if isinstance(parsed, list):
+                return parsed
         return [name.strip() for name in v.split(",") if name.strip()]
+
+    @field_validator("allowed_hosts")
+    @classmethod
+    def _validate_allowed_hosts(cls, v: list[str]) -> list[str]:
+        for entry in v:
+            if "/" in entry or "*" in entry:
+                raise ValueError(
+                    f"COWORK_ALLOWED_HOSTS entry {entry!r} must be a bare host name, e.g. "
+                    "cowork.example.com or tunnel.example:8443 — no scheme, path or wildcard."
+                )
+        return v
 
     # Which connector methods this deployment may run as a cloud datasource:
     # `{"manifest_version": 1, "enabled": ["postgres:host-port"]}`. A string,

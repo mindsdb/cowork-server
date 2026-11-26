@@ -3,13 +3,10 @@
 from __future__ import annotations
 
 import ipaddress
-from urllib.parse import urlparse
 
 from fastapi import HTTPException, Request, status
 
-_TRUSTED_LOOPBACK_HOSTS = frozenset({"localhost"})
-# The detail of a refusal by network position (client or socket address).
-LOCAL_REQUESTS_ONLY = "local requests only"
+from cowork.common import trusted_hosts
 
 
 def _is_loopback_ip(value: str | None) -> bool:
@@ -31,16 +28,11 @@ def _is_loopback_ip(value: str | None) -> bool:
 def _is_loopback_address(value: str | None) -> bool:
     """Whether an address literal, or a host name trusted as local, is loopback."""
     name = (value or "").strip().strip("[]").casefold()
-    return name in _TRUSTED_LOOPBACK_HOSTS or _is_loopback_ip(name)
+    return name in trusted_hosts.TRUSTED_HOSTS or _is_loopback_ip(name)
 
 
 def _trusted_loopback_host(value: str) -> bool:
-    try:
-        hostname = urlparse(f"//{value}").hostname
-    except ValueError:
-        # An unbalanced IPv6 literal such as "[::1" names no host.
-        return False
-    return _is_loopback_address(hostname)
+    return _is_loopback_address(trusted_hosts.hostname(value))
 
 
 def require_local(request: Request) -> None:
@@ -58,7 +50,7 @@ def require_local(request: Request) -> None:
     # such as "localhost" can only have come from a header.
     client = request.client.host if request.client else None
     if not _is_loopback_ip(client):
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=LOCAL_REQUESTS_ONLY)
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="local requests only")
 
     # The peer address alone is forgeable wherever uvicorn trusts a proxy: the
     # image passes --forwarded-allow-ips '*', so an X-Forwarded-For from any
@@ -71,7 +63,7 @@ def require_local(request: Request) -> None:
     # allowance is for TestClient, which reports its base_url host here.
     server = request.scope.get("server") or ()
     if not (len(server) == 2 and isinstance(server[1], int) and _is_loopback_address(server[0])):
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=LOCAL_REQUESTS_ONLY)
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="local requests only")
 
     # A loopback TCP peer is not sufficient in a browser: DNS rebinding can
     # make an attacker-controlled hostname resolve to 127.0.0.1. Browsers set

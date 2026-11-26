@@ -343,14 +343,7 @@ def test_a_forwarded_loopback_address_on_a_container_socket_reaches_no_local_rou
         method, path, json=body, headers={**FORGED_LOOPBACK_HEADERS, "Host": "localhost"}
     )
 
-    # The chosen-folder gate rewraps the network-position refusal with its
-    # own wording; every other local route keeps require_local's own detail.
-    detail = (
-        "a chosen project folder needs a request over loopback"
-        if path == "/api/v1/projects/"
-        else "local requests only"
-    )
-    assert (resp.status_code, resp.json()) == (403, {"detail": detail}), resp.text
+    assert (resp.status_code, resp.json()) == (403, {"detail": "local requests only"}), resp.text
 
 
 @pytest.fixture()

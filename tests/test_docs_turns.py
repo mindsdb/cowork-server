@@ -111,7 +111,7 @@ async def _ask(monkeypatch, stub: _SeesDocs, *, stream: bool, **body) -> httpx.R
     monkeypatch.setattr(responses_mod, "get_harness", lambda name: stub)
     monkeypatch.setattr(responses_mod.ResponsesHandler, "_collect", collected)
     transport = httpx.ASGITransport(app=create_app())
-    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+    async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
         return await asyncio.wait_for(
             client.post(
                 "/api/v1/responses/",

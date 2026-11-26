@@ -20,6 +20,9 @@ _REFUSAL_REASONS = frozenset(
         "expected_organization_missing",
         "expected_organization_invalid",
         "organization_mismatch",
+        # RebindingHostMiddleware (cowork/host_middleware.py): a Host an
+        # operator hasn't listed in COWORK_ALLOWED_HOSTS.
+        "untrusted_host",
         # The draft-preview host (cowork/draft_host/app.py): why a signed link
         # was refused, never the link itself.
         "draft_links_disabled",
