@@ -84,6 +84,13 @@ DOCUMENT_CONTENT_TYPES = {
 # can share is one it can keep versions of. Text keeps MAX_SOURCE_BYTES.
 MAX_DOCUMENT_BYTES = 25 * 1024 * 1024
 MAX_REVISIONS = 80
+# The most the distinct blobs of an artifact's kept revisions may hold, on top
+# of MAX_REVISIONS. A count alone let 80 revisions of a 25 MB document keep
+# 2 GB per artifact; text can't reach it (80 x 2 MB is 160 MB), so in practice
+# this bounds documents, by the same rule for every kind. The head of each
+# path, the published revision and those an open repair names are kept past
+# it (_beyond_byte_budget).
+MAX_REVISION_BYTES = 250 * 1024 * 1024
 # Names inside the journal folder (artifact_journal.JOURNAL_DIRNAME).
 _MANIFEST = "manifest.json"
 _PENDING = "pending-source-write.json"
@@ -576,6 +583,62 @@ def _prune_orphan_blobs(folder: Path, revisions: list[RevisionEntry]) -> None:
         pass
 
 
+def _protected_revision_ids(folder: Path, manifest: Manifest) -> set[str]:
+    """The revisions the byte budget never drops: the head of each path, the
+    one each live publish shows (so "Unshared changes" keeps its before side),
+    and those a queued or ready repair is based on or produced."""
+    from cowork.services.artifacts import load_published_map
+
+    protected = {head.id for path in {r.path for r in manifest.revisions} if (head := manifest.head(path))}
+    for repair in _repair_records(folder):
+        if repair.status in {"queued", "ready"}:
+            protected.update(i for i in (repair.base_revision_id, repair.revision_id) if i)
+    # The journal doesn't know which file is the primary, so each live entry
+    # protects its revision on every path it could name.
+    for published in load_published_map(folder).values():
+        for path in {r.path for r in manifest.revisions}:
+            revision = _published_entry_revision(manifest, published, path)
+            if revision is not None:
+                protected.add(revision.id)
+    return protected
+
+
+def _beyond_byte_budget(folder: Path, manifest: Manifest) -> set[str]:
+    """The ids of the oldest revisions to drop so the distinct blobs of those
+    kept hold at most MAX_REVISION_BYTES.
+
+    Protected revisions (_protected_revision_ids) are kept and counted first;
+    the rest are kept newest first until the next would pass the budget, and
+    every older one goes with it, so history stays one unbroken run. When the
+    protected set can't be read nothing is dropped: keeping too much is
+    cheaper than losing the published version's content.
+    """
+    revisions = manifest.revisions
+    sizes = {item.content_hash: item.size or 0 for item in revisions}
+    if sum(sizes.values()) <= MAX_REVISION_BYTES:
+        return set()
+    try:
+        protected = _protected_revision_ids(folder, manifest)
+    except Exception:
+        logger.warning("Could not tell which revisions to keep; kept them all", exc_info=True)
+        return set()
+    kept = {item.content_hash for item in revisions if item.id in protected}
+    total = sum(sizes[h] for h in kept)
+    dropped: set[str] = set()
+    full = False
+    for item in reversed(revisions):
+        if item.id in protected:
+            continue
+        if not full and (item.content_hash in kept or total + sizes[item.content_hash] <= MAX_REVISION_BYTES):
+            if item.content_hash not in kept:
+                kept.add(item.content_hash)
+                total += sizes[item.content_hash]
+            continue
+        full = True
+        dropped.add(item.id)
+    return dropped
+
+
 def _persist_revision(
     folder: Path, manifest: Manifest, entry: RevisionEntry, content: bytes
 ) -> RevisionEntry:
@@ -593,6 +656,10 @@ def _persist_revision(
     pruned = len(revisions) > MAX_REVISIONS
     if pruned:
         del revisions[:-MAX_REVISIONS]
+    dropped = _beyond_byte_budget(folder, manifest)
+    if dropped:
+        revisions[:] = [item for item in revisions if item.id not in dropped]
+        pruned = True
     _write_manifest(folder, manifest)
     if pruned:
         _prune_orphan_blobs(folder, revisions)
@@ -1814,9 +1881,18 @@ def published_revision(folder: Path, entry: object, rel_path: str | None) -> dic
         return None
     with artifact_lock(folder):
         manifest = _read_manifest(folder)
+    revision = _published_entry_revision(manifest, entry, rel_path)
+    return revision.to_json() if revision is not None else None
+
+
+def _published_entry_revision(manifest: Manifest, entry: object, rel_path: str) -> RevisionEntry | None:
+    """published_revision's choice, from a manifest already read: also what
+    the byte budget keeps (_protected_revision_ids)."""
+    if not isinstance(entry, dict) or not entry.get("report_id") or entry.get("published") is False:
+        return None
     recorded = manifest.revision(entry.get("published_revision_id"))
     if recorded is not None and recorded.path == rel_path:
-        return recorded.to_json()
+        return recorded
     published_mtime = entry.get("published_mtime")
     if not isinstance(published_mtime, (int, float)) or isinstance(published_mtime, bool):
         return None
@@ -1828,4 +1904,4 @@ def published_revision(folder: Path, entry: object, rel_path: str | None) -> dic
         created = _parse_timestamp(revision.created_at)
         if created is not None and created <= cutoff:
             best = revision
-    return best.to_json() if best is not None else None
+    return best

@@ -222,6 +222,73 @@ def test_text_sources_answer_exactly_as_before(html_artifact):
         revision_content(folder, source["revision"]["id"])
 
 
+def _blobs(folder) -> set[str]:
+    return {p.name for p in (folder / ".revisions" / "blobs").iterdir()}
+
+
+def _new_document_version(folder, metadata, artifact_id, number: int) -> dict:
+    (folder / "report.docx").write_bytes(b"PK\x03\x04" + bytes([number]) * 1000)
+    return current_source(folder, metadata, artifact_id)["revision"]
+
+
+def test_a_document_over_the_byte_budget_drops_its_oldest_revisions(docx_artifact, monkeypatch):
+    folder, metadata, artifact_id = docx_artifact
+    # Room for three 1 KB versions; the fixture's first draft is larger.
+    monkeypatch.setattr(revision_service, "MAX_REVISION_BYTES", 3 * 1004)
+    first = current_source(folder, metadata, artifact_id)["revision"]
+    versions = [_new_document_version(folder, metadata, artifact_id, n) for n in range(1, 7)]
+
+    kept = list_revisions(folder)
+    # The newest three, the oldest gone, and their blobs with them.
+    assert [r["id"] for r in kept] == [v["id"] for v in reversed(versions[-3:])]
+    assert _blobs(folder) == {r["contentHash"] for r in kept}
+    assert first["contentHash"] not in _blobs(folder)
+    assert sum(r["bytes"] for r in kept) <= revision_service.MAX_REVISION_BYTES
+
+
+def test_the_byte_budget_keeps_the_head_and_the_published_revision(docx_artifact, monkeypatch):
+    folder, metadata, artifact_id = docx_artifact
+    first = current_source(folder, metadata, artifact_id)["revision"]
+    # The published revision is the old, large first draft.
+    (folder / ".published.json").write_text(json.dumps({
+        "report.docx": {"report_id": "r-1", "url": "https://x", "published_revision_id": first["id"]},
+    }), encoding="utf-8")
+    monkeypatch.setattr(revision_service, "MAX_REVISION_BYTES", first["bytes"] + 2 * 1004)
+    versions = [_new_document_version(folder, metadata, artifact_id, n) for n in range(1, 7)]
+
+    kept = [r["id"] for r in list_revisions(folder)]
+    assert kept == [versions[-1]["id"], versions[-2]["id"], first["id"]]
+    assert revision_content(folder, first["id"]).data
+    entry = json.loads((folder / ".published.json").read_text())["report.docx"]
+    assert revision_service.published_revision(folder, entry, "report.docx")["id"] == first["id"]
+
+    # Even a head past the budget on its own is kept.
+    monkeypatch.setattr(revision_service, "MAX_REVISION_BYTES", 10)
+    head = _new_document_version(folder, metadata, artifact_id, 9)
+    assert [r["id"] for r in list_revisions(folder)] == [head["id"], first["id"]]
+
+
+def test_the_byte_budget_keeps_revisions_an_open_repair_names(html_artifact, monkeypatch):
+    folder, metadata, artifact_id = html_artifact
+    base = current_source(folder, metadata, artifact_id)["revision"]
+    revision_service.create_agent_repair(
+        folder, metadata, artifact_id, expected_revision_id=base["id"], comment_thread_id="t-1",
+        selector="h1", thread=[{"text": "Bigger"}], conversation_id=CONVERSATION,
+    )
+    monkeypatch.setattr(revision_service, "MAX_REVISION_BYTES", 1)
+    (folder / "index.html").write_text("<h1>Agent</h1>", encoding="utf-8")
+    agent = capture_agent_revision(folder, conversation_id=CONVERSATION)
+    (folder / "index.html").write_text("<h1>Later</h1>", encoding="utf-8")
+    head = current_source(folder, metadata, artifact_id)["revision"]
+
+    assert [r["id"] for r in list_revisions(folder)] == [head["id"], agent["id"], base["id"]]
+
+
+def test_text_artifacts_stay_under_the_byte_budget():
+    # 80 revisions of the largest page source fit, so text keeps its count rule.
+    assert revision_service.MAX_REVISIONS * MAX_SOURCE_BYTES <= revision_service.MAX_REVISION_BYTES
+
+
 # ── the routes ────────────────────────────────────────────────────────────
 
 
