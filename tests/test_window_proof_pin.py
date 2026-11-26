@@ -119,7 +119,7 @@ OPEN_A_FOLDER_TO_ANTON = (
 )
 #: The desktop publishes with the person's own publishing key. Saving a
 #: published artifact's source, or restoring a revision of it, publishes it
-#: again.
+#: again, and so does editing a shared doc or restoring a version of it.
 PUBLISH_IN_THE_PERSONS_NAME = (
     "publish an artifact, or change what a published one shows or who may open it, with the person's "
     "publishing key, so the agent makes its own content public in the person's name"
@@ -401,6 +401,8 @@ WINDOW_PROOF_REASONS: dict[tuple[str, tuple[str, ...]], str] = {
     ("/api/v1/artifacts/workspace/{project_ref}/{artifact_id}/revisions/{revision_id}/restore", ("POST",)): (
         PUBLISH_IN_THE_PERSONS_NAME
     ),
+    ("/api/v1/docs/{project_ref}/{artifact_id}/ops", ("POST",)): PUBLISH_IN_THE_PERSONS_NAME,
+    ("/api/v1/docs/{project_ref}/{artifact_id}/history/{rev}/restore", ("POST",)): PUBLISH_IN_THE_PERSONS_NAME,
     # Anton: run a program on this computer.
     ("/api/v1/artifacts/preview-mount", ("POST",)): (
         "start a full-stack artifact's backend, a program that runs on this computer outside any sandbox"
@@ -580,6 +582,12 @@ WRITES_WITHOUT_THE_PROOF: dict[tuple[str, tuple[str, ...]], str] = {
     ("/api/v1/pins/", ("POST",)): CHANGES_THE_PERSONS_OWN_WORK,
     ("/api/v1/pins/{item_id}/visit", ("POST",)): CHANGES_THE_PERSONS_OWN_WORK,
     ("/api/v1/pins/{item_id}", ("DELETE",)): CHANGES_THE_PERSONS_OWN_WORK,
+    # Docs. A new doc gets a fresh folder and isn't shared, so on the desktop
+    # its republish sends nothing. An image is named by its hash and never
+    # replaces a file; it shows in the doc only once an edit, which asks for
+    # the proof, puts it there.
+    ("/api/v1/docs/", ("POST",)): CHANGES_THE_PERSONS_OWN_WORK,
+    ("/api/v1/docs/{project_ref}/{artifact_id}/images", ("POST",)): CHANGES_THE_PERSONS_OWN_WORK,
     # Projects and their files. Upload writes only top-level names that don't
     # start with a dot, so it can't reach .anton/.
     ("/api/v1/projects/{project_id}", ("PATCH",)): CHANGES_THE_PERSONS_OWN_WORK,
