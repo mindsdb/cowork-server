@@ -210,3 +210,26 @@ async def test_status_lists_the_voices_a_call_can_speak_in(inference):
     assert status["defaultVoice"] == voice.DEFAULT_VOICE
     assert status["voices"][0] == {"name": "cinder", "style": voice.VOICE_STYLES["cinder"]}
     assert [v["name"] for v in status["voices"]] == list(voice.VOICE_STYLES)
+
+
+async def test_dictation_only_listens_and_reads_no_memory(inference, monkeypatch):
+    """ENG-4630: the composer's mic starts a session that only transcribes."""
+    import cowork.api.v1.endpoints.voice as endpoint
+
+    def no_memory(scope):
+        raise AssertionError("dictation reads no memory")
+
+    monkeypatch.setattr(endpoint, "_person_memory", no_memory)
+    started = await _call("POST", "/session", json={"sdp": "offer-sdp", "mode": "dictation", "timezone": "UTC"})
+
+    assert started.status_code == 200, started.text
+    instructions = json.loads(inference.seen[0].content)["session"]["instructions"]
+    assert instructions == voice.DICTATION_PROMPT
+    assert "Never speak" in instructions
+
+
+async def test_an_unknown_session_mode_is_refused(inference):
+    refused = await _call("POST", "/session", json={"sdp": "offer-sdp", "mode": "karaoke"})
+
+    assert refused.status_code == 422
+    assert inference.seen == []

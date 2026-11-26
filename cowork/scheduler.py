@@ -112,7 +112,7 @@ _SHUTDOWN_RUN_ERROR = "Run did not start: the server was shutting down."
 _CLAIM_UNAVAILABLE_RUN_ERROR = "Run did not start: Cowork was busy."
 # A run's error when a shutdown cancelled it before it recorded its turn's
 # outcome. Saved as failed, not success, so a cron slot it did not consume
-# stays due, and the freshness guard skips no slot because of it.
+# stays due.
 _INTERRUPTED_RUN_ERROR = "Run was interrupted: the server shut down before it finished."
 # The runs the poll loop started and nothing awaits. A shutdown waits for them
 # (wait_for_scheduled_runs) so each run's last writes land before the process
@@ -128,27 +128,11 @@ _RECURRING_CADENCES = {
 
 # A one-off may start up to this late on its own. At this lateness or more
 # (the app was not running when its time came) it is marked missed, and runs
-# only when the user presses Run now. Independent of the freshness window
-# below despite the shared hour: this bounds how late a one-off may still run.
+# only when the user presses Run now.
 _ONCE_LATE_LIMIT = timedelta(hours=1)
 # A recurring schedule that fell behind runs its latest missed slot once, when
 # that slot is no older than this; every other missed slot is passed over.
 _MISSED_RUN_LOOKBACK = timedelta(days=7)
-
-# Freshness guard (ENG-688): if a successful run — typically a manual
-# "run now" — finished this recently before a due cron slot, the slot is
-# skipped instead of executed, so both runs don't publish the same output
-# twice. Hourly gets a tighter window so consecutive slots never suppress
-# each other even when a run finishes mid-hour. Shorter
-# cadences get none: at every 15 or 30 minutes, a slot right after a manual
-# run is wanted.
-_FRESHNESS_WINDOW_SECONDS = {
-    Cadence.once: 60 * 60,
-    Cadence.hourly: 30 * 60,
-    Cadence.daily: 60 * 60,
-    Cadence.weekdays: 60 * 60,
-    Cadence.weekly: 60 * 60,
-}
 
 
 def _advance_next_run_at(schedule: Schedule, session) -> None:
@@ -403,6 +387,8 @@ class _TurnEvidence:
     # What the turn handed the browser to a person for (its hand-over's
     # reason), when it did. A scheduled run has nobody to take it.
     handed_over: str | None = None
+    # Whether a change the agent asked approval for went unapproved.
+    writes_refused: bool = False
 
 
 @dataclass(frozen=True)
@@ -454,6 +440,12 @@ def _hand_over_error(reason: str) -> str:
     )
 
 
+_WRITES_REFUSED_ERROR = (
+    "Run stopped short: a change needed approval, and a scheduled run has nobody to approve it, "
+    "so it wasn't made. Open the run to see the change, then run the task now and approve it there."
+)
+
+
 def _classify(evidence: _TurnEvidence) -> _AttemptEnd:
     """What the turn's ending says about whether its agent acted, and what to
     tell the user: the turn's own failure text when it gave one. When in doubt
@@ -464,6 +456,9 @@ def _classify(evidence: _TurnEvidence) -> _AttemptEnd:
             # The agent ends its turn once nobody takes the browser, so the
             # turn reads as finished though its work stopped at that step.
             return _AttemptEnd(outcome=AttemptOutcome.failed_during_execution, error=_hand_over_error(evidence.handed_over))
+        if evidence.writes_refused:
+            # Ranked above a limit: a lost write is the bigger surprise.
+            return _AttemptEnd(outcome=AttemptOutcome.writes_refused, error=_WRITES_REFUSED_ERROR)
         limit_error = _LIMIT_ERRORS.get(evidence.stopped_by or "")
         if limit_error:
             return _AttemptEnd(outcome=AttemptOutcome.stopped_at_limit, error=limit_error)
@@ -678,9 +673,8 @@ def _record_turn_outcome(
     elif end.outcome != AttemptOutcome.completed:
         # Any other ending is a failure, an uncertain one included: a turn
         # with no record of how it ended is not a success anyone can vouch
-        # for, so it neither suppresses the next slot nor ends a failure
-        # streak. It doesn't extend the streak either: an unreadable record
-        # says nothing about the task, and auto-pause is for tasks that keep
+        # for, so it does not end a failure streak. An unreadable record
+        # also says nothing about the task, and auto-pause is for tasks that keep
         # failing. A run stopped at a limit is left out of the streak for the
         # same reason: it worked as far as its settings allowed.
         outcome = _RunOutcome(status=RunStatus.failed, error=end.error or _FAILED_DURING_ERROR)
@@ -691,9 +685,7 @@ def _record_turn_outcome(
 
     def settle(schedule: Schedule) -> None:
         # Always consume the cron slot: the schedule stays due otherwise and
-        # the loop would immediately restart the run the user killed (a
-        # cancelled or failed run isn't a success, so the freshness guard
-        # wouldn't block the restart).
+        # the loop would immediately restart the run the user killed.
         if not is_manual:
             _advance_next_run_at(schedule, session)
             if (
@@ -709,9 +701,11 @@ def _record_turn_outcome(
         if outcome.status is None:
             # A success of either kind ends the failure streak.
             count_settled_slot(session, schedule_id, failed=False)
-        if schedule.cadence == Cadence.once and (not is_manual or end.outcome == AttemptOutcome.completed):
-            # Cron consumes its slot, but Run now uses a one-off up only on
-            # confirmed completion. Other endings preserve its prior state.
+        if schedule.cadence == Cadence.once and (
+            not is_manual or (schedule.missed_at is not None and end.outcome == AttemptOutcome.completed)
+        ):
+            # A successful Run now resolves an already-missed one-off. Active
+            # and paused one-offs keep their scheduled occurrence.
             schedule.enabled = False
             schedule.missed_at = None
             schedule.paused_at = None
@@ -840,9 +834,7 @@ async def _execute_schedule(
     A Run now passes the ``run_id`` its request already claimed
     (claim_manual_run), so the press and its run are one claim.
 
-    A ``trial`` run is a run-now that tries the task out. It doesn't use a
-    one-off up, and neither the freshness guard nor the failure streak counts
-    it.
+    A ``trial`` run tries the task out and leaves the failure streak unchanged.
     """
     is_manual = trigger != RunTrigger.cron
     trial = trigger == RunTrigger.trial
@@ -1157,6 +1149,7 @@ async def _execute_schedule(
                             AttemptOutcome.failed_during_execution,
                             AttemptOutcome.interrupted,
                             AttemptOutcome.stopped_at_limit,
+                            AttemptOutcome.writes_refused,
                         }
                         and not shutdown_interrupted
                     ),
@@ -1476,6 +1469,7 @@ async def _turn_evidence(conversation_id: str) -> _TurnEvidence:
         shutdown_interrupted=shutdown_interrupted,
         stopped_by=await _turn_stopped_by(conversation_id) if reason == "completed" else None,
         handed_over=await _turn_handed_over(conversation_id) if reason == "completed" else None,
+        writes_refused=reason == "completed" and await _turn_refused_writes(conversation_id),
     )
 
 
@@ -1561,6 +1555,49 @@ async def _turn_handed_over(conversation_id: str) -> str | None:
     return handed_over
 
 
+# anton's write-approval cards name their question with this prefix; other
+# cards (a browser step, a plain question) aren't write approval.
+_WRITE_APPROVAL_PREFIX = "write:"
+
+
+async def _turn_refused_writes(conversation_id: str) -> bool:
+    """Whether a write-approval card the turn asked went without Approve:
+    declined, timed out, or never answered. After one goes unanswered, anton
+    refuses the turn's later writes without a card, so one is enough. False
+    when the frames can't be read.
+
+    Only call after the turn's stream has been fully drained."""
+    handle = registry.get(conversation_id)
+    if handle is None:
+        return False
+    asked: set[str] = set()
+    approved: set[str] = set()
+    try:
+        async with asyncio.timeout(_EVIDENCE_READ_TIMEOUT_SECONDS):
+            async for rec in handle.buffer.tail(0):
+                if rec.is_terminal:
+                    break
+                for event, data in _sse_frames(rec):
+                    question = data.get("question_id")
+                    if not isinstance(question, str) or not question.startswith(_WRITE_APPROVAL_PREFIX):
+                        continue
+                    if event == "response.ask_user":
+                        asked.add(question)
+                    elif (
+                        event == "response.ask_user_answered"
+                        and data.get("status") == "answered"
+                        and data.get("values") == ["approve"]
+                    ):
+                        approved.add(question)
+    except Exception:
+        logger.exception(
+            "Could not read whether the turn's writes were approved",
+            extra=log_context(conversation_id=conversation_id)
+        )
+        return False
+    return bool(asked - approved)
+
+
 async def _turn_activity(conversation_id: str) -> tuple[bool, _TurnFailure | None]:
     """Whether the turn's buffer holds anything beyond its start, its memory
     read, a wait for the model and its failure, and the last failure frame it
@@ -1597,29 +1634,12 @@ async def _turn_activity(conversation_id: str) -> tuple[bool, _TurnFailure | Non
     return True, failure
 
 
-def _ran_recently(schedule: Schedule, run_service: ScheduleRunService, now: datetime) -> bool:
-    window = _FRESHNESS_WINDOW_SECONDS.get(schedule.cadence)
-    if not window:
-        return False
-    last = run_service.last_successful_finish(schedule.id)
-    return last is not None and (now - last).total_seconds() < window
-
-
 def _due_schedules(session, now: datetime) -> list[Schedule]:
-    """Enabled schedules whose slot is due and should actually execute.
-
-    A due slot with a successful run inside the freshness window is skipped
-    and advanced to its next occurrence instead of returned.
-    """
     run_service = ScheduleRunService(session)
     due: list[Schedule] = []
-    skipped = False
     for s in ScheduleService(session).list_schedules():
-        # Gate on ANY in-flight run, manual included: a manual run still
-        # executing when the slot comes due would otherwise run alongside the
-        # cron run and publish the same output twice. The slot is deferred,
-        # not consumed — once the run finishes, the freshness guard decides
-        # whether it still fires.
+        # A manual run can still be in flight when the scheduled slot comes
+        # due. Leave the slot pending until the active run finishes.
         if not s.enabled or ensure_utc(s.next_run_at) > now or run_service.has_active_run(s.id):
             continue
         # Read the row again: a run that ended after this poll read it has
@@ -1631,17 +1651,7 @@ def _due_schedules(session, now: datetime) -> list[Schedule]:
             continue  # deleted since this poll read it
         if not s.enabled or ensure_utc(s.next_run_at) > now:
             continue
-        if _ran_recently(s, run_service, now):
-            logger.info(
-                "Skipping schedule slot after a recent successful run",
-                extra=log_context(schedule_id=s.id)
-            )
-            _advance_next_run_at(s, session)
-            skipped = True
-            continue
         due.append(s)
-    if skipped:
-        session.commit()
     return due
 
 

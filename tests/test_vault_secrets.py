@@ -128,3 +128,65 @@ async def test_a_web_turn_answers_503_when_the_file_store_is_too_busy_to_registe
     assert response.json()["code"] == "server_busy"
     assert response.headers["retry-after"] == "1"
     assert routed == []
+
+
+@pytest.fixture
+def unparsable_sealed_record(monkeypatch, request, key_file, tmp_path):
+    """A key file, and a base vault whose one sealed record is cut short, so
+    the vault can't list its connections."""
+    from cowork.services.connectors.persist import own_vault_for_scope
+
+    monkeypatch.setenv("COWORK_VAULT_DIR", str(tmp_path / "vault"))
+    get_app_settings.cache_clear()
+    request.addfinalizer(get_app_settings.cache_clear)
+    vault = own_vault_for_scope(LOCAL_SCOPE)
+    vault.save("postgres", "sales", {"password": "salesDsnPass"})
+    path = vault._path_for("postgres", "sales")
+    path.write_bytes(path.read_bytes()[:100])
+    request.addfinalizer(_reset_registered_ds_vars)
+
+
+async def test_a_sealed_record_that_wont_open_stops_the_registration_naming_it(unparsable_sealed_record, owned_logger):
+    """Scrubbing by shape alone would replay every connection's saved values
+    unredacted, so the registration stops instead of going on without them."""
+    from cowork.services.connectors.sealed_vault import SealedRecordError
+    from tests._logging_assertions import assert_log_fields
+
+    logged = owned_logger(vault_secrets_mod.logger.name, level=logging.WARNING)
+
+    with pytest.raises(SealedRecordError, match="postgres-sales"):
+        await register_vault_secrets(LOCAL_SCOPE)
+
+    assert_log_fields(
+        logged.output(),
+        log_level="ERROR",
+        event="sealed_connection_unopenable",
+        connection="postgres-sales",
+        reason="its record file isn't valid JSON",
+    )
+    assert "Could not register vault secrets" not in logged.output()
+
+
+async def test_a_web_turn_answers_409_naming_a_sealed_record_that_wont_open(monkeypatch, unparsable_sealed_record):
+    """Before the routing gate reads any history, through create_app's handler."""
+    import httpx
+
+    import cowork.handlers.responses as responses_mod
+    from cowork.server import create_app
+
+    routed = []
+
+    async def route_request(self, **kwargs):
+        routed.append(kwargs)
+        raise RuntimeError("the gate ran")
+
+    monkeypatch.setattr(responses_mod.ResponsesHandler, "_route_request", route_request)
+    transport = httpx.ASGITransport(app=create_app(), raise_app_exceptions=False)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.post("/api/v1/responses/", json={"input": "hi", "stream": True})
+
+    assert response.status_code == 409, response.text
+    assert response.json() == {
+        "detail": "The saved connection postgres-sales can't be opened: its record file isn't valid JSON."
+    }
+    assert routed == []
