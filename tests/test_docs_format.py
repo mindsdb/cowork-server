@@ -395,4 +395,4 @@ def test_an_empty_paragraph_keeps_its_line_on_the_page_and_in_the_exports():
                          "tabs": [{"id": "t_1", "title": "T", "blocks": blocks}]})
     expected = "<p>First</p>\n<p><br></p>\n<p><br></p>\n<p>Second</p>"
     assert expected in doc_html(doc)
-    assert expected in export_body_html(doc)
+    assert expected in export_body_html(doc, highlight=False)

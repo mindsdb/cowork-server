@@ -121,3 +121,41 @@ def test_the_css_gives_each_class_its_colour_and_background():
     assert ".hljs-addition{color:rgb(20, 121, 79)}" in css
     assert ".hljs-addition{background:rgba(20, 121, 79, 0.12)}" in css
     assert ".hljs-comment{color:var(--ink-4)}" in css
+
+
+from cowork.docs.export import _document, export_bytes  # noqa: E402
+from cowork.docs.model import SCHEMA, normalize_doc  # noqa: E402
+from cowork.docs.render import doc_html, export_body_html  # noqa: E402
+
+
+def _doc(*blocks: dict):
+    return normalize_doc({"schema": SCHEMA, "title": "T", "rev": 1,
+                          "tabs": [{"id": "t_1", "title": "T", "blocks": list(blocks)}]})
+
+
+_PY = {"type": "code", "language": "py", "code": "def f():\n    return 1"}
+
+
+def test_the_page_highlights_a_known_language():
+    page = doc_html(_doc(_PY))
+    assert "<pre><code class='hljs language-python'><span class=\"hljs-keyword\">def</span>" in page
+
+
+def test_the_page_keeps_an_unknown_language_plain():
+    page = doc_html(_doc({"type": "code", "language": "java", "code": "int x = 1;"}))
+    assert "<pre><code>int x = 1;</code></pre>" in page
+
+
+def test_the_html_and_pdf_exports_are_highlighted_and_word_is_not():
+    doc = _doc(_PY)
+    assert "hljs-keyword" in export_bytes(doc, "html").decode()
+    assert "hljs-keyword" in _document(doc, "pdf").decode()
+    word = _document(doc, "docx").decode()
+    assert "hljs-" not in word
+    assert "def f():\n    return 1" in word
+
+
+def test_the_body_markup_chooses_its_highlighting():
+    doc = _doc(_PY)
+    assert "hljs-" in export_body_html(doc, highlight=True)
+    assert "hljs-" not in export_body_html(doc, highlight=False)
