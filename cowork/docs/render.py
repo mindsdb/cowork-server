@@ -663,7 +663,7 @@ def _hbar_svg(labels: list[str], series: list[dict[str, Any]], low: float, span:
 # with an id, so each block's root carries one. Only ids that need no escaping
 # in HTML or CSS: the app reads them back from the layer's selector as written.
 _PAGE_ID = re.compile(r"[A-Za-z0-9_-]{1,64}")
-_ROOT_TAG = re.compile(r"^<[a-z][a-z0-9]*")
+_ROOT_TAG = re.compile(r"<[a-z][a-z0-9]*")
 
 
 def _page_id(b: Block) -> str:
@@ -676,7 +676,8 @@ def _page_id(b: Block) -> str:
 
 def _with_page_id(markup: str, b: Block) -> str:
     attr = _page_id(b)
-    return _ROOT_TAG.sub(lambda m: m.group(0) + attr, markup, count=1) if attr else markup
+    root = _ROOT_TAG.match(markup) if attr else None
+    return markup[:root.end()] + attr + markup[root.end():] if root else markup
 
 
 def _list_html(items: list[Block], rich: bool) -> str:
