@@ -232,6 +232,7 @@ async def test_an_unknown_session_mode_is_refused(inference):
     refused = await _call("POST", "/session", json={"sdp": "offer-sdp", "mode": "karaoke"})
 
     assert refused.status_code == 422
+    assert inference.seen == []
 
 
 def test_person_memory_is_empty_when_memory_mode_is_off_alone(monkeypatch):

@@ -90,9 +90,10 @@ async def remote_turn_events(
     (_turn_stream), not a read made in here.
 
     `memory_off` tells the controller this turn's settings say memory reads
-    are off; a channel turn never sends project memory either way
-    (_read_channel_turn_inputs), but the controller still needs this to
-    decide the global memory mount."""
+    are off. A channel turn always sends `user_id=None`
+    (AntonChannelRuntime._turn_stream), so the controller's own
+    wants_memory_mount already mounts nothing here regardless; this is
+    forwarded for when a channel turn carries a user."""
     from anton.core.llm.provider import StreamTaskProgress, StreamTextDelta
     from cowork.handlers._turn_history import remote_turn_history
     from cowork.harnesses.anton_harness.stream_formatter import ArtifactCreated, SkillCreated, TurnContext
