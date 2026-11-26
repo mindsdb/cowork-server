@@ -47,6 +47,7 @@ from cowork.services.product_permissions import has_product_permission, require_
 from cowork.services.artifact_permissions import (
     artifact_capabilities,
     require_artifact_owner,
+    with_display_limits,
     with_export_formats,
 )
 from cowork.services import artifact_files
@@ -54,7 +55,7 @@ from cowork.services.artifact_autopublish import job_budget_for, lock_ttl_for
 from cowork.services.preview_html import prepare_preview_html
 from cowork.services.quick_edit import direct_edit_available, quick_edit_available
 from cowork.services.artifact_identity import opened_artifact_folder
-from cowork.services.artifact_metadata import ArtifactMetadata
+from cowork.services.artifact_metadata import WIDGET_PUBLISH_REFUSAL, ArtifactMetadata, is_widget
 from cowork.schemas.artifact_export import ExportRequest, ExportResult
 from cowork.schemas.artifact_access import (
     ArtifactAccessRequest,
@@ -794,7 +795,10 @@ async def artifact_source(
             scope=scope,
         )
         capabilities = await _current_capabilities(
-            scope, with_export_formats(scope, owner_capabilities, export_source)
+            scope,
+            with_display_limits(
+                with_export_formats(scope, owner_capabilities, export_source), metadata.display
+            ),
         )
         return {**result, "capabilities": capabilities, "repair": repair}
     except FileNotFoundError as exc:
@@ -979,7 +983,9 @@ async def artifact_review_entry(
     capabilities = await _current_capabilities(
         scope,
         await run_db(
-            lambda unit: artifact_capabilities(unit, artifact.source, artifact.folder.name),
+            lambda unit: artifact_capabilities(
+                unit, artifact.source, artifact.folder.name, display=artifact.metadata.display
+            ),
             scope=scope,
         ),
     )
@@ -1238,6 +1244,14 @@ def _owner_publish_context(scope: TenantScope, folder: Path):
     )
 
 
+def _refuse_widget(metadata: ArtifactMetadata | None) -> None:
+    """400 for a widget: it is never published or shared (ENG-4684). Checked
+    before the publish lock and the audience checks; publish_artifact refuses
+    it again for every other path."""
+    if metadata is not None and is_widget(metadata.display):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=WIDGET_PUBLISH_REFUSAL)
+
+
 def _artifact_primary(folder: Path, metadata: ArtifactMetadata | None):
     from cowork.services.artifacts import _pick_primary, _user_files
 
@@ -1461,6 +1475,7 @@ async def set_artifact_access(
     source, folder, metadata, _capabilities = await _owner_workspace(
         scope, project_ref, artifact_id
     )
+    _refuse_widget(metadata)
     if await run_efs(partial(_artifact_primary, folder, metadata), scope=scope) is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -1643,6 +1658,7 @@ async def republish_artifact(
     source, folder, metadata, _capabilities = await _owner_workspace(
         scope, project_ref, artifact_id
     )
+    _refuse_widget(metadata)
     if await run_efs(partial(_artifact_primary, folder, metadata), scope=scope) is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,

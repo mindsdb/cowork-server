@@ -57,6 +57,11 @@ class VoiceOperateRequest(BaseModel):
     snapshot: str = Field(default="", max_length=voice_operator.MAX_SNAPSHOT_CHARS * 2)
     # The person's IANA time zone, from their browser, so dates are counted from their today.
     timezone: str | None = Field(default=None, max_length=64)
+    # The widgets and inline pieces in the open chat, latest first (ENG-4684):
+    # the model sees the first MAX_WIDGETS, each field cut to its bound.
+    widgets: list[voice_operator.ScreenWidget] = Field(
+        default_factory=list, max_length=voice_operator.MAX_WIDGETS * 2
+    )
 
 
 @router.get("/status", response_model=voice.VoiceStatus, dependencies=[Depends(require(AuthenticatedInOrgMode))])
@@ -85,6 +90,8 @@ async def voice_session(
 @router.post("/operate", dependencies=[Depends(require(AuthenticatedInOrgMode))])
 async def voice_operate(body: VoiceOperateRequest, request: Request) -> dict:
     try:
-        return await voice_operator.operate(mindshub_credential(request), body.messages, body.snapshot, body.timezone)
+        return await voice_operator.operate(
+            mindshub_credential(request), body.messages, body.snapshot, body.timezone, body.widgets
+        )
     except voice_operator.OperatorError as exc:
         raise HTTPException(status_code=exc.status, detail={"code": exc.code, "message": exc.message}) from exc

@@ -5,6 +5,7 @@ from fastapi import HTTPException, status
 
 from cowork.principal import Principal, can_manage_org
 from cowork.services.artifact_export import ExportSource, offered_export_formats
+from cowork.services.artifact_metadata import is_widget
 
 _OWNER_ONLY = "Only the artifact owner can change this draft"
 _OWNER_UNKNOWN = "Artifact owner is unknown"
@@ -17,6 +18,7 @@ def artifact_capabilities(
     *,
     resolution=None,
     export_source: ExportSource | None = None,
+    display: str | None = None,
 ) -> dict:
     """Return the permissions the API will enforce for this artifact.
 
@@ -32,6 +34,9 @@ def artifact_capabilities(
     route accepts from this caller, from ``offered_export_formats`` alone:
     none for a caller who can't edit, and none in organization mode while
     org export is off.
+
+    ``display`` is the artifact's metadata.json ``display``: a widget's
+    capabilities say it can't be published or shared (with_display_limits).
     """
     scope = getattr(session, "scope", None)
     if not scope or not scope.org_mode:
@@ -67,7 +72,17 @@ def artifact_capabilities(
             capabilities["ownerUserId"] = str(owner_id)
     if export_source is not None:
         capabilities = with_export_formats(scope, capabilities, export_source)
-    return capabilities
+    return with_display_limits(capabilities, display)
+
+
+def with_display_limits(capabilities: dict, display: str | None) -> dict:
+    """*capabilities* with ``canPublish`` and ``canShare`` false for a widget
+    (metadata.json ``display: "widget"``, ENG-4684), which the publish and
+    access routes refuse. Any other artifact's capabilities leave both keys
+    out, and a missing key means the route decides as before."""
+    if not is_widget(display):
+        return capabilities
+    return {**capabilities, "canPublish": False, "canShare": False}
 
 
 def with_export_formats(scope, capabilities: dict, export_source: ExportSource) -> dict:

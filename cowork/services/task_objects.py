@@ -18,7 +18,7 @@ from cowork.models.conversation import Conversation
 from cowork.models.project import Project
 from cowork.models.task_object import TaskObject
 from cowork.services.artifact_identity import ArtifactListing, ListedIds
-from cowork.services.artifact_metadata import ArtifactMetadata
+from cowork.services.artifact_metadata import ArtifactMetadata, is_widget, shows_inline
 from cowork.turnqueue.models import TurnCompleted
 
 if TYPE_CHECKING:
@@ -965,7 +965,7 @@ def cards_for_slugs(
             continue
         if card is not None:
             captured = (revisions or {}).get(slug)
-            if captured and card.display:
+            if captured and shows_inline(card.display):
                 card.revision_id = captured
             cards.append(card)
     return cards
@@ -1026,14 +1026,18 @@ async def publish_and_card_turn_artifacts(
     )
     if getattr(scope, "org_mode", False):
         carded = set(new_slugs) | (republished & set(touched_slugs))
+        # A widget is never published, so an edit of one never comes back in
+        # `republished`: it cards whenever this turn touched it (ENG-4684).
+        maybe_widgets = set(touched_slugs) - carded
     else:
         carded = set(touched_slugs)
+        maybe_widgets = set()
     from cowork.db.units import run_efs
 
-    return await run_efs(
+    cards = await run_efs(
         partial(
             cards_for_slugs,
-            artifacts_base, sorted(carded),
+            artifacts_base, sorted(carded | maybe_widgets),
             scope=scope,
             project_id=project_id, project_name=project_name, project_label=project_label,
             revisions=revisions,
@@ -1041,6 +1045,12 @@ async def publish_and_card_turn_artifacts(
         scope=scope or LOCAL_SCOPE,
         deadline=False,
     )
+    if not maybe_widgets:
+        return cards
+    return [
+        card for card in cards
+        if Path(card.folder).name not in maybe_widgets or is_widget(card.display)
+    ]
 
 
 # ── skill-draft attribution ────────────────────────────────────────────────

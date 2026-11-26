@@ -45,10 +45,11 @@ class ArtifactCard(BaseModel):
     folder: str
     path: str
     primary: str | None
-    # "inline" for an artifact the chat reply shows live (metadata.json
-    # `display`); set only then, so other cards carry no key.
+    # "inline" or "widget" for an artifact the chat reply shows live
+    # (metadata.json `display`, artifact_metadata.INLINE_DISPLAYS); set only
+    # then, so other cards carry no key.
     display: str | None = None
-    # On an inline card, the primary's revision the card shows: the head
+    # On an inline or widget card, the primary's revision the card shows: the head
     # revision while it still matches the file. Set only then.
     revision_id: str | None = None
     project_id: str | None

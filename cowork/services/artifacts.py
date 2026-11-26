@@ -49,7 +49,7 @@ from cowork.db.personal_resources import PersonalResource
 from cowork.models.artifact_owner_choice import AccessMode
 from cowork.schemas.artifact_access import ArtifactAccessView, ArtifactStatusView
 from cowork.schemas.artifact_card import ArtifactCard
-from cowork.services.artifact_metadata import ArtifactMetadata, lenient_text
+from cowork.services.artifact_metadata import ArtifactMetadata, is_widget, lenient_text, shows_inline
 from anton.core.artifacts.internal_files import (
     NON_CONTENT_NAMES,
     REVISIONS_DIRNAME,
@@ -1676,7 +1676,7 @@ def _prepare_artifact_card(
         path=primary_path,
         primary=meta.primary or None,
         # Only when metadata.json asks for it, so other cards keep their keys.
-        **({"display": meta.display} if meta.display else {}),
+        **({"display": meta.display} if shows_inline(meta.display) else {}),
         project_id=project_id,
         # What the card shows. The serve URL below carries `project_name`
         # instead, because serve_artifact_file resolves that segment by name
@@ -1720,7 +1720,7 @@ def _prepare_artifact_card(
             card.draft_url = draft_url_for(
                 project_id=project_id, artifact_id=artifact_id, rel_path=rel
             )
-            if card.display:
+            if shows_inline(card.display):
                 from cowork.services.artifact_revisions import head_revision_id
 
                 # The version this card shows, so a chat card from an earlier
@@ -2340,6 +2340,9 @@ def _publishable_in_folder(
     ]
     meta = _load_metadata(folder) if (folder / "metadata.json").is_file() else None
     meta = meta or ArtifactMetadata.empty()
+    if is_widget(meta.display):
+        # A widget is never published (publish.WidgetPublishRefused).
+        return []
     if meta.type not in fullstack_types:
         return [
             _PublishableCandidate(st.st_mtime_ns, path, st.st_size, path.parent, _humanize(path.stem))

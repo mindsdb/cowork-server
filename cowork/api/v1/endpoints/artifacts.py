@@ -57,6 +57,7 @@ from cowork.schemas.live_apps import (
     SharedLiveAppResponse,
 )
 from cowork.services.artifact_identity import canonical_artifact_id
+from cowork.services.artifact_metadata import is_widget
 from cowork.services.artifact_locations import Location, forget_location
 from cowork.services.artifact_roots import (
     RootsPlan,
@@ -349,6 +350,7 @@ async def _cards_for(
     find_sources: Callable[[], list[ProjectArtifacts]],
     *,
     newest: NewestFolders | None = None,
+    include_widgets: bool = True,
 ) -> list[ArtifactCard]:
     """``_artifact_cards`` with the roots found and their folders walked in one
     file store call, then the owner reads in a database unit, so no pooled
@@ -366,8 +368,11 @@ async def _cards_for(
     not read."""
     found = await run_efs(partial(_sources_and_cards, find_sources=find_sources, newest=newest), scope=scope)
     _ask_for_location_checks(scope, roots=found.stale)
+    cards = found.cards if include_widgets else [
+        card for card in found.cards if not is_widget(card.card.display)
+    ]
     return await run_db(
-        partial(_card_capabilities, sources=found.sources, cards=found.cards), scope=scope
+        partial(_card_capabilities, sources=found.sources, cards=cards), scope=scope
     )
 
 
@@ -432,6 +437,7 @@ def _card_capabilities(session, *, sources, cards: list[_FoundCard]) -> list[Art
                 slug,
                 resolution=resolutions[slug],
                 export_source=found.export_source,
+                display=found.card.display,
             )
     plain = [found.card for found in cards]
     _mark_received_live_apps(session, cards_by_base=cards_by_base, by_base=by_base, cards=plain)
@@ -872,6 +878,9 @@ async def list_artifacts(
     scope: ScopeDep,
     project_id: UUID | None = Query(default=None),
     project_path: str | None = Query(default=None, max_length=4096),
+    # Widgets (metadata.json `display: "widget"`) collect input in the chat
+    # and are no deliverable, so the user's list leaves them out unless asked.
+    include_widgets: Annotated[bool, Query()] = False,
 ):
     if project_path is not None:
         if _org_mode():
@@ -898,7 +907,7 @@ async def list_artifacts(
             source = _desktop_registered_source(catalog, requested, project_name)
             if source is None:
                 return []
-            return [card.to_json() for card in await _cards_for(scope, lambda: [source])]
+            return [card.to_json() for card in await _cards_for(scope, lambda: [source], include_widgets=include_widgets)]
     if project_id is not None:
         raw_project_ref = str(project_id)
         # Although FastAPI has already parsed this as UUID, make the recognized
@@ -910,9 +919,19 @@ async def list_artifacts(
                 detail="Invalid project",
             )
         plan = await _scoped_project_plan(scope, project_ref, listed=True)
-        return [card.to_json() for card in await _cards_for(scope, partial(readable_sources, plan), newest=plan.newest)]
+        return [
+            card.to_json()
+            for card in await _cards_for(
+                scope, partial(readable_sources, plan), newest=plan.newest, include_widgets=include_widgets
+            )
+        ]
     plan = await run_db(_listed_scope_plan, scope=scope)
-    return [card.to_json() for card in await _cards_for(scope, partial(_browsable_sources, plan=plan), newest=plan.newest)]
+    return [
+        card.to_json()
+        for card in await _cards_for(
+            scope, partial(_browsable_sources, plan=plan), newest=plan.newest, include_widgets=include_widgets
+        )
+    ]
 
 
 
