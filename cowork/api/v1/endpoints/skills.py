@@ -7,7 +7,7 @@ from typing import Annotated, NamedTuple
 from fastapi import APIRouter, Depends, Form, HTTPException, Request, UploadFile, status
 from sqlalchemy.exc import IntegrityError
 
-from cowork.api.v1.permissions import AuthenticatedInOrgMode, require
+from cowork.api.v1.permissions import AuthenticatedInOrgMode, WindowProof, require
 from cowork.db.personal_resources import PersonalResource
 from cowork.db.scoped import (
     ScopedSession,
@@ -525,6 +525,7 @@ def _list_skills(
     "/",
     status_code=status.HTTP_201_CREATED,
     response_model=SkillResponse,
+    dependencies=[Depends(require(WindowProof))],
 )
 async def create_skill(
     body: SkillCreateRequest,
@@ -678,6 +679,7 @@ def _upload_skill_bytes(
     "/upload",
     status_code=status.HTTP_201_CREATED,
     response_model=SkillResponse,
+    dependencies=[Depends(require(WindowProof))],
 )
 async def upload_skill(
     file: UploadFile,
@@ -722,7 +724,7 @@ def _get_skill(
     ).model_dump(by_alias=True)
 
 
-@router.put("/{skill_id}", response_model=SkillResponse)
+@router.put("/{skill_id}", response_model=SkillResponse, dependencies=[Depends(require(WindowProof))])
 async def update_skill(
     skill_id: str,
     body: SkillUpdateRequest,
@@ -965,7 +967,7 @@ def _set_personal_skill_sharing(
     ).model_dump(by_alias=True)
 
 
-@router.delete("/{skill_id}", status_code=status.HTTP_204_NO_CONTENT)
+@router.delete("/{skill_id}", status_code=status.HTTP_204_NO_CONTENT, dependencies=[Depends(require(WindowProof))])
 async def delete_skill(
     skill_id: str,
     scope: ScopeDep,

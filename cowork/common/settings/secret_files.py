@@ -9,16 +9,20 @@ process that loads settings read the same value.
 
 Only the process environment can name a file. A ``<NAME>_FILE`` line in
 cowork-home's ``.env`` is ignored, so a line written there can't point a
-credential read at another file.
+credential read at another file. The process environment is read through
+``launch_value``: a local launch moves every ``COWORK_*`` variable out of
+``os.environ`` once its settings load (cowork.common.launch_environment), and a
+read after that still sees the value the process started with.
 """
 
 from __future__ import annotations
 
-import os
 from collections.abc import Mapping
 
 from pydantic_settings import EnvSettingsSource
 from pydantic_settings.sources.utils import parse_env_vars
+
+from cowork.common.launch_environment import launch_value
 
 #: The settings a self-hosted process must get from its environment, as a
 #: value or a file (require_process_secrets).
@@ -64,10 +68,10 @@ def read_secret_file(*, name: str) -> str | None:
             can't be read, isn't UTF-8 text, or holds nothing.
     """
     variable = file_variable(name=name)
-    path = os.environ.get(variable, "")
+    path = launch_value(variable) or ""
     if not path:
         return None
-    if os.environ.get(name):
+    if launch_value(name):
         raise SecretFileError(f"{name} and {variable} are both set; set only one of them")
     try:
         with open(path, encoding="utf-8") as handle:
@@ -91,7 +95,7 @@ def process_secret(*, name: str) -> str:
     from_file = read_secret_file(name=name)
     if from_file is not None:
         return from_file
-    return os.environ.get(name, "")
+    return launch_value(name) or ""
 
 
 def require_process_secrets() -> None:
@@ -107,7 +111,7 @@ def require_process_secrets() -> None:
     missing = [
         name
         for name in REQUIRED_SELF_HOSTED_NAMES
-        if not os.environ.get(name) and not os.environ.get(file_variable(name=name))
+        if not launch_value(name) and not launch_value(file_variable(name=name))
     ]
     if missing:
         names = ", ".join(f"{name} or {file_variable(name=name)}" for name in missing)
