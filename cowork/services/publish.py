@@ -27,6 +27,7 @@ from fastapi import HTTPException
 from pydantic import SecretStr
 
 from cowork.code_sandbox import refuse_planted_links
+from cowork.common.launch_environment import launch_value
 from cowork.common.logger import log_context
 from cowork.common.minds_tls import minds_ssl_verify
 from cowork.common.paths import cowork_home, pod_local_only
@@ -1212,7 +1213,7 @@ def _document_viewer_base() -> str:
     return document_viewer_base(
         web_origin=web_origin,
         publish_url=publish_url,
-        override=os.environ.get("COWORK_DOCUMENT_VIEWER_URL", "").strip(),
+        override=(launch_value("COWORK_DOCUMENT_VIEWER_URL") or "").strip(),
     )
 
 
