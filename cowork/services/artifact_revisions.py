@@ -565,6 +565,31 @@ def _prune_orphan_blobs(folder: Path, revisions: list[RevisionEntry]) -> None:
         pass
 
 
+def _prune_revisions(revisions: list[RevisionEntry]) -> None:
+    """Cut *revisions* to MAX_REVISIONS, oldest first.
+
+    An inline page's saved state (state.json) goes before anything else, and
+    never its newest entry: a page that saves on every click would otherwise
+    push out the page revisions earlier chat cards name (ENG-4684).
+    """
+    excess = len(revisions) - MAX_REVISIONS
+    if excess <= 0:
+        return
+    newest_state = next(
+        (item.id for item in reversed(revisions) if item.path == INLINE_STATE_FILE), None
+    )
+    stale_state = {
+        item.id for item in revisions if item.path == INLINE_STATE_FILE and item.id != newest_state
+    }
+    if stale_state:
+        dropped = set(
+            [item.id for item in revisions if item.id in stale_state][:excess]
+        )
+        revisions[:] = [item for item in revisions if item.id not in dropped]
+    if len(revisions) > MAX_REVISIONS:
+        del revisions[:-MAX_REVISIONS]
+
+
 def _persist_revision(
     folder: Path, manifest: Manifest, entry: RevisionEntry, content: bytes
 ) -> RevisionEntry:
@@ -581,7 +606,7 @@ def _persist_revision(
     revisions.append(entry)
     pruned = len(revisions) > MAX_REVISIONS
     if pruned:
-        del revisions[:-MAX_REVISIONS]
+        _prune_revisions(revisions)
     _write_manifest(folder, manifest)
     if pruned:
         _prune_orphan_blobs(folder, revisions)

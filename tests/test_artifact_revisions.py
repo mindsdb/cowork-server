@@ -1943,3 +1943,40 @@ def test_the_turn_capture_never_takes_state_json_for_the_page(inline_app):
 
     assert captured["path"] == "index.html"
     assert current_source(folder, metadata, artifact_id)["path"] == "index.html"
+
+
+def test_inline_state_saves_never_push_out_the_page_revisions(inline_app, monkeypatch):
+    """ENG-4684: a page that saves its state on every click must not prune the
+    page revisions earlier chat cards name. Stale state saves go first, and
+    the newest state save stays."""
+    folder, metadata, artifact_id = inline_app
+    monkeypatch.setattr(revision_service, "MAX_REVISIONS", 5)
+    first_page = capture_agent_revision(folder, conversation_id="conversation-1")
+    (folder / "index.html").write_text("<ul><li>Ana</li></ul>", encoding="utf-8")
+    second_page = capture_agent_revision(folder, conversation_id="conversation-1")
+
+    head = None
+    for n in range(8):
+        saved = save_source(
+            folder, metadata, artifact_id, content=json.dumps({"n": n}),
+            expected_revision_id=head, rel_path="state.json",
+        )
+        head = saved["revision"]["id"]
+
+    kept = list_revisions(folder)
+    assert len(kept) == 5
+    ids = {r["id"] for r in kept}
+    assert {first_page["id"], second_page["id"], head} <= ids
+    assert revision_with_content(folder, first_page["id"])["content"] == "<ul></ul>"
+    assert json.loads(current_source(folder, metadata, artifact_id, "state.json")["content"]) == {"n": 7}
+
+
+def test_without_state_saves_pruning_still_drops_the_oldest(inline_app, monkeypatch):
+    folder, metadata, artifact_id = inline_app
+    monkeypatch.setattr(revision_service, "MAX_REVISIONS", 3)
+    captured = []
+    for n in range(5):
+        (folder / "index.html").write_text(f"<p>{n}</p>", encoding="utf-8")
+        captured.append(capture_agent_revision(folder, conversation_id="conversation-1")["id"])
+
+    assert [r["id"] for r in list_revisions(folder)] == list(reversed(captured[-3:]))
