@@ -10,9 +10,15 @@ memory limit, so a hostile file can't hold the server.
 
 Each kind is bounded: a long file shows its start and says the download has
 the rest. Everything taken from the file is escaped; the page carries no
-script. A PDF shows in the browser's own viewer, from the copy published beside the
+script of its own. A PDF shows in the browser's own viewer, from the copy published beside the
 page, with its text below in case the host won't show it. A file a reader can't open raises ``FilePageRefused``, which the
 server answers as not publishable (413), like a Markdown file it can't render.
+
+A Word document, deck or spreadsheet also shows as it does in the app: the page
+loads the shared document viewer from the Cowork web app
+(``document_viewer_base``), the app's own preview frame and renderer, which
+shows the file published beside the page and hides the text once it renders.
+The text stays the page wherever the viewer can't load or render the file.
 """
 from __future__ import annotations
 
@@ -21,11 +27,24 @@ import html
 import io
 import re
 import zipfile
+from urllib.parse import urlparse
 from xml.etree import ElementTree
 
 # The kinds a person can share as a page of their own. HTML and Markdown are
 # ``artifacts.PUBLISHABLE_STATIC_SUFFIXES``.
 PUBLISHABLE_FILE_SUFFIXES = (".pdf", ".docx", ".xlsx", ".pptx", ".csv", ".txt")
+
+# The kinds the shared document viewer renders, and its script for each: the
+# cowork repository's scripts/document-viewer.mjs builds
+# /document-viewer/v1/<type>.js on the Cowork web app.
+VIEWER_TYPES = {".docx": "docx", ".pptx": "pptx", ".xlsx": "xlsx"}
+DOCUMENT_VIEWER_PATH = "/document-viewer/v1/"
+# The Cowork web app a desktop server's pages load the viewer from, by the
+# publish host it publishes to (``providers.publish_url_for_endpoint``).
+PROD_COWORK_WEB_ORIGIN = "https://cowork.mindshub.ai"
+_PROD_PUBLISH_HOST = "view.mindshub.ai"
+_ENV_PUBLISH_HOST = re.compile(r"^api\.([a-z0-9-]+)\.mindshub\.ai$")
+_VIEWER_BASE = re.compile(r"^https://[^\s\"'<>]+/$")
 
 # How much of each kind the page shows.
 MAX_PDF_PAGES = 200
@@ -58,6 +77,20 @@ _PDF_STYLE = """<style>
   .doc { max-width: none; padding: 0 16px 16px; }
   .file-pdf { display: block; width: 100%; height: calc(100vh - 74px); border: 0; border-radius: 8px; }
 </style>"""
+# A file the viewer renders takes the whole width and the rest of the window's
+# height, as a PDF does. The viewer sets data-cowork-document-viewer on <html>
+# (the cowork repository's preview/share/mountDocumentViewer.tsx): the preview
+# shows while it loads and once it renders, the text otherwise, including when
+# the script never loads.
+_VIEWER_STYLE = """<style>
+  .doc { max-width: none; padding: 0 16px 16px; }
+  .file-viewer { display: none; height: calc(100vh - 74px); }
+  .file-viewer iframe { display: block; width: 100%; height: 100%; border: 0; border-radius: 8px; background: #fff; }
+  html[data-cowork-document-viewer="loading"] .file-viewer,
+  html[data-cowork-document-viewer="rendered"] .file-viewer { display: block; }
+  html[data-cowork-document-viewer="loading"] .file-fallback,
+  html[data-cowork-document-viewer="rendered"] .file-fallback { display: none; }
+</style>"""
 _DOWNLOAD_ICON = (
     '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" '
     'stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">'
@@ -81,8 +114,38 @@ def published_file_name(name: str) -> str:
     return f"{safe[:120]}.{suffix.lower()}" if dot else safe[:120]
 
 
-def file_page_body(*, data: bytes, suffix: str, name: str) -> str:
-    """The body of the page that shows *data*, a file of *suffix* named *name*."""
+def document_viewer_base(*, web_origin: str, publish_url: str, override: str = "") -> str:
+    """Where a shared page loads the document viewer's scripts from, or "".
+
+    *override* (``COWORK_DOCUMENT_VIEWER_URL``) wins. A cloud server names its
+    Cowork web app in ``COWORK_WEB_ORIGIN`` (*web_origin*). A desktop server has
+    none, so the publish host names it: MindsHub's own (prod) publishes beside
+    cowork.mindshub.ai, and ``api.<env>.mindshub.ai`` beside
+    ``cowork.<env>.mindshub.ai``. Any other publisher gets pages of text alone.
+    """
+    if override:
+        base = override if override.endswith("/") else override + "/"
+        return base if _VIEWER_BASE.match(base) else ""
+    origin = web_origin.rstrip("/")
+    if not origin.startswith("https://"):
+        host = (urlparse(publish_url or "").hostname or "").lower()
+        env = _ENV_PUBLISH_HOST.match(host)
+        if host == _PROD_PUBLISH_HOST:
+            origin = PROD_COWORK_WEB_ORIGIN
+        elif env:
+            origin = f"https://cowork.{env.group(1)}.mindshub.ai"
+        else:
+            return ""
+    base = origin + DOCUMENT_VIEWER_PATH
+    return base if _VIEWER_BASE.match(base) else ""
+
+
+def file_page_body(*, data: bytes, suffix: str, name: str, viewer_base: str = "") -> str:
+    """The body of the page that shows *data*, a file of *suffix* named *name*.
+
+    With *viewer_base* (``document_viewer_base``), a kind the viewer renders
+    also gets its mount element and script, its text kept as the fallback.
+    """
     render = _RENDERERS.get(suffix)
     if render is None:
         raise FilePageRefused(f"{suffix} files aren't published as a page")
@@ -94,6 +157,15 @@ def file_page_body(*, data: bytes, suffix: str, name: str) -> str:
     )
     style = _PAGE_STYLE + (_PDF_STYLE if suffix == ".pdf" else "")
     body = render(data, link) if suffix == ".pdf" else render(data)
+    viewer_type = VIEWER_TYPES.get(suffix)
+    if viewer_type and viewer_base and _VIEWER_BASE.match(viewer_base):
+        style += _VIEWER_STYLE
+        body = (
+            f'<div class="file-viewer" data-cowork-document="{html.escape(link)}" '
+            f'data-cowork-document-type="{viewer_type}"></div>\n'
+            f'<div class="file-fallback">\n{body}\n</div>\n'
+            f'<script src="{html.escape(viewer_base + viewer_type)}.js" defer></script>'
+        )
     return f"{style}\n{bar}\n{body}"
 
 

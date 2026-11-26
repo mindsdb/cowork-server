@@ -90,7 +90,11 @@ from anton.publish_access import resolve_access as _resolve_access
 from anton.publish_access import resolve_publish_target as _anton_resolve_publish_target
 from cowork.docs.store import DOC_HTML, is_doc_folder, is_doc_primary
 from cowork.schemas.export_child import PublishFileRequest, PublishMarkdownRequest
-from cowork.services.file_page import PUBLISHABLE_FILE_SUFFIXES, published_file_name
+from cowork.services.file_page import (
+    PUBLISHABLE_FILE_SUFFIXES,
+    document_viewer_base,
+    published_file_name,
+)
 from cowork.services.artifacts import (
     _content_mtime,
     _load_published_map,
@@ -1110,13 +1114,16 @@ def _render_file_to_html(path: Path, out_dir: Path, *, background: bool = False)
     if len(data) > PUBLISH_FILE_MAX_BYTES:
         raise FileNotPublishable(FILE_TOO_LARGE_MESSAGE)
     suffix = path.suffix.lower()
-    key = hashlib.sha256(b"file\0" + f"{suffix}\0{path.name}\0".encode() + data).hexdigest()
+    viewer_base = _document_viewer_base()
+    key = hashlib.sha256(
+        b"file\0" + f"{suffix}\0{path.name}\0{viewer_base}\0".encode() + data
+    ).hexdigest()
     page = _RENDERED_PAGES.page(key)
     if page is None:
         if background and _RENDERED_PAGES.was_refused(key):
             raise FileNotPublishable(FILE_NOT_CONVERTED_MESSAGE)
         try:
-            body = _publish_file_body(data, suffix=suffix, name=path.name)
+            body = _publish_file_body(data, suffix=suffix, name=path.name, viewer_base=viewer_base)
         except FileNotPublishable:
             _RENDERED_PAGES.refuse(key)
             raise
@@ -1128,7 +1135,24 @@ def _render_file_to_html(path: Path, out_dir: Path, *, background: bool = False)
     return out_path
 
 
-def _publish_file_body(data: bytes, *, suffix: str, name: str) -> str:
+def _document_viewer_base() -> str:
+    """Where this server's shared document pages load the viewer from (ENG-4687,
+    ``file_page.document_viewer_base``), or "" for pages of text alone."""
+    # The viewer is an addition to a page that reads on its own, so settings
+    # that can't be read give that page, never a failed publish.
+    try:
+        publish_url, _api_key = _resolve_publish_endpoint(get_user_settings())
+        web_origin = get_app_settings().draft_frame_origin()
+    except Exception:  # noqa: BLE001
+        return ""
+    return document_viewer_base(
+        web_origin=web_origin,
+        publish_url=publish_url,
+        override=os.environ.get("COWORK_DOCUMENT_VIEWER_URL", "").strip(),
+    )
+
+
+def _publish_file_body(data: bytes, *, suffix: str, name: str, viewer_base: str = "") -> str:
     """The page body ``file_page`` renders for a file, in a conversion process."""
     from cowork.services.artifact_export import conversion_limits
     from cowork.services.export_runner import (
@@ -1140,7 +1164,7 @@ def _publish_file_body(data: bytes, *, suffix: str, name: str) -> str:
 
     try:
         conversion = convert_in_child(
-            request=PublishFileRequest(suffix=suffix, name=name[:255]),
+            request=PublishFileRequest(suffix=suffix, name=name[:255], viewer_base=viewer_base),
             source=data,
             limits=conversion_limits(org_mode=_org_mode()),
         )

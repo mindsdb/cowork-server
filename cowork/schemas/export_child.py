@@ -52,6 +52,9 @@ class PublishFileRequest(_Message):
     suffix: Literal[".pdf", ".docx", ".xlsx", ".pptx", ".csv", ".txt"]
     # Its name, for the page's heading and download link.
     name: str = Field(min_length=1, max_length=255)
+    # Where the shared document viewer's scripts are, an https URL ending in
+    # "/" (file_page.document_viewer_base), or "" for a page of text alone.
+    viewer_base: str = Field(default="", max_length=512, pattern=r"^(https://[^\s\"'<>]+/)?$")
 
 
 class AssetRequest(_Message):
