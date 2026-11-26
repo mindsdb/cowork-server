@@ -571,3 +571,31 @@ async def test_a_task_scheduled_in_chat_runs_from_its_prompt_alone(monkeypatch):
         messages = ConversationService(session).get_ordered_messages(finished.conversation_id)
         first_question = next(m.content for m in messages if str(getattr(m.role, "value", m.role)) == "user")
     assert first_question == PROMPT
+
+
+@pytest.mark.parametrize("left_out", [[{"engine": "gmail", "name": "Work mail"}], None], ids=["one left out", "none"])
+async def test_only_a_run_whose_task_leaves_a_connection_out_can_report_needing_one(monkeypatch, left_out):
+    """The report tool reaches the agent through the scheduled turn's own
+    session, and only when the task leaves something out."""
+    from cowork.harnesses.anton_harness.schedule_connector_reporting import REPORT_BLOCKED_CONNECTOR
+
+    schedule_id = UUID((await _create_confirmed())["schedule_id"])
+    with unit_session(scope=LOCAL_SCOPE) as session:
+        schedule = session.get(Schedule, schedule_id)
+        schedule.disabled_connections = left_out
+        session.add(schedule)
+        session.commit()
+    built: list = []
+    model = PausedModel()
+    model.release.set()
+
+    def build(config):
+        built.append(config)
+        return model.build(config)
+
+    monkeypatch.setattr(harness_mod, "build_chat_session", build)
+
+    await scheduler.execute_schedule(schedule_id, is_manual=True)
+
+    (run_config,) = built
+    assert (REPORT_BLOCKED_CONNECTOR in {tool.name for tool in run_config.tools}) is bool(left_out)

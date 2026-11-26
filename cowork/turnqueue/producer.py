@@ -579,7 +579,12 @@ def _datasource_connection_refs(
 ) -> list[dict]:
     """The grant set: every verified connection auth listed, minus the
     conversation's disabled ones. A disabled entry carries ``engine`` and
-    ``name``; auth's ``connector_id`` is the same value, so the join is exact."""
+    ``name``; auth's ``connector_id`` is the same value, so the join is exact.
+
+    An entry also carrying a ``datasource_id`` is matched by that id, which
+    survives a rename. Once the id is gone from the listing, its datasource
+    was deleted, and the entry falls back to its name: one added again under
+    that name gets a new id and must stay left out."""
     disabled_keys = {
         (entry.get("engine"), entry.get("name")) for entry in disabled or []
         if isinstance(entry, dict) and entry.get("datasource_id") is None
@@ -591,6 +596,12 @@ def _datasource_connection_refs(
     # Old saved exclusions lack a stable id. A renamed datasource may now
     # have any label, so omit its engine's datasources until the list is saved again.
     legacy_engines = {engine for engine, _ in disabled_keys} if scheduled else set()
+    listed_ids = {(c.get("connector_id"), c.get("id")) for c in connections if isinstance(c, dict)}
+    disabled_keys |= {
+        (entry.get("engine"), entry.get("name")) for entry in disabled or []
+        if isinstance(entry, dict) and entry.get("datasource_id")
+        and (entry.get("engine"), entry["datasource_id"]) not in listed_ids
+    }
     refs: list[dict] = []
     seen: set[int] = set()
     for connection in connections:

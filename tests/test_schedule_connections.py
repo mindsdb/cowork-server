@@ -190,6 +190,19 @@ def test_hosted_grants_keep_the_renamed_datasource_excluded_and_allow_its_peer()
     assert _datasource_connection_refs(connections, [{"engine": "postgres", "name": "Primary"}], scheduled=True) == []
 
 
+def test_a_datasource_deleted_and_added_again_under_its_name_stays_left_out():
+    """The task leaves out Primary, id 12. Its owner deletes it and adds a
+    new Primary, which auth lists as id 13. The run still gets no grant for
+    it, and the engine's other datasources stay usable."""
+    connections = [
+        {"id": 13, "connector_id": "postgres", "name": "Primary", "status": "verified", "credential_version": 1},
+        {"id": 14, "connector_id": "postgres", "name": "Other", "status": "verified", "credential_version": 1},
+    ]
+    assert _datasource_connection_refs(
+        connections, [{"engine": "postgres", "name": "Primary", "datasource_id": 12}], scheduled=True,
+    ) == [{"connection_id": 14, "credential_version": 1}]
+
+
 def test_a_scheduled_run_is_told_which_connections_its_task_leaves_out():
     guidance = _left_out_connections_guidance([GMAIL, {"engine": "hubspot", "name": "CRM"}])
     assert "Work mail (gmail), CRM (hubspot)" in guidance
