@@ -27,6 +27,30 @@ def test_a_rewritten_credit_rejection_is_classified_from_its_error_code() -> Non
 
 
 @pytest.mark.parametrize(
+    ("code", "message"),
+    [
+        (
+            "included_allowance_exhausted",
+            "You have no free allowance left. Add credits to continue now.",
+        ),
+        (
+            "free_air_daily_spend_fuse_exceeded",
+            "Free models are paused until the daily budget resets. Add credits to continue now.",
+        ),
+    ],
+)
+def test_the_free_stops_speak_of_free_models_and_name_none(code: str, message: str) -> None:
+    # The free allowance and the free-serving fuse can cover more than one model,
+    # so neither message names a model, and each keeps credits as the way forward.
+    raw = f'unexpected status 400 Bad Request: {{"error": {{"code": "{code}", "message": "x"}}}}'
+    failure = classify_engine_failure(raw, CREDS, model="gpt")
+
+    assert failure.code == code
+    assert failure.message == message
+    assert "mindshub" not in failure.message.lower()
+
+
+@pytest.mark.parametrize(
     ("message", "code"),
     [
         ("unexpected status 402 Payment Required: Your wallet has no balance to cover the model 'gpt'., url: http://x", "insufficient_credits"),

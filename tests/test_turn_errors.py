@@ -1179,8 +1179,8 @@ def test_reset_at_rides_the_failed_payload_only_when_present():
 
 # ── The free-Air spend fuse is its own stop ─────────────────────────────────
 #
-# The gate trips `free_air_daily_spend_fuse_exceeded` (429) when the day's free
-# MindsHub Air budget is spent fleet-wide, and denies every org whose wallet
+# The gate trips `free_air_daily_spend_fuse_exceeded` (429) when the day's
+# budget for serving free models is spent fleet-wide, and denies every org whose wallet
 # cannot pay until the end of the UTC day. It must not read as out of credits,
 # which misnames a stop the user did nothing to cause.
 
@@ -1513,8 +1513,24 @@ def test_fuse_copy_names_the_shared_pause_and_the_way_out():
     assert "—" not in te.FREE_SERVING_PAUSED_USER_MESSAGE
 
 
+@pytest.mark.parametrize(
+    "message",
+    [
+        pytest.param(te.ALLOWANCE_EXHAUSTED_USER_MESSAGE, id="allowance"),
+        pytest.param(te.FREE_SERVING_PAUSED_USER_MESSAGE, id="fuse"),
+    ],
+)
+def test_the_free_stop_copy_names_no_model(message):
+    # The free allowance and the free-serving fuse can cover more than one
+    # model, so the copy speaks of what is free and names no model. A model
+    # name would tell a user on another free model that the stop is not theirs.
+    lowered = message.lower()
+    assert "free" in lowered
+    assert "mindshub" not in lowered
+
+
 def test_the_free_allowance_is_never_called_monthly():
-    # The free MindsHub Air allowance is not monthly. Copy that calls it
+    # The free allowance is not monthly. Copy that calls it
     # monthly tells a user who hit it to wait weeks for something that comes
     # back much sooner. Both strings reach users: the allowance message is the
     # channel reply on Slack and Discord, and the description is the settings

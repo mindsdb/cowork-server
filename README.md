@@ -827,7 +827,7 @@ taken on a shared file reaches no workspace at all, not even the minter's own.
 That check holds no session, deliberately: `preview-asset` serves every sub-asset
 a page pulls, and a session there is a database connection per image.
 
-### The default model is the one the free allowance covers
+### The default model is one the free allowance covers
 
 Every minds-cloud role defaults to `mindshub_air`, for all three roles: planning,
 coding and router. **MindsHub's catalog declares it**, in the

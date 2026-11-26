@@ -32,7 +32,7 @@ def is_one_of(value: object, allowed: frozenset[str]) -> TypeGuard[str]:
 
 
 class MindsHubFreeTokens(CamelResponse):
-    """The free MindsHub Air allowance, as a proportion.
+    """The free allowance, as a proportion.
 
     Auth does not publish the size of the allowance, so there is no token count
     to relay. ``percentRemaining`` is the figure to read.

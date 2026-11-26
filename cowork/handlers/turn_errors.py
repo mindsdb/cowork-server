@@ -160,7 +160,7 @@ TOKEN_LIMIT_CODE = "token_limit"
 # and the window is plan config.
 ALLOWANCE_EXHAUSTED_CODE = "included_allowance_exhausted"
 ALLOWANCE_EXHAUSTED_USER_MESSAGE = (
-    "You have no free MindsHub Air allowance left. "
+    "You have no free allowance left. "
     "Add credits to keep working now."
 )
 
@@ -193,7 +193,7 @@ MODEL_NOT_IN_TIER_USER_MESSAGE = (
 
 # Curated copy + wire code for the fleet-wide free-Air spend fuse (gateway 429
 # `free_air_daily_spend_fuse_exceeded`). The gate trips it when the day's
-# budget for free MindsHub Air serving is spent, and then denies every org
+# budget for serving free models is spent, and then denies every org
 # whose wallet cannot pay until the end of the UTC day. The gate names that
 # instant on `X-MindsHub-Reset-At`, which rides the failure frame as
 # `reset_at`. The user did nothing to cause this, so the copy must not read as
@@ -201,7 +201,7 @@ MODEL_NOT_IN_TIER_USER_MESSAGE = (
 # wallet that can pay is not subject to the fuse.
 FREE_SERVING_PAUSED_CODE = "free_serving_paused"
 FREE_SERVING_PAUSED_USER_MESSAGE = (
-    "Free MindsHub Air is paused for everyone until the daily budget resets. "
+    "Free models are paused for everyone until the daily budget resets. "
     "Add credits to keep working now."
 )
 
