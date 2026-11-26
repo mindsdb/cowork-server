@@ -38,6 +38,7 @@ from cowork.common.settings.app_settings import get_app_settings  # noqa: F401
 from cowork.models.artifact_owner_choice import AccessMode
 from cowork.schemas.artifact_access import (
     PUBLISHER_EMAILS_FIELD,
+    OWNER_ONLY_ACCESS,
     ArtifactAccessRequest,
     ArtifactAudienceView,
     ArtifactPublishResult,
@@ -57,6 +58,15 @@ from cowork.services.artifact_audience import (
     sync_team_audience,
 )
 from cowork.services.connectors.persist import vault_for_scope
+from cowork.services.datasource_approval import (
+    AllowedDataVault,
+    DatasourceKey,
+    datasource_labels,
+    declared_datasources,
+    is_saved,
+    record_approval,
+    stored_approvals,
+)
 from cowork.services.sharing_contract import (
     ARTIFACTS_SHARE_ORG,
     LEGACY_RULE_USER_DIR_CHARS,
@@ -78,9 +88,13 @@ from anton.publisher import PUBLISH_JOB_BUDGET_S, PublishJobFailed, PublishJobTi
 from anton.publish_access import access_from_owner_side
 from anton.publish_access import resolve_access as _resolve_access
 from anton.publish_access import resolve_publish_target as _anton_resolve_publish_target
-from cowork.schemas.export_child import PublishMarkdownRequest
+from cowork.docs.store import DOC_HTML, is_doc_folder, is_doc_primary
+from cowork.schemas.export_child import PublishFileRequest, PublishMarkdownRequest
+from cowork.services.artifact_metadata import WIDGET_PUBLISH_REFUSAL, is_widget
+from cowork.services.file_page import PUBLISHABLE_FILE_SUFFIXES, published_file_name
 from cowork.services.artifacts import (
     _content_mtime,
+    _load_metadata,
     _load_published_map,
     _org_mode,
     PUBLISHABLE_STATIC_SUFFIXES,
@@ -107,6 +121,29 @@ class ComparisonPublishRefused(ValueError):
     A ValueError so every caller's existing mapping applies unchanged: 400 on
     the REST paths, a failed tool result for the agent.
     """
+
+
+class WidgetPublishRefused(ValueError):
+    """Publishing or sharing a widget (metadata.json ``display: "widget"``),
+    which is never allowed: a widget collects input in the chat and is no
+    deliverable (ENG-4684).
+
+    A ValueError, as ComparisonPublishRefused, so every caller's existing
+    mapping applies unchanged: 400 on the REST paths, a failed tool result
+    for the agent, a skip for autopublish.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(WIDGET_PUBLISH_REFUSAL)
+
+
+def is_widget_folder(folder: Path) -> bool:
+    """Whether ``folder`` is an artifact folder whose metadata.json makes it a
+    widget. A folder without readable metadata is not one."""
+    if not (folder / "metadata.json").is_file():
+        return False
+    metadata = _load_metadata(folder)
+    return metadata is not None and is_widget(metadata.display)
 
 
 class PublisherUnavailable(RuntimeError):
@@ -142,6 +179,39 @@ class PublishOwnedByOtherUser(_CodedRefusal):
 
     def __init__(self) -> None:
         super().__init__(409, OWNED_BY_OTHER_USER_CODE, OWNED_BY_OTHER_USER_MESSAGE)
+
+
+# A full-stack publish would send credentials of connections the person
+# hasn't approved for this artifact.
+DATASOURCE_APPROVAL_REQUIRED_CODE = "datasource_approval_required"
+DATASOURCE_APPROVAL_REQUIRED_MESSAGE = (
+    "Publishing this app uploads the credentials of connections you haven't approved."
+)
+
+
+class DatasourceApprovalRequired(_CodedRefusal):
+    """Nothing was uploaded: the person must approve ``pending`` first, each
+    ``{"engine", "name", "label"}``. The body lists them as ``detail.pending``.
+    ``artifact_slug`` is the published folder's name, for the chat card."""
+
+    def __init__(self, pending: list[dict[str, str]], *, artifact_slug: str = "") -> None:
+        super().__init__(409, DATASOURCE_APPROVAL_REQUIRED_CODE, DATASOURCE_APPROVAL_REQUIRED_MESSAGE)
+        self.pending = pending
+        self.artifact_slug = artifact_slug
+        self.detail = {**self.detail, "pending": pending}
+
+
+# A first publish that names no access, through a shared publish token: the
+# publisher has no owner to let in, so a link only the owner opens can't exist.
+ACCESS_CHOICE_REQUIRED_CODE = "access_choice_required"
+ACCESS_CHOICE_REQUIRED_MESSAGE = (
+    "Choose who can open this link: this deployment can't publish a link only you can open."
+)
+
+
+class AccessChoiceRequired(_CodedRefusal):
+    def __init__(self) -> None:
+        super().__init__(400, ACCESS_CHOICE_REQUIRED_CODE, ACCESS_CHOICE_REQUIRED_MESSAGE)
 
 
 # The upload service's 413: the bundle is over its request size limit.
@@ -199,11 +269,16 @@ MARKDOWN_CONVERSION_FAILED_CODE = "markdown_conversion_failed"
 MARKDOWN_CONVERSION_FAILED_MESSAGE = "This Markdown file couldn't be converted for publishing."
 
 
-class MarkdownNotPublishable(_CodedRefusal):
+class PageNotPublishable(_CodedRefusal):
+    """A file that publishes as a page rendered from it can't be rendered:
+    Markdown (MarkdownNotPublishable) or a file that isn't a web page
+    (FileNotPublishable, ENG-4687). Nothing was published, and the same file
+    is refused again, so callers report it instead of retrying."""
+
+
+class MarkdownNotPublishable(PageNotPublishable):
     """The file is past publish's Markdown bound, or rendering it passed the
-    conversion's time or memory limit or failed on the file's content.
-    Nothing was published, and the same file is refused again, so callers
-    report it instead of retrying."""
+    conversion's time or memory limit or failed on the file's content."""
 
     def __init__(self, message: str) -> None:
         super().__init__(413, MARKDOWN_NOT_PUBLISHABLE_CODE, message)
@@ -221,6 +296,33 @@ class MarkdownConversionFailed(_CodedRefusal):
 
     def __init__(self) -> None:
         super().__init__(500, MARKDOWN_CONVERSION_FAILED_CODE, MARKDOWN_CONVERSION_FAILED_MESSAGE)
+
+
+# A file that isn't a web page publishes as a page rendered in the conversion
+# process too (ENG-4687, _publish_file_body), refused the same way.
+FILE_NOT_PUBLISHABLE_CODE = "file_not_publishable"
+FILE_TOO_LARGE_MESSAGE = "This file is too large to share as a page. Share a file under 25 MiB."
+FILE_NOT_CONVERTED_MESSAGE = (
+    "This file can't be shared as a page. "
+    "Reading it took too long, used too much memory, or failed on something in the file."
+)
+FILE_CONVERSION_FAILED_CODE = "file_conversion_failed"
+FILE_CONVERSION_FAILED_MESSAGE = "This file couldn't be converted for sharing."
+
+
+class FileNotPublishable(PageNotPublishable):
+    """The file is past publish's bound for a file page, or rendering it passed
+    the conversion's time or memory limit or failed on the file's content."""
+
+    def __init__(self, message: str) -> None:
+        super().__init__(413, FILE_NOT_PUBLISHABLE_CODE, message)
+
+
+class FileConversionFailed(_CodedRefusal):
+    """The conversion process failed on a file page without passing a limit: a fault on this server."""
+
+    def __init__(self) -> None:
+        super().__init__(500, FILE_CONVERSION_FAILED_CODE, FILE_CONVERSION_FAILED_MESSAGE)
 
 
 # Sharing an artifact with everyone takes MindsHub's artifacts.share_org,
@@ -711,8 +813,28 @@ def _resolve_publish_target(
     (`_scan_artifact_dirs(scope=...)`), which only sees the desktop layout.
 
     Returns (publish_target, published_dir, published_key, is_fullstack).
+
+    A doc (cowork.docs) is shared as its rendered page, doc.html, never as the
+    JSON its metadata names as the primary. So every route that shares a doc's
+    folder, re-publishes it, or reads how it is shared addresses the page, as
+    the doc's own Share menu does.
     """
-    return _anton_resolve_publish_target(artifact, container_dirs)
+    target, published_dir, published_key, is_fullstack = _anton_resolve_publish_target(artifact, container_dirs)
+    if is_doc_primary(published_key) and is_doc_folder(published_dir):
+        return published_dir / DOC_HTML, published_dir, DOC_HTML, False
+    return target, published_dir, published_key, is_fullstack
+
+
+def _shared_publish_token() -> str:
+    return _secret_str(get_app_settings().publish_token).strip()
+
+
+def uses_shared_publish_token(scope: TenantScope | None) -> bool:
+    """Whether this publish goes through COWORK_PUBLISH_TOKEN: the key
+    _resolve_publish_endpoint substitutes outside org mode. The org path
+    mints a turn key instead (artifact_workspace._owner_publish_context)."""
+    org = scope is not None and scope.org_mode
+    return not org and bool(_shared_publish_token())
 
 
 def _resolve_publish_endpoint(settings) -> tuple[str, str]:
@@ -746,7 +868,7 @@ def _resolve_publish_endpoint(settings) -> tuple[str, str]:
         api_key = _secret_str(provider_api_key(settings, Provider.OPENAI_COMPATIBLE))
     else:
         endpoint, api_key = settings.minds_url, _secret_str(settings.minds_api_key)
-    api_key = _secret_str(get_app_settings().publish_token).strip() or api_key
+    api_key = _shared_publish_token() or api_key
     env_publish_url = os.environ.get("ANTON_PUBLISH_URL", "").strip()
     publish_url = normalize_publish_url(
         env_publish_url or settings.publish_url or publish_url_for_endpoint(endpoint)
@@ -771,11 +893,27 @@ def list_publishable(*, scope: TenantScope | None) -> dict:
 
 
 def is_publishable_static(target: Path, artifacts_base: Path) -> bool:
-    """A non-fullstack target publishes only when it is an HTML/Markdown file
-    that is artifact content (not README, a generation input or a revision copy)."""
-    return target.suffix.lower() in PUBLISHABLE_STATIC_SUFFIXES and not is_non_content_path(
-        target, artifacts_base
-    )
+    """A non-fullstack target publishes only when it is artifact content (not
+    README, a generation input or a revision copy) of a kind that becomes a
+    page: HTML, Markdown, or a file shown as a page of its own (ENG-4687)."""
+    suffix = target.suffix.lower()
+    return (
+        suffix in PUBLISHABLE_STATIC_SUFFIXES or suffix in PUBLISHABLE_FILE_SUFFIXES
+    ) and not is_non_content_path(target, artifacts_base)
+
+
+def _renders_to_page(target: Path) -> bool:
+    """Whether *target* publishes as a page rendered from it, not as itself:
+    Markdown, and a file that isn't a web page (ENG-4687)."""
+    suffix = target.suffix.lower()
+    return suffix == ".md" or suffix in PUBLISHABLE_FILE_SUFFIXES
+
+
+def _render_to_page(target: Path, out_dir: Path, *, background: bool = False) -> Path:
+    """The page *target* publishes as, written to ``out_dir/index.html``."""
+    if target.suffix.lower() == ".md":
+        return _render_markdown_to_html(target, out_dir, background=background)
+    return _render_file_to_html(target, out_dir, background=background)
 
 # What Share and the agent's publish tool report for a full-stack artifact when
 # the publish URL is not MindsHub's service (`is_mindshub_publish_url`).
@@ -976,6 +1114,70 @@ def _render_markdown_to_html(md_path: Path, out_dir: Path, *, background: bool =
     return out_path
 
 
+PUBLISH_FILE_MAX_BYTES = 25 * 1024 * 1024
+
+
+def _render_file_to_html(path: Path, out_dir: Path, *, background: bool = False) -> Path:
+    """Render a file that isn't a web page to a standalone ``index.html`` in ``out_dir`` (ENG-4687).
+
+    The page shows what the file says and links to the file, which is copied
+    beside it under ``published_file_name``, so the publisher bundles it and
+    the link downloads it. Like ``_render_markdown_to_html``: the original is
+    never modified, the page renders in the conversion process
+    (``cowork.services.file_page``), and one render per version of the file
+    serves every "changed since publish" check. Raises ``FileNotPublishable``
+    for a file past the bound or one the conversion refused or stopped,
+    ``MarkdownRenderBusy`` while another conversion runs, and
+    ``FileConversionFailed`` for one that failed.
+    """
+    with path.open("rb") as source:
+        data = source.read(PUBLISH_FILE_MAX_BYTES + 1)
+    if len(data) > PUBLISH_FILE_MAX_BYTES:
+        raise FileNotPublishable(FILE_TOO_LARGE_MESSAGE)
+    suffix = path.suffix.lower()
+    key = hashlib.sha256(b"file\0" + f"{suffix}\0{path.name}\0".encode() + data).hexdigest()
+    page = _RENDERED_PAGES.page(key)
+    if page is None:
+        if background and _RENDERED_PAGES.was_refused(key):
+            raise FileNotPublishable(FILE_NOT_CONVERTED_MESSAGE)
+        try:
+            body = _publish_file_body(data, suffix=suffix, name=path.name)
+        except FileNotPublishable:
+            _RENDERED_PAGES.refuse(key)
+            raise
+        page = _MD_HTML_TEMPLATE.format(title=_html.escape(path.stem), body=body).encode("utf-8")
+        _RENDERED_PAGES.keep(key, page)
+    out_path = out_dir / "index.html"
+    out_path.write_text(page.decode("utf-8"), encoding="utf-8")
+    (out_dir / published_file_name(path.name)).write_bytes(data)
+    return out_path
+
+
+def _publish_file_body(data: bytes, *, suffix: str, name: str) -> str:
+    """The page body ``file_page`` renders for a file, in a conversion process."""
+    from cowork.services.artifact_export import conversion_limits
+    from cowork.services.export_runner import (
+        ConversionBusy,
+        ConversionError,
+        ConversionOverrun,
+        convert_in_child,
+    )
+
+    try:
+        conversion = convert_in_child(
+            request=PublishFileRequest(suffix=suffix, name=name[:255]),
+            source=data,
+            limits=conversion_limits(org_mode=_org_mode()),
+        )
+    except ConversionBusy as exc:
+        raise MarkdownRenderBusy() from exc
+    except ConversionOverrun as exc:
+        raise FileNotPublishable(FILE_NOT_CONVERTED_MESSAGE) from exc
+    except ConversionError as exc:
+        raise FileConversionFailed() from exc
+    return conversion.data.decode("utf-8")
+
+
 def _publish_markdown_body(md_text: str) -> str:
     """The page body Python-Markdown renders for *md_text*, in a conversion process."""
     from cowork.services.artifact_export import conversion_limits
@@ -1019,6 +1221,36 @@ def kept_access(entry: Any, *, org_mode: bool) -> ArtifactAccessRequest:
         # neither kept nor read.
         return ArtifactAccessRequest(mode=AccessMode.RESTRICTED, owner_only=True)
     return ArtifactAccessRequest.of_publisher(publisher_access)
+
+
+def default_publish_access(
+    access: ArtifactAccessRequest | None,
+    password: str | None,
+    *,
+    report_id: str | None,
+    previous: Any,
+    scope: TenantScope | None,
+) -> ArtifactAccessRequest | None:
+    """The access a publish gets: the one it names (or a legacy bare
+    password), else what a re-publish of a live page kept, else owner-only. A
+    page taken down (Stop sharing) keeps its report_id for the same URL, but
+    comes back like a first publish, not with the access it had. A shared
+    publish token has no owner to let in, so an owner-only first publish
+    through it is refused (AccessChoiceRequired)."""
+    taken_down = isinstance(previous, dict) and previous.get("published") is False
+    first_publish = report_id is None or taken_down
+    if access is None and not password:
+        access = (
+            OWNER_ONLY_ACCESS
+            if first_publish
+            else kept_access(previous, org_mode=scope is not None and scope.org_mode)
+        )
+    names_only_the_owner = (
+        access is not None and access.restricted and access.owner_only and not access.allowed_emails
+    )
+    if first_publish and names_only_the_owner and uses_shared_publish_token(scope):
+        raise AccessChoiceRequired()
+    return access
 
 
 class AccessPlan(NamedTuple):
@@ -1351,6 +1583,148 @@ def rule_held_over_entry(
     return held_rule_under(keys, scope)
 
 
+# Marks a publish history item written since publishes ask before sending
+# a connection's credentials.
+_APPROVAL_CHECKED = "approvalChecked"
+
+
+class _ApprovalTarget(NamedTuple):
+    """The folder a full-stack publish's connection approvals belong to."""
+
+    published_dir: Path
+    # What the publish uploads, as publish history names it.
+    publish_target: Path
+    artifact_key: str
+    # The folder's .published.json entry; None for a page that isn't this owner's.
+    entry: Any
+    scope: TenantScope | None
+
+
+def _last_published_at(target: _ApprovalTarget) -> float | None:
+    """When this server last published the target as the live page its
+    entry names, before publishes asked for approval, from its own publish
+    history (state.json, which the agent's code can't write, unlike the
+    entry). None when the entry isn't a live page, the history no longer
+    holds that publish, or the publish already asked."""
+    entry = target.entry
+    if not isinstance(entry, dict) or entry.get("published") is False:
+        return None
+    report_id = entry.get("report_id")
+    if not isinstance(report_id, str) or not report_id:
+        return None
+    artifact = str(target.publish_target)
+    for item in _load_state(scope=target.scope).get("publish_history", []):
+        if isinstance(item, dict) and item.get("artifact") == artifact and item.get("reportId") == report_id:
+            if item.get(_APPROVAL_CHECKED):
+                return None
+            try:
+                return datetime.fromisoformat(str(item["publishedAt"])).timestamp()
+            except (KeyError, ValueError):
+                return None
+    return None
+
+
+def _inherited_connections(target: _ApprovalTarget, saved: list[DatasourceKey]) -> frozenset[DatasourceKey]:
+    """The saved connections a page published before approvals were asked
+    for keeps without asking: all of them, while metadata.json is unchanged
+    since this server last published the page, since that publish sent the
+    same credentials (one saved only after it is the exception). Otherwise
+    none, and the person is asked."""
+    if not saved:
+        return frozenset()
+    try:
+        metadata = (target.published_dir / "metadata.json").lstat()
+    except OSError:
+        return frozenset()
+    if not stat.S_ISREG(metadata.st_mode):
+        return frozenset()
+    published_at = _last_published_at(target)
+    if published_at is None or metadata.st_mtime > published_at:
+        return frozenset()
+    return frozenset(saved)
+
+
+class _Connections(NamedTuple):
+    """One folder's connections as a full-stack publish sees them (_pending_connections)."""
+
+    # Saved and allowed: the allow-list AllowedDataVault gets.
+    sendable: frozenset[DatasourceKey]
+    # Saved and not allowed, as metadata.json writes them: asked for first.
+    pending: list[DatasourceKey]
+    # Allowed in this request or inherited, not yet stored: a publish records them.
+    unrecorded: frozenset[DatasourceKey]
+
+
+def _pending_connections(
+    target: _ApprovalTarget, *, approved: frozenset[DatasourceKey] | None, vault
+) -> _Connections:
+    """The connections metadata.json names, split by approval. A named
+    connection the vault lacks has no credentials to send, so it is neither
+    pending nor recorded as approved. A folder with no stored approval whose
+    entry shows it published before inherits its connections
+    (_inherited_connections)."""
+    saved = [key for key in declared_datasources(target.published_dir) if is_saved(vault, *key)]
+    stored = stored_approvals(
+        artifact_key=target.artifact_key, artifact_dir=target.published_dir, scope=target.scope
+    )
+    inherited = frozenset() if stored else _inherited_connections(target, saved)
+    unrecorded = (frozenset(approved or ()) | inherited) & frozenset(saved)
+    allowed = stored | unrecorded
+    return _Connections(
+        sendable=allowed & frozenset(saved),
+        pending=[key for key in saved if key not in allowed],
+        unrecorded=unrecorded,
+    )
+
+
+def _datasource_vault(
+    target: _ApprovalTarget, *, approved: frozenset[DatasourceKey] | None
+) -> AllowedDataVault:
+    """The vault a full-stack publish hands anton: only connections the
+    person approved for this folder. Raises DatasourceApprovalRequired, before
+    anything is uploaded, while metadata.json names a saved one they haven't."""
+    source = vault_for_scope(target.scope)
+    found = _pending_connections(target, approved=approved, vault=source)
+    if found.pending:
+        raise DatasourceApprovalRequired(
+            datasource_labels(source, found.pending), artifact_slug=target.published_dir.name
+        )
+    if found.unrecorded:
+        # Kept when the upload fails: the person approved sending them.
+        record_approval(
+            artifact_key=target.artifact_key,
+            artifact_dir=target.published_dir,
+            datasources=found.unrecorded,
+            scope=target.scope,
+        )
+    return AllowedDataVault(source=source, allowed=found.sendable)
+
+
+def pending_datasources(raw_path: str, *, scope: TenantScope | None) -> list[dict[str, str]]:
+    """The connections a publish of this artifact would send credentials for
+    without the person's approval yet, for the publish dialog. Empty for
+    anything but a full-stack app."""
+    found = desktop_artifact_and_base(raw_path, scope=scope)
+    publish_target, published_dir, published_key, is_fullstack = _resolve_publish_target(
+        found.artifact, container_dirs=[found.artifacts_base]
+    )
+    if not is_fullstack:
+        return []
+    artifact_key = _authorization_key(published_dir, found.artifacts_base, None, scope)
+    if not artifact_key:
+        return []
+    target = _ApprovalTarget(
+        published_dir=published_dir,
+        publish_target=publish_target,
+        artifact_key=artifact_key,
+        entry=_load_published_map(published_dir).get(published_key),
+        scope=scope,
+    )
+    vault = vault_for_scope(scope)
+    pending = _pending_connections(target, approved=None, vault=vault).pending
+    return datasource_labels(vault, pending) if pending else []
+
+
 def publish_artifact(
     artifact: Path,
     *,
@@ -1368,6 +1742,7 @@ def publish_artifact(
     notices: list[ShareNotice] | None = None,
     job_budget_s: float = PUBLISH_JOB_BUDGET_S,
     on_job_accepted: Callable[[dict], None] | None = None,
+    approved_datasources: frozenset[DatasourceKey] | None = None,
 ) -> dict:
     """Zip an artifact and upload it, returning its public URL.
 
@@ -1400,6 +1775,12 @@ def publish_artifact(
 
     `project_id` is the artifact's project; required in organization mode,
     where the owner lookup is keyed by it.
+
+    `approved_datasources` is what the person approved in this action (the
+    chat card or the publish dialog). A full-stack publish sends credentials
+    only of connections approved for the artifact's folder, this action's
+    included; it raises DatasourceApprovalRequired before uploading while
+    metadata.json names any other saved one.
 
     `access` is who the publish opens the artifact for, under MindsHub's
     names (ArtifactAccessRequest): a person's save of the Share dialog as
@@ -1465,7 +1846,13 @@ def publish_artifact(
         artifact, container_dirs=[artifacts_base]
     )
     if not is_fullstack and not is_publishable_static(publish_target, artifacts_base):
-        raise ValueError("Only HTML and Markdown artifact content can be published")
+        raise ValueError(
+            "Only web pages, Markdown, PDF, Word, Excel, PowerPoint, CSV and text artifact content can be published"
+        )
+    # Every publish path ends here, so this is the one place a widget is kept
+    # from going live or being shared; the routes also refuse it up front.
+    if is_widget_folder(published_dir):
+        raise WidgetPublishRefused()
     # anton bundles files from this folder by path. A file there with a second
     # name, such as a hard link a cell made to the project's `.anton/.env`,
     # would publish that file's current content on every publish.
@@ -1525,7 +1912,27 @@ def publish_artifact(
                 report_id = None
                 previous = None
 
+        # Before anything reads `access`: whether it is restricted decides
+        # which org checks run below.
+        access = default_publish_access(
+            access, password, report_id=report_id, previous=previous, scope=scope
+        )
         canonical_artifact_key = _authorization_key(published_dir, artifacts_base, project_id, scope)
+        datasource_vault = None
+        if is_fullstack:
+            if not canonical_artifact_key:
+                raise ValueError("A full-stack artifact needs its metadata to publish")
+            datasource_vault = _datasource_vault(
+                _ApprovalTarget(
+                    published_dir=published_dir,
+                    publish_target=publish_target,
+                    artifact_key=canonical_artifact_key,
+                    # None when the page isn't this owner's (the claim above).
+                    entry=previous,
+                    scope=scope,
+                ),
+                approved=approved_datasources,
+            )
         org_scope = scope if scope is not None and scope.org_mode else None
         restricted = access is not None and access.restricted
         refusal = (
@@ -1596,16 +2003,17 @@ def publish_artifact(
                     },
                 )
                 raise AccessModeChanged()
-        # Markdown is rendered to a throwaway index.html that we hand to the
-        # publisher; `.html` and fullstack publish their real target directly.
+        # Markdown, and a file that isn't a web page (ENG-4687), render to a
+        # throwaway index.html that we hand to the publisher; `.html` and
+        # fullstack publish their real target directly.
         # `publish_target` stays the original artifact so the registry, history,
         # and unpublish all key off the file the user actually sees.
         publish_source = publish_target
         md_tmp_dir: tempfile.TemporaryDirectory | None = None
         try:
-            if not is_fullstack and publish_target.suffix.lower() == ".md":
+            if not is_fullstack and _renders_to_page(publish_target):
                 md_tmp_dir = tempfile.TemporaryDirectory(prefix="cowork-md-publish-")
-                publish_source = _render_markdown_to_html(
+                publish_source = _render_to_page(
                     publish_target, Path(md_tmp_dir.name), background=background
                 )
 
@@ -1642,7 +2050,9 @@ def publish_artifact(
                 # the published artifact has no DB connection in the cloud.
                 # Org-keyed: the persisted vault is per organization, and an
                 # unscoped lookup would resolve to the shared namespace root.
-                vault=vault_for_scope(scope),
+                vault=datasource_vault
+                if datasource_vault is not None
+                else AllowedDataVault(source=vault_for_scope(scope), allowed=frozenset()),
                 # While the password is unchanged anton re-sends the hash stored
                 # here, so a content-only re-publish keeps viewers' password grants.
                 previous_access=previous if isinstance(previous, dict) else None,
@@ -1726,6 +2136,9 @@ def publish_artifact(
                 "url": view_url,
                 "reportId": returned_report_id,
                 "publishedAt": _utc_now_iso(),
+                # This publish asked before it sent any credentials, so it
+                # passes none on (_last_published_at).
+                _APPROVAL_CHECKED: True,
             }
             # Owner-side only: .published.json never enters the bundle. `owner_side`
             # carries `mode` (+ `access_password`/`pwd_version` for password, or
@@ -1814,11 +2227,17 @@ def publish_artifact(
         else:
             # The card's key: desktop routing finds the cloud scope in the record.
             response_key = canonical_artifact_key or echoed_key
+        unapproved = (
+            datasource_labels(datasource_vault.source, datasource_vault.refused)
+            if datasource_vault is not None and datasource_vault.refused
+            else []
+        )
         return ArtifactPublishResult(
             url=view_url,
             access_mode=AccessMode(owner_side.get("mode", AccessMode.PUBLIC)),
             access_protected=bool(owner_side.get("requires_password")),
             artifact_key=response_key or "",
+            unapproved_datasources=unapproved,
             replaced_link=replaced_link,
             result={k: v for k, v in result.items() if k != "file_payload"},
             **ArtifactAudienceView.of(audience).model_dump(),
@@ -1861,9 +2280,9 @@ def compute_publish_md5(artifact: Path, *, artifacts_base: Path) -> str | None:
     md_tmp_dir: tempfile.TemporaryDirectory | None = None
     try:
         publish_source = publish_target
-        if not is_fullstack and publish_target.suffix.lower() == ".md":
+        if not is_fullstack and _renders_to_page(publish_target):
             md_tmp_dir = tempfile.TemporaryDirectory(prefix="cowork-md-md5-")
-            publish_source = _render_markdown_to_html(
+            publish_source = _render_to_page(
                 publish_target, Path(md_tmp_dir.name), background=True
             )
         if is_fullstack:
@@ -2002,7 +2421,9 @@ def published_artifact_access(
     return kept_access(entry, org_mode=org_mode)
 
 
-def update_artifact(raw_path: str, *, scope: TenantScope | None) -> dict:
+def update_artifact(
+    raw_path: str, *, scope: TenantScope | None, approved_datasources: frozenset[DatasourceKey] | None = None
+) -> dict:
     """Re-publish an already-published artifact, preserving its URL and access.
 
     `publish_artifact` reuses the stored report_id (→ the lambda mints a new
@@ -2024,6 +2445,7 @@ def update_artifact(raw_path: str, *, scope: TenantScope | None) -> dict:
     return publish_artifact(
         artifact, artifacts_base=artifacts_base, api_key=api_key,
         publish_url=publish_url, access=access, scope=scope,
+        approved_datasources=approved_datasources,
     )
 
 

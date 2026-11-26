@@ -62,6 +62,9 @@ class AttemptOutcome(str, Enum):
     # The turn ended on its own, but at one of its limits (steps, tokens or
     # automatic continuations) with nobody there to say "keep going".
     stopped_at_limit = "stopped_at_limit"
+    # The turn ended on its own, but a change it asked approval for was
+    # refused: nobody approved it while the run waited, so it wasn't made.
+    writes_refused = "writes_refused"
     # Failed before the agent could act: setup or permission, or a turn whose
     # stream shows nothing but its start, its memory read and its failure.
     failed_before_execution = "failed_before_execution"
@@ -194,6 +197,10 @@ class ScheduleRunResponse(CamelResponse):
     outcome: AttemptOutcome | None = None
     # The pinned model that could not be served before using the account default.
     unavailable_model: str | None = None
+    # The cron slot the run was for; a run that started well after it was
+    # missed or delayed (the app closed, the computer asleep). None on a
+    # manual run.
+    slot_at: datetime | None = None
     created_at: datetime | None
 
     @computed_field

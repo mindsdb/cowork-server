@@ -35,7 +35,7 @@ from cowork.db.scoped import (
 )
 from cowork.db.session import get_session
 from cowork.principal import Principal, get_principal
-from cowork.api.v1.permissions import AuthenticatedInOrgMode, DesktopOnly, OpenByDesign, require
+from cowork.api.v1.permissions import AuthenticatedInOrgMode, DesktopOnly, OpenByDesign, WindowProof, require
 from cowork.api.v1.artifact_preview import (
     artifact_response_headers,
     html_preview_response,
@@ -59,6 +59,7 @@ from cowork.schemas.live_apps import (
     SharedLiveAppResponse,
 )
 from cowork.services.artifact_identity import canonical_artifact_id
+from cowork.services.artifact_metadata import is_widget
 from cowork.services.artifact_locations import Location, forget_location
 from cowork.services.artifact_roots import (
     RootsPlan,
@@ -351,6 +352,7 @@ async def _cards_for(
     find_sources: Callable[[], list[ProjectArtifacts]],
     *,
     newest: NewestFolders | None = None,
+    include_widgets: bool = True,
 ) -> list[ArtifactCard]:
     """``_artifact_cards`` with the roots found and their folders walked in one
     file store call, then the owner reads in a database unit, so no pooled
@@ -368,8 +370,11 @@ async def _cards_for(
     not read."""
     found = await run_efs(partial(_sources_and_cards, find_sources=find_sources, newest=newest), scope=scope)
     _ask_for_location_checks(scope, roots=found.stale)
+    cards = found.cards if include_widgets else [
+        card for card in found.cards if not is_widget(card.card.display)
+    ]
     return await run_db(
-        partial(_card_capabilities, sources=found.sources, cards=found.cards), scope=scope
+        partial(_card_capabilities, sources=found.sources, cards=cards), scope=scope
     )
 
 
@@ -434,6 +439,7 @@ def _card_capabilities(session, *, sources, cards: list[_FoundCard]) -> list[Art
                 slug,
                 resolution=resolutions[slug],
                 export_source=found.export_source,
+                display=found.card.display,
             )
     plain = [found.card for found in cards]
     _mark_received_live_apps(session, cards_by_base=cards_by_base, by_base=by_base, cards=plain)
@@ -916,6 +922,9 @@ async def list_artifacts(
     scope: ScopeDep,
     project_id: UUID | None = Query(default=None),
     project_path: str | None = Query(default=None, max_length=4096),
+    # Widgets (metadata.json `display: "widget"`) collect input in the chat
+    # and are no deliverable, so the user's list leaves them out unless asked.
+    include_widgets: Annotated[bool, Query()] = False,
 ):
     if project_path is not None:
         if _org_mode():
@@ -942,7 +951,7 @@ async def list_artifacts(
             source = _desktop_registered_source(catalog, requested, project_name)
             if source is None:
                 return []
-            return [card.to_json() for card in await _cards_for(scope, lambda: [source])]
+            return [card.to_json() for card in await _cards_for(scope, lambda: [source], include_widgets=include_widgets)]
     if project_id is not None:
         raw_project_ref = str(project_id)
         # Although FastAPI has already parsed this as UUID, make the recognized
@@ -954,9 +963,19 @@ async def list_artifacts(
                 detail="Invalid project",
             )
         plan = await _scoped_project_plan(scope, project_ref, listed=True)
-        return [card.to_json() for card in await _cards_for(scope, partial(readable_sources, plan), newest=plan.newest)]
+        return [
+            card.to_json()
+            for card in await _cards_for(
+                scope, partial(readable_sources, plan), newest=plan.newest, include_widgets=include_widgets
+            )
+        ]
     plan = await run_db(_listed_scope_plan, scope=scope)
-    return [card.to_json() for card in await _cards_for(scope, partial(_browsable_sources, plan=plan), newest=plan.newest)]
+    return [
+        card.to_json()
+        for card in await _cards_for(
+            scope, partial(_browsable_sources, plan=plan), newest=plan.newest, include_widgets=include_widgets
+        )
+    ]
 
 
 
@@ -1273,7 +1292,7 @@ async def preview_artifact(scope: ScopeDep, path: str = Query(...)):
         raise HTTPException(status_code=500, detail="Could not read artifact") from e
 
 
-@router.post("/preview-mount", dependencies=[Depends(require(DesktopOnly))])
+@router.post("/preview-mount", dependencies=[Depends(require(DesktopOnly)), Depends(require(WindowProof))])
 async def preview_mount_endpoint(req: _PathBody, request: Request, scope: ScopeDep):
     try:
         artifact = resolve_artifact_path(req.path, scope=scope)
@@ -1362,7 +1381,7 @@ def serve_artifact_file(
     return FileResponse(target, media_type=media_type, headers=artifact_response_headers(media_type))
 
 
-@router.post("/open", dependencies=[Depends(require(DesktopOnly))])
+@router.post("/open", dependencies=[Depends(require(DesktopOnly)), Depends(require(WindowProof))])
 async def open_artifact(req: _PathBody, scope: ScopeDep):
     from cowork.services.artifacts import _org_mode, _NO_EXEC_DETAIL
     # In org mode this always refuses; see _org_mode's docstring in services/artifacts.py.

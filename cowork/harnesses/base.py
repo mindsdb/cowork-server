@@ -95,6 +95,10 @@ class HarnessProvider(Protocol):
         # since people keep chatting in a scheduled run's conversation. A
         # harness that records artifact revisions attributes them to it.
         schedule_id: str | None = None,
+        # True only for a client that shows docs (ResponsesRequest.docs): a
+        # harness with doc tools registers them then. Others accept and
+        # ignore it.
+        docs: bool = False,
     ) -> AsyncIterator[str]:
         ...
 

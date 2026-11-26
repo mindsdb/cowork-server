@@ -29,14 +29,15 @@ from pydantic import ValidationError
 
 from cowork.common.logger import log_context
 from cowork.db.units import run_efs, run_efs_cleanup, run_on_unit_threads
-from cowork.models.artifact_owner_choice import AccessMode
-from cowork.schemas.artifact_access import ArtifactAccessRequest
+from cowork.schemas.artifact_access import OWNER_ONLY_ACCESS, ArtifactAccessRequest
 from cowork.services.artifact_locks import LOCKS_DIRNAME, acquire, refresh, release
 from cowork.services.artifact_publish_key import PublishKey
+from cowork.services.file_page import PUBLISHABLE_FILE_SUFFIXES
 from cowork.services.product_permissions import ProductPermissionDenied, ProductPermissionUnavailable
 from cowork.services.publish import (
-    MarkdownNotPublishable,
+    DatasourceApprovalRequired,
     MarkdownRenderBusy,
+    PageNotPublishable,
     PublishOwnedByOtherUser,
     PublishRejected,
     PublishTooLarge,
@@ -63,7 +64,7 @@ logger = logging.getLogger(__name__)
 #
 # An auto-published artifact is private to its owner until they share it,
 # which is what the Share control in the viewer changes.
-AUTOPUBLISH_ACCESS = ArtifactAccessRequest(mode=AccessMode.RESTRICTED, allowed_emails=[], owner_only=True)
+AUTOPUBLISH_ACCESS = OWNER_ONLY_ACCESS
 
 # Below this much remaining budget a publish is not started at all: entering
 # `wait_for` with a sliver of time only guarantees a timeout, an abandoned upload
@@ -105,6 +106,11 @@ REASON_NO_CONTENT = "no_content"
 REASON_NOT_PUBLISHABLE = "not_publishable"
 REASON_UNPUBLISHED = "unpublished"
 REASON_UNCHANGED = "unchanged"
+# A file that isn't a web page (PDF, Word, ...: ENG-4687) is first shared only
+# by its owner's choice. Auto-publishing one would convert every data file a
+# turn writes, in the server's one conversion slot. Once shared, it keeps in
+# step like a page.
+REASON_SHARED_ON_REQUEST = "shared_on_request"
 # Another conversion held the server's one slot, so whether a Markdown page
 # changed is unknown: the project's self-heal asks again later.
 REASON_CONVERSION_BUSY = "conversion_busy"
@@ -152,10 +158,14 @@ def needs_publish(folder: Path, artifacts_base: Path) -> PublishDecision:
         _resolve_publish_target,
         compute_publish_md5,
         is_publishable_static,
+        is_widget_folder,
     )
 
     if not _user_files(folder):
         return PublishDecision(None, REASON_NO_CONTENT)
+    if is_widget_folder(folder):
+        # A widget is never published (publish.WidgetPublishRefused).
+        return PublishDecision(None, REASON_NOT_PUBLISHABLE)
 
     try:
         publish_target, published_dir, published_key, is_fullstack = _resolve_publish_target(
@@ -180,6 +190,8 @@ def needs_publish(folder: Path, artifacts_base: Path) -> PublishDecision:
     entry = load_published_map(published_dir).get(published_key)
 
     if not isinstance(entry, dict) or not entry.get("report_id"):
+        if not is_fullstack and publish_target.suffix.lower() in PUBLISHABLE_FILE_SUFFIXES:
+            return PublishDecision(None, REASON_SHARED_ON_REQUEST, is_fullstack, current_mtime)
         return PublishDecision("new", None, is_fullstack, current_mtime)
     if entry.get("published") is False:
         # Explicitly unpublished: never resurrect it on our own. The pod can
@@ -501,10 +513,16 @@ async def _publish_one(
         await _release(artifacts_base, slug, scope=scope)
         _record("skipped", slug=slug, reason="too_large")
         return False
-    except MarkdownNotPublishable:
-        # The same Markdown is refused again until it changes: a skip.
+    except DatasourceApprovalRequired:
+        # Only a person approves sending an app's connection credentials, and
+        # no person asked for this publish: a skip until one publishes it.
         await _release(artifacts_base, slug, scope=scope)
-        _record("skipped", slug=slug, reason="markdown_not_publishable")
+        _record("skipped", slug=slug, reason="datasource_approval_required")
+        return False
+    except PageNotPublishable as exc:
+        # The same file is refused again until it changes: a skip.
+        await _release(artifacts_base, slug, scope=scope)
+        _record("skipped", slug=slug, reason=exc.detail["code"])
         return False
     except MarkdownRenderBusy:
         # Another conversion held the server's one slot: nothing was tried,

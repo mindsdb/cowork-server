@@ -6,13 +6,15 @@ from __future__ import annotations
 
 from typing import Annotated, Literal
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel, StrictBool, model_validator
 
-from cowork.api.v1.permissions import DesktopOnly, require
+from cowork.api.v1.endpoints.connectors.connections import require_app_secret
+from cowork.api.v1.permissions import DesktopOnly, WindowProof, require
 from cowork.db.scoped import TenantScope, get_tenant_scope
 from cowork.schemas.artifact_access import ArtifactAccessRequest
+from cowork.services.datasource_approval import DatasourceApprovalUnavailable, DatasourceKey
 
 from cowork.services import artifact_stats as _stats
 from cowork.services.publish import (
@@ -23,6 +25,7 @@ from cowork.services.publish import (
     desktop_publish_credential as _desktop_credential,
     list_publishable,
     list_versions as _list_versions,
+    pending_datasources as _pending,
     publish_artifact as _publish,
     unpublish_artifact as _unpublish,
     update_artifact as _update,
@@ -52,6 +55,21 @@ class _AccessBody(BaseModel):
     owner_only: bool = False
 
 
+class _ApprovedDatasource(BaseModel):
+    engine: str
+    name: str
+
+
+def _approved(items: list[_ApprovedDatasource], request: Request) -> frozenset[DatasourceKey] | None:
+    """The connections this request approves sending credentials for. An
+    approval carries the desktop app's secret: agent code on the same machine
+    can call this route too."""
+    if not items:
+        return None
+    require_app_secret(request)
+    return frozenset(DatasourceKey(item.engine, item.name) for item in items)
+
+
 class _PublishBody(BaseModel):
     path: str
     # Back-compat: a bare top-level password still publishes password-protected.
@@ -60,10 +78,12 @@ class _PublishBody(BaseModel):
     # .published.json for the in-app reveal.
     password: str | None = None
     access: _AccessBody | None = None
+    approved_datasources: list[_ApprovedDatasource] = []
 
 
 class _UpdateBody(BaseModel):
     path: str
+    approved_datasources: list[_ApprovedDatasource] = []
 
 
 class _ActivateBody(BaseModel):
@@ -90,13 +110,28 @@ async def list_publishable_endpoint(scope: ScopeDep):
     return list_publishable(scope=scope)
 
 
+# Plain `def`: it reads the approval table and the vault.
+@router.get("/datasources")
+def pending_datasources_endpoint(scope: ScopeDep, path: str = Query(...)):
+    try:
+        return {"pending": _pending(path, scope=scope)}
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
+    except ValueError as e:
+        # ensure_full_id: metadata.json can't be read.
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+    except DatasourceApprovalUnavailable as e:
+        raise HTTPException(status_code=503, detail=str(e))
+
+
 # Plain `def`: publishing renders a Markdown page in the conversion process
 # and uploads the bundle, both blocking, so FastAPI runs it in its threadpool,
 # off the event loop. A typed refusal (an HTTPException) answers with its own
 # status: 413, 429 or 500 for a Markdown page, 413 for a bundle too large.
-@router.post("/")
-def publish_artifact(req: _PublishBody, scope: ScopeDep):
+@router.post("/", dependencies=[Depends(require(WindowProof))])
+def publish_artifact(req: _PublishBody, request: Request, scope: ScopeDep):
     try:
+        approved = _approved(req.approved_datasources, request)
         artifact, artifacts_base, api_key, publish_url = _desktop_context(req.path, scope=scope)
         # The publisher resolves datasource secrets from the connector vault,
         # which is keyed by the scope wherever connections are partitioned;
@@ -111,12 +146,13 @@ def publish_artifact(req: _PublishBody, scope: ScopeDep):
             password=req.password,
             access=ArtifactAccessRequest.of_publisher(req.access.model_dump()) if req.access else None,
             scope=scope,
+            approved_datasources=approved,
         )
     except FileNotFoundError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
-    except PublisherUnavailable as e:
+    except (PublisherUnavailable, DatasourceApprovalUnavailable) as e:
         raise HTTPException(status_code=503, detail=str(e))
     except ShareOrgRequired as e:
         # MindsHub refused the share with everyone and nothing was published.
@@ -125,15 +161,18 @@ def publish_artifact(req: _PublishBody, scope: ScopeDep):
         raise HTTPException(status_code=502, detail=str(e))
 
 
-@router.post("/update")
-def update_artifact(req: _UpdateBody, scope: ScopeDep):
+@router.post("/update", dependencies=[Depends(require(WindowProof))])
+def update_artifact(req: _UpdateBody, request: Request, scope: ScopeDep):
     try:
-        return _update(req.path, scope=scope)
+        return _update(
+            req.path, scope=scope,
+            approved_datasources=_approved(req.approved_datasources, request),
+        )
     except FileNotFoundError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
-    except PublisherUnavailable as e:
+    except (PublisherUnavailable, DatasourceApprovalUnavailable) as e:
         raise HTTPException(status_code=503, detail=str(e))
     except ShareOrgRequired as e:
         # MindsHub refused the share with everyone and nothing was published.
@@ -184,7 +223,7 @@ async def list_versions_endpoint(
 
 # A plain `def`: the rollback waits for its folder's publish lock and calls
 # the publishing service, both off the event loop.
-@router.post("/activate")
+@router.post("/activate", dependencies=[Depends(require(WindowProof))])
 def activate_version_endpoint(req: _ActivateBody, scope: ScopeDep):
     try:
         return _activate_version(req.path, req.md5, scope=scope)

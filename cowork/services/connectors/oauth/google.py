@@ -19,6 +19,7 @@ from cowork.services.connectors.oauth.config import OAUTH_SERVICES
 from cowork.services.connectors.identity import oauth_default_label
 from cowork.services.connectors.oauth.state import OAuthStateStore
 from cowork.services.connectors.persist import persist_connection
+from cowork.services.connectors.sealed_vault import RecordTooLargeError, ReservedFieldError
 from cowork.services.connectors.specs._registry import registry as spec_registry
 
 import logging as _logging
@@ -623,6 +624,15 @@ class OAuthService:
                 "An error occurred during the sign-in flow. Return to CoWork and try again.",
                 success=False,
             )
+        except (RecordTooLargeError, ReservedFieldError) as exc:
+            # The sealed vault refuses these values (SealedDataVault.save), and a new sign-in from
+            # the same form brings the same ones, so the page gives its reason, not "try again". The
+            # reason names the connection and never a value. It refuses the person's input, not a
+            # server fault, so nothing is logged.
+            err_msg = str(exc)
+            store.clear_pending(service, error=err_msg)
+            store.set_outcome(state, {"status": "error", "error": err_msg})
+            return _callback_page(f"{service_label} connection failed", err_msg, success=False)
         except Exception as exc:
             err_msg = str(exc)
             _log.exception("OAuth callback failed for %s", service)

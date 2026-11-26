@@ -10,7 +10,7 @@ from fastapi.concurrency import run_in_threadpool
 from pydantic import BaseModel
 
 from cowork import app_secret
-from cowork.api.v1.permissions import AuthenticatedInOrgMode, LoopbackDesktopOnly, require
+from cowork.api.v1.permissions import AuthenticatedInOrgMode, LoopbackDesktopOnly, WindowProof, require
 from cowork.common.settings.app_settings import ConnectorSettings, OAuthSettings
 from cowork.db.scoped import TenantScope, get_tenant_scope
 from cowork.db.units import run_db, run_efs, unit_session
@@ -35,6 +35,7 @@ from cowork.services.connectors.layered_vault import SHARED_CONNECTION_REFUSAL, 
 from cowork.services.connectors.oauth import auth_proxy
 from cowork.services.connectors.oauth.google import oauth_service
 from cowork.services.connectors.persist import own_vault_for_scope, own_vault_root, persist_connection, vault_for_scope
+from cowork.services.connectors.sealed_vault import RecordTooLargeError, ReservedFieldError
 from cowork.services.connectors.sharepoint import ENGINE as SHAREPOINT, generic_setup_refusal
 
 _log = logging.getLogger("cowork.connectors.connections")
@@ -49,12 +50,19 @@ ScopeDep = Annotated[TenantScope, Depends(get_tenant_scope)]
 def require_app_secret(request: Request) -> None:
     """While the server holds the desktop app's secret, refuse a caller that
     doesn't send it: these routes change what an MCP connection may do, and
-    COWORK_AUTH_TOKEN alone is readable by agent code on the same machine.
+    a COWORK_AUTH_TOKEN kept in cowork-home's .env, as a launch without the
+    launch hand-off keeps it, is readable by agent code on the same machine.
     A no-op otherwise."""
     if app_secret.get_app_secret() is None:
         return
     if not app_secret.matches(request.headers.get(app_secret.HEADER)):
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="app_secret_required")
+        # Names the refusal in the request log (cowork.common.request_logging),
+        # and in the header a client reads, as WindowProof does.
+        reason = "app_secret_required"
+        request.state._request_log_reason = reason
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN, detail=reason, headers={"X-Cowork-Reason": reason}
+        )
 
 
 def _refuse_unchangeable(scope: TenantScope, engine: str, name: str) -> None:
@@ -92,6 +100,8 @@ async def list_connections(scope: ScopeDep, request: Request):
                 name=c["name"],
                 user_label=c.get("user_label"),
                 status="needs_reconnect" if c.get("status") == "needs_reconnect" else None,
+                method=c.get("method"),
+                access_mode=c.get("access_mode"),
             )
             for item in catalogue.get("items", [])
             for c in item.get("connections", [])
@@ -153,7 +163,7 @@ async def get_connection(engine: str, name: str, scope: ScopeDep, request: Reque
 @router.post(
     "/save",
     response_model=DirectSaveResponse,
-    dependencies=[Depends(require(LoopbackDesktopOnly))],
+    dependencies=[Depends(require(LoopbackDesktopOnly)), Depends(require(WindowProof))],
 )
 def save_connection_direct(body: DirectSaveRequest, scope: ScopeDep):
     """Persist credentials to the vault without running a probe.
@@ -173,7 +183,7 @@ def save_connection_direct(body: DirectSaveRequest, scope: ScopeDep):
 @router.post(
     "/validate-and-save",
     response_model=DirectSaveResponse,
-    dependencies=[Depends(require(LoopbackDesktopOnly))],
+    dependencies=[Depends(require(LoopbackDesktopOnly)), Depends(require(WindowProof))],
 )
 def validate_and_save_developer_connection(body: DirectSaveRequest, scope: ScopeDep):
     """Validate a Code developer-tool credential before storing it.
@@ -282,9 +292,11 @@ def _persist_direct_connection(
             vault=vault,
             scope=scope,
         )
-    except SharedConnectionError:
-        # A derived name that lands on a connection the caller can't change:
-        # create_app's handler answers it with 403, not the 500 below.
+    except (SharedConnectionError, RecordTooLargeError, ReservedFieldError):
+        # A derived name that lands on a connection the caller can't change,
+        # a sealed record too large to read back, or a field named like the
+        # sealed mark: create_app's handlers answer them with 403 and 422,
+        # not the 500 below.
         raise
     except Exception:
         _log.exception("Failed to save connection %s", body.connector_id)
@@ -299,7 +311,9 @@ def _persist_direct_connection(
 # Confirmed: auth's own /v1/oauth/{engine}/{name} view requires authentication
 # (IsAuthenticated) independently of anything cowork-server does.
 @router.delete(
-    "/{engine}/{name}", status_code=status.HTTP_204_NO_CONTENT, dependencies=[Depends(require(AuthenticatedInOrgMode))]
+    "/{engine}/{name}",
+    status_code=status.HTTP_204_NO_CONTENT,
+    dependencies=[Depends(require(AuthenticatedInOrgMode)), Depends(require(WindowProof))],
 )
 async def delete_connection(engine: str, name: str, scope: ScopeDep, request: Request):
     if scope.org_mode:
@@ -340,7 +354,7 @@ class PatchTokenBody(BaseModel):
 # handler runs. The in-body org-mode refusal below stays as a second check.
 @router.patch(
     "/{engine}/{name}/token",
-    dependencies=[Depends(require(LoopbackDesktopOnly)), Depends(require_app_secret)],
+    dependencies=[Depends(require(LoopbackDesktopOnly)), Depends(require(WindowProof)), Depends(require_app_secret)],
 )
 def patch_connection_token(engine: str, name: str, body: PatchTokenBody, scope: ScopeDep):
     """Partially update token fields on a vault entry.
@@ -488,7 +502,7 @@ class PatchAccessModeBody(BaseModel):
 # (CustomizeView.jsx), same as patch_picked_files above.
 @router.patch(
     "/{engine}/{name}/access-mode",
-    dependencies=[Depends(require(AuthenticatedInOrgMode)), Depends(require_app_secret)],
+    dependencies=[Depends(require(AuthenticatedInOrgMode)), Depends(require(WindowProof)), Depends(require_app_secret)],
 )
 async def patch_access_mode(engine: str, name: str, body: PatchAccessModeBody, scope: ScopeDep, request: Request):
     """Change a connection's read/write/none MCP tool-access mode after it's
@@ -528,7 +542,7 @@ class AppHeldBody(BaseModel):
 # refusal below stays as a second check.
 @router.put(
     "/{engine}/{name}/app-held",
-    dependencies=[Depends(require(LoopbackDesktopOnly)), Depends(require_app_secret)],
+    dependencies=[Depends(require(LoopbackDesktopOnly)), Depends(require(WindowProof)), Depends(require_app_secret)],
 )
 def put_app_held(engine: str, name: str, body: AppHeldBody, scope: ScopeDep):
     """Hold an MCP connection's access token and access mode in server memory

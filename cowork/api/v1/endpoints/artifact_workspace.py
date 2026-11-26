@@ -37,7 +37,7 @@ from cowork.api.v1.artifact_scope import (
     review_artifact_and_read,
     review_artifact_for_request,
 )
-from cowork.api.v1.permissions import AuthenticatedInOrgMode, require
+from cowork.api.v1.permissions import AuthenticatedInOrgMode, WindowProof, require
 from cowork.common.settings.app_settings import default_draft_env_label, get_app_settings
 from cowork.db.scoped import TenantScope, get_tenant_scope
 from cowork.db.units import FilesystemBusy, run_db, run_efs, run_on_unit_threads
@@ -47,6 +47,7 @@ from cowork.services.product_permissions import has_product_permission, require_
 from cowork.services.artifact_permissions import (
     artifact_capabilities,
     require_artifact_owner,
+    with_display_limits,
     with_export_formats,
 )
 from cowork.services import artifact_files
@@ -54,7 +55,7 @@ from cowork.services.artifact_autopublish import job_budget_for, lock_ttl_for
 from cowork.services.preview_html import prepare_preview_html
 from cowork.services.quick_edit import direct_edit_available, quick_edit_available
 from cowork.services.artifact_identity import opened_artifact_folder
-from cowork.services.artifact_metadata import ArtifactMetadata
+from cowork.services.artifact_metadata import WIDGET_PUBLISH_REFUSAL, ArtifactMetadata, is_widget
 from cowork.schemas.artifact_export import ExportRequest, ExportResult
 from cowork.schemas.artifact_access import (
     ArtifactAccessRequest,
@@ -75,6 +76,7 @@ from cowork.services.artifact_export import (
 )
 from cowork.services.render_pdf_client import RenderPdfFailed
 from cowork.services.artifact_revisions import (
+    INLINE_PAGE_FILES,
     JOURNAL_DIRNAME,
     RepairAlreadyPending,
     RevisionConflict,
@@ -185,9 +187,17 @@ def _editable_source_selector(source, folder: Path, requested: str | None) -> st
                 current = open_pinned_child(current, disk_name)
                 resources.callback(current.close)
                 disk_parts.append(disk_name)
-            disk_name = artifact_files.existing_draft_entry_name(
-                current, parts[-1], native_case=True
-            )
+            try:
+                disk_name = artifact_files.existing_draft_entry_name(
+                    current, parts[-1], native_case=True
+                )
+            except FileNotFoundError:
+                # An inline html-app's state.json or snapshot.json before its
+                # first save (ENG-4684): the service answers a read 404, lets
+                # a save create it, and refuses it for any other artifact type.
+                if len(parts) != 1 or parts[0] not in INLINE_PAGE_FILES:
+                    raise
+                return parts[0]
             if not stat.S_ISREG(dir_lstat(current, disk_name).st_mode):
                 raise OSError("draft source is not a regular file")
             disk_parts.append(disk_name)
@@ -422,7 +432,9 @@ def _not_found_detail(exc: FileNotFoundError) -> str:
 
 class _SourceUpdateBody(BaseModel):
     content: str
-    expectedRevisionId: str = Field(min_length=1, max_length=80)
+    # Null only for the save that creates an inline page's state.json or
+    # snapshot.json (ENG-4684); for a file that exists it answers 409 like a stale token.
+    expectedRevisionId: str | None = Field(min_length=1, max_length=80)
     path: str | None = Field(default=None, max_length=1000)
     summary: str = Field(default="Edited artifact", max_length=240)
 
@@ -501,8 +513,9 @@ async def _sync_live_artifact(
     """
     from cowork.services.publish import (
         AccessModeChanged,
-        MarkdownNotPublishable,
+        DatasourceApprovalRequired,
         MarkdownRenderBusy,
+        PageNotPublishable,
         PublishOwnedByOtherUser,
         PublishTooLarge,
         ShareOrgRequired,
@@ -584,15 +597,20 @@ async def _sync_live_artifact(
         # Repeats on every save until the artifact shrinks, so no traceback.
         logger.warning("Could not synchronize live artifact %s: it is too large to publish", folder)
         return False
-    except MarkdownNotPublishable:
-        # Repeats on every save until the Markdown changes, so no traceback.
+    except PageNotPublishable:
+        # Repeats on every save until the file changes, so no traceback.
         logger.warning(
-            "Could not synchronize live artifact %s: its Markdown page can't be rendered", folder
+            "Could not synchronize live artifact %s: its page can't be rendered", folder
         )
         return False
     except MarkdownRenderBusy:
         # Another conversion held the server's one slot; the next save tries again.
         logger.warning("Could not synchronize live artifact %s: another conversion runs", folder)
+        return False
+    except DatasourceApprovalRequired:
+        # Repeats on every save until the person approves the app's new
+        # connections in the publish dialog, so no traceback.
+        logger.warning("Could not synchronize live artifact %s: new connections need approval", folder)
         return False
     except (AccessModeChanged, ShareOrgRequired):
         # publish_artifact logged the refusal: a mode changed after the
@@ -783,7 +801,10 @@ async def artifact_source(
             scope=scope,
         )
         capabilities = await _current_capabilities(
-            scope, with_export_formats(scope, owner_capabilities, export_source)
+            scope,
+            with_display_limits(
+                with_export_formats(scope, owner_capabilities, export_source), metadata.display
+            ),
         )
         return {**result, "capabilities": capabilities, "repair": repair}
     except FileNotFoundError as exc:
@@ -792,7 +813,7 @@ async def artifact_source(
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
 
-@router.put("/workspace/{project_ref}/{artifact_id}")
+@router.put("/workspace/{project_ref}/{artifact_id}", dependencies=[Depends(require(WindowProof))])
 async def update_artifact_source(
     project_ref: str,
     artifact_id: ArtifactIdDep,
@@ -821,7 +842,9 @@ async def update_artifact_source(
             ),
             scope=scope,
         )
-        if saved["revision"]["id"] != body.expectedRevisionId:
+        # An inline page's saved state is no part of its published page, so
+        # saving it re-publishes nothing.
+        if saved["revision"]["id"] != body.expectedRevisionId and saved["path"] not in INLINE_PAGE_FILES:
             await _sync_live_artifact(scope, folder, project_id=source.project_id)
         return saved
     except RevisionConflict as exc:
@@ -966,7 +989,9 @@ async def artifact_review_entry(
     capabilities = await _current_capabilities(
         scope,
         await run_db(
-            lambda unit: artifact_capabilities(unit, artifact.source, artifact.folder.name),
+            lambda unit: artifact_capabilities(
+                unit, artifact.source, artifact.folder.name, display=artifact.metadata.display
+            ),
             scope=scope,
         ),
     )
@@ -1225,6 +1250,14 @@ def _owner_publish_context(scope: TenantScope, folder: Path):
     )
 
 
+def _refuse_widget(metadata: ArtifactMetadata | None) -> None:
+    """400 for a widget: it is never published or shared (ENG-4684). Checked
+    before the publish lock and the audience checks; publish_artifact refuses
+    it again for every other path."""
+    if metadata is not None and is_widget(metadata.display):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=WIDGET_PUBLISH_REFUSAL)
+
+
 def _artifact_primary(folder: Path, metadata: ArtifactMetadata | None):
     from cowork.services.artifacts import _pick_primary, _user_files
 
@@ -1449,6 +1482,7 @@ async def set_artifact_access(
     source, folder, metadata, _capabilities = await _owner_workspace(
         scope, project_ref, artifact_id
     )
+    _refuse_widget(metadata)
     if await run_efs(partial(_artifact_primary, folder, metadata), scope=scope) is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -1605,11 +1639,12 @@ router.add_api_route(
     "/workspace/{project_ref}/{artifact_id}/access",
     set_artifact_access,
     methods=["PUT"],
+    dependencies=[Depends(require(WindowProof))],
     route_class_override=_AccessSaveRoute,
 )
 
 
-@router.post("/workspace/{project_ref}/{artifact_id}/republish")
+@router.post("/workspace/{project_ref}/{artifact_id}/republish", dependencies=[Depends(require(WindowProof))])
 async def republish_artifact(
     project_ref: str,
     artifact_id: ArtifactIdDep,
@@ -1631,6 +1666,7 @@ async def republish_artifact(
     source, folder, metadata, _capabilities = await _owner_workspace(
         scope, project_ref, artifact_id
     )
+    _refuse_widget(metadata)
     if await run_efs(partial(_artifact_primary, folder, metadata), scope=scope) is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -1966,7 +2002,10 @@ def _restore_revision(
     )
 
 
-@router.post("/workspace/{project_ref}/{artifact_id}/revisions/{revision_id}/restore")
+@router.post(
+    "/workspace/{project_ref}/{artifact_id}/revisions/{revision_id}/restore",
+    dependencies=[Depends(require(WindowProof))],
+)
 async def restore_artifact_revision(
     project_ref: str,
     artifact_id: ArtifactIdDep,
@@ -1992,7 +2031,7 @@ async def restore_artifact_revision(
             ),
             scope=scope,
         )
-        if saved["revision"]["id"] != body.expectedRevisionId:
+        if saved["revision"]["id"] != body.expectedRevisionId and saved["path"] not in INLINE_PAGE_FILES:
             await _sync_live_artifact(scope, folder, project_id=source.project_id)
         return saved
     except RevisionConflict as exc:
@@ -2082,7 +2121,10 @@ async def get_agent_repair(
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
 
-@router.post("/workspace/{project_ref}/{artifact_id}/agent-repairs/release")
+@router.post(
+    "/workspace/{project_ref}/{artifact_id}/agent-repairs/release",
+    dependencies=[Depends(require(WindowProof))],
+)
 async def release_agent_repairs_for_comment(
     project_ref: str,
     artifact_id: ArtifactIdDep,
@@ -2113,7 +2155,10 @@ async def release_agent_repairs_for_comment(
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
 
-@router.post("/workspace/{project_ref}/{artifact_id}/agent-repairs/{repair_id}/cancel")
+@router.post(
+    "/workspace/{project_ref}/{artifact_id}/agent-repairs/{repair_id}/cancel",
+    dependencies=[Depends(require(WindowProof))],
+)
 async def cancel_queued_agent_repair(
     project_ref: str,
     artifact_id: ArtifactIdDep,
@@ -2142,7 +2187,10 @@ async def cancel_queued_agent_repair(
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
 
-@router.post("/workspace/{project_ref}/{artifact_id}/agent-repairs/{repair_id}/decision")
+@router.post(
+    "/workspace/{project_ref}/{artifact_id}/agent-repairs/{repair_id}/decision",
+    dependencies=[Depends(require(WindowProof))],
+)
 async def decide_agent_repair(
     project_ref: str,
     artifact_id: ArtifactIdDep,

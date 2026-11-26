@@ -8,7 +8,7 @@ from fastapi import APIRouter, Body, Depends, HTTPException, Query, Request, sta
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 
-from cowork.api.v1.permissions import AuthenticatedInOrgMode, LoopbackDesktopOnly, OpenByDesign, require
+from cowork.api.v1.permissions import AuthenticatedInOrgMode, LoopbackDesktopOnly, OpenByDesign, WindowProof, require
 from cowork.common.settings.app_settings import ConnectorSettings, OAuthSettings, get_app_settings
 from cowork.db.scoped import TenantScope, get_tenant_scope
 from cowork.db.units import run_efs
@@ -59,7 +59,7 @@ ScopeDep = Annotated[TenantScope, Depends(get_tenant_scope)]
     "/{service}/start",
     response_model=OAuthStartResponse,
     response_model_by_alias=True,
-    dependencies=[Depends(require(AuthenticatedInOrgMode))],
+    dependencies=[Depends(require(AuthenticatedInOrgMode)), Depends(require(WindowProof))],
 )
 async def start_oauth(service: str, request: Request, scope: ScopeDep,
                        body: OAuthStartRequest = Body(default_factory=OAuthStartRequest)):
@@ -102,7 +102,9 @@ async def start_oauth(service: str, request: Request, scope: ScopeDep,
 # LoopbackDesktopOnly: returns a raw client_secret, so the credential is the
 # caller being on this machine, the same restriction as settings reveal-key.
 # Only Electron main calls it, so an org deployment refuses it outright.
-@router.get("/{engine}/credentials", dependencies=[Depends(require(LoopbackDesktopOnly))])
+@router.get(
+    "/{engine}/credentials", dependencies=[Depends(require(LoopbackDesktopOnly)), Depends(require(WindowProof))]
+)
 def get_oauth_credentials(engine: str):
     """Return client_id and client_secret for a builtin-OAuth engine.
     Called by Electron main process only — never exposed to the renderer."""
@@ -191,7 +193,9 @@ def _parse_mcp_identity(user_details: Any, org_details: Any) -> tuple[str, str]:
 # itself (it's TypeScript, the client is Python), so it hands the
 # freshly-obtained access token here instead of calling the provider
 # directly, unlike every other FETCHERS entry.
-@router.post("/{engine}/mcp/identity", dependencies=[Depends(require(LoopbackDesktopOnly))])
+@router.post(
+    "/{engine}/mcp/identity", dependencies=[Depends(require(LoopbackDesktopOnly)), Depends(require(WindowProof))]
+)
 async def get_mcp_identity(engine: str, body: McpIdentityRequest):
     """Resolve {account_email, account_name} for an MCP-based connector by
     calling its `get_user_details`/`get_organization_details` tools directly

@@ -11,7 +11,7 @@ from typing import Annotated
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from fastapi.responses import StreamingResponse
 
-from cowork.api.v1.permissions import AuthenticatedInOrgMode, SingleUserOnly, require
+from cowork.api.v1.permissions import AuthenticatedInOrgMode, SingleUserOnly, WindowProof, require
 from cowork.db.scoped import TenantScope, get_tenant_scope, tenant_scope_required
 from cowork.db.units import run_db
 from cowork.handlers.datasource_relay import relay_cloud_submission
@@ -40,6 +40,12 @@ from cowork.services.connectors.connector_test_flow import (
 from cowork.services.connectors.connector_test_run import ConnectorTestError
 from cowork.services.connectors.layered_vault import SHARED_CONNECTION_REFUSAL
 from cowork.services.connectors.persist import connection_a_new_save_replaces, vault_for_scope
+from cowork.services.connectors.sealed_vault import (
+    RecordTooLargeError,
+    ReservedFieldError,
+    reserved_field_refusal,
+    too_large_refusal,
+)
 from cowork.services.connectors.sharepoint import ENGINE as SHAREPOINT, generic_setup_refusal
 from cowork.services.connectors.specs._registry import registry
 from cowork.services.connectors.pending_tests import pending_tests
@@ -121,7 +127,7 @@ def _relayed_in_org_mode(connector_id: str) -> bool:
     return spec is not None and spec.category == _DATABASE_CATEGORY
 
 
-@router.post("/", name="submit_form")
+@router.post("/", name="submit_form", dependencies=[Depends(require(WindowProof))])
 async def submit_form_route(req: SubmitFormRequest, request: Request, scope: TenantScopeDep) -> StreamingResponse:
     """Answer one form submission.
 
@@ -139,7 +145,9 @@ async def submit_form_route(req: SubmitFormRequest, request: Request, scope: Ten
 
 
 @router.post(
-    "/allow-private", name="submission_allow_private", dependencies=[Depends(require(SingleUserOnly))],
+    "/allow-private",
+    name="submission_allow_private",
+    dependencies=[Depends(require(SingleUserOnly)), Depends(require(WindowProof))],
 )
 async def allow_private_route(answer: ConnectorTestAnswer, scope: TenantScopeDep) -> dict:
     """Continue a custom connector's test after the member allows a private host.
@@ -161,19 +169,35 @@ async def allow_private_route(answer: ConnectorTestAnswer, scope: TenantScopeDep
         return {"patch": failed_patch(entry.form_id, exc.reason)}
 
 
-@router.post("/confirm", name="submission_confirm", dependencies=[Depends(require(SingleUserOnly))])
+@router.post(
+    "/confirm",
+    name="submission_confirm",
+    dependencies=[Depends(require(SingleUserOnly)), Depends(require(WindowProof))],
+)
 async def confirm_route(answer: ConnectorTestAnswer, scope: TenantScopeDep) -> dict:
     """Save the connection whose test result the member confirmed.
 
     Single use: the entry is gone before anything is saved, so a second
     confirm answers 404. A save that then fails is not retried; the member
-    submits the form again.
+    submits the form again, changed as the reason says when the sealed vault
+    refused its values.
     """
     entry = pending_tests.pop(answer.confirm_id or "", "confirm", scope)
     if entry is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=_GONE)
     try:
         slug, user_label, note = await save_confirmed(entry)
+    except (RecordTooLargeError, ReservedFieldError) as refused:
+        # The sealed vault refuses these values whatever the member retries
+        # (SealedDataVault.save), so the form and the conversation say why.
+        # The reason is built from the entry, never from the exception, so no
+        # exception text reaches the answer; it names the connector, never a value.
+        if isinstance(refused, ReservedFieldError):
+            reason = reserved_field_refusal(connection=entry.connector_id)
+        else:
+            reason = too_large_refusal(connection=entry.connector_id)
+        await record_outcome(entry, f"Not saved: {reason}")
+        return {"patch": failed_patch(entry.form_id, reason)}
     except Exception:
         logger.exception("Could not save a confirmed %s connection", entry.connector_id)
         reason = "Cowork could not save the connection. Submit the form again."
@@ -185,7 +209,7 @@ async def confirm_route(answer: ConnectorTestAnswer, scope: TenantScopeDep) -> d
 
 @router.post(
     "/cancel", name="submission_cancel", status_code=status.HTTP_204_NO_CONTENT,
-    dependencies=[Depends(require(SingleUserOnly))],
+    dependencies=[Depends(require(SingleUserOnly)), Depends(require(WindowProof))],
 )
 async def cancel_route(answer: ConnectorTestAnswer, scope: TenantScopeDep, reason: str | None = None) -> None:
     """Drop a waiting test and the values it holds. Idempotent: an unknown id

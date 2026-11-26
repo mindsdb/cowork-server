@@ -34,7 +34,7 @@ from cowork.api.v1.endpoints.connectors.sharepoint import (
     _granted_site,
     _stored_connection,
 )
-from cowork.api.v1.permissions import AuthenticatedInOrgMode, DesktopOnly, require
+from cowork.api.v1.permissions import AuthenticatedInOrgMode, DesktopOnly, WindowProof, require
 from cowork.api.v1.pinned_response import PinnedStreamingResponse
 
 from cowork.common.logger import log_context
@@ -1900,7 +1900,7 @@ def _forget_artifact_folder_delete(scoped: ScopedSession, *, project_name: str, 
 @router.put(
     "/{project_name}/files/{path:path}",
     response_model=ProjectFileWriteResponse,
-    dependencies=[Depends(_authorize_artifact_file_mutation)],
+    dependencies=[Depends(require(WindowProof)), Depends(_authorize_artifact_file_mutation)],
     response_model_exclude_unset=True,
 )
 async def write_project_file(
@@ -2337,7 +2337,7 @@ def import_sharepoint_files(
 @router.delete(
     "/{project_name}/files/{path:path}",
     response_model=ProjectFileDeleteResponse,
-    dependencies=[Depends(_authorize_artifact_file_mutation)],
+    dependencies=[Depends(require(WindowProof)), Depends(_authorize_artifact_file_mutation)],
 )
 async def delete_project_file(
     project_name: str,
