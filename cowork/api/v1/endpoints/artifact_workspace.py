@@ -37,7 +37,7 @@ from cowork.api.v1.artifact_scope import (
     review_artifact_and_read,
     review_artifact_for_request,
 )
-from cowork.api.v1.permissions import AuthenticatedInOrgMode, require
+from cowork.api.v1.permissions import AuthenticatedInOrgMode, WindowProof, require
 from cowork.common.settings.app_settings import default_draft_env_label, get_app_settings
 from cowork.db.scoped import TenantScope, get_tenant_scope
 from cowork.db.units import FilesystemBusy, run_db, run_efs, run_on_unit_threads
@@ -813,7 +813,7 @@ async def artifact_source(
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
 
-@router.put("/workspace/{project_ref}/{artifact_id}")
+@router.put("/workspace/{project_ref}/{artifact_id}", dependencies=[Depends(require(WindowProof))])
 async def update_artifact_source(
     project_ref: str,
     artifact_id: ArtifactIdDep,
@@ -1639,11 +1639,12 @@ router.add_api_route(
     "/workspace/{project_ref}/{artifact_id}/access",
     set_artifact_access,
     methods=["PUT"],
+    dependencies=[Depends(require(WindowProof))],
     route_class_override=_AccessSaveRoute,
 )
 
 
-@router.post("/workspace/{project_ref}/{artifact_id}/republish")
+@router.post("/workspace/{project_ref}/{artifact_id}/republish", dependencies=[Depends(require(WindowProof))])
 async def republish_artifact(
     project_ref: str,
     artifact_id: ArtifactIdDep,
@@ -2001,7 +2002,10 @@ def _restore_revision(
     )
 
 
-@router.post("/workspace/{project_ref}/{artifact_id}/revisions/{revision_id}/restore")
+@router.post(
+    "/workspace/{project_ref}/{artifact_id}/revisions/{revision_id}/restore",
+    dependencies=[Depends(require(WindowProof))],
+)
 async def restore_artifact_revision(
     project_ref: str,
     artifact_id: ArtifactIdDep,
@@ -2117,7 +2121,10 @@ async def get_agent_repair(
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
 
-@router.post("/workspace/{project_ref}/{artifact_id}/agent-repairs/release")
+@router.post(
+    "/workspace/{project_ref}/{artifact_id}/agent-repairs/release",
+    dependencies=[Depends(require(WindowProof))],
+)
 async def release_agent_repairs_for_comment(
     project_ref: str,
     artifact_id: ArtifactIdDep,
@@ -2148,7 +2155,10 @@ async def release_agent_repairs_for_comment(
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
 
-@router.post("/workspace/{project_ref}/{artifact_id}/agent-repairs/{repair_id}/cancel")
+@router.post(
+    "/workspace/{project_ref}/{artifact_id}/agent-repairs/{repair_id}/cancel",
+    dependencies=[Depends(require(WindowProof))],
+)
 async def cancel_queued_agent_repair(
     project_ref: str,
     artifact_id: ArtifactIdDep,
@@ -2177,7 +2187,10 @@ async def cancel_queued_agent_repair(
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
 
-@router.post("/workspace/{project_ref}/{artifact_id}/agent-repairs/{repair_id}/decision")
+@router.post(
+    "/workspace/{project_ref}/{artifact_id}/agent-repairs/{repair_id}/decision",
+    dependencies=[Depends(require(WindowProof))],
+)
 async def decide_agent_repair(
     project_ref: str,
     artifact_id: ArtifactIdDep,
