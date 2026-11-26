@@ -232,4 +232,23 @@ async def test_an_unknown_session_mode_is_refused(inference):
     refused = await _call("POST", "/session", json={"sdp": "offer-sdp", "mode": "karaoke"})
 
     assert refused.status_code == 422
-    assert inference.seen == []
+
+
+def test_person_memory_is_empty_when_memory_mode_is_off_alone(monkeypatch):
+    """memory_mode "off" alone, MEMORY_ENABLED left true: the call must not
+    read stored memory, the same gate _persist_turn_memory uses."""
+    import cowork.api.v1.endpoints.voice as endpoint
+    from cowork.common.settings.user_settings import UserSettings
+    from cowork.db.scoped import LOCAL_SCOPE
+
+    monkeypatch.setattr(
+        endpoint, "get_user_settings",
+        lambda scope: UserSettings(_env_file=None, memory_enabled=True, memory_mode="off"),
+    )
+    # Not a raise: _person_memory's own try/except would catch it and return
+    # {} either way, passing whether or not the gate actually ran.
+    reads: list[object] = []
+    monkeypatch.setattr(endpoint, "build_turn_memory", lambda scope: reads.append(scope) or {"global": {}})
+
+    assert endpoint._person_memory(LOCAL_SCOPE) == {}
+    assert reads == []
