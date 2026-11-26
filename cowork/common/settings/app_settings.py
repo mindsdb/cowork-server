@@ -315,7 +315,8 @@ def default_minds_auth_host() -> str:
     This is the PUBLIC host. It is not ``TurnQueueSettings.auth_internal_base_url``,
     which is a ClusterIP address for the secret-authenticated mint routes and is
     unreachable from a desktop install. A desktop install, and any deployment
-    that sets no internal auth base, reads MindsHub here. A hosted deployment reads it at ``OAuthSettings.auth_service_base_url``
+    that sets no internal auth base, reads MindsHub here. A hosted deployment
+    reads it at ``OAuthSettings.auth_service_base_url``
     (cowork.services.mindshub_client.mindshub_v1) and keeps this host only for
     the URLs a browser loads, such as brand images (org_branding.absolute_auth_url).
     """
