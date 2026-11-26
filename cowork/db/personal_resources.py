@@ -90,6 +90,10 @@ MODEL_RESOURCE: dict[str, PersonalResource] = {
     # every resource is partitioned, so this entry decides nothing in
     # single-tenant mode.
     "artifact_owner_choices": PersonalResource.PROJECTS,
+    # Which connections a person approved for an artifact's full-stack
+    # publish. The approval releases the person's connection credentials, so
+    # it follows connections.
+    "artifact_datasource_approvals": PersonalResource.CONNECTIONS,
     # Written and read only in org mode, where every resource is partitioned,
     # so this entry decides nothing in a personal scope.
     "artifact_locations": PersonalResource.PROJECTS,
@@ -119,6 +123,9 @@ MODEL_RESOURCE: dict[str, PersonalResource] = {
     # the person alone) where skills are left shared.
     "skill_user_setting": PersonalResource.SKILLS,
     "schedules": PersonalResource.SCHEDULES,
+    # A person's inbox. Kept with schedules, its first source: a notice
+    # carries its schedule's org_id, so it lands in the same partition.
+    "notices": PersonalResource.SCHEDULES,
     "pins": PersonalResource.PINS,
     # The phones a person registered for push. Org mode only (cowork.services.push),
     # where every resource is partitioned, so this entry decides nothing in a

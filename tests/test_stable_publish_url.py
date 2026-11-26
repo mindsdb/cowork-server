@@ -70,6 +70,8 @@ class _FakeUserSettings:
 
 
 class _FakeAppSettings:
+    publish_token = ""
+
     class connector:  # noqa: N801 - mimic nested settings attr
         vault_dir = "/tmp/does-not-matter"
 

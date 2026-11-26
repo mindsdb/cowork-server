@@ -4,6 +4,7 @@ from collections.abc import Callable
 
 from cowork.coding.contracts import CodingSession, DeliveryRecord, SourceContext
 from cowork.coding.control_service import ControlPlaneService
+from cowork.coding.delivery import confirmation_mismatch
 from cowork.coding.integrations import DeveloperIntegrationService
 from cowork.coding.project_models import (
     CodeProject,
@@ -85,11 +86,20 @@ class TaskDeliveryService:
                 records.append(self._failed(item, item.detail))
                 continue
             draft = requested.get(item.folder_id)
+            changed = confirmation_mismatch(item, draft)
+            if changed:
+                records.append(self._failed(item, changed))
+                continue
             try:
                 self.remote.operation(
                     session,
-                    "push_branch",
-                    {"folder_id": item.folder_id},
+                    "push_confirmed_commit",
+                    {
+                        "folder_id": item.folder_id,
+                        "revision": item.head_revision,
+                        "task_branch": item.task_branch,
+                        "remote_url": item.remote_url,
+                    },
                     timeout=180,
                 )
                 external_url = integrations.create_draft_pull_request(

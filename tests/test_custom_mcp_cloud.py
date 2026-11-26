@@ -70,6 +70,8 @@ def hosts(monkeypatch):
         answer = state["answers"].get((request.method, request.url.path), (404, {"detail": "Not found."}))
         if isinstance(answer, BaseException):
             raise answer
+        if isinstance(answer, httpx.Response):
+            return answer
         status_code, body = answer
         return httpx.Response(status_code) if body is None else httpx.Response(status_code, json=body)
 
@@ -276,10 +278,13 @@ def test_a_failed_first_listing_leaves_the_server_connected_with_no_tools(hosts)
     ("POST", f"{ROUTES}/connect", {"server_url": "https://mcp.example.com/mcp", "label": "x"},
      "/v1/custom-mcp/start", "connected"),
 ], ids=["sign-in finished", "no-login server connected"])
+@pytest.mark.parametrize("list_answer", [
+    httpx.ConnectError("down"), httpx.Response(200, text="<html>proxy</html>"), httpx.Response(200, json=[]),
+], ids=["unreachable", "an HTML 200", "a list 200"])
 def test_a_connected_server_whose_list_cannot_be_read_still_answers_connected(
-        hosts, method, path, body, auth_path, status_word):
+        hosts, method, path, body, auth_path, status_word, list_answer):
     hosts["answers"][(method, auth_path)] = (200, {"status": status_word, "name": NAME})
-    hosts["answers"][("GET", "/v1/custom-mcp/connections")] = httpx.ConnectError("down")
+    hosts["answers"][("GET", "/v1/custom-mcp/connections")] = list_answer
 
     response = _client().request(method, path, json=body)
 
@@ -301,8 +306,8 @@ def test_a_codeless_400_from_auth_answers_a_fixed_refusal(hosts, body):
 
 
 @pytest.mark.parametrize(("body", "relayed"), [
-    ({"tools": [f"t{i}" for i in range(12_684)], "tools_revision": 3}, True),
-    ({"tools": [f"t{i}" for i in range(12_685)], "tools_revision": 3}, False),
+    ({"tools": [f"t{i}" for i in range(100)], "tools_revision": 3}, True),
+    ({"tools": [f"t{i}" for i in range(101)], "tools_revision": 3}, False),
     ({"tools": ["search", "search"], "tools_revision": 3}, False),
     ({"tools": ["search"], "tools_revision": True}, False),
     ({"tools": ["search"], "tools_revision": 1.0}, False),

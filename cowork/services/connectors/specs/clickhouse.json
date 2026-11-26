@@ -76,7 +76,7 @@
             "type": "password",
             "required": true,
             "secret": true,
-            "description": "Password for the ClickHouse user. Stored securely and never sent to Anton servers."
+            "description": "Password for the ClickHouse user. Stored locally with restricted file permissions, and never sent to Anton servers."
           },
           {
             "name": "use_https",

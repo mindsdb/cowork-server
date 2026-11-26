@@ -1,6 +1,7 @@
 from cowork.models.artifact_location import ArtifactLocation  # noqa: F401
 from cowork.models.artifact_sort_time import ArtifactSortTime  # noqa: F401
 from cowork.models.artifact_owner_choice import ArtifactOwnerChoice  # noqa: F401
+from cowork.models.artifact_datasource_approval import ArtifactDatasourceApproval  # noqa: F401
 from cowork.models.channel import (  # noqa: F401
     ChannelBinding,
     ChannelEvent,
@@ -19,6 +20,7 @@ from cowork.models.live_app import (  # noqa: F401
     LiveAppLaunchRecord,
     LiveAppShare,
 )
+from cowork.models.notice import Notice  # noqa: F401
 from cowork.models.push_device import PushDevice  # noqa: F401
 from cowork.models.setting import Setting  # noqa: F401
 from cowork.models.skill_access import SkillAccess  # noqa: F401

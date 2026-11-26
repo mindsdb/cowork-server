@@ -78,9 +78,8 @@ class AllowedToolsRequest(BaseModel):
 #: auth's own bounds on the web routes' fields, so a body auth would refuse never leaves.
 _MAX_LOGIN_HOSTS = 4
 _MAX_LOGIN_HOST = 260
-#: auth sets no list bound, but its largest member ceiling (768 KiB) holds at most this many
-#: of its smallest stored definitions (62 bytes), so a longer list can never save.
-_MAX_CLOUD_SWITCHES = 768 * 1024 // 62
+#: auth switches on at most this many tools per member, so a longer list can never save.
+_MAX_CLOUD_SWITCHES = 100
 
 
 class CloudReconnectRequest(BaseModel):

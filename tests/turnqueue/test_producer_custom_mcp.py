@@ -7,6 +7,7 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import logging
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
@@ -229,6 +230,15 @@ async def test_the_block_carries_the_grants_versions_and_the_served_strings_minu
     assert [c["engine"] for c in params["oauth"]["connections"]] == ["hubspot"]
 
 
+async def test_a_member_at_the_server_cap_gets_every_server(auth):
+    auth["listing"] = [httpx.Response(200, json=_listing(*_more_servers(24)))]
+
+    params, items = await _run(auth)
+
+    assert items[-1][0] == "turn_completed"
+    assert [c["connection_id"] for c in params["custom_mcp"]["connections"]] == list(range(1, 26))
+
+
 async def test_a_member_with_no_server_gets_no_block_and_no_event(auth):
     auth["listing"] = [httpx.Response(200, json={"items": []})]
 
@@ -240,23 +250,47 @@ async def test_a_member_with_no_server_gets_no_block_and_no_event(auth):
     assert _events(auth) == []
 
 
-async def test_the_backstop_measures_unescaped_utf8(auth):
-    """48 definitions of 16 KiB of non-Latin text: 768 KiB by auth's measure, about twice that escaped."""
-    def definition(index: int) -> str:
-        head = json.dumps({"description": "", "input_schema": {"type": "object"}, "name": f"t{index}"},
-                          separators=(",", ":"), sort_keys=True, ensure_ascii=False)
-        room = 16 * 1024 - len(head.encode("utf-8"))
-        return head.replace('"description":""', '"description":"' + "文" * (room // 3) + '"')
+def _definition(index: int, size: int) -> str:
+    """A definition of exactly ``size`` UTF-8 bytes, padded mostly with three-byte characters."""
+    head = json.dumps({"description": "", "input_schema": {"type": "object"}, "name": f"t{index}"},
+                      separators=(",", ":"), sort_keys=True, ensure_ascii=False)
+    room = size - len(head.encode("utf-8"))
+    padding = "文" * (room // 3) + "x" * (room % 3)
+    return head.replace('"description":""', '"description":"' + padding + '"')
 
-    tools = [definition(i) for i in range(48)]
+
+def _sixteen_kib_tools(extra_bytes: int = 0) -> list[str]:
+    """16 definitions of 16 KiB: anton's block total exactly, plus ``extra_bytes`` on the last."""
+    tools = [_definition(i, 16 * 1024) for i in range(16)]
+    tools[-1] = _definition(15, 16 * 1024 + extra_bytes)
+    return tools
+
+
+async def test_a_block_at_antons_byte_total_is_sent_measured_unescaped(auth):
+    tools = _sixteen_kib_tools()
     auth["listing"] = [httpx.Response(200, json={"items": [{**_listing()["items"][0], "tools": tools}]})]
 
     params, _ = await _run(auth)
 
     assert params["custom_mcp"]["connections"][0]["tools"] == tools
-    assert 700 * 1024 < sum(len(t.encode("utf-8")) for t in tools) <= 768 * 1024
-    assert len(json.dumps(tools).encode("utf-8")) > 1024 * 1024
+    assert sum(len(t.encode("utf-8")) for t in tools) == 262144
+    assert len(json.dumps(tools).encode("utf-8")) > 262144
     assert _events(auth) == []
+
+
+@pytest.mark.parametrize(
+    "tools",
+    [_sixteen_kib_tools(extra_bytes=1), [_definition(i, 100) for i in range(101)]],
+    ids=["one byte past the total", "101 tools"],
+)
+async def test_a_block_past_either_anton_total_is_left_out(auth, tools):
+    auth["listing"] = [httpx.Response(200, json={"items": [{**_listing()["items"][0], "tools": tools}]})]
+
+    params, _ = await _run(auth)
+
+    assert "custom_mcp" not in params
+    assert _GRANT_PATH not in _paths(auth)
+    assert [event["reason"] for event in _events(auth)] == ["over_backstop"]
 
 
 # ── a grant answer that contradicts the turn ─────────────────────────────────
@@ -281,11 +315,40 @@ async def test_a_grant_answer_bound_to_anything_else_fails_the_turn(auth, field,
     assert items[-1][0] == "turn_failed"
 
 
+async def test_a_refused_grant_answer_logs_its_route_and_reason(auth, caplog, owned_logger):
+    """The line the console prints for a grant answer that fails the turn, as for a custom API grant."""
+    logged = owned_logger("cowork.services.product_permissions", level=logging.WARNING)
+    auth["grant"] = [lambda request: httpx.Response(
+        200, json=_grant_answer(json.loads(request.content), turn_key_id="other"))]
+
+    params, items = await _run(auth)
+
+    assert params is None and items[-1][0] == "turn_failed"
+    reason = "grant response binding does not match this turn"
+    [record] = [
+        r for r in caplog.records
+        if r.name == "cowork.services.product_permissions" and getattr(r, "event", None) == "permission_unavailable"
+    ]
+    assert (record.route, record.reason) == (auth_keys.CUSTOM_MCP_GRANTS_ROUTE, reason)
+    line = json.loads(logged.output().strip())
+    assert (line["event"], line["route"], line["reason"]) == ("permission_unavailable", _GRANT_PATH, reason)
+
+
 # ── leave-outs: the turn runs, one event names why ───────────────────────────
 
 
 def _deep(depth: int) -> bytes:
     return b'{"items":' + b"[" * depth + b"]" * depth + b"}"
+
+
+def _deep_error(depth: int) -> bytes:
+    """An error body whose code nests ``depth`` arrays deep, past what the JSON parser can read."""
+    return b'{"code":' + b"[" * depth + b"]" * depth + b"}"
+
+
+def _more_servers(count: int) -> list[dict]:
+    """``count`` more servers shaped like the contract's item, at ids 2 and up."""
+    return [_second_server(id=index, name=f"cm-{index:032x}") for index in range(2, count + 2)]
 
 
 def _over_backstop() -> dict:
@@ -306,10 +369,20 @@ def _over_backstop() -> dict:
         _second_server(tools=["LONE"]))).replace("LONE", "\\ud800").encode())], None,
      "listing_malformed", 1),
     ("listing nested 100,000 deep", [httpx.Response(200, content=_deep(100_000))], None, "listing_failed", 1),
+    ("listing's 503 nested too deep", [httpx.Response(503, content=_deep_error(10_000))] * 2, None,
+     "listing_failed", 2),
+    ("26 servers", [httpx.Response(200, json=_listing(*_more_servers(25)))], None, "listing_malformed", 1),
+    ("listing answers a list", [httpx.Response(200, json=[])], None, "listing_failed", 1),
+    ("a 503 from a proxy is retried", [httpx.Response(503, text="<html>"), httpx.Response(503, text="<html>")], None,
+     "listing_failed", 2),
+    ("auth's other 503 is retried", [httpx.Response(503, json={"code": "storage_unavailable"})] * 2, None,
+     "listing_failed", 2),
     ("over the backstop", [httpx.Response(200, json=_over_backstop())], None, "over_backstop", 1),
     ("grant answers 429", None, [httpx.Response(429, json={"code": "quota_exceeded"})], "grant_quota", 1),
     ("grant answers 409", None, [httpx.Response(409, json={"code": "conflict"})], "grant_conflict", 1),
     ("grant answers 404", None, [httpx.Response(404, json={"code": "capability_denied"})], "grant_refused", 1),
+    ("grant answers a list", None, [httpx.Response(200, json=[])], "grant_refused", 1),
+    ("grant's 404 nested too deep", None, [httpx.Response(404, content=_deep_error(10_000))], "grant_refused", 1),
 ])
 async def test_a_turn_runs_without_the_block_and_logs_why(auth, case, listing, grant, reason, listing_calls):
     if listing is not None:
@@ -325,6 +398,31 @@ async def test_a_turn_runs_without_the_block_and_logs_why(auth, case, listing, g
     assert _paths(auth).count(_LISTING_PATH) == listing_calls
     if grant is None:
         assert _GRANT_PATH not in _paths(auth)
+
+
+@pytest.mark.parametrize("call", ["listing", "grant"])
+async def test_auths_switch_off_leaves_the_block_out_at_info_without_a_retry(auth, call):
+    auth[call] = [httpx.Response(503, json={"code": "disabled", "detail": "off", "request_id": "r"})]
+
+    params, _ = await _run(auth)
+
+    assert "custom_mcp" not in params
+    assert _paths(auth).count(_LISTING_PATH if call == "listing" else _GRANT_PATH) == 1
+    assert [e["reason"] for e in _events(auth, level="info")] == ["auth_disabled"]
+    assert _events(auth) == []
+
+
+async def test_with_custom_mcp_off_and_custom_api_on_nothing_asks_auth_about_custom_mcp(auth, monkeypatch):
+    monkeypatch.setenv("COWORK_TURN_CUSTOM_MCP_ENABLED", "false")
+    monkeypatch.setenv("COWORK_TURN_CUSTOM_API_ENABLED", "true")
+    get_app_settings.cache_clear()
+
+    params, _ = await _run(auth)
+
+    assert TurnQueueSettings().needs_turn_key_id is True
+    assert "custom_mcp" not in params
+    assert _LISTING_PATH not in _paths(auth) and _GRANT_PATH not in _paths(auth)
+    assert _events(auth) == [] and _events(auth, level="info") == []
 
 
 async def test_a_listing_that_fails_fast_once_is_tried_again_and_the_block_is_sent(auth):
@@ -352,7 +450,7 @@ async def test_a_turn_with_a_key_but_no_prefix_logs_it_at_info(auth):
     """A channel turn hands the producer a minted key and no prefix: every such turn has it, so not a warning."""
     block = {"provider": "minds-cloud", "api_key": "mdb_x.secret", "base_url": "https://minds.internal/v1"}
 
-    params, _ = await _run(auth, llm=block)
+    params, _ = await _run(auth, llm=prod.TurnLlm(block=block, turn_key_id=None, ttl_seconds=1200))
 
     assert "custom_mcp" not in params
     assert auth["calls"] == []

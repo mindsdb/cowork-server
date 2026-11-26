@@ -85,13 +85,28 @@ def test_metadata_only_folder_has_no_content(base):
     assert (d.action, d.reason) == (None, "no_content")
 
 
-def test_dataset_only_artifact_is_not_publishable(base):
+def test_a_file_shared_as_a_page_is_published_like_one(base):
+    """A CSV (or PDF, Word, ...) publishes as a page of its own (ENG-4687), so
+    autopublish takes it owner-only as it takes a web page: the viewer then
+    shows it in the same published state, with the same Share menu."""
     folder = _make(base, "data", files={"rows.csv": "a,b\n1,2"},
                    meta={"slug": "data", "type": "dataset"})
 
     d = needs_publish(folder, base)
 
-    assert (d.action, d.reason) == (None, "not_publishable")
+    assert d.action == "new"
+
+
+def test_a_shared_data_file_keeps_in_step_like_a_page(base):
+    folder = _make(base, "data", files={"rows.csv": "a,b\n1,2"},
+                   meta={"slug": "data", "type": "dataset"})
+    (folder / ".published.json").write_text(
+        '{"rows.csv": {"report_id": "r1", "published": true, "published_mtime": 1, "last_md5": "old"}}'
+    )
+
+    d = needs_publish(folder, base)
+
+    assert d.action == "changed"
 
 
 def test_fullstack_with_required_layout_is_new(base):

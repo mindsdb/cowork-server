@@ -37,7 +37,7 @@ from cowork.api.v1.artifact_scope import (
     review_artifact_and_read,
     review_artifact_for_request,
 )
-from cowork.api.v1.permissions import AuthenticatedInOrgMode, require
+from cowork.api.v1.permissions import AuthenticatedInOrgMode, WindowProof, require
 from cowork.common.settings.app_settings import default_draft_env_label, get_app_settings
 from cowork.db.scoped import TenantScope, get_tenant_scope
 from cowork.db.units import FilesystemBusy, run_db, run_efs, run_on_unit_threads
@@ -47,14 +47,15 @@ from cowork.services.product_permissions import has_product_permission, require_
 from cowork.services.artifact_permissions import (
     artifact_capabilities,
     require_artifact_owner,
+    with_display_limits,
     with_export_formats,
 )
 from cowork.services import artifact_files
 from cowork.services.artifact_autopublish import job_budget_for, lock_ttl_for
 from cowork.services.preview_html import prepare_preview_html
-from cowork.services.quick_edit import direct_edit_available, quick_edit_available
+from cowork.services.quick_edit import direct_edit_available, edits_in_place, quick_edit_available
 from cowork.services.artifact_identity import opened_artifact_folder
-from cowork.services.artifact_metadata import ArtifactMetadata
+from cowork.services.artifact_metadata import WIDGET_PUBLISH_REFUSAL, ArtifactMetadata, is_widget
 from cowork.schemas.artifact_export import ExportRequest, ExportResult
 from cowork.schemas.artifact_access import (
     ArtifactAccessRequest,
@@ -75,6 +76,7 @@ from cowork.services.artifact_export import (
 )
 from cowork.services.render_pdf_client import RenderPdfFailed
 from cowork.services.artifact_revisions import (
+    INLINE_PAGE_FILES,
     JOURNAL_DIRNAME,
     RepairAlreadyPending,
     RevisionConflict,
@@ -86,8 +88,11 @@ from cowork.services.artifact_revisions import (
     current_source,
     current_workspace,
     finalize_agent_repair,
+    is_document,
     list_revisions,
     release_repairs_for_comment,
+    restore_revision,
+    revision_content,
     revision_with_content,
     save_source,
 )
@@ -185,9 +190,17 @@ def _editable_source_selector(source, folder: Path, requested: str | None) -> st
                 current = open_pinned_child(current, disk_name)
                 resources.callback(current.close)
                 disk_parts.append(disk_name)
-            disk_name = artifact_files.existing_draft_entry_name(
-                current, parts[-1], native_case=True
-            )
+            try:
+                disk_name = artifact_files.existing_draft_entry_name(
+                    current, parts[-1], native_case=True
+                )
+            except FileNotFoundError:
+                # An inline html-app's state.json or snapshot.json before its
+                # first save (ENG-4684): the service answers a read 404, lets
+                # a save create it, and refuses it for any other artifact type.
+                if len(parts) != 1 or parts[0] not in INLINE_PAGE_FILES:
+                    raise
+                return parts[0]
             if not stat.S_ISREG(dir_lstat(current, disk_name).st_mode):
                 raise OSError("draft source is not a regular file")
             disk_parts.append(disk_name)
@@ -422,7 +435,9 @@ def _not_found_detail(exc: FileNotFoundError) -> str:
 
 class _SourceUpdateBody(BaseModel):
     content: str
-    expectedRevisionId: str = Field(min_length=1, max_length=80)
+    # Null only for the save that creates an inline page's state.json or
+    # snapshot.json (ENG-4684); for a file that exists it answers 409 like a stale token.
+    expectedRevisionId: str | None = Field(min_length=1, max_length=80)
     path: str | None = Field(default=None, max_length=1000)
     summary: str = Field(default="Edited artifact", max_length=240)
 
@@ -501,8 +516,9 @@ async def _sync_live_artifact(
     """
     from cowork.services.publish import (
         AccessModeChanged,
-        MarkdownNotPublishable,
+        DatasourceApprovalRequired,
         MarkdownRenderBusy,
+        PageNotPublishable,
         PublishOwnedByOtherUser,
         PublishTooLarge,
         ShareOrgRequired,
@@ -584,15 +600,20 @@ async def _sync_live_artifact(
         # Repeats on every save until the artifact shrinks, so no traceback.
         logger.warning("Could not synchronize live artifact %s: it is too large to publish", folder)
         return False
-    except MarkdownNotPublishable:
-        # Repeats on every save until the Markdown changes, so no traceback.
+    except PageNotPublishable:
+        # Repeats on every save until the file changes, so no traceback.
         logger.warning(
-            "Could not synchronize live artifact %s: its Markdown page can't be rendered", folder
+            "Could not synchronize live artifact %s: its page can't be rendered", folder
         )
         return False
     except MarkdownRenderBusy:
         # Another conversion held the server's one slot; the next save tries again.
         logger.warning("Could not synchronize live artifact %s: another conversion runs", folder)
+        return False
+    except DatasourceApprovalRequired:
+        # Repeats on every save until the person approves the app's new
+        # connections in the publish dialog, so no traceback.
+        logger.warning("Could not synchronize live artifact %s: new connections need approval", folder)
         return False
     except (AccessModeChanged, ShareOrgRequired):
         # publish_artifact logged the refusal: a mode changed after the
@@ -636,7 +657,9 @@ async def _acquire_live_publish_lock(
         await asyncio.sleep(0.1)
 
 
-async def _current_capabilities(scope: TenantScope, capabilities: dict) -> dict:
+async def _current_capabilities(
+    scope: TenantScope, capabilities: dict, *, source_path: str | None = None
+) -> dict:
     """*capabilities* narrowed by the caller's current product permissions.
 
     ``canQuickEdit`` (ENG-4227): the viewer's chat bar is offered. It needs
@@ -645,6 +668,11 @@ async def _current_capabilities(scope: TenantScope, capabilities: dict) -> dict:
     anton predates it. ``quickEditDirect``: the bar can also edit directly,
     because a decisions model serves the caller's provider; without one the
     bar still shows and hands every message to the chat.
+
+    ``source_path`` is the tracked source the viewer has open. A document the
+    quick editor can't change itself (a PDF, or an OOXML package on an anton
+    without ``OOXML_EDITS``, ``quick_edit.edits_in_place``) keeps the bar,
+    as a shortcut into the chat, so ``quickEditDirect`` is false for it.
     """
     if not capabilities["canEdit"]:
         return {**capabilities, "canQuickEdit": False, "quickEditDirect": False}
@@ -659,7 +687,9 @@ async def _current_capabilities(scope: TenantScope, capabilities: dict) -> dict:
     }
     can_quick_edit = bool(can_address and quick_edit_available())
     current["canQuickEdit"] = can_quick_edit
-    current["quickEditDirect"] = can_quick_edit and await direct_edit_available(scope)
+    current["quickEditDirect"] = (
+        can_quick_edit and edits_in_place(source_path) and await direct_edit_available(scope)
+    )
     # The export route needs `artifact.manage` too, so it offers nothing here.
     if not can_edit and "exportFormats" in capabilities:
         current["exportFormats"] = []
@@ -783,7 +813,11 @@ async def artifact_source(
             scope=scope,
         )
         capabilities = await _current_capabilities(
-            scope, with_export_formats(scope, owner_capabilities, export_source)
+            scope,
+            with_display_limits(
+                with_export_formats(scope, owner_capabilities, export_source), metadata.display
+            ),
+            source_path=result.get("path"),
         )
         return {**result, "capabilities": capabilities, "repair": repair}
     except FileNotFoundError as exc:
@@ -792,7 +826,7 @@ async def artifact_source(
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
 
-@router.put("/workspace/{project_ref}/{artifact_id}")
+@router.put("/workspace/{project_ref}/{artifact_id}", dependencies=[Depends(require(WindowProof))])
 async def update_artifact_source(
     project_ref: str,
     artifact_id: ArtifactIdDep,
@@ -821,7 +855,9 @@ async def update_artifact_source(
             ),
             scope=scope,
         )
-        if saved["revision"]["id"] != body.expectedRevisionId:
+        # An inline page's saved state is no part of its published page, so
+        # saving it re-publishes nothing.
+        if saved["revision"]["id"] != body.expectedRevisionId and saved["path"] not in INLINE_PAGE_FILES:
             await _sync_live_artifact(scope, folder, project_id=source.project_id)
         return saved
     except RevisionConflict as exc:
@@ -966,9 +1002,12 @@ async def artifact_review_entry(
     capabilities = await _current_capabilities(
         scope,
         await run_db(
-            lambda unit: artifact_capabilities(unit, artifact.source, artifact.folder.name),
+            lambda unit: artifact_capabilities(
+                unit, artifact.source, artifact.folder.name, display=artifact.metadata.display
+            ),
             scope=scope,
         ),
+        source_path=(current_revision or {}).get("path"),
     )
     return {
         "artifactKey": artifact_key(artifact_id),
@@ -1225,6 +1264,14 @@ def _owner_publish_context(scope: TenantScope, folder: Path):
     )
 
 
+def _refuse_widget(metadata: ArtifactMetadata | None) -> None:
+    """400 for a widget: it is never published or shared (ENG-4684). Checked
+    before the publish lock and the audience checks; publish_artifact refuses
+    it again for every other path."""
+    if metadata is not None and is_widget(metadata.display):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=WIDGET_PUBLISH_REFUSAL)
+
+
 def _artifact_primary(folder: Path, metadata: ArtifactMetadata | None):
     from cowork.services.artifacts import _pick_primary, _user_files
 
@@ -1408,7 +1455,7 @@ async def artifact_audience(
     )
 
 
-def _push_share(scope, principal: Principal | None, notices: list) -> None:
+def _push_share(scope, principal: Principal | None, notices: list, *, artifact_ref: str) -> None:
     """Push the people the save asked to notify, the ones MindsHub emails:
     individuals by id only. People named by address alone, and the members
     of a team or the whole organization a share opens to, get no push, as
@@ -1424,6 +1471,7 @@ def _push_share(scope, principal: Principal | None, notices: list) -> None:
                 recipient_ids=notice.recipients.user_ids,
                 artifact_title=notice.artifact_title,
                 url=notice.artifact_url,
+                artifact_ref=artifact_ref,
             )
     except Exception:
         logger.warning("Could not push an artifact share", exc_info=True, extra={"event": "push_share_failed"})
@@ -1448,6 +1496,7 @@ async def set_artifact_access(
     source, folder, metadata, _capabilities = await _owner_workspace(
         scope, project_ref, artifact_id
     )
+    _refuse_widget(metadata)
     if await run_efs(partial(_artifact_primary, folder, metadata), scope=scope) is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -1553,7 +1602,7 @@ async def _publish_live(
                 ),
                 timeout=_LIVE_PUBLISH_TIMEOUT_S,
             )
-            _push_share(scope, principal, notices)
+            _push_share(scope, principal, notices, artifact_ref=f"{source.project_id}/{artifact_id}")
             return published
         except asyncio.TimeoutError as exc:
             publish_abandoned = True
@@ -1604,11 +1653,12 @@ router.add_api_route(
     "/workspace/{project_ref}/{artifact_id}/access",
     set_artifact_access,
     methods=["PUT"],
+    dependencies=[Depends(require(WindowProof))],
     route_class_override=_AccessSaveRoute,
 )
 
 
-@router.post("/workspace/{project_ref}/{artifact_id}/republish")
+@router.post("/workspace/{project_ref}/{artifact_id}/republish", dependencies=[Depends(require(WindowProof))])
 async def republish_artifact(
     project_ref: str,
     artifact_id: ArtifactIdDep,
@@ -1630,6 +1680,7 @@ async def republish_artifact(
     source, folder, metadata, _capabilities = await _owner_workspace(
         scope, project_ref, artifact_id
     )
+    _refuse_widget(metadata)
     if await run_efs(partial(_artifact_primary, folder, metadata), scope=scope) is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -1922,6 +1973,14 @@ async def enable_artifact_comments(
     )
 
 
+def _revision_content_url(project_ref: str, artifact_id: str, revision_id: str) -> str:
+    """Where the app fetches a document revision's bytes (the route below)."""
+    return (
+        f"/api/v1/artifacts/workspace/{quote(project_ref, safe='')}/{quote(artifact_id, safe='')}"
+        f"/revisions/{quote(revision_id, safe='')}/content"
+    )
+
+
 @router.get("/workspace/{project_ref}/{artifact_id}/revisions/{revision_id}")
 async def artifact_revision(
     project_ref: str,
@@ -1929,43 +1988,50 @@ async def artifact_revision(
     revision_id: str,
     scope: ScopeDep,
 ):
+    """One revision with its text. A document's revision has no text: it
+    answers with its metadata and ``contentUrl``, where the viewer's document
+    preview fetches the bytes of that version."""
     _source, folder, _metadata, _capabilities = await _owner_workspace(
         scope, project_ref, artifact_id
     )
     try:
-        return await run_efs(partial(revision_with_content, folder, revision_id), scope=scope)
+        revision = await run_efs(partial(revision_with_content, folder, revision_id), scope=scope)
     except FileNotFoundError as exc:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=_not_found_detail(exc)) from exc
     except RevisionValidationError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
+    if is_document(revision.get("path")):
+        return {**revision, "contentUrl": _revision_content_url(project_ref, artifact_id, revision["id"])}
+    return revision
 
 
-def _restore_revision(
-    folder: Path,
-    metadata: ArtifactMetadata,
-    artifact_id: str,
+@router.get("/workspace/{project_ref}/{artifact_id}/revisions/{revision_id}/content")
+async def artifact_revision_content(
+    project_ref: str,
+    artifact_id: ArtifactIdDep,
     revision_id: str,
-    *,
-    expected_revision_id: str,
-    actor_id: str | None,
-) -> dict:
-    """A restore's file store work, in one hop: the old revision's content,
-    then its save as the new head."""
-    restored = revision_with_content(folder, revision_id)
-    return save_source(
-        folder,
-        metadata,
-        artifact_id,
-        content=restored["content"],
-        expected_revision_id=expected_revision_id,
-        rel_path=restored["path"],
-        actor_kind="manual",
-        actor_id=actor_id,
-        summary=f"Restored revision {restored['number']}",
+    scope: ScopeDep,
+):
+    """The saved bytes of a document revision, owner-authorized as the
+    revision GET is, with the file's Content-Type. Never cached: the bytes
+    are a private draft. A text revision answers 422 (its text is in the
+    revision GET)."""
+    _source, folder, _metadata, _capabilities = await _owner_workspace(
+        scope, project_ref, artifact_id
     )
+    try:
+        found = await run_efs(partial(revision_content, folder, revision_id), scope=scope)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=_not_found_detail(exc)) from exc
+    except RevisionValidationError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return Response(content=found.data, media_type=found.content_type, headers=_DRAFT_RESPONSE_HEADERS)
 
 
-@router.post("/workspace/{project_ref}/{artifact_id}/revisions/{revision_id}/restore")
+@router.post(
+    "/workspace/{project_ref}/{artifact_id}/revisions/{revision_id}/restore",
+    dependencies=[Depends(require(WindowProof))],
+)
 async def restore_artifact_revision(
     project_ref: str,
     artifact_id: ArtifactIdDep,
@@ -1981,7 +2047,7 @@ async def restore_artifact_revision(
         actor_id = str(scope.user_id) if scope and scope.user_id else None
         saved = await run_efs(
             partial(
-                _restore_revision,
+                restore_revision,
                 folder,
                 metadata,
                 artifact_id,
@@ -1991,7 +2057,7 @@ async def restore_artifact_revision(
             ),
             scope=scope,
         )
-        if saved["revision"]["id"] != body.expectedRevisionId:
+        if saved["revision"]["id"] != body.expectedRevisionId and saved["path"] not in INLINE_PAGE_FILES:
             await _sync_live_artifact(scope, folder, project_id=source.project_id)
         return saved
     except RevisionConflict as exc:
@@ -2081,7 +2147,10 @@ async def get_agent_repair(
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
 
-@router.post("/workspace/{project_ref}/{artifact_id}/agent-repairs/release")
+@router.post(
+    "/workspace/{project_ref}/{artifact_id}/agent-repairs/release",
+    dependencies=[Depends(require(WindowProof))],
+)
 async def release_agent_repairs_for_comment(
     project_ref: str,
     artifact_id: ArtifactIdDep,
@@ -2112,7 +2181,10 @@ async def release_agent_repairs_for_comment(
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
 
-@router.post("/workspace/{project_ref}/{artifact_id}/agent-repairs/{repair_id}/cancel")
+@router.post(
+    "/workspace/{project_ref}/{artifact_id}/agent-repairs/{repair_id}/cancel",
+    dependencies=[Depends(require(WindowProof))],
+)
 async def cancel_queued_agent_repair(
     project_ref: str,
     artifact_id: ArtifactIdDep,
@@ -2141,7 +2213,10 @@ async def cancel_queued_agent_repair(
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
 
-@router.post("/workspace/{project_ref}/{artifact_id}/agent-repairs/{repair_id}/decision")
+@router.post(
+    "/workspace/{project_ref}/{artifact_id}/agent-repairs/{repair_id}/decision",
+    dependencies=[Depends(require(WindowProof))],
+)
 async def decide_agent_repair(
     project_ref: str,
     artifact_id: ArtifactIdDep,

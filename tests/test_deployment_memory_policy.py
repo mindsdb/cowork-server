@@ -14,6 +14,7 @@ from cowork.db.scoped import LOCAL_SCOPE, TenantScope
 from cowork.harnesses.memory.store import GlobalMemoryStore
 from cowork.server import create_app
 from tests._turns import built_turn
+from _self_hosted import enable_self_hosted
 
 
 @pytest.mark.parametrize("trusted,shared,enabled,mode", [
@@ -29,7 +30,7 @@ async def test_encoding_off_keeps_existing_saved_memory_readable(
     monkeypatch.setenv("COWORK_PERSONAL_RESOURCES", ",".join(sorted(resources)))
     monkeypatch.setenv("COWORK_MEMORY_DIR", str(tmp_path / "memory"))
     monkeypatch.setenv("COWORK_SHARED_DIR", str(tmp_path / "shared"))
-    monkeypatch.setenv("COWORK_DEPLOYMENT_KIND", "self-hosted")
+    enable_self_hosted(monkeypatch)
     pack = tmp_path / "pack.json"
     pack.write_text(json.dumps({"name": "Acme Cowork"}))
     monkeypatch.setenv("COWORK_DEPLOYMENT_BRAND_FILE", str(pack))

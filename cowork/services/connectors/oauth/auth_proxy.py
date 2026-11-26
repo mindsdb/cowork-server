@@ -80,7 +80,7 @@ async def _relay(
         try:
             body = resp.json()
             detail = body.get("detail", resp.text) if isinstance(body, dict) else resp.text
-        except ValueError:
+        except (ValueError, RecursionError):
             body, detail = None, resp.text
         # Datasource callers pass keep_code so auth's machine-readable code
         # (invalid_connection, stale_version) survives the hop; OAuth callers
@@ -91,8 +91,18 @@ async def _relay(
             detail = {"code": body[code_key], "message": detail}
         raise HTTPException(status_code=resp.status_code, detail=detail)
     # Every route but disconnect returns a JSON object; disconnect's 204 has
-    # no body at all, so decoding it unconditionally would raise.
-    return resp.json() if resp.text else {}
+    # no body at all. Anything else is a broken answer, never a 500 here.
+    if not resp.text:
+        return {}
+    try:
+        body = resp.json()
+    except (ValueError, RecursionError):
+        body = None
+    if not isinstance(body, dict):
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY, detail="auth answered something other than a JSON object",
+        )
+    return body
 
 
 async def proxy_start(service: str, request: Request, settings: OAuthSettings, body: dict) -> dict:

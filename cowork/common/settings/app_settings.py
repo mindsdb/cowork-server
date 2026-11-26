@@ -19,9 +19,12 @@ from pydantic import (
     field_validator,
     model_validator,
 )
-from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
+from pydantic_settings import BaseSettings, EnvSettingsSource, NoDecode, SettingsConfigDict
+from pydantic_settings.sources.utils import parse_env_vars
 
+from cowork.common.launch_environment import captured_environment, launch_value
 from cowork.common.paths import cowork_home
+from cowork.common.settings.secret_files import SecretFileSettingsSource, require_process_secrets
 from cowork.db.personal_resources import ALL_PERSONAL_RESOURCES, PersonalResource
 from cowork.schemas.artifact_export import ExportPdfSettings
 
@@ -313,7 +316,11 @@ def default_minds_auth_host() -> str:
 
     This is the PUBLIC host. It is not ``TurnQueueSettings.auth_internal_base_url``,
     which is a ClusterIP address for the secret-authenticated mint routes and is
-    unreachable from a desktop install.
+    unreachable from a desktop install. A desktop install, and any deployment
+    that sets no internal auth base, reads MindsHub here. A hosted deployment
+    reads it at ``OAuthSettings.auth_service_base_url``
+    (cowork.services.mindshub_client.mindshub_v1) and keeps this host only for
+    the URLs a browser loads, such as brand images (org_branding.absolute_auth_url).
     """
     return re.sub(r"^(https?://)api([.-])", r"\1auth\2", default_turn_minds_api_host())
 
@@ -330,8 +337,8 @@ def _launched_by_pre_token_desktop() -> bool:
     # host 127.0.0.1 and no COWORK_SERVER_OWNER; every token-aware build sets the
     # owner, and the Docker image binds 0.0.0.0.
     return (
-        os.environ.get("COWORK_SERVER_HOST") == "127.0.0.1"
-        and not os.environ.get("COWORK_SERVER_OWNER")
+        launch_value("COWORK_SERVER_HOST") == "127.0.0.1"
+        and not launch_value("COWORK_SERVER_OWNER")
     )
 
 
@@ -357,10 +364,10 @@ def _env_file_chain() -> list[str]:
     file server about a missing file, and a slow file server would slow every
     one of them.
     """
-    if os.environ.get("COWORK_TENANCY_MODE") == "org":
+    if launch_value("COWORK_TENANCY_MODE") == "org":
         return [".env"]
     files = [str(cowork_home() / ".env"), ".env"]
-    if not os.environ.get("COWORK_HOME"):
+    if not launch_value("COWORK_HOME"):
         # Prod (default home) still consults the legacy file, ordered BEFORE
         # <COWORK_HOME>/.env so the migrated file wins (fresh over stale).
         files.insert(0, str(Path.home() / ".anton" / ".env"))
@@ -375,7 +382,7 @@ def _dev_oauth_env_path() -> Path | None:
     pointer. Reject every other path rather than turning an environment
     variable into an arbitrary dotenv-file loader.
     """
-    raw = os.environ.get("COWORK_DEV_OAUTH_ENV_FILE", "").strip()
+    raw = (launch_value("COWORK_DEV_OAUTH_ENV_FILE") or "").strip()
     if not raw:
         return None
 
@@ -413,6 +420,18 @@ def _dev_oauth_settings_source() -> dict[str, str]:
     }
 
 
+class LaunchEnvironmentSource(EnvSettingsSource):
+    """The ``COWORK_*`` and ``MINDSHUB_*`` variables a local launch moved out of
+    the environment (cowork.common.launch_environment), read as the
+    environment is. Ranked just under the live environment, so a settings
+    object built after the scrub reads what it read before."""
+
+    def _load_env_vars(self) -> Mapping[str, str | None]:
+        return parse_env_vars(
+            captured_environment(), self.case_sensitive, self.env_ignore_empty, self.env_parse_none_str
+        )
+
+
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
         env_file=_env_file_chain(),
@@ -420,6 +439,18 @@ class Settings(BaseSettings):
         env_nested_delimiter="_",
         extra="ignore",
     )
+
+    @classmethod
+    def settings_customise_sources(
+        cls, settings_cls, init_settings, env_settings, dotenv_settings, file_secret_settings
+    ):
+        return (
+            init_settings,
+            env_settings,
+            LaunchEnvironmentSource(settings_cls),
+            dotenv_settings,
+            file_secret_settings,
+        )
 
 
 class DatabaseSettings(Settings):
@@ -601,12 +632,14 @@ class OAuthSettings(Settings):
     def settings_customise_sources(
         cls, settings_cls, init_settings, env_settings, dotenv_settings, file_secret_settings
     ):
-        # Explicit values, process env, and the isolated COWORK_HOME dotenv all
-        # win. The fixed developer file is a narrow fallback and returns only
-        # the validation aliases for the two coding connectors.
+        # Explicit values, process env (live, then as captured at launch), and
+        # the isolated COWORK_HOME dotenv all win. The fixed developer file is
+        # a narrow fallback and returns only the validation aliases for the
+        # two coding connectors.
         return (
             init_settings,
             env_settings,
+            LaunchEnvironmentSource(settings_cls),
             dotenv_settings,
             _dev_oauth_settings_source,
             file_secret_settings,
@@ -673,7 +706,9 @@ class OAuthSettings(Settings):
         description=(
             "Base URL of the auth service's public API, used in org/cloud mode to proxy the "
             "OAuth Connector Lifecycle (start/status/catalogue), the Google Drive Picker token "
-            "mint, and the turn-key oauth-token base URL anton calls directly. This is the same "
+            "mint, the turn-key oauth-token base URL anton calls directly, and every MindsHub "
+            "read made for a caller (mindshub_client.mindshub_v1, which falls back to the "
+            "public default_minds_auth_host when this is unset). This is the same "
             "auth service TurnQueueSettings.auth_internal_base_url reaches (just different, "
             "public /v1/... routes instead of /internal/...) — accepts that env var as a "
             "fallback so a single k8s config value covers both."
@@ -821,7 +856,8 @@ class TurnQueueSettings(Settings):
         default=1200,
         description=(
             "TTL, in seconds, of the minted per-turn MindsHub key for a turn without a "
-            "time limit (20 min; keep within auth's turn_key_max_ttl_seconds). "
+            "time limit, and for a time-limited turn whose longer key auth refused "
+            "(20 min; keep within auth's turn_key_max_ttl_seconds). "
             "scratchpad-controller's MAX_TURN_WALL_CLOCK_SECONDS (1080) is derived from "
             "it (TTL - 120); change both together."
         ),
@@ -840,7 +876,9 @@ class TurnQueueSettings(Settings):
             "none, and the turn keeps today's caps. Turn it on only where auth extends "
             "turn keys and scratchpad-controller raises its backstop for time-limited "
             "turns; a turn key then lives one time-limit window at a time "
-            "(turn_key_lifetime_seconds) and is extended on each \"Keep going\"."
+            "(turn_key_lifetime_seconds) and is extended on each \"Keep going\". "
+            "An auth whose turn-key cap is below that window refuses the key; the "
+            "turn then runs untimed on a turn_key_ttl_seconds key."
         ),
     )  # COWORK_TURN_TIME_LIMIT_SECONDS
     time_limit_key_margin_seconds: int = Field(
@@ -863,8 +901,8 @@ class TurnQueueSettings(Settings):
             raise ValueError(
                 f"COWORK_TURN_TIME_LIMIT_SECONDS + COWORK_TURN_TIME_LIMIT_KEY_MARGIN_SECONDS "
                 f"({self.turn_key_lifetime_seconds}s) must leave {AUTH_TURN_KEY_SKEW_SECONDS}s "
-                f"under auth's turn-key cap ({AUTH_TURN_KEY_MAX_TTL_SECONDS}s), or every web "
-                f"turn's key mint is refused"
+                f"under auth's turn-key cap ({AUTH_TURN_KEY_MAX_TTL_SECONDS}s), or auth refuses "
+                f"every time-limited key and each web turn runs untimed"
             )
         return self
 
@@ -1018,6 +1056,23 @@ class AppSettings(Settings):
     _deployment_identity: DeploymentIdentity | None = PrivateAttr(default=None)
     _deployment_identity_initialized: bool = PrivateAttr(default=False)
 
+    @classmethod
+    def settings_customise_sources(
+        cls, settings_cls, init_settings, env_settings, dotenv_settings, file_secret_settings
+    ):
+        # A credential whose file the process environment names wins over the
+        # environment and every .env (cowork.common.settings.secret_files).
+        # The values a local launch moved out of the environment rank just
+        # under it, as for every other settings class (Settings).
+        return (
+            init_settings,
+            SecretFileSettingsSource(settings_cls),
+            env_settings,
+            LaunchEnvironmentSource(settings_cls),
+            dotenv_settings,
+            file_secret_settings,
+        )
+
     deployment_kind: Literal["self-hosted"] | None = Field(
         default=None,
         validation_alias=AliasChoices("COWORK_DEPLOYMENT_KIND"),
@@ -1031,6 +1086,14 @@ class AppSettings(Settings):
             "agent's product name when COWORK_DEPLOYMENT_KIND=self-hosted. Read once at startup."
         ),
     )
+
+    @model_validator(mode="after")
+    def _self_hosted_credentials_come_from_the_process(self) -> "AppSettings":
+        """A self-hosted process stops rather than fall back to SQLite, a generated
+        token or a credential in cowork-home's .env (secret_files.require_process_secrets)."""
+        if self.deployment_kind == "self-hosted":
+            require_process_secrets()
+        return self
 
     env: str = Field(default="local", description="The environment (local, dev, prod, etc.)")  # ENV
 
@@ -1177,6 +1240,17 @@ class AppSettings(Settings):
             "kill switch because a renderer that does not know the event "
             "drops it silently, stalling the agent until the question times "
             "out. Set to false to degrade to plain-text questions (ENG-1984)."
+        ),
+    )
+    remote_docs: bool = Field(
+        default=False,
+        validation_alias=AliasChoices("COWORK_REMOTE_DOCS"),
+        description=(
+            "Org mode: whether a remote (pod) turn's agent gets the doc tools, which "
+            "this server runs for the pod (cowork/turnqueue/host_tools.py). Off by "
+            "default. Turn it on only once the anton image and scratchpad-controller "
+            "that relay host tools are deployed: before that the turn's input tells "
+            "the agent to call doc tools its pod does not have."
         ),
     )
     quick_edit_enabled: bool = Field(
@@ -1558,6 +1632,11 @@ class AppSettings(Settings):
         """
         parsed = _bare_origin(self.web_origin)
         return parsed[0] if parsed else ""
+
+    def remote_docs_available(self) -> bool:
+        """Whether remote turns get the doc tools. Doc tools answer the pod on
+        the stdin only an interactive turn keeps open, so ask_user must be on."""
+        return bool(self.remote_docs and self.ask_user_enabled)
 
     def draft_links_enabled(self) -> bool:
         """Whether this server issues and serves signed draft links."""
