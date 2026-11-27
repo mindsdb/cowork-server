@@ -14,6 +14,7 @@ from typing import Any
 from collections.abc import Callable
 
 from .markdown import block_to_markdown
+from .highlight import code_css, highlight as highlight_code
 from .model import (
     LIST_TYPES,
     TEXT_TYPES,
@@ -659,6 +660,27 @@ def _hbar_svg(labels: list[str], series: list[dict[str, Any]], low: float, span:
     return "".join(parts)
 
 
+# The comment layer on a shared page anchors a comment to the closest element
+# with an id, so each block's root carries one. Only ids that need no escaping
+# in HTML or CSS: the app reads them back from the layer's selector as written.
+_PAGE_ID = re.compile(r"[A-Za-z0-9_-]{1,64}")
+_ROOT_TAG = re.compile(r"<[a-z][a-z0-9]*")
+
+
+def _page_id(b: Block) -> str:
+    """` id="blk-<id>"` for a block the comment layer can point to; "" otherwise."""
+    bid = b.get("id")
+    if isinstance(bid, str) and _PAGE_ID.fullmatch(bid):
+        return f' id="blk-{bid}"'
+    return ""
+
+
+def _with_page_id(markup: str, b: Block) -> str:
+    attr = _page_id(b)
+    root = _ROOT_TAG.match(markup) if attr else None
+    return markup[:root.end()] + attr + markup[root.end():] if root else markup
+
+
 def _list_html(items: list[Block], rich: bool) -> str:
     """Consecutive list blocks → nested <ul>/<ol>, honouring indent."""
     out: list[str] = []
@@ -677,14 +699,15 @@ def _list_html(items: list[Block], rich: bool) -> str:
             out.append(f"<{tag}{cls}>")
             stack.append(tag)
         text = inline_html(b.get("text", ""))
+        page_id = _page_id(b) if rich else ""
         if b["type"] == "task" and rich:
             # The editor's check box, drawn by PAGE_CSS in the list's indent.
             done = " done" if b.get("done") else ""
-            out.append(f"<li class='task{done}'><span class='task-box'></span><span class='task-text'>{text}</span>")
+            out.append(f"<li{page_id} class='task{done}'><span class='task-box'></span><span class='task-text'>{text}</span>")
             continue
         if b["type"] == "task":
             text = ("☑ " if b.get("done") else "☐ ") + text
-        out.append(f"<li>{text}")
+        out.append(f"<li{page_id}>{text}")
     while stack:
         out.append(f"</li></{stack.pop()}>")
     return "".join(out)
@@ -771,8 +794,13 @@ def _callout_html(tab: Tab, b: Block, rich: bool) -> str:
     return f"<div class='callout callout-{b['tone']}'><p>{title}{inline_html(b['text'])}</p></div>"
 
 
-def _code_html(tab: Tab, b: Block, rich: bool) -> str:
-    return f"<pre><code>{html.escape(b.get('code', ''))}</code></pre>"
+def _code_html(b: Block, *, highlight: bool) -> str:
+    code = b.get("code", "")
+    found = highlight_code(code, b.get("language")) if highlight else None
+    if found is None:
+        return f"<pre><code>{html.escape(code)}</code></pre>"
+    name, markup = found
+    return f"<pre><code class='hljs language-{name}'>{markup}</code></pre>"
 
 
 def _divider_html(tab: Tab, b: Block, rich: bool) -> str:
@@ -834,7 +862,6 @@ _BLOCK_HTML: dict[str, Callable[[Tab, Block, bool], str]] = {
     "paragraph": _paragraph_html,
     "quote": _quote_html,
     "callout": _callout_html,
-    "code": _code_html,
     "divider": _divider_html,
     "image": _image_html,
     "table": _table_html,
@@ -845,7 +872,7 @@ _BLOCK_HTML: dict[str, Callable[[Tab, Block, bool], str]] = {
 }
 
 
-def tab_html(tab: Tab, *, rich: bool = True) -> str:
+def tab_html(tab: Tab, *, rich: bool = True, highlight: bool) -> str:
     out: list[str] = []
     blocks = tab["blocks"]
     i = 0
@@ -857,9 +884,13 @@ def tab_html(tab: Tab, *, rich: bool = True) -> str:
             out.append(_list_html(blocks[i:j], rich))
             i = j
             continue
-        markup = _BLOCK_HTML[blocks[i]["type"]](tab, blocks[i], rich)
+        if blocks[i]["type"] == "code":
+            # Word gets no spans: each is a node in its converter's budget.
+            markup = _code_html(blocks[i], highlight=highlight)
+        else:
+            markup = _BLOCK_HTML[blocks[i]["type"]](tab, blocks[i], rich)
         if markup:
-            out.append(markup)
+            out.append(_with_page_id(markup, blocks[i]) if rich else markup)
         i += 1
     return "\n".join(out)
 
@@ -879,8 +910,10 @@ def _font_face(style: str, name: str) -> str:
 
 
 FONT_CSS = _font_face("normal", "inter.woff2") + _font_face("italic", "inter-italic.woff2")
-# A PDF export draws the doc's plain markup in the page's font.
-PDF_CSS = FONT_CSS + f"body{{font-family:{FONT_STACK}}}"
+# The PDF has no page palette of its own: code takes the light one, and the
+# variables it names (the page's light values).
+PDF_CSS = (FONT_CSS + ":root{--ink:#0e0f10;--ink-2:#3a3d40;--ink-4:#9b9fa3}" + code_css("light")
+           + f"body{{font-family:{FONT_STACK}}}")
 
 # The page a doc opens as in a browser and is shared as: the editor's look,
 # standalone (no external assets; a small script only for tabs), light and dark,
@@ -1004,7 +1037,7 @@ body.tabbed{display:block}.doc-tabs,.js.tabs-hidden .doc-tabs__show{display:none
 .doc-tabs,.doc-tabstrip,.js.tabs-hidden .doc-tabs__show{display:none}
 .js section.tab:not(.is-active),.js .tab-title{display:block}
 .js section.tab+section.tab{margin-top:48px;padding-top:28px;border-top:1px solid var(--line)}}
-"""
+""" + code_css("light") + "@media (prefers-color-scheme:dark){" + code_css("dark") + "}"
 
 # The tabs as the editor shows them, one at a time. Without the script every
 # tab stays on the page and the links scroll to it. The rail's folded state is
@@ -1041,12 +1074,12 @@ def _tab_links(doc: Doc) -> str:
         for n, t in enumerate(doc["tabs"]))
 
 
-def export_body_html(doc: Doc) -> str:
+def export_body_html(doc: Doc, *, highlight: bool) -> str:
     """The doc as body markup for the Word and PDF converters, each extra tab under its title."""
     multi = len(doc["tabs"]) > 1
     parts = []
     for n, tab in enumerate(doc["tabs"]):
-        body = tab_html(tab, rich=False)
+        body = tab_html(tab, rich=False, highlight=highlight)
         starts_with_h1 = bool(tab["blocks"]) and tab["blocks"][0]["type"] == "heading" and tab["blocks"][0]["level"] == 1
         if multi and not starts_with_h1:
             body = f"<h1{' class=tab' if n else ''}>{html.escape(tab['title'])}</h1>\n" + body
@@ -1061,7 +1094,7 @@ def doc_html(doc: Doc) -> str:
     for n, tab in enumerate(doc["tabs"]):
         head = f"<h2 class='tab-title'>{html.escape(tab['title'])}</h2>" if multi else ""
         active = " is-active" if multi and n == 0 else ""
-        sections.append(f"<section class='tab{active}' id='tab-{n + 1}'>{head}{tab_html(tab)}</section>")
+        sections.append(f"<section class='tab{active}' id='tab-{n + 1}'>{head}{tab_html(tab, highlight=True)}</section>")
     updated = (doc.get("updated_at") or "")[:10]
     meta = f"<p class='meta'>Updated {html.escape(_date_label(updated))}</p>" if updated else ""
     main = (f"<main class='page'><h1 class='page-title'>{html.escape(doc['title'])}</h1>{meta}"

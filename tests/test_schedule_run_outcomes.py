@@ -722,6 +722,77 @@ def test_a_refused_write_stops_a_finished_turn_short_and_outranks_a_limit():
     assert failed.outcome == AttemptOutcome.failed_during_execution
 
 
+@pytest.mark.parametrize("continued", [False, True])
+async def test_an_excluded_connector_is_a_blocked_outcome_when_the_run_stops(tmp_path, monkeypatch, continued):
+    from cowork.harnesses.anton_harness.schedule_connector_reporting import REPORT_BLOCKED_CONNECTOR
+
+    buffer = FileStreamBuffer(tmp_path / "turn.jsonl")
+    report = _sse("response.in_progress", {
+        "tool_use_id": "report", "tool_name": REPORT_BLOCKED_CONNECTOR,
+        "content": '{"blocked_connector": "Work mail (gmail)"}',
+    })
+    await buffer.append("sse", {"sse": report})
+    if continued:
+        await buffer.append("sse", {"sse": _sse("response.in_progress", {
+            "tool_use_id": "alternate", "tool_name": "some_other_tool", "content": "Done",
+        })})
+    await buffer.close("completed")
+    monkeypatch.setattr(scheduler, "registry", SimpleNamespace(get=lambda _cid: SimpleNamespace(buffer=buffer)))
+
+    end = scheduler._classify(await scheduler._run_evidence("c1", _leaving_out_work_mail()))
+    if continued:
+        assert end.outcome == AttemptOutcome.completed
+    else:
+        assert end.outcome == AttemptOutcome.connector_blocked
+        assert "Work mail (gmail)" in end.error
+
+
+_WORK_MAIL = {"engine": "gmail", "name": "Work mail"}
+
+
+def _leaving_out_work_mail() -> scheduler._ScheduledTurn:
+    return scheduler._ScheduledTurn(
+        principal=None, title="t", prompt="p", model=None, project_id=None, disabled_connections=[_WORK_MAIL],
+    )
+
+
+@pytest.mark.parametrize(
+    ("frames", "blocked"),
+    [
+        # anton streams the report call's name and input, and no result.
+        (_tool_frames("t1", "report_blocked_connector", _WORK_MAIL)[:2], "Work mail (gmail)"),
+        (_tool_frames("t1", "report_blocked_connector", _WORK_MAIL), "Work mail (gmail)"),
+        # The tool refuses a connection the task does not leave out.
+        (_tool_frames("t1", "report_blocked_connector", {"engine": "gmail", "name": "Personal"}), None),
+        (_tool_frames("t1", "report_blocked_connector", "not json"), None),
+        # The run went on with another tool after reporting.
+        (
+            _tool_frames("t1", "report_blocked_connector", _WORK_MAIL)
+            + _tool_frames("t2", "scratchpad", {"action": "exec"}),
+            None,
+        ),
+        (
+            _tool_frames("t1", "scratchpad", {"action": "exec"})
+            + _tool_frames("t2", "report_blocked_connector", _WORK_MAIL),
+            "Work mail (gmail)",
+        ),
+    ],
+)
+async def test_a_run_that_reports_a_left_out_connection_is_read_from_the_calls_own_frames(
+    tmp_path, monkeypatch, frames, blocked,
+):
+    buffer = FileStreamBuffer(tmp_path / "turn.jsonl")
+    for frame in frames:
+        await buffer.append("sse", {"sse": frame})
+    await buffer.close("completed")
+    monkeypatch.setattr(scheduler, "registry", SimpleNamespace(get=lambda _cid: SimpleNamespace(buffer=buffer)))
+
+    evidence = await scheduler._run_evidence("c1", _leaving_out_work_mail())
+    assert evidence.blocked_connector == blocked
+    expected = AttemptOutcome.connector_blocked if blocked else AttemptOutcome.completed
+    assert scheduler._classify(evidence).outcome == expected
+
+
 def test_a_turn_with_no_buffer_counts_as_having_acted(monkeypatch):
     monkeypatch.setattr(scheduler, "registry", SimpleNamespace(get=lambda _cid: None))
     assert asyncio.run(scheduler._turn_activity("c1")) == (True, None)

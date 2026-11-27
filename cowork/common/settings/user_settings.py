@@ -741,6 +741,16 @@ class UserSettings(Settings):
             "or about to run."
         ),
     )
+    schedule_notify_failed: bool = Field(
+        default=True,
+        title="Notify On Failed Scheduled Runs",
+        description="Post a notice when one of your scheduled tasks fails or stops before finishing.",
+    )
+    schedule_notify_succeeded: bool = Field(
+        default=False,
+        title="Notify On Successful Scheduled Runs",
+        description="Post a notice when one of your scheduled tasks finishes successfully.",
+    )
     nav_title: str = Field(
         default="",
         title="Nav Title",
@@ -1048,8 +1058,8 @@ class UserSettings(Settings):
         description=(
             "The most tokens the agent may spend on one request before it "
             "pauses and checks in with you. On MindsHub, every token the agent "
-            "reads or writes counts against your credits or your free MindsHub "
-            "Air allowance, including tokens re-read from cache, so a task that "
+            "reads or writes counts against your credits or your "
+            "allowance, including tokens re-read from cache, so a task that "
             "gets stuck can use up a large share of either without finishing. "
             "Raise it if you routinely give the agent "
             "big jobs; lower it to cap what any single request can cost. "
