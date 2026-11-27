@@ -659,6 +659,27 @@ def _hbar_svg(labels: list[str], series: list[dict[str, Any]], low: float, span:
     return "".join(parts)
 
 
+# The comment layer on a shared page anchors a comment to the closest element
+# with an id, so each block's root carries one. Only ids that need no escaping
+# in HTML or CSS: the app reads them back from the layer's selector as written.
+_PAGE_ID = re.compile(r"[A-Za-z0-9_-]{1,64}")
+_ROOT_TAG = re.compile(r"<[a-z][a-z0-9]*")
+
+
+def _page_id(b: Block) -> str:
+    """` id="blk-<id>"` for a block the comment layer can point to; "" otherwise."""
+    bid = b.get("id")
+    if isinstance(bid, str) and _PAGE_ID.fullmatch(bid):
+        return f' id="blk-{bid}"'
+    return ""
+
+
+def _with_page_id(markup: str, b: Block) -> str:
+    attr = _page_id(b)
+    root = _ROOT_TAG.match(markup) if attr else None
+    return markup[:root.end()] + attr + markup[root.end():] if root else markup
+
+
 def _list_html(items: list[Block], rich: bool) -> str:
     """Consecutive list blocks → nested <ul>/<ol>, honouring indent."""
     out: list[str] = []
@@ -677,14 +698,15 @@ def _list_html(items: list[Block], rich: bool) -> str:
             out.append(f"<{tag}{cls}>")
             stack.append(tag)
         text = inline_html(b.get("text", ""))
+        page_id = _page_id(b) if rich else ""
         if b["type"] == "task" and rich:
             # The editor's check box, drawn by PAGE_CSS in the list's indent.
             done = " done" if b.get("done") else ""
-            out.append(f"<li class='task{done}'><span class='task-box'></span><span class='task-text'>{text}</span>")
+            out.append(f"<li{page_id} class='task{done}'><span class='task-box'></span><span class='task-text'>{text}</span>")
             continue
         if b["type"] == "task":
             text = ("☑ " if b.get("done") else "☐ ") + text
-        out.append(f"<li>{text}")
+        out.append(f"<li{page_id}>{text}")
     while stack:
         out.append(f"</li></{stack.pop()}>")
     return "".join(out)
@@ -859,7 +881,7 @@ def tab_html(tab: Tab, *, rich: bool = True) -> str:
             continue
         markup = _BLOCK_HTML[blocks[i]["type"]](tab, blocks[i], rich)
         if markup:
-            out.append(markup)
+            out.append(_with_page_id(markup, blocks[i]) if rich else markup)
         i += 1
     return "\n".join(out)
 
