@@ -299,6 +299,21 @@ def test_the_page_carries_the_editor_when_the_app_provides_it(shared, tmp_path, 
         assert (folder / name).read_bytes() == (src / name).read_bytes()
 
 
+def test_the_page_finds_the_editor_after_the_launch_moves_the_variable_out(shared, tmp_path, monkeypatch):
+    """A desktop launch moves COWORK_* variables out of os.environ; the editor
+    directory the app handed over must still be found."""
+    from types import MappingProxyType
+
+    from cowork.common import launch_environment
+
+    folder, _ = shared
+    monkeypatch.delenv(EDITOR_DIR_ENV, raising=False)
+    monkeypatch.setattr(launch_environment, "_captured",
+                        MappingProxyType({EDITOR_DIR_ENV: str(_editor_dir(tmp_path))}))
+    render_page(folder, load_doc(folder))
+    assert "<script defer src='doc-editor.js'></script>" in (folder / DOC_HTML).read_text()
+
+
 def test_only_a_shared_doc_keeps_the_editor_beside_it(shared, tmp_path, monkeypatch):
     """The editor is ~600 KB: copied into every doc it filled project folders
     (a project can be a git repository) for a page that only runs when shared."""

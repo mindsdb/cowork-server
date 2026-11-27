@@ -8,9 +8,9 @@ folders, and a project can be someone's git repository.
 
 from __future__ import annotations
 
-import os
 from pathlib import Path
 
+from cowork.common.launch_environment import launch_value
 from cowork.db.scoped import tenant_scope_required
 
 from .model import Doc, DocError
@@ -35,7 +35,7 @@ def link_editing_available() -> bool:
 
 
 def _editor_source() -> Path | None:
-    raw = os.environ.get(EDITOR_DIR_ENV, "").strip()
+    raw = (launch_value(EDITOR_DIR_ENV) or "").strip()
     if not raw:
         return None
     src = Path(raw)
