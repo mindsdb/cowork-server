@@ -17,6 +17,7 @@ never bound.
 
 import hashlib
 import hmac
+import json
 import os
 import secrets
 import socket
@@ -56,6 +57,7 @@ _PASSTHROUGH_ENV = (
 
 def _spawn_like_desktop(
     tmp_path, port: int, owner: str | None, port_var: str, proof_key: str | None = None,
+    handoff_line: str | None = None,
 ) -> tuple[subprocess.Popen, "os.PathLike[str]"]:
     # Mirror the env block the desktop app builds before spawning the
     # sidecar. DATABASE_URI is pinned to a fresh SQLite file so the spawned
@@ -75,6 +77,8 @@ def _spawn_like_desktop(
         env["COWORK_SERVER_OWNER"] = owner
     if proof_key is not None:
         env["COWORK_SERVER_HEALTH_PROOF_KEY"] = proof_key
+    if handoff_line is not None:
+        env["COWORK_APP_SECRET_STDIN"] = "2"
     # Server output goes to a file, not a PIPE: nobody drains a pipe while
     # we poll /health, so chatty startup logging could fill the pipe buffer
     # and block the child. The file doubles as failure diagnostics.
@@ -83,9 +87,14 @@ def _spawn_like_desktop(
         proc = subprocess.Popen(
             [sys.executable, "-c", "from cowork.cli import main; main()"],
             env=env,
+            stdin=subprocess.PIPE if handoff_line is not None else None,
             stdout=log_file,
             stderr=subprocess.STDOUT,
         )
+    if handoff_line is not None:
+        # One line, then EOF, as the desktop app writes it.
+        proc.stdin.write(handoff_line.encode())
+        proc.stdin.close()
     return proc, log_path
 
 
@@ -184,5 +193,31 @@ def test_desktop_spawn_health_proof_names_the_port_the_server_bound(tmp_path):
         expected = hmac.new(key.encode(), f"cowork-health-proof:{port}:{nonce}".encode(), hashlib.sha256).hexdigest()
         assert payload["proof"] == expected
         assert key not in repr(payload)
+    finally:
+        _stop(proc)
+
+
+def test_desktop_spawn_with_the_launch_hand_off(tmp_path):
+    """COWORK_APP_SECRET_STDIN=2: the token arrives on stdin, /health says so,
+    the bearer check takes that token alone, and the copy an earlier launch
+    mirrored into cowork-home's .env is gone."""
+    port = _free_port()
+    token, earlier = "cd" * 32, "0123456789abcdef" * 4
+    home = tmp_path / "home"
+    home.mkdir()
+    (home / ".env").write_text(f"COWORK_AUTH_TOKEN={earlier}\n", encoding="utf-8")
+    line = json.dumps({"app_secret": "ab" * 32, "auth_token": token, "window_proof": "ef" * 32}) + "\n"
+    proc, log_path = _spawn_like_desktop(tmp_path, port, "owner-token", "COWORK_SERVER_PORT", handoff_line=line)
+    try:
+        payload = _wait_for_health(proc, port, log_path)
+        assert payload["app_secret_protocol"] == 2
+
+        url = f"http://127.0.0.1:{port}/api/v1/settings/"
+        assert httpx.get(url, timeout=5.0).status_code == 401
+        assert httpx.get(url, headers={"Authorization": f"Bearer {earlier}"}, timeout=5.0).status_code == 401
+        assert httpx.get(url, headers={"Authorization": f"Bearer {token}"}, timeout=5.0).status_code == 200
+        text = (home / ".env").read_text(encoding="utf-8")
+        assert "COWORK_AUTH_TOKEN" not in text
+        assert token not in text
     finally:
         _stop(proc)

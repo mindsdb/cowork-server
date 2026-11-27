@@ -244,6 +244,16 @@ async def test_a_run_refused_for_shutdown_leaves_its_slot_due_and_no_empty_conve
     assert _scheduler_records(caplog) == [
         (logging.INFO, "Schedule run did not start; the server is shutting down"),
     ]
+    # It did nothing and runs again, so its owner's inbox hears nothing.
+    from cowork.db.session import get_open_session
+    from cowork.models.notice import Notice
+    from sqlmodel import select
+
+    session = get_open_session()
+    try:
+        assert session.exec(select(Notice).where(Notice.source_id == str(run.id))).all() == []
+    finally:
+        session.close()
 
 
 async def test_a_manual_run_refused_for_shutdown_keeps_the_conversation_its_request_made(
@@ -321,19 +331,57 @@ async def test_a_run_whose_turn_claim_redis_cannot_answer_leaves_its_slot_due_an
     assert [r.levelno for r in records] == [logging.WARNING]
 
 
+async def test_a_run_a_shutdown_cancels_before_its_turn_starts_tells_its_owner_nothing(monkeypatch, due_schedule):
+    """A shutdown that lands while the run is still starting its turn cut a
+    run that did nothing. Its slot stays due and it runs again, so its
+    owner's inbox hears nothing."""
+    import cowork.handlers.responses as responses_mod
+    from cowork.db.session import get_open_session
+    from cowork.models.notice import Notice
+    from cowork.schemas.schedules import AttemptOutcome, RunStatus
+    from sqlmodel import select
+
+    starting = asyncio.Event()
+
+    class StartingHandler:
+        def __init__(self, *, principal=None, interactive=True, schedule_id=None):
+            pass
+
+        async def handle(self, request):
+            starting.set()
+            await asyncio.Event().wait()
+
+    monkeypatch.setattr(responses_mod, "ResponsesHandler", StartingHandler)
+    run = asyncio.create_task(scheduler.execute_schedule(due_schedule.id, is_manual=False))
+    await asyncio.wait_for(starting.wait(), timeout=5)
+    run.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await run
+
+    _, finished, _ = due_schedule.state()
+    assert finished.status == RunStatus.failed
+    assert finished.outcome == AttemptOutcome.failed_before_execution
+    session = get_open_session()
+    try:
+        assert session.exec(select(Notice).where(Notice.source_id == str(finished.id))).all() == []
+    finally:
+        session.close()
+
+
 @pytest.mark.parametrize("is_manual", [False, True], ids=["cron", "run-now"])
 async def test_a_run_a_shutdown_cancels_mid_turn_is_saved_failed_and_its_slot_stays_due(
     monkeypatch, due_schedule, is_manual,
 ):
     """Uvicorn's request drain cancels a Run now request at its bound, and the
     event loop's close cancels a cron run still going. The run is saved as
-    failed, not success, so the next poll still runs the slot: the freshness
-    guard skips a slot only after a successful run."""
+    failed and leaves the slot available for the next poll."""
     import cowork.handlers.responses as responses_mod
     from cowork.common.datetime_utils import ensure_utc
     from cowork.db.scoped import SYSTEM_SCOPE, ScopedSession
     from cowork.db.session import get_open_session
+    from cowork.models.notice import Notice
     from cowork.schemas.schedules import RunStatus
+    from sqlmodel import select
 
     streaming = asyncio.Event()
 
@@ -363,6 +411,8 @@ async def test_a_run_a_shutdown_cancels_mid_turn_is_saved_failed_and_its_slot_st
     poll = get_open_session()
     try:
         due = scheduler._due_schedules(ScopedSession(poll, SYSTEM_SCOPE), datetime.now(timezone.utc))
+        (notice,) = poll.exec(select(Notice).where(Notice.source_id == str(finished.id))).all()
+        assert notice.kind == "scheduled_run.failed"
     finally:
         poll.close()
     assert due_schedule.id in [schedule.id for schedule in due]

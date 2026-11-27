@@ -5,7 +5,7 @@ import json
 import random
 import threading
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from functools import partial
 from typing import TYPE_CHECKING, TypeVar
@@ -112,7 +112,7 @@ _SHUTDOWN_RUN_ERROR = "Run did not start: the server was shutting down."
 _CLAIM_UNAVAILABLE_RUN_ERROR = "Run did not start: Cowork was busy."
 # A run's error when a shutdown cancelled it before it recorded its turn's
 # outcome. Saved as failed, not success, so a cron slot it did not consume
-# stays due, and the freshness guard skips no slot because of it.
+# stays due.
 _INTERRUPTED_RUN_ERROR = "Run was interrupted: the server shut down before it finished."
 # The runs the poll loop started and nothing awaits. A shutdown waits for them
 # (wait_for_scheduled_runs) so each run's last writes land before the process
@@ -120,35 +120,20 @@ _INTERRUPTED_RUN_ERROR = "Run was interrupted: the server shut down before it fi
 # waits for that request only up to --timeout-graceful-shutdown, then cancels
 # it, and the run is saved as interrupted (_INTERRUPTED_RUN_ERROR).
 _scheduled_runs: set[asyncio.Task] = set()
+_notice_retries: set[asyncio.Task] = set()
 
 _RECURRING_CADENCES = {
     Cadence.every_15_minutes, Cadence.every_30_minutes, Cadence.hourly,
-    Cadence.daily, Cadence.weekly, Cadence.weekdays,
+    Cadence.daily, Cadence.weekly, Cadence.weekdays, Cadence.monthly,
 }
 
 # A one-off may start up to this late on its own. At this lateness or more
 # (the app was not running when its time came) it is marked missed, and runs
-# only when the user presses Run now. Independent of the freshness window
-# below despite the shared hour: this bounds how late a one-off may still run.
+# only when the user presses Run now.
 _ONCE_LATE_LIMIT = timedelta(hours=1)
 # A recurring schedule that fell behind runs its latest missed slot once, when
 # that slot is no older than this; every other missed slot is passed over.
 _MISSED_RUN_LOOKBACK = timedelta(days=7)
-
-# Freshness guard (ENG-688): if a successful run — typically a manual
-# "run now" — finished this recently before a due cron slot, the slot is
-# skipped instead of executed, so both runs don't publish the same output
-# twice. Hourly gets a tighter window so consecutive slots never suppress
-# each other even when a run finishes mid-hour. Shorter
-# cadences get none: at every 15 or 30 minutes, a slot right after a manual
-# run is wanted.
-_FRESHNESS_WINDOW_SECONDS = {
-    Cadence.once: 60 * 60,
-    Cadence.hourly: 30 * 60,
-    Cadence.daily: 60 * 60,
-    Cadence.weekdays: 60 * 60,
-    Cadence.weekly: 60 * 60,
-}
 
 
 def _advance_next_run_at(schedule: Schedule, session) -> None:
@@ -164,6 +149,7 @@ def _advance_next_run_at(schedule: Schedule, session) -> None:
         schedule.cadence,
         schedule.next_run_at,
         schedule.timezone,
+        recurrence=schedule.recurrence,
     )
     session.add(schedule)
 
@@ -230,6 +216,7 @@ def _catch_up(session: ScopedSession, schedule: Schedule, now: datetime) -> None
     elif schedule.cadence in _RECURRING_CADENCES:
         missed = missed_slots(
             schedule.cadence, next_run, schedule.timezone, now=now, lookback=_MISSED_RUN_LOOKBACK,
+            recurrence=schedule.recurrence,
         )
         if not missed.skipped:
             # At most one slot is overdue, and it is recent: the due-check runs it.
@@ -276,6 +263,7 @@ class _ScheduledTurn:
     prompt: str
     model: str | None
     project_id: UUID | None
+    disabled_connections: list[dict] | None = None
 
 
 @dataclass(frozen=True)
@@ -403,6 +391,9 @@ class _TurnEvidence:
     # What the turn handed the browser to a person for (its hand-over's
     # reason), when it did. A scheduled run has nobody to take it.
     handed_over: str | None = None
+    # Whether a change the agent asked approval for went unapproved.
+    writes_refused: bool = False
+    blocked_connector: str | None = None
 
 
 @dataclass(frozen=True)
@@ -454,6 +445,12 @@ def _hand_over_error(reason: str) -> str:
     )
 
 
+_WRITES_REFUSED_ERROR = (
+    "Run stopped short: a change needed approval, and nobody approved it while the run waited, "
+    "so it wasn't made. Open the run to see the change, then run the task now and approve it there."
+)
+
+
 def _classify(evidence: _TurnEvidence) -> _AttemptEnd:
     """What the turn's ending says about whether its agent acted, and what to
     tell the user: the turn's own failure text when it gave one. When in doubt
@@ -464,6 +461,15 @@ def _classify(evidence: _TurnEvidence) -> _AttemptEnd:
             # The agent ends its turn once nobody takes the browser, so the
             # turn reads as finished though its work stopped at that step.
             return _AttemptEnd(outcome=AttemptOutcome.failed_during_execution, error=_hand_over_error(evidence.handed_over))
+        if evidence.writes_refused:
+            # Ranked above a limit: a lost write is the bigger surprise.
+            return _AttemptEnd(outcome=AttemptOutcome.writes_refused, error=_WRITES_REFUSED_ERROR)
+        if evidence.blocked_connector is not None:
+            return _AttemptEnd(
+                outcome=AttemptOutcome.connector_blocked,
+                error=f"This task needed an excluded connector: {evidence.blocked_connector}. "
+                "Change the task's connector settings to allow it.",
+            )
         limit_error = _LIMIT_ERRORS.get(evidence.stopped_by or "")
         if limit_error:
             return _AttemptEnd(outcome=AttemptOutcome.stopped_at_limit, error=limit_error)
@@ -580,6 +586,7 @@ def _read_schedule(session: ScopedSession, *, schedule_id: UUID) -> _ScheduledTu
         prompt=schedule.prompt,
         model=schedule.model,
         project_id=schedule.project_id,
+        disabled_connections=schedule.disabled_connections or None,
     )
 
 
@@ -678,9 +685,8 @@ def _record_turn_outcome(
     elif end.outcome != AttemptOutcome.completed:
         # Any other ending is a failure, an uncertain one included: a turn
         # with no record of how it ended is not a success anyone can vouch
-        # for, so it neither suppresses the next slot nor ends a failure
-        # streak. It doesn't extend the streak either: an unreadable record
-        # says nothing about the task, and auto-pause is for tasks that keep
+        # for, so it does not end a failure streak. An unreadable record
+        # also says nothing about the task, and auto-pause is for tasks that keep
         # failing. A run stopped at a limit is left out of the streak for the
         # same reason: it worked as far as its settings allowed.
         outcome = _RunOutcome(status=RunStatus.failed, error=end.error or _FAILED_DURING_ERROR)
@@ -691,9 +697,7 @@ def _record_turn_outcome(
 
     def settle(schedule: Schedule) -> None:
         # Always consume the cron slot: the schedule stays due otherwise and
-        # the loop would immediately restart the run the user killed (a
-        # cancelled or failed run isn't a success, so the freshness guard
-        # wouldn't block the restart).
+        # the loop would immediately restart the run the user killed.
         if not is_manual:
             _advance_next_run_at(schedule, session)
             if (
@@ -709,9 +713,11 @@ def _record_turn_outcome(
         if outcome.status is None:
             # A success of either kind ends the failure streak.
             count_settled_slot(session, schedule_id, failed=False)
-        if schedule.cadence == Cadence.once and (not is_manual or end.outcome == AttemptOutcome.completed):
-            # Cron consumes its slot, but Run now uses a one-off up only on
-            # confirmed completion. Other endings preserve its prior state.
+        if schedule.cadence == Cadence.once and (
+            not is_manual or (schedule.missed_at is not None and end.outcome == AttemptOutcome.completed)
+        ):
+            # A successful Run now resolves an already-missed one-off. Active
+            # and paused one-offs keep their scheduled occurrence.
             schedule.enabled = False
             schedule.missed_at = None
             schedule.paused_at = None
@@ -840,15 +846,17 @@ async def _execute_schedule(
     A Run now passes the ``run_id`` its request already claimed
     (claim_manual_run), so the press and its run are one claim.
 
-    A ``trial`` run is a run-now that tries the task out. It doesn't use a
-    one-off up, and neither the freshness guard nor the failure streak counts
-    it.
+    A ``trial`` run tries the task out and leaves the failure streak unchanged.
     """
     is_manual = trigger != RunTrigger.cron
     trial = trigger == RunTrigger.trial
     from cowork.handlers.responses import ResponsesHandler
     from cowork.schemas.responses import ResponsesRequest
-    from cowork.services.product_permissions import ProductPermissionUnavailable, require_product_permission
+    from cowork.services.product_permissions import (
+        ProductPermissionUnavailable,
+        report_permission_unavailable,
+        require_product_permission,
+    )
 
     try:
         run_id = run_id or await run_db(
@@ -904,6 +912,7 @@ async def _execute_schedule(
     timed_out = False
     end: _AttemptEnd | None = None
     shutdown_interrupted = False
+    shutdown_failed = False
     scheduled: _ScheduledTurn | None = None
     # Set once the run's ending is recorded: True finished, False didn't, and
     # None sends no push (_push_run_ending).
@@ -929,6 +938,7 @@ async def _execute_schedule(
             input=scheduled.prompt,
             model=resolve_schedule_model(scheduled.model),
             stream=True,
+            disabled_connections=scheduled.disabled_connections,
             conversation=str(conversation_id),
             trace_tags=["scheduled_task", f"trigger:{trigger.value}"],
             trace_metadata={
@@ -1014,7 +1024,7 @@ async def _execute_schedule(
         # buffer's records are the only truthful signal of how the turn ended
         # and whether its agent acted — without them every run is recorded as
         # success.
-        evidence = await _turn_evidence(str(conversation_id))
+        evidence = await _run_evidence(str(conversation_id), scheduled)
         shutdown_interrupted = evidence.shutdown_interrupted
         end = _classify(evidence)
 
@@ -1056,7 +1066,7 @@ async def _execute_schedule(
                 await _stop_reaped_turn(str(conversation_id))
                 raise _LeaseLost()
             if fallback_ran:
-                evidence = await _turn_evidence(str(conversation_id))
+                evidence = await _run_evidence(str(conversation_id), scheduled)
                 shutdown_interrupted = evidence.shutdown_interrupted
                 end = _classify(evidence)
 
@@ -1096,6 +1106,9 @@ async def _execute_schedule(
         # cron run still going. The finally saves it as failed.
         error = _INTERRUPTED_RUN_ERROR
         outcome = AttemptOutcome.interrupted if turn_started else AttemptOutcome.failed_before_execution
+        # A run cut before its turn started did nothing, and its slot stays
+        # due: nothing to tell its owner, as when a start is refused.
+        shutdown_failed = turn_started
         raise
     except Exception as exc:
         # The ids travel as record attributes: a database error's sanitized
@@ -1104,6 +1117,9 @@ async def _execute_schedule(
             "Schedule run failed: %s", str(exc),
             extra=log_context(schedule_id=schedule_id, conversation_id=conversation_id),
         )
+        if isinstance(exc, ProductPermissionUnavailable):
+            # The run's error is this answer; say why auth couldn't verify it.
+            report_permission_unavailable(exc)
         if end is not None and end.outcome not in {AttemptOutcome.completed, AttemptOutcome.cancelled}:
             # A bookkeeping failure must not erase an already observed failure.
             outcome = end.outcome
@@ -1150,6 +1166,8 @@ async def _execute_schedule(
                             AttemptOutcome.failed_during_execution,
                             AttemptOutcome.interrupted,
                             AttemptOutcome.stopped_at_limit,
+                            AttemptOutcome.writes_refused,
+                            AttemptOutcome.connector_blocked,
                         }
                         and not shutdown_interrupted
                     ),
@@ -1194,8 +1212,11 @@ async def _execute_schedule(
         finally:
             with _active_run_lock:
                 _active_run_ids.discard(run_id)
-            if push_succeeded is not None and not lease_lost.is_set() and trigger != RunTrigger.trial:
-                _push_run_ending(scheduled, conversation_id=conversation_id, succeeded=push_succeeded)
+            if not lease_lost.is_set() and trigger != RunTrigger.trial:
+                if push_succeeded is not None:
+                    _push_run_ending(scheduled, conversation_id=conversation_id, succeeded=push_succeeded)
+                if push_succeeded is not None or shutdown_failed:
+                    await _post_run_notice(run_id, schedule_id=schedule_id)
 
 
 def _push_run_ending(
@@ -1236,6 +1257,55 @@ def _push_reaped_run(push: ReapedRunPush) -> None:
         )
     except Exception:
         logger.warning("Could not push a reaped run's ending", exc_info=True, extra={"event": "push_schedule_failed"})
+
+
+async def _post_run_notice(run_id: UUID, *, schedule_id: UUID) -> None:
+    """Put the run's ending in its owner's inbox, if they asked to hear
+    about it. Never holds up or fails a run.
+
+    Same callers as _push_run_ending, and a run a shutdown cut mid-turn,
+    which push skips. On every deployment: the inbox is how the desktop and
+    self-hosted hear about a run, where there is no push.
+    """
+    try:
+        from cowork.services.notices import post_scheduled_run_notice
+
+        unit = partial(post_scheduled_run_notice, run_id=run_id)
+        await run_db(unit, scope=SYSTEM_SCOPE)
+    except PoolTimeoutError:
+        # The run is already recorded. Let it release its scheduler slot
+        # while the inbox write waits for a connection independently.
+        retry = asyncio.create_task(_retry_run_notice(unit, schedule_id=schedule_id))
+        _notice_retries.add(retry)
+        retry.add_done_callback(_notice_retries.discard)
+    except Exception:
+        logger.warning("Could not post a scheduled run's notice", exc_info=True, extra={"event": "schedule_notice_failed"})
+
+
+async def _retry_run_notice(unit: Callable[[ScopedSession], object], *, schedule_id: UUID) -> None:
+    try:
+        await _until_it_lands(unit, schedule_id=schedule_id)
+    except Exception:
+        logger.warning("Could not post a scheduled run's notice", exc_info=True, extra={"event": "schedule_notice_failed"})
+
+
+async def wait_for_scheduled_notices(*, timeout_seconds: float) -> None:
+    pending = [task for task in _notice_retries if not task.done()]
+    if pending:
+        await asyncio.wait(pending, timeout=timeout_seconds)
+
+
+def post_reaped_run_notices(session: ScopedSession, run_ids: list[UUID]) -> None:
+    """Post the notices for runs a reaper failed, inside its database unit.
+    One run's failure to post never stops the others, or the reap."""
+    from cowork.services.notices import post_scheduled_run_notice
+
+    for run_id in run_ids:
+        try:
+            post_scheduled_run_notice(session, run_id=run_id)
+        except Exception:
+            session.rollback()
+            logger.warning("Could not post a reaped run's notice", exc_info=True, extra={"event": "schedule_notice_failed"})
 
 
 class _LeaseLost(Exception):
@@ -1469,7 +1539,73 @@ async def _turn_evidence(conversation_id: str) -> _TurnEvidence:
         shutdown_interrupted=shutdown_interrupted,
         stopped_by=await _turn_stopped_by(conversation_id) if reason == "completed" else None,
         handed_over=await _turn_handed_over(conversation_id) if reason == "completed" else None,
+        writes_refused=reason == "completed" and await _turn_refused_writes(conversation_id),
     )
+
+
+async def _run_evidence(conversation_id: str, scheduled: _ScheduledTurn) -> _TurnEvidence:
+    """The turn's evidence, with the left-out connection a finished run
+    reported it needed."""
+    evidence = await _turn_evidence(conversation_id)
+    if evidence.reason != "completed" or not scheduled.disabled_connections:
+        return evidence
+    blocked = await _turn_blocked_connector(conversation_id, scheduled.disabled_connections)
+    return replace(evidence, blocked_connector=blocked)
+
+
+async def _turn_blocked_connector(conversation_id: str, excluded: list[dict]) -> str | None:
+    """The left-out connection the finished turn's agent last reported it
+    needed, when it called no other tool afterwards.
+
+    Read from the report call's own frames, as _turn_handed_over reads a
+    hand-over: a tool's first frame names it and a later one holds its input.
+    anton streams no result for this tool, so the call is checked against the
+    task's exclusions here, as the tool checks it. A worker that does stream
+    the result is read too."""
+    from cowork.harnesses.anton_harness.schedule_connector_reporting import (
+        REPORT_BLOCKED_CONNECTOR,
+        reported_connector,
+    )
+
+    handle = registry.get(conversation_id)
+    if handle is None:
+        return None
+    named: dict[str, str] = {}
+    blocked_connector = None
+    try:
+        async with asyncio.timeout(_EVIDENCE_READ_TIMEOUT_SECONDS):
+            async for record in handle.buffer.tail(0):
+                if record.is_terminal:
+                    break
+                for event, data in _sse_frames(record):
+                    call_id, content = data.get("tool_use_id"), data.get("content")
+                    if event != "response.in_progress" or not isinstance(call_id, str) or not call_id:
+                        continue
+                    tool = data.get("tool_name")
+                    if not tool and isinstance(content, str) and call_id not in named:
+                        named[call_id] = tool = content
+                        content = None
+                    if tool and tool != REPORT_BLOCKED_CONNECTOR:
+                        # The run continued using other tools after the report.
+                        blocked_connector = None
+                    if (tool or named.get(call_id)) != REPORT_BLOCKED_CONNECTOR:
+                        continue
+                    try:
+                        report = json.loads(content or "")
+                    except (ValueError, TypeError):
+                        continue
+                    if not isinstance(report, dict):
+                        continue
+                    if tool:
+                        name = report.get("blocked_connector")
+                        if isinstance(name, str) and name:
+                            blocked_connector = name
+                    else:
+                        blocked_connector = reported_connector(excluded, report) or blocked_connector
+    except Exception:
+        logger.exception("Could not read the scheduled turn's connector report", extra=log_context(conversation_id=conversation_id))
+        return None
+    return blocked_connector
 
 
 async def _turn_stopped_by(conversation_id: str) -> str | None:
@@ -1554,6 +1690,49 @@ async def _turn_handed_over(conversation_id: str) -> str | None:
     return handed_over
 
 
+# anton's write-approval cards name their question with this prefix; other
+# cards (a browser step, a plain question) aren't write approval.
+_WRITE_APPROVAL_PREFIX = "write:"
+
+
+async def _turn_refused_writes(conversation_id: str) -> bool:
+    """Whether a write-approval card the turn asked went without Approve:
+    declined, timed out, or never answered. After one goes unanswered, anton
+    refuses the turn's later writes without a card, so one is enough. False
+    when the frames can't be read.
+
+    Only call after the turn's stream has been fully drained."""
+    handle = registry.get(conversation_id)
+    if handle is None:
+        return False
+    asked: set[str] = set()
+    approved: set[str] = set()
+    try:
+        async with asyncio.timeout(_EVIDENCE_READ_TIMEOUT_SECONDS):
+            async for rec in handle.buffer.tail(0):
+                if rec.is_terminal:
+                    break
+                for event, data in _sse_frames(rec):
+                    question = data.get("question_id")
+                    if not isinstance(question, str) or not question.startswith(_WRITE_APPROVAL_PREFIX):
+                        continue
+                    if event == "response.ask_user":
+                        asked.add(question)
+                    elif (
+                        event == "response.ask_user_answered"
+                        and data.get("status") == "answered"
+                        and data.get("values") == ["approve"]
+                    ):
+                        approved.add(question)
+    except Exception:
+        logger.exception(
+            "Could not read whether the turn's writes were approved",
+            extra=log_context(conversation_id=conversation_id)
+        )
+        return False
+    return bool(asked - approved)
+
+
 async def _turn_activity(conversation_id: str) -> tuple[bool, _TurnFailure | None]:
     """Whether the turn's buffer holds anything beyond its start, its memory
     read, a wait for the model and its failure, and the last failure frame it
@@ -1590,29 +1769,12 @@ async def _turn_activity(conversation_id: str) -> tuple[bool, _TurnFailure | Non
     return True, failure
 
 
-def _ran_recently(schedule: Schedule, run_service: ScheduleRunService, now: datetime) -> bool:
-    window = _FRESHNESS_WINDOW_SECONDS.get(schedule.cadence)
-    if not window:
-        return False
-    last = run_service.last_successful_finish(schedule.id)
-    return last is not None and (now - last).total_seconds() < window
-
-
 def _due_schedules(session, now: datetime) -> list[Schedule]:
-    """Enabled schedules whose slot is due and should actually execute.
-
-    A due slot with a successful run inside the freshness window is skipped
-    and advanced to its next occurrence instead of returned.
-    """
     run_service = ScheduleRunService(session)
     due: list[Schedule] = []
-    skipped = False
     for s in ScheduleService(session).list_schedules():
-        # Gate on ANY in-flight run, manual included: a manual run still
-        # executing when the slot comes due would otherwise run alongside the
-        # cron run and publish the same output twice. The slot is deferred,
-        # not consumed — once the run finishes, the freshness guard decides
-        # whether it still fires.
+        # A manual run can still be in flight when the scheduled slot comes
+        # due. Leave the slot pending until the active run finishes.
         if not s.enabled or ensure_utc(s.next_run_at) > now or run_service.has_active_run(s.id):
             continue
         # Read the row again: a run that ended after this poll read it has
@@ -1624,17 +1786,7 @@ def _due_schedules(session, now: datetime) -> list[Schedule]:
             continue  # deleted since this poll read it
         if not s.enabled or ensure_utc(s.next_run_at) > now:
             continue
-        if _ran_recently(s, run_service, now):
-            logger.info(
-                "Skipping schedule slot after a recent successful run",
-                extra=log_context(schedule_id=s.id)
-            )
-            _advance_next_run_at(s, session)
-            skipped = True
-            continue
         due.append(s)
-    if skipped:
-        session.commit()
     return due
 
 
@@ -1756,6 +1908,7 @@ def _reap_lapsed_runs(
                 conversation_id=str(run.conversation_id) if run.conversation_id else None,
             ))
     session.commit()
+    post_reaped_run_notices(session, [run.id for run in executed if not run.trial])
     if abandoned is not None:
         abandoned.extend(committed_abandoned)
     if pushes is not None:

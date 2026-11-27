@@ -345,7 +345,7 @@ async def test_run_now_uses_up_a_missed_one_off(made, turns):
     ("reason", "acted"),
     [("completed", True), ("cancelled", True), ("error", False), ("error", True), ("interrupted", True), (None, True)],
 )
-async def test_only_completed_run_now_finishes_a_one_off(made, turns, prior_state, reason, acted):
+async def test_run_now_only_resolves_a_missed_one_off_after_success(made, turns, prior_state, reason, acted):
     schedule_id = made(cadence="once", next_run_at=NOW + timedelta(days=1))
     if prior_state == ScheduleState.paused:
         _service(lambda s: s.pause_schedule(schedule_id))
@@ -360,7 +360,7 @@ async def test_only_completed_run_now_finishes_a_one_off(made, turns, prior_stat
 
     after = _schedule(schedule_id)
     assert len(turns.started) == 1
-    if reason == "completed":
+    if prior_state == ScheduleState.missed and reason == "completed":
         assert schedule_state(after) == ScheduleState.done
         assert after.enabled is False
         assert after.paused_at is None and after.missed_at is None
@@ -391,12 +391,47 @@ async def test_a_one_off_paused_during_its_cron_run_is_done_after_completion(mad
     assert len(turns.started) == 1
 
 
-async def test_run_now_uses_up_a_one_off_that_has_not_come_due(made, turns):
-    schedule_id = made(cadence="once", next_run_at=NOW + timedelta(days=1))
+@pytest.mark.parametrize("cadence", ["daily", "once"])
+async def test_run_now_at_0955_preserves_the_1000_occurrence(made, turns, monkeypatch, cadence):
+    from cowork import schedule_timing
+    from cowork.services import schedules
 
-    await scheduler.execute_schedule(schedule_id, is_manual=True)
+    due = NOW.replace(hour=10, minute=0, second=0)
+    now = due - timedelta(minutes=5)
 
-    assert schedule_state(_schedule(schedule_id)) == ScheduleState.done
+    class Clock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return now.astimezone(tz) if tz else now.replace(tzinfo=None)
+
+    for module in (scheduler, schedules, schedule_timing):
+        monkeypatch.setattr(module, "datetime", Clock)
+
+    schedule_id = made(cadence=cadence, next_run_at=due)
+    url = f"/api/v1/schedules/{schedule_id}"
+    async with _client() as client:
+        assert (await client.post(f"{url}/run-now")).status_code == 202
+        task = (await client.get(url)).json()
+        assert task["state"] == "active"
+        assert datetime.fromisoformat(task["nextRunAt"]) == due
+        assert _poll(schedule_id) == []
+
+        now = due
+        (slot,) = _poll(schedule_id)
+        assert slot.slot_at == due
+        await _run(slot)
+        assert _poll(schedule_id) == []
+        history = (await client.get(f"{url}/runs")).json()["runs"]
+        entries = [(run["trigger"], run["status"], datetime.fromisoformat(run["startedAt"])) for run in history]
+        assert entries == [
+            ("cron", "success", due),
+            ("manual", "success", due - timedelta(minutes=5)),
+        ]
+        task = (await client.get(url)).json()
+        if cadence == "once":
+            assert task["state"] == "done"
+        else:
+            assert datetime.fromisoformat(task["nextRunAt"]) == due + timedelta(days=1)
 
 
 def test_a_missed_one_off_given_a_new_time_is_scheduled_again(made, turns):

@@ -5,7 +5,7 @@ from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, status
 
-from cowork.api.v1.permissions import AuthenticatedInOrgMode, LoopbackDesktopOnly, require
+from cowork.api.v1.permissions import AuthenticatedInOrgMode, LoopbackDesktopOnly, WindowProof, require
 from cowork.db.scoped import ScopedSession, ScopedSessionDep, TenantScopeDep
 from cowork.db.units import run_db, run_efs_unit
 from cowork.models.conversation import Conversation
@@ -319,7 +319,7 @@ def list_conversation_folders(conversation_id: UUID, scoped: ScopedSessionDep):
 @router.post(
     "/{conversation_id}/folders",
     status_code=status.HTTP_201_CREATED,
-    dependencies=_FOLDER_ROUTE_GUARDS,
+    dependencies=[*_FOLDER_ROUTE_GUARDS, Depends(require(WindowProof))],
 )
 def add_conversation_folder(
     conversation_id: UUID, body: ConversationFolderAddRequest, scoped: ScopedSessionDep

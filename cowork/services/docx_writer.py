@@ -445,6 +445,9 @@ class _Writer:
             # Past the depth limit, tags lose their meaning and only text flows.
             inner = outer
         elif tag == "br":
+            if _ends_paragraph(br=element):
+                # Its tail, if any, is space a browser drops at a line end.
+                return
             self._line_break(context=outer)
             self._write_tail(visit=visit)
             return
@@ -976,6 +979,19 @@ def _list_style(*, kind: str, level: int) -> str:
 
 def _list_continue_style(*, level: int) -> str:
     return "List Continue" if level == 1 else f"List Continue {level}"
+
+
+def _ends_paragraph(*, br: HtmlElement) -> bool:
+    """True for a <br> that is the last thing in its paragraph.
+
+    A browser draws no line for it, so <p>text<br></p> is one line and
+    <p><br></p> one empty line; in Word a break there adds a second line.
+    """
+    parent = br.getparent()
+    if parent is None or parent.tag not in _PARAGRAPH_TAGS or br.getnext() is not None:
+        return False
+    tail = br.tail or ""
+    return not tail or (parent.tag != "pre" and not _HTML_SPACE.sub("", tail))
 
 
 def _close_paragraph(*, flow: _Flow) -> None:

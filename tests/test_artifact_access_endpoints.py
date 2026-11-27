@@ -1151,6 +1151,8 @@ def share_pushes(monkeypatch):
 async def test_a_save_that_notifies_people_pushes_exactly_those_people(
     as_owner, publish_calls, publish_context, share_pushes,
 ):
+    from uuid import UUID
+
     person = "aaaaaaaa-1111-1111-1111-111111111111"
     sharer = Principal(user_id=ORG_SCOPE.user_id, org_id=ORG_SCOPE.org_id, email="owner@example.com")
     request = SimpleNamespace(headers={}, state=SimpleNamespace(principal=sharer))
@@ -1159,13 +1161,15 @@ async def test_a_save_that_notifies_people_pushes_exactly_those_people(
         "notify": {"user_ids": [person], "emails": ["a@example.com"]},
     }
 
-    await aw.set_artifact_access("proj", ARTIFACT_ID, aw._AccessBody(access=access), ORG_SCOPE, request, principal=sharer)
+    artifact_id = await aw._artifact_id_from_path(UUID(ARTIFACT_ID))
+    await aw.set_artifact_access("proj", artifact_id, aw._AccessBody(access=access), ORG_SCOPE, request, principal=sharer)
 
     assert share_pushes == [{
         "org_id": ORG_SCOPE.org_id,
         "sharer_id": ORG_SCOPE.user_id,
         "sharer_name": "owner@example.com",
         "recipient_ids": (person,),
+        "artifact_ref": f"proj-1/{artifact_id}",
         "artifact_title": "Q3 report",
         "url": "https://view.example/r/1",
     }]

@@ -1092,6 +1092,23 @@ def test_anything_else_is_refused(public_auth, value):
     assert org_branding.absolute_auth_url(value) is None
 
 
+def test_a_read_inside_the_cluster_still_hands_the_browser_the_public_origin(monkeypatch):
+    """A PR env's auth has no public origin of its own and trusts no request
+    Host, so a read sent to ``http://auth:80`` gets root-relative image URLs.
+    They must join the PR env's public auth host, which a browser can reach,
+    never the in-cluster base the read went to."""
+    from cowork.services import mindshub_client
+
+    monkeypatch.setenv("ENV", "development")
+    monkeypatch.setenv("POD_NAMESPACE", "pr-42")
+    monkeypatch.delenv("AUTH_SERVICE_BASE_URL", raising=False)
+    monkeypatch.setenv("COWORK_TURN_AUTH_INTERNAL_BASE_URL", "http://auth:80")
+    path = f"/v1/organizations/{ORG_ID}/branding/icon?v=abc"
+
+    assert mindshub_client.mindshub_v1() == "http://auth:80/v1"
+    assert org_branding.absolute_auth_url(path) == f"https://auth-pr-42.dev.mindshub.ai{path}"
+
+
 def test_a_relative_url_is_refused_without_an_https_public_origin(monkeypatch):
     monkeypatch.setattr(org_branding, "default_minds_auth_host", lambda: "http://localhost:8000")
     assert org_branding.absolute_auth_url("/v1/organizations/x/branding/icon") is None

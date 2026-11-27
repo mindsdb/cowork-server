@@ -43,6 +43,11 @@ from cowork.services.settings import SettingService
 # `register_runtime`, whose credential is the registration token in its body.
 # Declared on the router because it refuses: a route added here inherits the
 # desktop-only refusal rather than a marker saying it is open.
+#
+# No route here declares WindowProof, unlike Code mode's other write routes:
+# a remote runtime, or the task tool it starts, calls each one with its own
+# credential and never holds the window proof. tests/test_window_proof_pin.py
+# names each route's caller.
 router = APIRouter(dependencies=[Depends(require(DesktopOnly)), Depends(refuse_code_mode_in_sandbox)])
 
 

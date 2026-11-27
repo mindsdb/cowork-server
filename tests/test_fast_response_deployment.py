@@ -12,13 +12,15 @@ from cowork.deployment_identity import identity_for_turn
 from cowork.handlers import first_take, response_routing, responses
 from cowork.schemas.responses import ResponsesRequest
 from cowork.server import create_app
+from _self_hosted import enable_self_hosted
 
 
 PRODUCT = "Acme & Co's $workbench"
 # Exact unbranded prompts: the gate's since it delegates write, approval and
-# reply-to-a-question turns, the take's since staging 8b1ecf4. These
+# reply-to-a-question turns and anything about an open doc, the take's since
+# staging 8b1ecf4. These
 # compatibility assertions exercise provider requests, not just the constants.
-DEFAULT_GATE_SHA256 = "473e669f1b741110e9ed69b163b449b5b5ac4dd25fb6733d5214d9418edf84a4"
+DEFAULT_GATE_SHA256 = "b343d70dd550bc75c26370aa840cec7b8e0b615396efacb5dfa6c947d2b41e85"
 DEFAULT_TAKE_SHA256 = "423cf10dd88589f84adadb158b7851a89cfd32da4bad967c473062f07a51427a"
 
 
@@ -35,7 +37,7 @@ def _initialize(monkeypatch, tmp_path, *, branded: bool, name: str = PRODUCT):
     if branded:
         pack = tmp_path / "pack.json"
         pack.write_text(json.dumps({"name": name}), encoding="utf-8")
-        monkeypatch.setenv("COWORK_DEPLOYMENT_KIND", "self-hosted")
+        enable_self_hosted(monkeypatch)
         monkeypatch.setenv("COWORK_DEPLOYMENT_BRAND_FILE", str(pack))
         get_app_settings.cache_clear()
     else:

@@ -6,6 +6,7 @@ from pathlib import Path
 import uvicorn
 
 from cowork import app_secret
+from cowork.common.launch_environment import scrub_launch_environment
 from cowork.common.settings.app_settings import (
     EXPORT_PDF_ENGINE_VAR,
     EXPORT_RENDER_URL_VAR,
@@ -27,23 +28,47 @@ def main() -> None:
     get_export_pdf_settings()
     # Taken from the spawn environment only, before the .env file below joins
     # it: that file is writable by agent code.
-    secret_on_stdin = os.environ.get(app_secret.STDIN_FLAG) == "1"
+    stdin_protocol = os.environ.get(app_secret.STDIN_FLAG)
+    # The launch hand-off comes first, before anything else could read stdin,
+    # and whatever the settings say about tenancy: the .env file could
+    # otherwise name org tenancy to skip it. A hand-off that is missing, late
+    # or incomplete stops the start with one line naming the problem.
+    if stdin_protocol == str(app_secret.HANDOFF_PROTOCOL):
+        try:
+            app_secret.read_handoff_from_stdin()
+        except app_secret.LaunchHandoffError as error:
+            raise SystemExit(f"{app_secret.SERVER_REFUSAL_PREFIX}{error}") from None
     started_with = {name: os.environ.get(name) for name in (EXPORT_PDF_ENGINE_VAR, EXPORT_RENDER_URL_VAR)}
     try:
         from dotenv import load_dotenv
         load_dotenv(override=False)
     except ImportError:
         pass
-    # Whatever reads the environment from here on, in this process or one it
-    # starts, sees the PDF settings the server started with.
+    # Whatever reads these variables from here on sees the PDF settings the
+    # server started with, as does the copy the scrub below captures.
     for name, value in started_with.items():
         if value is None:
             os.environ.pop(name, None)
         else:
             os.environ[name] = value
     settings = get_app_settings()
-    if secret_on_stdin and settings.tenancy_mode != "org":
+    # The desktop app always runs local tenancy, so a hand-off start whose
+    # settings name org tenancy got that from the .env file, which agent code
+    # can write. It stops here with one line the desktop shows; create_app
+    # refuses the same start for a caller that builds the app directly.
+    if app_secret.held_handoff() is not None and settings.tenancy_mode == "org":
+        raise SystemExit(
+            f"{app_secret.SERVER_REFUSAL_PREFIX}the desktop app's launch hand-off needs local tenancy, "
+            "and the settings name org tenancy (COWORK_TENANCY_MODE)"
+        )
+    if stdin_protocol == str(app_secret.SECRET_PROTOCOL) and settings.tenancy_mode != "org":
         app_secret.read_from_stdin()
+    # Every process this server starts inherits its environment: git, project
+    # commands, terminals, the Codex app-server and anton's cells. Move this
+    # server's own COWORK_* and MINDSHUB_* variables out of it, now that the
+    # cached settings hold them; the server reads them from
+    # cowork.common.launch_environment from here on.
+    scrub_launch_environment()
     port = settings.port
     host = settings.host
     # A SIGTERM from the desktop, a logout or a system shutdown must end the

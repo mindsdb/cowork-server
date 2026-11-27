@@ -14,6 +14,8 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from cowork.schemas.artifact_export import ExportFormat, InlineLimits, OmittedReason
 
+from cowork.services.file_page import VIEWER_BASE_PATTERN
+
 # The most items a conversion can report left out: far past what one
 # document's node and reference caps allow, so only a broken process passes it.
 MAX_OMITTED = 1_000_000
@@ -41,6 +43,21 @@ class PublishMarkdownRequest(_Message):
     """Render one Markdown file as the body of a published page. The payload is its text, UTF-8."""
 
     type: Literal["publish_markdown"] = "publish_markdown"
+
+
+class PublishFileRequest(_Message):
+    """Render one file that isn't a web page as the body of a published page
+    (ENG-4687, ``cowork.services.file_page``). The payload is the file's bytes."""
+
+    type: Literal["publish_file"] = "publish_file"
+    # The file's suffix, lowercased, one of file_page.PUBLISHABLE_FILE_SUFFIXES.
+    suffix: Literal[".pdf", ".docx", ".xlsx", ".pptx", ".csv", ".txt"]
+    # Its name, for the page's heading and download link.
+    name: str = Field(min_length=1, max_length=255)
+    # Where the shared document viewer's scripts are
+    # (file_page.VIEWER_BASE_PATTERN, from publish.document_viewer_base), or ""
+    # for a page of text alone.
+    viewer_base: str = Field(default="", max_length=512, pattern=f"^$|{VIEWER_BASE_PATTERN}")
 
 
 class AssetRequest(_Message):
@@ -91,10 +108,10 @@ class ConversionFailed(_Message):
 
 
 ServerMessage = Annotated[
-    ConvertRequest | PublishMarkdownRequest | AssetReply, Field(discriminator="type")
+    ConvertRequest | PublishMarkdownRequest | PublishFileRequest | AssetReply, Field(discriminator="type")
 ]
 # What the server asks a conversion process to do.
-ConversionRequest = ConvertRequest | PublishMarkdownRequest
+ConversionRequest = ConvertRequest | PublishMarkdownRequest | PublishFileRequest
 ChildMessage = Annotated[AssetRequest | Converted | ConversionFailed, Field(discriminator="type")]
 
 

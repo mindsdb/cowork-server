@@ -160,7 +160,9 @@ is `"false"` in `values.yaml` and in every environment;
 `tests/test_chart_values.py` pins that. Turn it on per environment only after
 auth's custom MCP switch and the inference gateway's are on there, a
 scratchpad image whose anton reads the version 1 `custom_mcp` block is
-deployed, the producer key bundle (`datasource-service-keys`) exists, and
+deployed, the turn controller passes that block on (one older than the
+change that forwards it drops it without a log line, so turns would run
+without the tools while each still spends a grant and quota), the producer key bundle (`datasource-service-keys`) exists, and
 every model cloud turns offer was checked against a large custom tool set. With it on, the producer mints the
 turn key prefix even when datasource and custom API turns are off. Rollback
 sets it back to `"false"`; a member can still remove a stored server through

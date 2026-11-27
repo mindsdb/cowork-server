@@ -111,6 +111,8 @@ class CodingService(
             self.workspaces.usage_roots,
             lambda: [session.id for session in self.store.list_sessions()],
         )
+        # Folders waiting for removal count as removed-task storage until they are gone.
+        self.workspaces.pending_removals.on_drained = self.workspace_usage.invalidate
         shell_options = [item.id.value for item in shell_inventory().items]
         available_engines = [item.id for item in self.registry.capabilities() if item.available]
         self.control = ControlPlaneService(

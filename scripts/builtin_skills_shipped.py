@@ -91,18 +91,27 @@ class NeedsVersionBump(Exception):
 
 
 def entry_for(slug: str, fingerprint: str, version: int, previous: dict, *,
-              store_last: int, bootstrap_introduced: int = 0) -> dict:
+              store_last: int, bootstrap_introduced: int = 0, head: dict | None = None) -> dict:
     """The manifest fields for one builtin, except `shipped`.
 
     `version` is its store's version now; `store_last` is the highest version
     the previous manifest recorded for that store (0 when there is none, i.e.
     the manifest is being created). A new or changed builtin needs `version`
     above what was recorded, or stores already there would never get it.
+    `head` is the manifest the branch itself carries.
     """
     prev = previous.get(slug)
+    # A release PR carries several bumps since its baseline, so the head's own
+    # manifest can record this exact content at a version between the
+    # baseline's and the store's. Keep that version instead of the store's.
+    mine = (head or {}).get(slug)
+    kept = (bool(store_last) and mine is not None and mine.get("current") == fingerprint
+            and store_last < mine.get("version", 0) <= version)
     if prev is None:
         if store_last and version <= store_last:
             raise NeedsVersionBump(f"{slug} is new: bump its store's version above {store_last} first")
+        if kept and store_last < mine.get("introduced", 0) <= mine["version"]:
+            return {"introduced": mine["introduced"], "version": mine["version"], "current": fingerprint}
         introduced = version if store_last else (bootstrap_introduced or version)
         return {"introduced": introduced, "version": version, "current": fingerprint}
     if fingerprint == prev.get("current"):
@@ -111,6 +120,8 @@ def entry_for(slug: str, fingerprint: str, version: int, previous: dict, *,
     # store_last never re-seeds, even if this skill was recorded lower.
     if "current" in prev and version <= store_last:
         raise NeedsVersionBump(f"{slug} changed: bump its store's version above {store_last} first")
+    if kept:
+        return {"introduced": prev["introduced"], "version": mine["version"], "current": fingerprint}
     return {"introduced": prev["introduced"], "version": version, "current": fingerprint}
 
 
@@ -153,6 +164,7 @@ def build() -> dict:
             slug, fingerprint, versions[store_of(slug)], released,
             store_last=store_last[store_of(slug)],
             bootstrap_introduced=0 if released else version_when_added(slug, refs),
+            head=previous,
         )
         shipped = committed_fingerprints(slug, refs) | set(previous.get(slug, {}).get("shipped", ()))
         shipped.add(fingerprint)
