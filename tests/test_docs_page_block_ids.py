@@ -53,7 +53,9 @@ def test_each_list_item_carries_its_page_id_nested_and_tasks_too():
 
 def test_word_and_pdf_exports_carry_no_page_ids():
     blocks = _numbered(parse_markdown(MARKDOWN + "\n- one\n- [ ] todo\n") + EXTRA)
-    assert 'id="blk-' not in export_body_html(_doc(blocks))
+    # Word's markup has no code spans and the PDF's has them; neither has page ids.
+    for highlight in (False, True):
+        assert 'id="blk-' not in export_body_html(_doc(blocks), highlight=highlight)
 
 
 @pytest.mark.parametrize("bad", [7, "b 1", 'b"1', "<b>", "x" * 65])

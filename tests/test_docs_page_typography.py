@@ -198,3 +198,29 @@ def test_the_word_and_pdf_markup_keeps_its_tab_headings_and_no_tab_ui():
         source = _document(doc, fmt).decode("utf-8")
         assert "<h1>Overview</h1>" in source and "<h1 class=tab>Risks</h1>" in source
         assert "doc-tab" not in source and "<script" not in source and "<nav" not in source
+
+
+_CODE = json.loads((Path(__file__).parent / "fixtures" / "docs_code_highlight" / "contract.json").read_bytes())
+
+
+def _decls(rules: dict[str, list[tuple[str, str]]], selector: str) -> list[tuple[str, str]]:
+    return [(name, re.sub(r"\s+", "", value)) for name, value in rules.get(selector, [])]
+
+
+@pytest.mark.parametrize("theme, prefix", [("light", ""), ("dark", "@media (prefers-color-scheme:dark) ")])
+def test_the_page_colours_code_with_the_editors_palette(theme, prefix):
+    for cls, value in _CODE["colors"][theme].items():
+        prop = "background" if cls.endswith("-bg") else "color"
+        selector = prefix + ".hljs-" + cls.removesuffix("-bg")
+        assert (prop, re.sub(r"\s+", "", value)) in _decls(_PAGE, selector), selector
+
+
+def test_the_pdf_colours_code_with_the_light_palette_and_has_its_variables():
+    pdf = _parse(PDF_CSS)
+    for cls, value in _CODE["colors"]["light"].items():
+        prop = "background" if cls.endswith("-bg") else "color"
+        assert (prop, re.sub(r"\s+", "", value)) in _decls(pdf, ".hljs-" + cls.removesuffix("-bg")), cls
+    page_root = dict(_PAGE[":root"])
+    pdf_root = dict(pdf[":root"])
+    for var in sorted({m for v in _CODE["colors"]["light"].values() for m in re.findall(r"var\((--[\w-]+)\)", v)}):
+        assert pdf_root[var] == page_root[var], var
