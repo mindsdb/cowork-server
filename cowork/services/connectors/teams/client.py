@@ -1,5 +1,5 @@
 """Outbound calls to Microsoft Teams: the bot's token, thread replies and
-member lookups. Not a channel plugin; the Teams plugin builds on it.
+member lookups. The Teams connector's routes (cowork/api/v1/endpoints/connectors/teams.py) build on it.
 
 microsoft-teams-api talks to the Teams service and msal gets the bot's token.
 We don't use microsoft-teams-apps: it brings its own app server we'd bypass

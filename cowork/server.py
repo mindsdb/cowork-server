@@ -864,6 +864,9 @@ async def lifespan(app: FastAPI):
             # As before the gather: a failed wait for the closes ends the teardown.
             raise closes
         await app.state.channel_adapters.shutdown()
+        teams_bot = getattr(app.state, "teams_bot", None)
+        if teams_bot is not None:
+            await teams_bot.aclose()
         get_coding_service().close_all()
         shutdown_launched_backends()
         await close_scratchpads()
@@ -1428,6 +1431,12 @@ def create_app() -> FastAPI:
     app.include_router(v1_router)
 
     _install_channels(app, channel_webhook_paths)
+
+    # The Teams connector's internal routes, called only by the recording proxy and signed by it, so
+    # they join the paths the bearer and identity layers skip.
+    from cowork.api.v1.endpoints.connectors.teams import install_teams_routes
+
+    install_teams_routes(app, channel_webhook_paths)
 
     # ENG-2094: every route must declare a Permission (require(...)) so a
     # walker can tell "open on purpose" from "someone forgot the line" — see
