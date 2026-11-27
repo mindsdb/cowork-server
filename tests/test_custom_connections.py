@@ -55,6 +55,8 @@ def auth(monkeypatch):
             raise scripted["error"]
         if scripted["status"] == 204:
             return httpx.Response(204)
+        if isinstance(scripted["body"], bytes):
+            return httpx.Response(scripted["status"], content=scripted["body"])
         return httpx.Response(scripted["status"], json=scripted["body"])
 
     real_client = httpx.AsyncClient
@@ -221,7 +223,8 @@ async def test_a_refusal_without_a_code_reads_as_uncoded(auth):
 
 @pytest.mark.parametrize(
     "problem",
-    ["unreachable", "unreadable", "not-an-object", "no-base-url", "no-key-id", "no-key", "no-credential"],
+    ["unreachable", "unreadable", "nested-too-deep", "not-an-object", "no-base-url", "no-key-id", "no-key",
+     "no-credential"],
 )
 async def test_create_is_unavailable_without_a_usable_answer_or_identity(auth, problem):
     _, scripted = auth
@@ -231,6 +234,9 @@ async def test_create_is_unavailable_without_a_usable_answer_or_identity(auth, p
     elif problem == "unreadable":
         scripted["body"] = None
         scripted["status"] = 200
+    elif problem == "nested-too-deep":
+        scripted["body"] = b'{"code":' + b"[" * 10_000 + b"]" * 10_000 + b"}"
+        scripted["status"] = 400
     elif problem == "not-an-object":
         scripted["body"] = [SECRET]
     elif problem == "no-base-url":
