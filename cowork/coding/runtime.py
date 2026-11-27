@@ -7,6 +7,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
+from cowork import capability_tokens
 from cowork.coding.contracts import CodingSession, TerminalPage, TerminalShellPreference
 from cowork.coding.engines.base import (
     EngineCredentials,
@@ -45,6 +46,11 @@ class RuntimeManager:
 
     Per-task locks serialize runtime creation and teardown without holding the
     CodingService state lock around app-server I/O.
+
+    Each runtime gets its own ``inference`` capability token
+    (cowork.capability_tokens), its credential for the loopback inference
+    proxy. The token lives as long as the runtime: every path that drops a
+    runtime from this manager, or fails to open one, revokes it.
     """
 
     def __init__(
@@ -79,41 +85,52 @@ class RuntimeManager:
             if existing is not None and not existing.is_closed:
                 return existing
             self._runtimes.pop(session.id, None)
+            # A runtime that closed itself leaves its token behind.
+            capability_tokens.revoke_session(session_id=session.id)
 
         engine = self._registry.get(session.engine_id)
         runtime_workspace = engine_workspace_path(session)
-        opened = engine.open_session(
-            cowork_root=str(self._root),
-            workspace=runtime_workspace,
-            config=EngineSessionConfig(
-                model=session.model,
-                permission_mode=session.permission_mode,
-                task_mode=session.task_mode,
-                reasoning_effort=session.reasoning_effort,
-                service_tier=None if session.service_tier == "standard" else session.service_tier,
-                personality=session.personality,
-                network_access=session.network_access,
-                web_search=session.web_search and not _zdr_known_on(credentials),
-                additional_dirs=tuple(session.additional_dirs),
-                writes_allowed=session.writes_allowed,
-                developer_instructions=session.developer_instructions,
-                skill_roots=tuple(session.skill_roots),
-                environment=tuple(session.environment.items()),
-                session_id=session.id,
+        inference_token = capability_tokens.mint(purpose="inference", session_id=session.id)
+        try:
+            opened = engine.open_session(
                 cowork_root=str(self._root),
-                project_linked=bool(session.project_id),
-                workspace_label=session.project_name or Path(session.source_path).name or "Workspace",
-            ),
-            credentials=credentials,
-            existing_session_id=session.engine_session_id,
-            approval_handler=lambda method, params: self._approval_request(session.id, method, params),
-        )
+                workspace=runtime_workspace,
+                config=EngineSessionConfig(
+                    model=session.model,
+                    permission_mode=session.permission_mode,
+                    task_mode=session.task_mode,
+                    reasoning_effort=session.reasoning_effort,
+                    service_tier=None if session.service_tier == "standard" else session.service_tier,
+                    personality=session.personality,
+                    network_access=session.network_access,
+                    web_search=session.web_search and not _zdr_known_on(credentials),
+                    additional_dirs=tuple(session.additional_dirs),
+                    writes_allowed=session.writes_allowed,
+                    developer_instructions=session.developer_instructions,
+                    skill_roots=tuple(session.skill_roots),
+                    environment=tuple(session.environment.items()),
+                    session_id=session.id,
+                    cowork_root=str(self._root),
+                    project_linked=bool(session.project_id),
+                    workspace_label=session.project_name or Path(session.source_path).name or "Workspace",
+                    inference_api_key=inference_token,
+                ),
+                credentials=credentials,
+                existing_session_id=session.engine_session_id,
+                approval_handler=lambda method, params: self._approval_request(session.id, method, params),
+            )
+        except BaseException:
+            capability_tokens.revoke(token=inference_token)
+            raise
         with self._lock:
             closing = self._closed
             if not closing:
                 self._runtimes[session.id] = opened
         if closing:
-            opened.close()
+            try:
+                opened.close()
+            finally:
+                capability_tokens.revoke(token=inference_token)
             raise RuntimeError("The coding runtime manager is shutting down")
         return opened
 
@@ -130,8 +147,11 @@ class RuntimeManager:
                 for key in list(self._terminals)
                 if key[0] == session_id
             ]
-        if runtime is not None:
-            runtime.close()
+        try:
+            if runtime is not None:
+                runtime.close()
+        finally:
+            capability_tokens.revoke_session(session_id=session_id)
         for terminal in terminals:
             if terminal.is_running:
                 terminal.finish(None, None)
@@ -142,6 +162,9 @@ class RuntimeManager:
         with self._lock:
             if self._runtimes.get(session_id) is runtime:
                 self._runtimes.pop(session_id, None)
+                # Under the lock, so a runtime opened for this session after
+                # the pop keeps the token it mints.
+                capability_tokens.revoke_session(session_id=session_id)
 
     def terminal_page(self, session_id: str, terminal_id: str, after: int = 0) -> TerminalPage:
         with self._lock:
@@ -235,12 +258,15 @@ class RuntimeManager:
     def close_all(self) -> None:
         with self._lock:
             self._closed = True
-            runtimes = list(self._runtimes.values())
+            runtimes = list(self._runtimes.items())
             terminals = list(self._terminals.values())
             self._runtimes.clear()
             self._terminals.clear()
-        for runtime in runtimes:
-            runtime.close()
+        for session_id, runtime in runtimes:
+            try:
+                runtime.close()
+            finally:
+                capability_tokens.revoke_session(session_id=session_id)
         for terminal in terminals:
             if terminal.is_running:
                 terminal.finish(None, None)

@@ -27,6 +27,7 @@ from cowork.api.v1.permissions import (
     AuthenticatedInOrgMode,
     LoopbackDesktopOnly,
     OpenByDesign,
+    WindowProof,
     require,
 )
 from cowork.common.paths import cowork_home
@@ -309,7 +310,7 @@ async def _reject_browser_that_cant_run(
 # gating on org-scoped keys stays in _require_org_admin_for below — it's
 # conditional on which keys are in the request body, not a blanket per-route
 # check a declared dependency can express.
-@router.put("/", dependencies=[Depends(require(AuthenticatedInOrgMode))])
+@router.put("/", dependencies=[Depends(require(AuthenticatedInOrgMode)), Depends(require(WindowProof))])
 async def bulk_upsert_settings(
     body: SettingsBulkUpsertRequest,
     scope: ScopeDep,
@@ -343,7 +344,11 @@ async def bulk_upsert_settings(
 
 # AuthenticatedInOrgMode, declared explicitly: same _require_writable
 # fail-closed reasoning as bulk_upsert_settings above.
-@router.put("/{key}", response_model=SettingResponse, dependencies=[Depends(require(AuthenticatedInOrgMode))])
+@router.put(
+    "/{key}",
+    response_model=SettingResponse,
+    dependencies=[Depends(require(AuthenticatedInOrgMode)), Depends(require(WindowProof))],
+)
 async def upsert_setting(
     key: str,
     body: SettingUpsertRequest,
@@ -368,7 +373,7 @@ async def upsert_setting(
 
 # AuthenticatedInOrgMode, declared explicitly: same _require_writable
 # fail-closed reasoning as bulk_upsert_settings above.
-@router.delete("/{key}", dependencies=[Depends(require(AuthenticatedInOrgMode))])
+@router.delete("/{key}", dependencies=[Depends(require(AuthenticatedInOrgMode)), Depends(require(WindowProof))])
 def delete_setting(key: str, session: SessionDep, scope: ScopeDep, principal: PrincipalDep):
     _require_org_admin_for([key], scope, principal)
     try:
@@ -423,17 +428,21 @@ def check_configured(session: SessionDep, scope: ScopeDep):
     return {"configured": False, "provider": ""}
 
 
-# OpenByDesign, standalone reason: what protects this route is
-# require_local_in_desktop_mode below. In org mode it is a deliberate no-op
-# (credentials are org-owned there, see the docstring) and needs no caller; in
-# local mode it DELETES every stored credential, so the desktop half takes the
-# same loopback restriction as reveal-key and /raw. The only caller is
-# Electron main's sign-out (cowork src/main/sign-out.ts), already over
-# 127.0.0.1; without the guard, a plain POST from any page or network peer
-# signs the desktop install out.
+# WindowProof, with no class before it: contradictory_routes refuses
+# OpenByDesign beside it, so tests/test_open_by_design_pin.py pins this route
+# with the open ones. In org mode the route is a deliberate no-op
+# (credentials are org-owned there, see the docstring) and needs no caller,
+# and WindowProof is a no-op there too. In local mode it DELETES every
+# stored credential, so the desktop half takes the same loopback restriction
+# as reveal-key and /raw (require_local_in_desktop_mode below), and the same
+# window proof as DELETE /{key}, so agent code holding the bearer token can't
+# sign the person out. The only caller is Electron main's sign-out (cowork
+# src/main/sign-out.ts), which sends the proof over 127.0.0.1; without the
+# loopback guard, a plain POST from any page or network peer signs the
+# desktop install out.
 @router.post(
     "/logout",
-    dependencies=[Depends(require_local_in_desktop_mode), Depends(require(OpenByDesign))],
+    dependencies=[Depends(require_local_in_desktop_mode), Depends(require(WindowProof))],
 )
 def logout_clear_credentials(session: SessionDep, scope: ScopeDep):
     """Clear all stored credentials from the DB (desktop sign-out flow, so
@@ -467,7 +476,9 @@ def install_status():
 # is the caller being on this machine, not who they are. Only the desktop app
 # calls it. An org deployment refuses it outright: loopback inside a hosted pod
 # says nothing about which member is calling, and no hosted caller needs it.
-@router.get("/reveal-key/{name}", dependencies=[Depends(require(LoopbackDesktopOnly))])
+@router.get(
+    "/reveal-key/{name}", dependencies=[Depends(require(LoopbackDesktopOnly)), Depends(require(WindowProof))]
+)
 def reveal_key(name: str, session: SessionDep, scope: ScopeDep):
     name_map = {
         "anthropic": Provider.ANTHROPIC,
@@ -1164,7 +1175,7 @@ def _read_env_dict() -> dict[str, str]:
 # LoopbackDesktopOnly: /raw dumps the dotenv verbatim, every provider secret
 # in it. Loopback-only, and desktop-only because the dotenv is
 # deployment-global state no org boundary divides.
-@router.get("/raw", dependencies=[Depends(require(LoopbackDesktopOnly))])
+@router.get("/raw", dependencies=[Depends(require(LoopbackDesktopOnly)), Depends(require(WindowProof))])
 def read_raw_settings():
     # /raw dumps the dotenv verbatim (all provider secrets) — same loopback
     # restriction as reveal-key, and desktop-only (deployment-global state).
@@ -1176,7 +1187,7 @@ class _RawSettingsBody(BaseModel):
 
 
 # LoopbackDesktopOnly: same reasoning as GET /raw above, and this one writes.
-@router.post("/raw", dependencies=[Depends(require(LoopbackDesktopOnly))])
+@router.post("/raw", dependencies=[Depends(require(LoopbackDesktopOnly)), Depends(require(WindowProof))])
 async def write_raw_settings(body: _RawSettingsBody, session: SessionDep):
     """Merge dotenv content into ~/.cowork/.env and sync recognised keys to the DB.
 

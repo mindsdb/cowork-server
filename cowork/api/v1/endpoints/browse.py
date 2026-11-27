@@ -43,7 +43,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
-from cowork.api.v1.permissions import AuthenticatedInOrgMode, TurnKey, require
+from cowork.api.v1.permissions import AuthenticatedInOrgMode, TurnKey, WindowProof, require
 from cowork.common.settings.user_settings import get_user_settings
 from cowork.db.scoped import TenantScope, get_tenant_scope
 from cowork.db.units import run_on_unit_threads
@@ -177,7 +177,7 @@ async def browse_open(body: OpenRequest, request: Request, scope: ScopeDep) -> b
 
 @router.post(
     "/approve", response_model=browser_service.BrowserApproval,
-    dependencies=[Depends(require(AuthenticatedInOrgMode))],
+    dependencies=[Depends(require(AuthenticatedInOrgMode)), Depends(require(WindowProof))],
 )
 async def browse_approve(body: browser_service.ApproveRequest, request: Request) -> browser_service.BrowserApproval:
     try:
@@ -188,7 +188,7 @@ async def browse_approve(body: browser_service.ApproveRequest, request: Request)
 
 @router.post(
     "/decline", response_model=browser_service.BrowserDecline,
-    dependencies=[Depends(require(AuthenticatedInOrgMode))],
+    dependencies=[Depends(require(AuthenticatedInOrgMode)), Depends(require(WindowProof))],
 )
 async def browse_decline(body: browser_service.DeclineRequest, request: Request) -> browser_service.BrowserDecline:
     try:

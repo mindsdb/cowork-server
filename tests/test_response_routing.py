@@ -1068,7 +1068,8 @@ async def test_router_binding_mints_per_turn_key_in_hosted_org_mode(monkeypatch)
     real_client = openai.AsyncOpenAI
     monkeypatch.setattr(
         openai, "AsyncOpenAI",
-        lambda **kwargs: real_client(http_client=http_client, max_retries=0, **kwargs),
+        # anton hands the SDK its own http_client; the mock transport replaces it.
+        lambda **kwargs: real_client(**{**kwargs, "http_client": http_client, "max_retries": 0}),
     )
 
     async def fake_mint(*, org_id, user_id, correlation_id, settings, workspace_id=None, coding_model=None):
@@ -1835,8 +1836,9 @@ def _router_on_an_endpoint_answering(monkeypatch, status: int, error: dict):
         transport = httpx.MockTransport(
             lambda request: httpx.Response(status, json={"error": error})
         )
+        # anton hands the SDK its own http_client; the mock transport replaces it.
         return real_client(
-            http_client=httpx.AsyncClient(transport=transport), max_retries=0, **kwargs
+            **{**kwargs, "http_client": httpx.AsyncClient(transport=transport), "max_retries": 0}
         )
 
     monkeypatch.setattr(openai, "AsyncOpenAI", _client)

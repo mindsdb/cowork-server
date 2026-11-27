@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import os
 import re
-import secrets
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -11,12 +10,21 @@ from typing import Any
 from cowork.coding.contracts import PermissionMode, TerminalShellPreference
 from cowork.coding.engines.base import EngineInputReference, EngineSessionConfig
 from cowork.coding.shells import resolve_shell, shell_environment
+from cowork.common.launch_environment import launch_value
 
-# Process-local bearer credential for the inference proxy. A fixed string would
-# turn the credential-injecting loopback endpoint into a confused deputy for
-# any unrelated process on the machine. Rotation on every server start is fine:
-# task runtimes are children of, and owned by, this process.
-LOCAL_PROXY_TOKEN = secrets.token_urlsafe(32)
+#: The variable the Codex app-server reads its inference credential from
+#: (``model_providers.mindshub.env_key``). On the desktop it holds the
+#: session's own ``inference`` capability token (cowork.capability_tokens),
+#: which the loopback inference proxy accepts; a remote runtime gives it the
+#: lease's scoped token.
+INFERENCE_KEY_ENV = "MINDSHUB_CODEX_API_KEY"
+
+#: What the integration MCP server needs to find the server's stores. Codex
+#: starts an MCP server with a bare environment (HOME, PATH and a few locale
+#: variables) plus the server's ``env`` table, so each one it needs is passed
+#: there. Paths only: the app-server's arguments are visible to every local
+#: process.
+INTEGRATION_MCP_ENVIRONMENT = ("COWORK_HOME", "COWORK_VAULT_DIR", "COWORK_MANAGED_DIR")
 
 # Codex's local estimate can substantially under-count context forwarded
 # through the MindsHub Responses proxy (notably cached input and large tool
@@ -43,6 +51,21 @@ def persistent_home(cowork_root: Path) -> Path:
     return cowork_root / "codex-home"
 
 
+def prepare_home(*, cowork_root: Path) -> Path:
+    """Create the persistent Codex home with mode 0700, and return it.
+
+    Codex keeps thread rollouts there, and its shell snapshot, which records
+    the session's inference token (``INFERENCE_KEY_ENV``). The mode keeps
+    other OS accounts out, not an agent running as this user, which can read
+    every session's snapshot. The mode is set at every start, so a home an
+    earlier start created with the default mode is closed too.
+    """
+    home = persistent_home(cowork_root)
+    home.mkdir(mode=0o700, parents=True, exist_ok=True)
+    home.chmod(0o700)
+    return home
+
+
 def user_skills_root() -> Path:
     """Locate skills installed for the user's regular Codex environment."""
     codex_home = os.environ.get("CODEX_HOME")
@@ -52,16 +75,21 @@ def user_skills_root() -> Path:
 def client_environment(
     codex_home: Path,
     project_environment: tuple[tuple[str, str], ...] = (),
-    inference_api_key: str = LOCAL_PROXY_TOKEN,
+    *,
+    inference_api_key: str,
 ) -> dict[str, str]:
-    """Build the child env without placing the user's MindsHub key in it."""
+    """Build the app-server's added env without placing the user's MindsHub
+    key in it: ``inference_api_key`` is the session's own credential for the
+    inference proxy, never the user's key."""
+    if not inference_api_key:
+        raise RuntimeError("A Codex session needs its own inference credential.")
     environment = dict(project_environment)
     # Runtime-owned values win over project configuration. Otherwise a project
     # could accidentally point Codex at a different home or break the private
     # loopback credential used by the inference proxy.
     environment.update({
         "CODEX_HOME": str(codex_home),
-        "MINDSHUB_CODEX_API_KEY": inference_api_key,
+        INFERENCE_KEY_ENV: inference_api_key,
         # Blank (Codex reads empty as unset): an inherited Codex login would turn on its analytics.
         "CODEX_API_KEY": "",
         "CODEX_ACCESS_TOKEN": "",
@@ -196,7 +224,7 @@ def auto_compact_token_limit() -> int:
     fail safe to the supported default instead of preventing Code Mode from
     launching.
     """
-    raw_value = os.environ.get(AUTO_COMPACT_TOKEN_LIMIT_ENV)
+    raw_value = launch_value(AUTO_COMPACT_TOKEN_LIMIT_ENV)
     if raw_value is None:
         return DEFAULT_AUTO_COMPACT_TOKEN_LIMIT
     try:
@@ -251,7 +279,7 @@ def prepare_launch(config: EngineSessionConfig, workspace: Path, endpoint: str) 
         f"model={toml_string(config.model)}",
         'model_providers.mindshub.name="MindsHub Inference"',
         f"model_providers.mindshub.base_url={toml_string(endpoint)}",
-        'model_providers.mindshub.env_key="MINDSHUB_CODEX_API_KEY"',
+        f"model_providers.mindshub.env_key={toml_string(INFERENCE_KEY_ENV)}",
         'model_providers.mindshub.wire_api="responses"',
         f"model_providers.mindshub.request_max_retries={REQUEST_MAX_RETRIES}",
         f"model_providers.mindshub.stream_max_retries={STREAM_MAX_RETRIES}",
@@ -265,6 +293,20 @@ def prepare_launch(config: EngineSessionConfig, workspace: Path, endpoint: str) 
         'otel.exporter="none"',
         'otel.trace_exporter="none"',
         'otel.metrics_exporter="none"',
+        # The app-server reads the inference credential from its own
+        # environment, and every command it starts (the agent's shell calls
+        # and the terminals) inherits that environment. Codex 0.147 applies no
+        # default exclusion of *KEY* names, so the policy blanks this one key.
+        # A single `set` key merges with a project's own policy, where an
+        # `exclude` list would replace the project's list and clash with its
+        # `filters`. Codex's shell snapshot under codex-home still records the
+        # token as `export MINDSHUB_CODEX_API_KEY=...`. codex-home's 0700 mode
+        # (prepare_home) keeps other OS accounts out, not an agent running as
+        # this user: every session shares codex-home and Codex's sandbox
+        # doesn't limit reads, so an agent can read another session's token.
+        # That token opens the same inference routes as the agent's own, for
+        # as long as that session runs, a same-user read the design accepts.
+        f"shell_environment_policy.set.{INFERENCE_KEY_ENV}={toml_string('')}",
     ]
     if config.reasoning_effort:
         overrides.append(f"model_reasoning_effort={toml_string(config.reasoning_effort)}")
@@ -289,6 +331,10 @@ def prepare_launch(config: EngineSessionConfig, workspace: Path, endpoint: str) 
                 config.session_id,
             )),
         ])
+        for name in INTEGRATION_MCP_ENVIRONMENT:
+            value = launch_value(name)
+            if value is not None:
+                overrides.append(f"mcp_servers.mindshub_code.env.{name}={toml_string(value)}")
     thread_params = {
         "cwd": str(workspace),
         "model": config.model,

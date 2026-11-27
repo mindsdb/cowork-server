@@ -408,6 +408,28 @@ def test_identity_headers_never_copy_the_token(stack, tmp_path):
     assert not env.exists() or TOKEN not in env.read_text(encoding="utf-8")
 
 
+def test_identity_headers_take_the_token_a_local_launch_moved_out_of_the_environment(stack):
+    """cowork.cli.main moves COWORK_AUTH_TOKEN out of os.environ before
+    create_app runs (cowork.common.launch_environment); the value it captured
+    is the token the server checks."""
+    from types import MappingProxyType
+
+    from fastapi.testclient import TestClient
+
+    from cowork.common import launch_environment
+
+    stack.delenv("COWORK_AUTH_TOKEN")
+    stack.setattr(launch_environment, "_captured", MappingProxyType({"COWORK_AUTH_TOKEN": TOKEN}))
+    get_app_settings.cache_clear()
+    client = TestClient(cowork_server.create_app())
+    try:
+        assert client.get("/api/v1/conversations/").status_code == 401
+        authed = client.get("/api/v1/conversations/", headers={"Authorization": f"Bearer {TOKEN}"})
+        assert authed.status_code != 401
+    finally:
+        client.close()
+
+
 def test_identity_headers_need_the_token_in_the_environment(stack):
     stack.setenv("COWORK_AUTH_TOKEN", "")
     assert _refusal().startswith(
@@ -484,6 +506,31 @@ def test_remove_auth_token_keeps_every_other_line(tmp_path):
     )
     assert remove_auth_token(env) is True
     assert env.read_text(encoding="utf-8") == "A=1\nCOWORK_AUTH_TOKEN_NOTE=kept\nB=2"
+
+
+def test_remove_auth_token_drops_every_spelling_of_the_key(tmp_path):
+    """python-dotenv reads a single-quoted key, and the settings read the name
+    in any case, so each of these lines is the token. A double-quoted key goes
+    too, as the desktop app's filter drops it. Names that only contain the key,
+    and a key with mismatched quotes, stay."""
+    env = tmp_path / ".env"
+    env.write_text(
+        "A=1\n"
+        "'COWORK_AUTH_TOKEN'=one\n"
+        "export 'COWORK_AUTH_TOKEN' = two\n"
+        '"COWORK_AUTH_TOKEN"=three\n'
+        "cowork_auth_token=four\n"
+        "  export Cowork_Auth_Token=five\n"
+        "COWORK_AUTH_TOKEN_OLD=kept\n"
+        "MY_COWORK_AUTH_TOKEN=kept\n"
+        "'COWORK_AUTH_TOKEN\"=kept\n"
+        "B=2\n",
+        encoding="utf-8",
+    )
+    assert remove_auth_token(env) is True
+    assert env.read_text(encoding="utf-8") == (
+        "A=1\nCOWORK_AUTH_TOKEN_OLD=kept\nMY_COWORK_AUTH_TOKEN=kept\n'COWORK_AUTH_TOKEN\"=kept\nB=2\n"
+    )
 
 
 def test_remove_auth_token_replaces_the_file_and_keeps_its_mode(tmp_path):

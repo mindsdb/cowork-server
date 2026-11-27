@@ -13,6 +13,9 @@ This module holds what the route needs around that:
   an anton that has neither; the route then answers 501 and the capability
   ``canQuickEdit`` is false.
 * ``quick_edit_available()``: the setting and the anton support together.
+* ``edits_in_place()``: whether the editor can change a given source itself.
+  A document (ENG-4687) can be edited only when it is an OOXML package and
+  the installed anton has ``OOXML_EDITS``; a PDF always goes to the agent.
 * ``QuickEditLocks``: one quick edit per artifact at a time in this process.
 * ``resolve_backend()``: the editor's LLM and the router's Jev endpoint for
   the caller, from the same settings and keys a turn of theirs would use.
@@ -48,6 +51,8 @@ __all__ = [
     "decisions_for",
     "decisions_for_scope",
     "direct_edit_available",
+    "edits_in_place",
+    "ooxml_edits_available",
     "zdr_blocks",
     "quick_edit_available",
     "quick_edit_locks",
@@ -221,6 +226,32 @@ def quick_edit_available() -> bool:
     """Whether this server can run a quick edit at all: the setting is on and
     the installed anton has the quick editor."""
     return bool(get_app_settings().quick_edit_enabled) and anton_quick_edit() is not None
+
+
+def ooxml_edits_available() -> bool:
+    """Whether the installed anton's quick editor can patch OOXML packages
+    (Word, Excel, PowerPoint). Read from the module-level ``OOXML_EDITS``
+    flag without calling anything, so an anton from before it reads as one
+    that can't. Never raises."""
+    try:
+        import anton.core.artifact_editor as editor
+    except Exception:
+        return False
+    return getattr(editor, "OOXML_EDITS", False) is True
+
+
+def edits_in_place(rel_path: str | None) -> bool:
+    """Whether a quick edit of the tracked source *rel_path* can run here.
+
+    Text sources always can. A document can only when it is an OOXML package
+    and this anton has ``OOXML_EDITS``. A PDF can't at all: there is no part
+    to patch, so a change to it is the agent's. A message the editor can't
+    take still reaches the chat, as with no decisions model."""
+    from cowork.services.artifact_revisions import is_document, is_ooxml
+
+    if not is_document(rel_path):
+        return True
+    return is_ooxml(rel_path) and ooxml_edits_available()
 
 
 # ── one quick edit per artifact ──────────────────────────────────────────

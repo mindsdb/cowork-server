@@ -20,7 +20,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import os
 import time
 from collections.abc import Awaitable, Callable, Coroutine
 from dataclasses import dataclass, field
@@ -28,6 +27,7 @@ from typing import TYPE_CHECKING, Any, Optional
 from weakref import WeakValueDictionary
 from uuid import UUID, uuid4
 
+from cowork.common.launch_environment import launch_value
 from cowork.common.logger import log_context
 from cowork.streaming import turn_claim
 from cowork.streaming.buffer import RedisStreamBuffer, StreamBuffer
@@ -53,7 +53,7 @@ logger = logging.getLogger(__name__)
 # COWORK_MAX_TURN_IDLE_SECONDS widens the window for deployments with long silent
 # tool calls; a non-positive or unparseable value falls back to the default.
 def _idle_bound_seconds() -> int:
-    raw = os.environ.get("COWORK_MAX_TURN_IDLE_SECONDS")
+    raw = launch_value("COWORK_MAX_TURN_IDLE_SECONDS")
     if raw is None:
         return 600
     try:

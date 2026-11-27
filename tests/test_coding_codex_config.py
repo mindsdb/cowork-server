@@ -87,7 +87,8 @@ def test_codex_sends_no_analytics_feedback_or_telemetry() -> None:
 
 def test_the_child_env_blanks_an_inherited_codex_login() -> None:
     environment = codex_config.client_environment(
-        Path("/tmp/codex-home"), (("CODEX_API_KEY", "project-key"), ("CODEX_ACCESS_TOKEN", "token"))
+        Path("/tmp/codex-home"), (("CODEX_API_KEY", "project-key"), ("CODEX_ACCESS_TOKEN", "token")),
+        inference_api_key="session-inference-token",
     )
 
     assert environment["CODEX_API_KEY"] == ""
@@ -142,3 +143,74 @@ def test_plan_mode_stays_read_only_without_approvals_when_writes_are_held() -> N
 
     assert launch.sandbox_policy["type"] == "readOnly"
     assert launch.approval_policy == "never"
+
+
+@pytest.mark.parametrize("permission_mode", list(PermissionMode))
+def test_commands_the_engine_runs_get_a_blank_inference_key(permission_mode: PermissionMode) -> None:
+    """The app-server reads its inference credential from its own environment
+    and every command it starts inherits that environment. Codex 0.147 drops
+    no *KEY* variable by default, so the launch blanks this one for commands:
+    its shell_environment_policy `set` runs after inheritance and excludes.
+    Checked against the bundled app-server: with this override a command/exec
+    child sees MINDSHUB_CODEX_API_KEY empty, without it the full value."""
+    launch = codex_config.prepare_launch(
+        EngineSessionConfig(model="gpt", permission_mode=permission_mode),
+        Path("/workspace"),
+        "http://127.0.0.1:1/api/v1/coding/inference",
+    )
+
+    parsed = tomllib.loads("\n".join(launch.config_overrides))
+    assert parsed["model_providers"]["mindshub"]["env_key"] == "MINDSHUB_CODEX_API_KEY"
+    assert parsed["shell_environment_policy"] == {"set": {"MINDSHUB_CODEX_API_KEY": ""}}
+    assert 'shell_environment_policy.set.MINDSHUB_CODEX_API_KEY=""' in launch.config_overrides
+
+
+def _integration_launch() -> codex_config.CodexLaunchConfig:
+    return codex_config.prepare_launch(
+        EngineSessionConfig(
+            model="gpt",
+            permission_mode=PermissionMode.workspace,
+            session_id="session-1",
+            cowork_root="/data/coding",
+            project_linked=True,
+        ),
+        Path("/workspace"),
+        "http://127.0.0.1:1/api/v1/coding/inference",
+    )
+
+
+def test_the_integration_mcp_server_gets_the_store_paths_the_server_started_with(monkeypatch) -> None:
+    """Codex starts an MCP server with a bare environment, so the paths that
+    locate the server's stores go in its env table, from the launch values."""
+    from types import MappingProxyType
+
+    from cowork.common import launch_environment
+
+    for name in codex_config.INTEGRATION_MCP_ENVIRONMENT:
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setattr(launch_environment, "_captured", MappingProxyType({
+        "COWORK_HOME": "/accounts/a1",
+        "COWORK_VAULT_DIR": "/accounts/a1/orgs/o1/data-vault",
+        "COWORK_SERVER_HEALTH_PROOF_KEY": "fake-not-a-path",
+    }))
+
+    parsed = tomllib.loads("\n".join(_integration_launch().config_overrides))
+
+    assert parsed["mcp_servers"]["mindshub_code"]["env"] == {
+        "COWORK_HOME": "/accounts/a1",
+        "COWORK_VAULT_DIR": "/accounts/a1/orgs/o1/data-vault",
+    }
+
+
+def test_the_integration_mcp_server_gets_no_env_table_when_nothing_was_set(monkeypatch) -> None:
+    from types import MappingProxyType
+
+    from cowork.common import launch_environment
+
+    for name in codex_config.INTEGRATION_MCP_ENVIRONMENT:
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setattr(launch_environment, "_captured", MappingProxyType({}))
+
+    parsed = tomllib.loads("\n".join(_integration_launch().config_overrides))
+
+    assert "env" not in parsed["mcp_servers"]["mindshub_code"]

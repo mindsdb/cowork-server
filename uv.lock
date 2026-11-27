@@ -141,7 +141,7 @@ wheels = [
 
 [[package]]
 name = "anton-agent"
-version = "2.26.11.23.1"
+version = "2.26.11.26.1rc1"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "anthropic" },
@@ -163,9 +163,9 @@ dependencies = [
     { name = "truststore" },
     { name = "typer" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/b1/46/5b55359ad4b37f58d8cbf6c488059fffc258dde44cff65467fa93c519933/anton_agent-2.26.11.23.1.tar.gz", hash = "sha256:fad26e2be525ff275aaf5d7a2f065a490e7accbf8ae7ff89816c0fe299ad0fe9", size = 7678092, upload-time = "2026-11-23T02:25:19.774Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/74/c9/18d61a00fe06246dda2c45365a1d1cb8fdda4917e2438828a291edd17b1c/anton_agent-2.26.11.26.1rc1.tar.gz", hash = "sha256:e08612bfccc94a1a28fa9add611613cd1378b7db71b8c759f3200a829c6aebee", size = 7771831, upload-time = "2026-11-26T02:35:10.927Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/6b/e6/c9b0c3ef1b0e09582d4195af437bd96806c403ca773df917a6d8947c56e1/anton_agent-2.26.11.23.1-py3-none-any.whl", hash = "sha256:fbc38ca3f89bc50878289318e5818a7c5ba95be41e40c28ca1efc5daa5d9f145", size = 4542456, upload-time = "2026-11-23T02:25:17.969Z" },
+    { url = "https://files.pythonhosted.org/packages/b0/01/606df31e13729e72752af4111cd0ef444de0233a9735ca405d5876feacff/anton_agent-2.26.11.26.1rc1-py3-none-any.whl", hash = "sha256:912038332df56c936d357e805beb8ee4ecbd3735551c575c6451a5e1b8c74e5b", size = 4583809, upload-time = "2026-11-26T02:35:08.52Z" },
 ]
 
 [[package]]
@@ -459,7 +459,7 @@ requires-dist = [
     { name = "aiohttp", specifier = ">=3.14" },
     { name = "aiohttp", marker = "extra == 'channels'", specifier = ">=3.9.0" },
     { name = "alembic", specifier = ">=1.17.0" },
-    { name = "anton-agent", specifier = ">=2.26.11.23.1,<3" },
+    { name = "anton-agent", specifier = ">=2.26.11.26.1rc1,<3" },
     { name = "anyio", specifier = ">=4.14.2" },
     { name = "beautifulsoup4", specifier = "==4.15.0" },
     { name = "cryptography", specifier = ">=48.0.0,<51" },

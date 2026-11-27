@@ -3614,6 +3614,7 @@ class ResponsesHandler:
                 # Questions need someone to answer them: this path serves
                 # the web UI, which renders the card and posts /answer.
                 interactive=self.interactive and get_app_settings().ask_user_enabled,
+                scheduled=self.schedule_id is not None,
                 # The web app answers response.artifact_check from the open
                 # viewer (ENG-4227); the producer sends it only with
                 # interactive, whose stdin the answer comes back on.
@@ -3788,6 +3789,7 @@ class ResponsesHandler:
                     turn_artifacts.directory.base,
                     new_slugs=changes.created,
                     touched_slugs=changes.touched,
+                    revisions=changes.revisions,
                     scope=scope,
                     project_id=turn_artifacts.directory.project_id,
                     project_name=turn_artifacts.directory.project_name,

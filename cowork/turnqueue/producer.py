@@ -375,7 +375,7 @@ async def _mint_oauth_block(*, org_id: str | None, user_id: str | None,
         )
         return None
     if disabled:
-        disabled_keys = {(d.get("engine"), d.get("name")) for d in disabled}
+        disabled_keys = {(d.get("engine"), d.get("name")) for d in disabled if d.get("datasource_id") is None}
         connections = [c for c in connections if (c.get("engine"), c.get("name")) not in disabled_keys]
     if not connections:
         return None
@@ -589,13 +589,32 @@ def _refuse_datasource_grants(reason: str, *, route: str) -> product_permissions
 
 
 def _datasource_connection_refs(
-    connections: list[dict], disabled: list[dict] | None, *, with_labels: bool = False
+    connections: list[dict], disabled: list[dict] | None, *, with_labels: bool = False, scheduled: bool = False,
 ) -> list[dict]:
     """The grant set: every verified connection auth listed, minus the
     conversation's disabled ones. A disabled entry carries ``engine`` and
-    ``name``; auth's ``connector_id`` is the same value, so the join is exact."""
+    ``name``; auth's ``connector_id`` is the same value, so the join is exact.
+
+    An entry also carrying a ``datasource_id`` is matched by that id, which
+    survives a rename. Once the id is gone from the listing, its datasource
+    was deleted, and the entry falls back to its name: one added again under
+    that name gets a new id and must stay left out."""
     disabled_keys = {
-        (entry.get("engine"), entry.get("name")) for entry in (disabled or []) if isinstance(entry, dict)
+        (entry.get("engine"), entry.get("name")) for entry in disabled or []
+        if isinstance(entry, dict) and entry.get("datasource_id") is None
+    }
+    disabled_ids = {
+        (entry.get("engine"), entry["datasource_id"]) for entry in disabled or []
+        if isinstance(entry, dict) and entry.get("datasource_id")
+    }
+    # Old saved exclusions lack a stable id. A renamed datasource may now
+    # have any label, so omit its engine's datasources until the list is saved again.
+    legacy_engines = {engine for engine, _ in disabled_keys} if scheduled else set()
+    listed_ids = {(c.get("connector_id"), c.get("id")) for c in connections if isinstance(c, dict)}
+    disabled_keys |= {
+        (entry.get("engine"), entry.get("name")) for entry in disabled or []
+        if isinstance(entry, dict) and entry.get("datasource_id")
+        and (entry.get("engine"), entry["datasource_id"]) not in listed_ids
     }
     refs: list[dict] = []
     seen: set[int] = set()
@@ -616,8 +635,6 @@ def _datasource_connection_refs(
             raise _refuse_datasource_grants(
                 "listing carries a connection without verified metadata", route=DATASOURCE_CONNECTIONS_ROUTE,
             )
-        if (connection.get("connector_id"), connection.get("name")) in disabled_keys:
-            continue
         if (
             isinstance(connection_id, bool)
             or not isinstance(connection_id, int)
@@ -631,6 +648,13 @@ def _datasource_connection_refs(
                 "listing carries a malformed or repeated connection reference", route=DATASOURCE_CONNECTIONS_ROUTE,
             )
         seen.add(connection_id)
+        engine = connection["connector_id"]
+        if (
+            (engine, connection_id) in disabled_ids
+            or engine in legacy_engines
+            or (engine, connection["name"]) in disabled_keys
+        ):
+            continue
         ref = {"connection_id": connection_id, "credential_version": credential_version}
         if with_labels:
             ref.update(_connection_labels(connection))
@@ -666,7 +690,7 @@ def _connection_labels(connection: dict) -> dict[str, str]:
 async def _mint_datasource_block(*, org_id: str | None, user_id: str | None,
                                  correlation_id: str, turn_key_id: str | None,
                                  disabled: list[dict] | None,
-                                 settings: TurnQueueSettings) -> dict | None:
+                                 settings: TurnQueueSettings, scheduled: bool = False) -> dict | None:
     """Register verified datasource grants before a datasource block is queued."""
     if not settings.datasource_enabled or not org_id or not user_id:
         return None
@@ -691,7 +715,9 @@ async def _mint_datasource_block(*, org_id: str | None, user_id: str | None,
             org_id, exc_info=True,
         )
         return None
-    refs = _datasource_connection_refs(connections, disabled, with_labels=settings.datasource_labels_enabled)
+    refs = _datasource_connection_refs(
+        connections, disabled, with_labels=settings.datasource_labels_enabled, scheduled=scheduled,
+    )
     if not refs:
         return None
     response = await register_datasource_grants(
@@ -739,7 +765,8 @@ def _custom_api_connection_refs(connections: list[dict], disabled: list[dict] | 
     Past MAX_CUSTOM_API_CONNECTIONS, the lowest ids are kept.
     """
     disabled_keys = {
-        (entry.get("engine"), entry.get("name")) for entry in (disabled or []) if isinstance(entry, dict)
+        (entry.get("engine"), entry.get("name")) for entry in (disabled or [])
+        if isinstance(entry, dict) and entry.get("datasource_id") is None
     }
     refs: list[dict] = []
     seen: set[int] = set()
@@ -1198,6 +1225,7 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
                                 disabled: list[dict] | None = None,
                                 started_at: str | None = None,
                                 interactive: bool = False,
+                                scheduled: bool = False,
                                 tool_messages: bool = False,
                                 connector_drafts: bool = False,
                                 preview_checks: bool = False,
@@ -1327,6 +1355,7 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
                 turn_key_id=turn_key_id,
                 disabled=disabled,
                 settings=settings,
+                scheduled=scheduled,
             ),
             _mint_custom_api_block(
                 scope=scope, correlation_id=corr, turn_key_id=turn_key_id, disabled=disabled, settings=settings,
@@ -1445,6 +1474,11 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
               # Web UI turns only: the pod then registers ask_user and takes
               # answers on stdin, which /answer feeds through Redis.
               "interactive": interactive,
+              # The runner owns this reporting tool. Only an actual scheduled
+              # turn gets excluded labels. Its connector blocks stay filtered.
+              **({"scheduled_excluded_connectors": [
+                  {"engine": connection["engine"], "name": connection["name"]} for connection in disabled
+              ]} if scheduled and disabled and not interactive else {}),
               # The cowork UI renders a tool's message to the user as an
               # agent message; without this the pod hands it to the agent.
               "tool_messages": tool_messages,

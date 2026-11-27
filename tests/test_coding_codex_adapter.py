@@ -159,15 +159,21 @@ def test_codex_model_discovery_reports_an_unreadable_model_list_plainly(
 
 
 def test_codex_child_environment_never_contains_the_real_mindshub_key() -> None:
-    environment = codex_config.client_environment(Path("/tmp/codex-home"))
+    environment = codex_config.client_environment(
+        Path("/tmp/codex-home"), inference_api_key="session-inference-token",
+    )
     assert environment == {
         "CODEX_HOME": "/tmp/codex-home",
-        "MINDSHUB_CODEX_API_KEY": codex_config.LOCAL_PROXY_TOKEN,
+        "MINDSHUB_CODEX_API_KEY": "session-inference-token",
         "CODEX_API_KEY": "",
         "CODEX_ACCESS_TOKEN": "",
     }
-    assert len(codex_config.LOCAL_PROXY_TOKEN) >= 32
     assert "mdb_real-secret" not in environment.values()
+
+
+def test_codex_child_environment_refuses_a_session_without_its_own_credential() -> None:
+    with pytest.raises(RuntimeError, match="own inference credential"):
+        codex_config.client_environment(Path("/tmp/codex-home"), inference_api_key="")
 
 
 def test_interactive_terminal_prefers_bash_over_the_users_shell(monkeypatch) -> None:
@@ -232,11 +238,12 @@ def test_codex_runtime_values_cannot_be_overridden_by_project_environment() -> N
     environment = codex_config.client_environment(
         Path("/tmp/codex-home"),
         (("PROJECT_NAME", "atlas"), ("CODEX_HOME", "/wrong"), ("MINDSHUB_CODEX_API_KEY", "wrong")),
+        inference_api_key="session-inference-token",
     )
 
     assert environment["PROJECT_NAME"] == "atlas"
     assert environment["CODEX_HOME"] == "/tmp/codex-home"
-    assert environment["MINDSHUB_CODEX_API_KEY"] == codex_config.LOCAL_PROXY_TOKEN
+    assert environment["MINDSHUB_CODEX_API_KEY"] == "session-inference-token"
 
 
 def test_codex_runtime_home_is_persistent_and_isolated_from_shell_config(

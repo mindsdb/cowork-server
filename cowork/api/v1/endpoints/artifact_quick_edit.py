@@ -17,7 +17,9 @@ The response is ``text/event-stream``:
   anton's router takes ``allow_reply`` and it has ``answer_request``;
   with no decisions model for the caller's provider, at once
   ``{"route": "agent", "confidence": 1, "ms": 0, "reason": "no_decisions_model"}``
-  and neither Jev nor the editor runs
+  and neither Jev nor the editor runs; likewise ``"reason": "document_not_editable"``
+  for a document the editor can't change (a PDF, or an OOXML package on an
+  anton without ``OOXML_EDITS``)
 * ``progress``      ``{"stage": str}``
 * ``check_request`` ``{"check_id": "acheck:<hex>", "artifact_slug": str, "timeout_s": int}``,
   answered with the existing ``POST /api/v1/artifacts/checks/{check_id}``
@@ -30,6 +32,12 @@ The response is ``text/event-stream``:
 ``images`` (at most 4 PNG, JPEG, GIF or WebP images of up to 5 MB, base64)
 go to the editor's model beside the request and are never stored; the router
 reads the text alone. Anything else there is a 422 before the stream starts.
+
+Documents (ENG-4687): a Word, Excel or PowerPoint primary is edited like a
+page when the installed anton has ``OOXML_EDITS``, and its edit lands as ONE
+revision the same way. There is no page to check in the viewer, so no
+``check_request`` is sent: anton's own checks for the kind (that the package
+still opens) are the check.
 
 ``POST .../quick-edits/{edit_id}/undo`` puts back every file an applied
 edit changed and removes those it created, all or nothing
@@ -81,6 +89,7 @@ from cowork.services.artifact_revisions import (
     RevisionConflict,
     RevisionValidationError,
     begin_quick_edit,
+    is_document,
     list_revisions,
     record_quick_edit,
 )
@@ -125,6 +134,8 @@ _REPLY_GRACE_S = 5.0
 NO_DECISIONS_REASON = "no_decisions_model"
 #: The route event's reason when the decisions model is Jev on MindsHub and the org has ZDR on.
 ZDR_ON_REASON = "zdr_on"
+#: The route event's reason for a document the editor can't change itself.
+DOCUMENT_NOT_EDITABLE_REASON = "document_not_editable"
 
 QUICK_EDIT_STATUSES = frozenset({"applied", "escalate", "failed", "noop"})
 
@@ -453,7 +464,15 @@ class QuickEditRun:
     _route_context: dict = field(default_factory=dict, init=False)
 
     @property
+    def document(self) -> bool:
+        """Whether the tracked source is a document (ENG-4687)."""
+        return is_document(self.source_path)
+
+    @property
     def kind(self) -> str:
+        if self.document and not self.metadata.type:
+            # Not "html-app": anton picks a document's checks by its kind.
+            return "document"
         return _artifact_kind(self.metadata)
 
     def release(self) -> None:
@@ -561,7 +580,13 @@ class QuickEditRun:
 
     def _checker(self, emit: Callable[[str], None]):
         """The editor's checker chain, ending in the viewer's preview, asked
-        through the preview check broker on THIS response's stream."""
+        through the preview check broker on THIS response's stream.
+
+        None for a document: there is no page in the viewer to check, and
+        anton's editor given no checker picks its own checks for the kind,
+        which for a document is that the package still opens."""
+        if self.document:
+            return None
         owner = TurnOwner(org_id=self.scope.org_id, user_id=self.scope.user_id)
 
         async def publish(check_id: str, slug: str, timeout: int) -> bool:
@@ -620,6 +645,14 @@ class QuickEditRun:
         try:
             if self.body.forceRoute == "agent":
                 emit(sse_frame("route", {"route": "agent", "confidence": 1.0, "ms": 0, "reason": "forced"}))
+                emit(_done(status_="agent", started=self.started))
+                return
+            if not quick_edit_service.edits_in_place(self.source_path):
+                # A PDF, or an OOXML package this anton can't patch: the
+                # change is the agent's, even when the app forces the edit.
+                emit(sse_frame("route", {
+                    "route": "agent", "confidence": 1.0, "ms": 0, "reason": DOCUMENT_NOT_EDITABLE_REASON,
+                }))
                 emit(_done(status_="agent", started=self.started))
                 return
             user, decisions = await quick_edit_service.decisions_for_scope(self.anton, self.scope)

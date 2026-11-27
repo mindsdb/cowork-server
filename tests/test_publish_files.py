@@ -267,3 +267,179 @@ def test_a_file_the_conversion_cant_read_is_refused_and_not_checked_again(tmp_pa
 def test_both_page_refusals_are_one_kind_for_their_callers():
     assert issubclass(publish.FileNotPublishable, publish.PageNotPublishable)
     assert issubclass(publish.MarkdownNotPublishable, publish.PageNotPublishable)
+
+
+# ─── The shared document viewer (ENG-4687) ───────────────────────────────
+
+VIEWER = "https://cowork.example.com/document-viewer/v1/"
+
+
+@pytest.mark.parametrize(
+    ("suffix", "data", "name", "kind"),
+    [
+        (".pptx", lambda: _pptx([["Q3 review"]]), "Q3 deck.pptx", "pptx"),
+        (".docx", _docx, "report.docx", "docx"),
+        (".xlsx", _xlsx, "model.xlsx", "xlsx"),
+    ],
+)
+def test_a_document_the_viewer_renders_loads_it_and_keeps_its_text_as_the_fallback(
+    suffix, data, name, kind
+):
+    body = file_page.file_page_body(
+        data=data(), suffix=suffix, name=name, viewer_base=VIEWER
+    )
+
+    link = file_page.published_file_name(name)
+    assert (
+        f'<div class="file-viewer" data-cowork-document="{link}" data-cowork-document-type="{kind}"></div>'
+        in body
+    )
+    assert f'<script src="{VIEWER}{kind}.js" defer></script>' in body
+    # The text is still the page until the viewer says it rendered.
+    fallback = body.split('<div class="file-fallback">', 1)[1]
+    assert "</div>" in fallback
+    assert 'html[data-cowork-document-viewer="rendered"] .file-fallback' in body
+
+
+def test_the_deck_text_is_the_fallback_inside_the_viewer_page():
+    body = file_page.file_page_body(
+        data=_pptx([["Q3 review", "Revenue up"]]),
+        suffix=".pptx",
+        name="deck.pptx",
+        viewer_base=VIEWER,
+    )
+
+    fallback = body.split('<div class="file-fallback">', 1)[1]
+    assert "<h2>Slide 1: Q3 review</h2>" in fallback
+
+
+@pytest.mark.parametrize(
+    ("suffix", "data", "name"),
+    [
+        (".pdf", lambda: _pdf(["One"]), "report.pdf"),
+        (".csv", lambda: b"a,b\n1,2\n", "t.csv"),
+        (".txt", lambda: b"hi", "n.txt"),
+    ],
+)
+def test_kinds_the_viewer_doesnt_render_carry_no_script(suffix, data, name):
+    body = file_page.file_page_body(
+        data=data(), suffix=suffix, name=name, viewer_base=VIEWER
+    )
+
+    assert "<script" not in body
+    assert "file-viewer" not in body
+
+
+@pytest.mark.parametrize(
+    "viewer_base",
+    [
+        "",
+        "http://cowork.example.com/v1/",
+        'https://x.example/"><script>/',
+        "https://x.example/no-slash",
+    ],
+)
+def test_a_page_without_a_usable_viewer_is_text_alone(viewer_base):
+    body = file_page.file_page_body(
+        data=_docx(), suffix=".docx", name="report.docx", viewer_base=viewer_base
+    )
+
+    assert "<script" not in body
+    assert "file-viewer" not in body
+
+
+@pytest.mark.parametrize(
+    ("web_origin", "publish_url", "override", "expected"),
+    [
+        # A MindsHub publish host names its environment's Cowork web app.
+        ("", "https://view.mindshub.ai", "", "https://cowork.mindshub.ai/document-viewer/v1/"),
+        ("", "https://api.staging.mindshub.ai", "", "https://cowork.staging.mindshub.ai/document-viewer/v1/"),
+        ("", "https://api.dev.mindshub.ai", "", "https://cowork.dev.mindshub.ai/document-viewer/v1/"),
+        # A PR environment's hosts, and over a server set to the shared dev app.
+        (
+            "",
+            "https://view-pr-cowork-1583.dev.mindshub.ai",
+            "",
+            "https://cowork-pr-cowork-1583.dev.mindshub.ai/document-viewer/v1/",
+        ),
+        (
+            "https://cowork.dev.mindshub.ai",
+            "https://api-pr-cowork-1583.dev.mindshub.ai/",
+            "",
+            "https://cowork-pr-cowork-1583.dev.mindshub.ai/document-viewer/v1/",
+        ),
+        # Another publisher: the server's own Cowork web app, or text alone.
+        ("https://cowork.example.com/", "https://publish.customer.example", "", "https://cowork.example.com/document-viewer/v1/"),
+        ("", "https://publish.customer.example", "", ""),
+        ("http://cowork.example.com", "https://publish.customer.example", "", ""),
+        ("", "", "", ""),
+        # A saved setting on the retired publish host means the prod one.
+        ("", "https://4nton.ai", "", "https://cowork.mindshub.ai/document-viewer/v1/"),
+        # A MindsHub host with no Cowork web app of its own: the server's.
+        ("https://cowork.example.com", "https://mdb.ai", "", "https://cowork.example.com/document-viewer/v1/"),
+        # Not a MindsHub host, whatever its name says.
+        ("", "https://view.mindshub.ai.evil.example", "", ""),
+        # An operator's override wins, and must be https.
+        ("https://cowork.mindshub.ai", "", "https://viewer.example/v1", "https://viewer.example/v1/"),
+        ("https://cowork.mindshub.ai", "", "http://viewer.example/v1/", ""),
+    ],
+)
+def test_where_shared_pages_load_the_viewer_from(
+    web_origin, publish_url, override, expected
+):
+    assert (
+        publish.document_viewer_base(
+            web_origin=web_origin, publish_url=publish_url, override=override
+        )
+        == expected
+    )
+
+
+def test_a_published_deck_page_loads_the_viewer_this_server_names(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(publish, "_document_viewer_base", lambda: VIEWER)
+    source = tmp_path / "Q3 deck.pptx"
+    source.write_bytes(_pptx([["Q3 review"]]))
+    out = tmp_path / "out"
+    out.mkdir()
+
+    html = publish._render_to_page(source, out).read_text()
+
+    assert f'<script src="{VIEWER}pptx.js" defer></script>' in html
+    assert 'data-cowork-document="Q3_deck.pptx"' in html
+    assert (out / "Q3_deck.pptx").read_bytes() == source.read_bytes()
+
+
+def test_a_new_viewer_location_renders_the_page_again(tmp_path, monkeypatch):
+    source = tmp_path / "deck.pptx"
+    source.write_bytes(_pptx([["Q3 review"]]))
+    out = tmp_path / "out"
+    out.mkdir()
+    monkeypatch.setattr(publish, "_document_viewer_base", lambda: "")
+    assert "<script" not in publish._render_to_page(source, out).read_text()
+
+    monkeypatch.setattr(publish, "_document_viewer_base", lambda: VIEWER)
+    assert f"{VIEWER}pptx.js" in publish._render_to_page(source, out).read_text()
+
+
+@pytest.mark.parametrize("viewer_base", ['https://x.example/"><script>/', "http://x.example/", "https://x.example/v1"])
+def test_the_conversion_request_refuses_a_viewer_location_the_page_cant_hold(viewer_base):
+    from pydantic import ValidationError
+
+    from cowork.schemas.export_child import PublishFileRequest
+
+    with pytest.raises(ValidationError):
+        PublishFileRequest(suffix=".pptx", name="deck.pptx", viewer_base=viewer_base)
+    assert PublishFileRequest(suffix=".pptx", name="deck.pptx", viewer_base=VIEWER).viewer_base == VIEWER
+    assert PublishFileRequest(suffix=".pptx", name="deck.pptx").viewer_base == ""
+
+
+def test_a_hostile_publish_host_answers_at_once():
+    """No backtracking blow-up on runs of "-" (CodeQL py/redos)."""
+    import time
+
+    host = "https://api-" + "-" * 5000 + "_.mindshub.ai"
+    started = time.perf_counter()
+    assert publish.document_viewer_base(web_origin="", publish_url=host) == ""
+    assert time.perf_counter() - started < 0.5

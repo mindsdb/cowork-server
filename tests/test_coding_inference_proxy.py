@@ -17,7 +17,7 @@ import httpx
 
 from cowork.coding import inference_proxy as inference_proxy_module
 from cowork.coding.engines.base import EngineCredentials
-from cowork.coding.engines.codex_config import LOCAL_PROXY_TOKEN
+from cowork import capability_tokens
 from cowork.coding.inference_proxy import (
     MAX_INFERENCE_BODY_BYTES,
     RATE_LIMIT_DEFAULT_WAIT_SECONDS,
@@ -74,8 +74,16 @@ def test_inference_headers_strip_codex_transport_headers() -> None:
     }
 
 
-def test_inference_proxy_requires_the_process_local_codex_credential() -> None:
-    _require_inference_client(_request([(b"authorization", f"Bearer {LOCAL_PROXY_TOKEN}".encode())]))
+def test_inference_proxy_requires_a_live_session_inference_token() -> None:
+    token = capability_tokens.mint(purpose="inference", session_id="coding-session-proxy")
+    try:
+        _require_inference_client(_request([(b"authorization", f"Bearer {token}".encode())]))
+    finally:
+        capability_tokens.revoke(token=token)
+
+    with pytest.raises(HTTPException) as revoked:
+        _require_inference_client(_request([(b"authorization", f"Bearer {token}".encode())]))
+    assert revoked.value.status_code == 401
 
     with pytest.raises(HTTPException) as missing:
         _require_inference_client(_request([]))
