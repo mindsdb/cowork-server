@@ -523,7 +523,7 @@
       } catch (inner) { /* never break the page */ }
     }, { capture: true, passive: true });
 
-    /* Keeping the place across a reload the app made (ENG-4383). A save, a
+    /* Keeping the place across a reload the app made. A save, a
        quick edit or an agent change reloads the preview, which would open on
        the first slide again. The app keeps the last view this document
        reported and, once the reloaded document says document-start, sends it
@@ -842,7 +842,7 @@
     window.addEventListener('load', reapplyTheme);
   } catch (e) { /* no theme: the page keeps its own */ }
 
-  /* The page's own state, for a page shown inside a chat reply (ENG-4684):
+  /* The page's own state, for a page shown inside a chat reply:
      a checklist the user ticks, then confirms. `window.anton` is the page's
      side of it:
        setState(obj)          keep obj and post `state` to the app, which
@@ -948,8 +948,8 @@
     });
   } catch (e) { /* no page state: the page still runs */ }
 
-  /* What the page's form shows, for a page that never calls setState
-     (ENG-4684): a slider the user moved to 0.47 must still be something the
+  /* What the page's form shows, for a page that never calls setState:
+     a slider the user moved to 0.47 must still be something the
      agent can read. Every page reports its controls and its text as a
      `snapshot`, which the app saves beside state.json as snapshot.json:
        { type: 'snapshot', snapshot: {

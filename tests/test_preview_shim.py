@@ -481,7 +481,7 @@ def test_a_failing_pdf_embed_install_is_reported_and_the_shim_goes_on():
 
 # The view reporter, run in node against a stand-in DOM and a fake clock: what
 # the shim tells the app about where the user is, so the app's inline editor
-# can open on the same slide (ENG-4384).
+# can open on the same slide.
 _VIEW_HARNESS = r"""
 const posted = [];
 const listeners = {};
@@ -726,7 +726,7 @@ def test_the_view_reporter_cannot_stop_the_storage_half():
     assert SHIM_JS.index("View reporter") < SHIM_JS.index("var nativeStorageWorks")
 
 
-# Keeping the place across a reload the app made (ENG-4383): the app sends the
+# Keeping the place across a reload the app made: the app sends the
 # last view back to the reloaded document, and the shim replays it.
 
 # The deck in the harness moves to slide Two on ArrowRight (read through the
@@ -868,7 +868,7 @@ def test_the_shim_reports_the_page_height_and_whether_it_scrolls():
     assert "window.addEventListener('resize', scheduleSize)" in js
 
 
-# The app's theme, for a page shown inside a chat reply (ENG-4684): the parent
+# The app's theme, for a page shown inside a chat reply: the parent
 # posts `theme` on the restore's channel, as often as the app's theme changes.
 _THEME = """
 const theme = (mode, more = {}) => fire('message', Object.assign({
@@ -940,7 +940,7 @@ def test_a_theme_does_not_take_the_restore():
     assert out["restored"] == ["ok"]
 
 
-# The page's own state, for a page shown inside a chat reply (ENG-4684):
+# The page's own state, for a page shown inside a chat reply:
 # `window.anton` posts `state` and `submit`, and takes the app's `state` on
 # the restore's channel. A scenario reports what the page saw as a `probe`.
 _STATE = """
@@ -1102,7 +1102,7 @@ def test_the_state_does_not_take_the_restore_or_the_theme():
     assert out["theme"] == {"dataset": "dark", "colorScheme": "dark"}
 
 
-# ENG-4684: two frames of one artifact (the chat card's and the viewer's)
+# Two frames of one artifact (the chat card's and the viewer's)
 # bounced a state between them without end: each page set again what it was
 # handed, and set a default before the app's state reached it.
 
@@ -1149,7 +1149,7 @@ def test_a_restore_replay_sets_no_state_for_the_app():
     assert [m["state"] for m in out["posted"] if m["type"] == "state"] == [{"picked": ["y"]}]
 
 
-# ENG-4684: a page that never calls setState still tells the app what its
+# A page that never calls setState still tells the app what its
 # form shows. The shim posts a `snapshot` of the page's controls and text,
 # which the app saves as snapshot.json, and puts a saved one back for a page
 # with no onState listener. The stand-in DOM below gains form controls, text
