@@ -35,8 +35,8 @@ from cowork.services.artifact_publish_key import PublishKey
 from cowork.services.product_permissions import ProductPermissionDenied, ProductPermissionUnavailable
 from cowork.services.publish import (
     DatasourceApprovalRequired,
-    MarkdownNotPublishable,
     MarkdownRenderBusy,
+    PageNotPublishable,
     PublishOwnedByOtherUser,
     PublishRejected,
     PublishTooLarge,
@@ -152,10 +152,14 @@ def needs_publish(folder: Path, artifacts_base: Path) -> PublishDecision:
         _resolve_publish_target,
         compute_publish_md5,
         is_publishable_static,
+        is_widget_folder,
     )
 
     if not _user_files(folder):
         return PublishDecision(None, REASON_NO_CONTENT)
+    if is_widget_folder(folder):
+        # A widget is never published (publish.WidgetPublishRefused).
+        return PublishDecision(None, REASON_NOT_PUBLISHABLE)
 
     try:
         publish_target, published_dir, published_key, is_fullstack = _resolve_publish_target(
@@ -507,10 +511,10 @@ async def _publish_one(
         await _release(artifacts_base, slug, scope=scope)
         _record("skipped", slug=slug, reason="datasource_approval_required")
         return False
-    except MarkdownNotPublishable:
-        # The same Markdown is refused again until it changes: a skip.
+    except PageNotPublishable as exc:
+        # The same file is refused again until it changes: a skip.
         await _release(artifacts_base, slug, scope=scope)
-        _record("skipped", slug=slug, reason="markdown_not_publishable")
+        _record("skipped", slug=slug, reason=exc.detail["code"])
         return False
     except MarkdownRenderBusy:
         # Another conversion held the server's one slot: nothing was tried,

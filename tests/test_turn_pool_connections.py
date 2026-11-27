@@ -43,6 +43,7 @@ from cowork.db.scoped import LOCAL_SCOPE, SYSTEM_SCOPE
 from cowork.db.units import DatabaseBusy, conversation_writes, unit_session
 from cowork.handlers.response_routing import DELEGATED_AGENTIC, DIRECT_CONTEXT, RouteDecision
 from cowork.handlers.turn_errors import (
+    ALLOWANCE_EXHAUSTED_USER_MESSAGE,
     INTERRUPTED_TURN_MESSAGE,
     SERVER_BUSY_CODE,
     TURN_LOST_MESSAGE,
@@ -1695,7 +1696,7 @@ async def test_a_remote_error_whose_save_fails_keeps_its_own_code_and_reset_at(m
         ("turn_failed", {
             "error": "AllowanceExhaustedError: exhausted",
             "code": "included_allowance_exhausted",
-            "message": "You have no free MindsHub Air allowance left. Add credits to keep working now.",
+            "message": ALLOWANCE_EXHAUSTED_USER_MESSAGE,
             "reset_at": reset_at,
         }),
     )

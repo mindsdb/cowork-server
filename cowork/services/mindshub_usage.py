@@ -1,7 +1,8 @@
 """MindsHub usage, read on behalf of the caller.
 
-Three MindsHub reads behind one route: ``GET /v1/entitlements/me/`` for the free
-Air allowance and the subscription plan, ``GET /v1/wallet/`` for the paid balance and auto top up, and
+Three MindsHub reads behind one route: ``GET /v1/entitlements/me/`` for the
+organization's allowance (Free's windows on Free, the plan's on Plus and Pro)
+and the subscription plan, ``GET /v1/wallet/`` for the paid balance and auto top up, and
 ``GET /v1/usage/summary/`` for what the period's credit spend adds up to (the
 same figure the console's "Credit spend this period" shows).
 The desktop shows them above the composer and in Settings so a person sees
@@ -9,7 +10,7 @@ The desktop shows them above the composer and in Settings so a person sees
 
 Same rules as ``mindshub_workspaces``: the sidecar makes the call because
 MindsHub's ingress does not allow Cowork origins, the bearer is the caller's own, and the
-host is the operator's (``default_minds_auth_host``), never the tenant-settable
+host is the operator's (``mindshub_client.mindshub_v1``), never the tenant-settable
 ``minds_url``. Transport and cache come from ``mindshub_client``.
 
 The cache is per credential, not per org or per user id: the allowance and

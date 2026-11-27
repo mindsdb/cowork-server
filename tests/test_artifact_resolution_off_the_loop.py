@@ -50,6 +50,7 @@ from cowork.server import create_app
 from cowork.services import artifact_files, artifact_identity, artifact_roots
 from cowork.services.artifact_identity import ensure_full_id
 from cowork.services.projects import ProjectService
+from tests.support.pinned_responses import served_body
 
 import _blocking_guard as blocking_guard
 import test_artifacts_api_tenancy as tenancy
@@ -868,7 +869,7 @@ async def _preview(route: str, project_id: str, artifact_id: str, caller):
         project_ref=project_id,
         artifact_id=artifact_id,
     )
-    request = SimpleNamespace(path_params={"rel_path": "index.html"}, query_params={})
+    request = SimpleNamespace(path_params={"rel_path": "index.html", "token": draft_token()}, query_params={}, headers={})
     return await draft_app._draft_response(request, grant)
 
 
@@ -1172,3 +1173,35 @@ async def test_lists_stuck_on_the_general_folder_leave_database_routes_answering
     assert [task.result().status_code for task in lists] == [200] * 5
     assert search.status_code == 200, search.text
     assert models.status_code == 200, models.text
+
+
+async def test_the_org_drafts_route_gives_the_shim_no_pdf_viewer_address(owned):
+    """In org mode /drafts serves only the legacy srcdoc path, where no PDF
+    embed is replaced."""
+    project_id, artifact_id = owned
+    response = await _preview("drafts", project_id, artifact_id, _caller(tenancy.USER_A))
+    assert response.status_code == 200
+    assert 'var PDF_ASSETS = "";' in response.body.decode()
+
+
+async def test_the_org_drafts_route_serves_no_pdf_viewer_files(owned):
+    project_id, artifact_id = owned
+    with pytest.raises(HTTPException) as refused:
+        await artifact_workspace.serve_private_draft(
+            project_id, artifact_id, "_anton_pdf/viewer.mjs", SimpleNamespace(query_params={}), _caller(tenancy.USER_A)
+        )
+    assert refused.value.status_code == 404
+
+
+async def test_a_frame_navigation_to_a_pdf_gets_its_bytes_on_the_org_drafts_route(owned, tmp_path):
+    project_id, artifact_id = owned
+    folder = next(p.parent for p in tmp_path.rglob("metadata.json") if "artifacts" in p.parts)
+    (folder / "report.pdf").write_bytes(b"%PDF-1.4 org draft")
+    response = await artifact_workspace.serve_private_draft(
+        project_id, artifact_id, "report.pdf", SimpleNamespace(query_params={}), _caller(tenancy.USER_A),
+        sec_fetch_dest="iframe",
+    )
+    assert response.headers["content-type"] == "application/pdf"
+    assert "vary" not in response.headers
+    assert "access-control-allow-origin" not in response.headers
+    assert await served_body(response) == b"%PDF-1.4 org draft"

@@ -5,10 +5,11 @@ What every MindsHub read in this server shares: the transport
 (CallerTtlCache), and the errors a route answers when MindsHub refuses a read
 (MindsHubRefused) or can't be asked (MindsHubUnreachable).
 
-The bearer is the caller's own and the host is the operator's
-(``default_minds_auth_host``, derived from ENV). The stored provider key and
-``minds_url`` are both tenant-settable, so using either would let an org admin
-point a member's credential at a host they chose.
+The bearer is the caller's own and the host is the operator's (mindshub_v1:
+the deployment's in-cluster auth base, else ``default_minds_auth_host``,
+derived from ENV). The stored provider key and ``minds_url`` are both
+tenant-settable, so using either would let an org admin point a member's
+credential at a host they chose.
 """
 
 from __future__ import annotations
@@ -40,10 +41,24 @@ ENTITLEMENTS_PATH = "/entitlements/me/"
 
 
 def mindshub_v1() -> str:
-    """MindsHub's public ``/v1`` base for this deployment."""
-    from cowork.common.settings.app_settings import default_minds_auth_host
+    """The ``/v1`` base every MindsHub read and write in this server goes to.
 
-    return f"{default_minds_auth_host().rstrip('/')}/v1"
+    A hosted deployment sets ``OAuthSettings.auth_service_base_url``
+    (``AUTH_SERVICE_BASE_URL``, else ``COWORK_TURN_AUTH_INTERNAL_BASE_URL``),
+    auth's address inside the cluster, and the connector relay (auth_proxy)
+    already sends the caller's bearer to auth's public ``/v1`` routes there.
+    Reads sent there never leave the cluster. Through the public host, every
+    hosted user's read would leave from the cluster's one egress address, and
+    Cloudflare's per-IP rate limit would count them all as one client.
+
+    A desktop install sets neither variable and reads the public host
+    (``default_minds_auth_host``) from the user's own address, as does any
+    deployment that sets neither.
+    """
+    from cowork.common.settings.app_settings import OAuthSettings, default_minds_auth_host
+
+    base = OAuthSettings().auth_service_base_url or default_minds_auth_host()
+    return f"{base.rstrip('/')}/v1"
 
 
 class MindsHubAnswer(StrEnum):

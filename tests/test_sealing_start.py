@@ -503,6 +503,84 @@ async def test_the_start_stops_before_migrations_without_a_key_file(monkeypatch,
     assert not legacy_key.exists()
 
 
+# ── what a refused start logs ───────────────────────────────────────────────
+
+
+def _start_refusal_lines(output: str) -> list[dict]:
+    return [line for line in map(json.loads, output.splitlines()) if line.get("event") == "sealing_start_refused"]
+
+
+@pytest.fixture
+def start_log(monkeypatch, owned_logger):
+    """The lifespan's and the sealing checks' lines, as the server's JSON console handler writes them."""
+    monkeypatch.setenv("LOG_FORMAT", "json")
+    logs = [owned_logger(name, level=logging.WARNING) for name in (server.logger.name, sealing.logger.name)]
+    return lambda: "".join(log.output() for log in logs)
+
+
+def _refusal_record(caplog) -> logging.LogRecord:
+    [record] = [
+        record
+        for record in caplog.records
+        if record.name == server.logger.name and getattr(record, "event", None) == "sealing_start_refused"
+    ]
+    return record
+
+
+@pytest.mark.parametrize("sealed", ["marker", "record"])
+async def test_a_start_refused_without_a_key_file_logs_the_reason_once(
+    monkeypatch, caplog, start_log, legacy_key, base_vault, stored_rows, sealed
+):
+    """Uvicorn's line for a failed start keeps only its frames and exception classes, so the
+    lifespan's own line is the only one that says why Cowork won't start."""
+    foreign = Fernet.generate_key()
+    SealedDataVault(base_vault, keys=MultiFernet([Fernet(foreign)])).save("postgres", "sales", {"password": CANARY})
+    token = json.loads((base_vault / "postgres-sales").read_text())["fields"]["password"]
+    if sealed == "marker":
+        stored_rows(sealing.SEALING_MARKER_KEY, "1")
+    named = "Sealing was turned on" if sealed == "marker" else "postgres-sales is sealed"
+    monkeypatch.setattr(server, "run_dev_setup", lambda: pytest.fail("the check runs before migrations"))
+
+    with pytest.raises(KeyFileError, match=named) as raised:
+        async with server.lifespan(FastAPI()):
+            pass
+
+    record = _refusal_record(caplog)
+    assert record.levelno == logging.ERROR and record.exc_info is None
+    output = start_log()
+    [line] = _start_refusal_lines(output)
+    assert line["log_level"] == "ERROR"
+    assert line["reason"] == str(raised.value)
+    assert named in line["reason"]
+    for secret in (CANARY, token, foreign.decode()):
+        assert secret not in output
+    assert not legacy_key.exists()
+
+
+async def test_a_start_refused_for_a_record_the_key_file_doesnt_open_logs_the_reason_once(
+    monkeypatch, caplog, start_log, key_file, base_vault
+):
+    foreign = Fernet.generate_key()
+    SealedDataVault(base_vault, keys=MultiFernet([Fernet(foreign)])).save("postgres", "sales", {"password": CANARY})
+    token = json.loads((base_vault / "postgres-sales").read_text())["fields"]["password"]
+    monkeypatch.setattr(server, "run_dev_setup", lambda: None)
+
+    with pytest.raises(sealing.SealedDataError) as raised:
+        async with server.lifespan(FastAPI()):
+            pass
+
+    record = _refusal_record(caplog)
+    assert record.levelno == logging.ERROR and record.exc_info is None
+    output = start_log()
+    [line] = _start_refusal_lines(output)
+    assert line["log_level"] == "ERROR"
+    assert line["reason"] == str(raised.value)
+    assert "connection postgres/sales" in line["reason"]
+    assert "its password field doesn't open with the server's key" in line["reason"]
+    for secret in (CANARY, token, foreign.decode(), key_file.read_text().strip()):
+        assert secret not in output
+
+
 # ── without a key file: an older or not yet made database starts as today ───
 
 # The revision before the settings table gained its scope column
