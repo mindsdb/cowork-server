@@ -9,6 +9,7 @@ import hashlib
 import html
 import json
 import re
+import time
 from pathlib import Path
 
 import pytest
@@ -18,7 +19,7 @@ from cowork.docs import highlight as hl
 
 _CONTRACT_BYTES = (Path(__file__).parent / "fixtures" / "docs_code_highlight" / "contract.json").read_bytes()
 # The same digest is pinned in cowork's components/markdown/hljs.test.js.
-_CONTRACT_SHA256 = "49bff234452131da4bbf58257056fbd66bb75e9e078cf047bb3dd34a09ba0f17"
+_CONTRACT_SHA256 = "a97667de812fe9c197838c019da8ce0d43986e7181132e26f4fdcaf73ed4645e"
 _CONTRACT = json.loads(_CONTRACT_BYTES)
 _PIECE = re.compile(r'<span class="hljs-([\w-]+)">|</span>|[^<]+')
 
@@ -104,6 +105,20 @@ def test_a_last_line_without_a_newline_is_kept():
     # Pygments' session lexer (console) drops a last line that has no newline.
     code = "$ ls -la\nfile.txt"
     assert _read(hl.highlight(code, "shell")[1])[0] == code
+
+
+@pytest.mark.parametrize("fence", ["fan", "terraform", "python"])
+def test_a_markdown_block_keeps_its_fenced_code_to_itself(fence):
+    # Handed to the lexer it names, a fan fence of 10,000 characters took
+    # seconds to split, on every edit to its doc.
+    code = f"```{fence}\n" + "a" * (hl.MAX_CHARS - 20) + "\n```"
+    hl._render.cache_clear()
+    started = time.perf_counter()
+    _, markup = hl.highlight(code, "markdown")
+    assert time.perf_counter() - started < 1
+    text, spans = _read(markup)
+    assert text == code
+    assert {cls for cls, *_ in spans} == {"code"}
 
 
 def test_neighbouring_tokens_of_one_class_share_a_span():

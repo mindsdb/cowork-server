@@ -83,7 +83,13 @@ _BY_LEXER: dict[str, list[tuple[_TokenType, str]]] = {
     "typescript": [(Keyword.Type, "built_in")],
     "tsx": [(Keyword.Type, "built_in")],
     "rust": [(String.Doc, "comment")],
+    # Inline code and fenced blocks: hljs leaves them uncoloured as `code`.
+    "markdown": [(String, "code")],
 }
+# Lexer options. Markdown would hand a fenced block to the lexer its fence
+# names, any of Pygments' hundreds (some take seconds on a 10,000-character
+# block); the editor doesn't colour fenced code either.
+_OPTIONS: dict[str, dict[str, bool]] = {"markdown": {"handlecodeblocks": False}}
 _YAML_NUMBER = re.compile(r"[-+]?\d[\d_]*(\.\d+)?([eE][-+]?\d+)?")
 
 
@@ -113,7 +119,8 @@ def _render(lexer: str, code: str) -> str | None:
     # A session lexer (console) drops a last line that has no newline.
     added = not code.endswith("\n")
     source = code + "\n" if added else code
-    for ttype, value in get_lexer_by_name(lexer, stripnl=False, ensurenl=False).get_tokens(source):
+    split = get_lexer_by_name(lexer, stripnl=False, ensurenl=False, **_OPTIONS.get(lexer, {}))
+    for ttype, value in split.get_tokens(source):
         cls = _class(lexer, ttype, value, prev)
         if runs and runs[-1][0] == cls:
             runs[-1][1] += value
