@@ -1032,15 +1032,20 @@ async def test_hosted_org_tenancy_keeps_every_connections_route(hosted, monkeypa
         )
     assert refused.value.status_code == 501
 
-    # Called directly: over HTTP, /save refuses org mode before this runs. The
-    # save and the picked-file untag still use the org's vault, unlayered and
-    # unstamped.
-    saved = connections_ep.save_connection_direct(
-        DirectSaveRequest(connector_id="postgres", name="erp", values=dict(ERP)), ORG
-    )
+    # Called directly: over HTTP, /save refuses org mode before this runs.
+    # The save itself refuses an org too, and writes nothing.
+    with pytest.raises(HTTPException) as failed:
+        connections_ep.save_connection_direct(
+            DirectSaveRequest(connector_id="postgres", name="erp", values=dict(ERP)), ORG
+        )
+    assert failed.value.status_code == 500
+    # The picked-file untag still uses the org's vault, unlayered: an entry
+    # saved before the refusal existed, written here as it was then.
     vault = vault_for_scope(ORG)
     assert not isinstance(vault, LayeredDataVault)
     assert Path(vault._dir) == hosted / "shared" / ORG_ID / "data-vault"
-    assert CREATED_BY_FIELD not in vault.read_record("postgres", saved["name"])["fields"]
+    assert vault.list_connections() == []
+    vault.save("postgres", "erp", dict(ERP))
+    assert CREATED_BY_FIELD not in vault.read_record("postgres", "erp")["fields"]
     ConnectionsService(ORG).merge_picked_files("postgres", "erp", [{"id": "f1", "projects": ["p"]}])
     assert (await connections_ep.delete_picked_file("postgres", "erp", "f1", "p", ORG))["ok"] is True

@@ -49,6 +49,23 @@ class ConnectionExistsError(Exception):
     """A ``create_only`` save named a connection that already exists."""
 
 
+ORG_LOCAL_SAVE_REFUSAL = "Connections for an organization are stored in its data vault, not on this server."
+
+
+class OrgLocalSaveRefused(PermissionError):
+    """A save for an organization reached this server's vault, which no org turn reads."""
+
+    def __init__(self) -> None:
+        super().__init__(ORG_LOCAL_SAVE_REFUSAL)
+
+
+def _refuses_local_save(scope: "TenantScope | None") -> bool:
+    """True for an org scope, with or without an org id, and for no scope under org tenancy."""
+    if scope is not None:
+        return scope.org_mode
+    return get_app_settings().tenancy_mode == "org"
+
+
 def own_vault_root(scope: "TenantScope | None" = None) -> Path:
     """The folder of the vault ``scope`` saves into (own_vault_for_scope), and
     the root its record locks are keyed by (vault_lock)."""
@@ -275,7 +292,13 @@ def persist_connection(
     ``scope`` names the vault saved into and the record lock the save takes
     (own_vault_root); a caller passing ``vault`` passes the scope it built
     that vault for.
+
+    Raises ``OrgLocalSaveRefused`` before the vault is touched for an org
+    scope, or for no scope under org tenancy: an org's credentials live in
+    auth's data vault.
     """
+    if _refuses_local_save(scope):
+        raise OrgLocalSaveRefused()
     if vault is None:
         vault = vault_for_scope(scope)
 
