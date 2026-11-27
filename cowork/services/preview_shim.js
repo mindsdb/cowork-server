@@ -523,7 +523,7 @@
       } catch (inner) { /* never break the page */ }
     }, { capture: true, passive: true });
 
-    /* Keeping the place across a reload the app made (ENG-4383). A save, a
+    /* Keeping the place across a reload the app made. A save, a
        quick edit or an agent change reloads the preview, which would open on
        the first slide again. The app keeps the last view this document
        reported and, once the reloaded document says document-start, sends it
@@ -808,10 +808,10 @@
     });
   } catch (e) { /* no view reports: the page still runs */ }
 
-  /* The app's light or dark theme, for a page shown inside a chat reply
-     (ENG-4684): the parent sends `theme` with mode 'light' or 'dark', on load
-     and whenever the app's theme changes, so unlike `restore` it is taken
-     every time. It lands as <html data-theme> and the root's color-scheme,
+  /* The app's light or dark theme, for a page shown inside a chat reply:
+     the parent sends `theme` with mode 'light' or 'dark', on load and
+     whenever the app's theme changes, so unlike `restore` it is taken every
+     time. It lands as the root element's data-theme and color-scheme,
      which a page styles from. The last mode is kept and set again once the
      document is parsed and loaded, so one that came before the page's own
      script ran (or that script overwrote) still holds. Only the parent window
@@ -842,7 +842,7 @@
     window.addEventListener('load', reapplyTheme);
   } catch (e) { /* no theme: the page keeps its own */ }
 
-  /* The page's own state, for a page shown inside a chat reply (ENG-4684):
+  /* The page's own state, for a page shown inside a chat reply:
      a checklist the user ticks, then confirms. `window.anton` is the page's
      side of it:
        setState(obj)          keep obj and post `state` to the app, which
@@ -948,8 +948,8 @@
     });
   } catch (e) { /* no page state: the page still runs */ }
 
-  /* What the page's form shows, for a page that never calls setState
-     (ENG-4684): a slider the user moved to 0.47 must still be something the
+  /* What the page's form shows, for a page that never calls setState:
+     a slider the user moved to 0.47 must still be something the
      agent can read. Every page reports its controls and its text as a
      `snapshot`, which the app saves beside state.json as snapshot.json:
        { type: 'snapshot', snapshot: {
