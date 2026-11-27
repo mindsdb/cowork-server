@@ -439,28 +439,75 @@ def _inside_project(base: Path, *, folder: Path) -> Path:
 settings = AntonHarnessSettings()
 
 
-def build_elicitor(conversation_id: str, *, interactive: bool = True):
-    """The question strategy for this conversation, or None when disabled or
-    when nobody watches the turn (``interactive`` False: a scheduled run).
-    Unattended, a question or a browser hand-over would only wait out its
-    timeout; without an elicitor the agent learns at once that nobody can
-    answer, as a pod turn without ``interactive`` does.
+def _anton_approval_kind() -> str | None:
+    """anton's approval capability, or None for an anton that predates it.
+    Such an anton's artifact brief reads any elicitor as someone who can
+    confirm it, so a scheduled run there gets no elicitor. Read with
+    getattr, so the anton floor doesn't move."""
+    from anton.core.interaction import elicit
 
-    Returning None is the kill switch: anton only registers `ask_user` when
-    an elicitor supports "choice", so the model reverts to asking in plain
-    text with no silent-failure window. This holds only as long as the
-    ChatSessionConfig built from this value is not also given a `console`:
-    with elicitor=None and a console present, anton constructs its own
-    CLIElicitor (which does support "choice"), silently reopening the
-    switch. See tests/test_ask_user_flag.py for the guard.
+    return getattr(elicit, "APPROVAL_KIND", None)
+
+
+def build_elicitor(
+    conversation_id: str, *, interactive: bool = True, write_approval: bool = False
+):
+    """The question strategy for this conversation's turn.
+
+    With questions off (COWORK_ASK_USER_ENABLED=false) it is None, the kill
+    switch: anton registers `ask_user` only when an elicitor supports
+    "choice", so the model reverts to asking in plain text with no
+    silent-failure window. No write waits on a card there either, because
+    check_write_approval_startup refuses to start the server with
+    ANTON_WRITE_APPROVAL on and questions off.
+
+    An interactive turn gets an elicitor that takes "choice": the model's
+    questions, the browser hand-over and the confirmation cards reach the
+    person watching the turn.
+
+    ``write_approval`` is the turn's own AntonSettings.write_approval, the
+    value anton's write gate reads, not this server's import-time settings.
+
+    A scheduled run (``interactive`` False) with ``write_approval`` on gets
+    an elicitor that takes only approval cards (anton's APPROVAL_KIND). A
+    person who opens the run can still approve a held write. A question, a
+    browser hand-over or a tool's own confirmation card (confirm_card) still
+    comes back at once, because the elicitor doesn't take "choice": nobody
+    waits to answer them, so they would only wait out their timeout. anton's
+    write gate remembers a card nobody answered (WriteGate.unanswered, which
+    ask_approval_choice sets and reads for every approval card) and refuses
+    the turn's later cards without asking, so the run waits out one card at
+    most.
+
+    On an anton that predates APPROVAL_KIND, a scheduled run gets no
+    elicitor even with ``write_approval`` on. That anton's artifact brief
+    reads any elicitor as someone who can confirm it, so an approvals-only
+    elicitor would stop a changed repeat brief at its confirmation. With no
+    elicitor, that anton refuses the held write at once.
+
+    A scheduled run with ``write_approval`` off gets None. With no write
+    gate, nothing remembers an unanswered card, so each approval card the run
+    raises, such as a browser step, would wait out its timeout with nobody
+    watching.
+
+    The kill switch holds only as long as the ChatSessionConfig built from
+    this value is not also given a `console`: with elicitor=None and a
+    console present, anton constructs its own CLIElicitor (which does
+    support "choice"), silently reopening the switch. See
+    tests/test_ask_user_flag.py for the guard.
     """
-    if not interactive or not get_app_settings().ask_user_enabled:
+    if not get_app_settings().ask_user_enabled:
         return None
     from cowork.harnesses.anton_harness.elicitor import CoworkElicitor
     from cowork.streaming.answers import broker
 
     # timeout_s deliberately not passed: elicitor.DEFAULT_TIMEOUT_S is the one
     # place the number lives, so this call site does not restate it.
+    if not interactive:
+        approval_kind = _anton_approval_kind()
+        if not write_approval or approval_kind is None:
+            return None
+        return CoworkElicitor(conversation_id, broker, supported_kinds=(approval_kind,))
     return CoworkElicitor(conversation_id, broker)
 
 
@@ -630,6 +677,18 @@ def _turn_memory_read(*, session: "ChatSession", learns: bool) -> TurnMemoryRead
     if read is None:
         return None
     return TurnMemoryRead(read=read.learned and learns, entries=read.entries)
+
+
+def _left_out_connections_guidance(disabled_connections: list[dict]) -> str:
+    """Tell a scheduled run which connections its task leaves out, so a run
+    that needed one says which instead of failing vaguely."""
+    names = ", ".join(f"{d['name']} ({d['engine']})" for d in disabled_connections)
+    return (
+        "\n\n## Connections this task leaves out\n"
+        f"This scheduled task is set not to use: {names}. If the task needs one of them, "
+        "don't work around it: say which connection it needs, and that it can be turned back "
+        "on in the task's settings.\n"
+    )
 
 
 def _picked_files_guidance(picked_by_connection: dict[str, list[dict]]) -> str:
@@ -1181,6 +1240,7 @@ class AntonHarness:
         ui_locale: str | None = None,
         # The scheduler's own turn (see HarnessProvider).
         schedule_id: str | None = None,
+        docs: bool = False,
     ) -> AsyncIterator[str]:
         if get_app_settings().tenancy_mode == "org":
             # Org-mode turns must run on the remote worker, never in this
@@ -1251,6 +1311,9 @@ class AntonHarness:
         skill_drafts: list[dict] = []
         new_slugs: list[str] = []
         touched_slugs: set[str] = set()
+        # The revision the turn end captured per touched folder; the inline
+        # cards name it (ENG-4684).
+        turn_revisions: dict[str, str] = {}
         turn_scope = None
         turn_history: TurnHistory | None = None
         memory_read: TurnMemoryRead | None = None
@@ -1268,7 +1331,7 @@ class AntonHarness:
         turn_seed_len: int | None = None
 
         async def record_turn_cleanup():
-            nonlocal new_slugs, touched_slugs, turn_scope, skill_drafts
+            nonlocal new_slugs, touched_slugs, turn_scope, skill_drafts, turn_revisions
             # The live-app stops the turn's prompt told go back unless the
             # turn finished, so the person's next turn tells them. Here, so
             # the same shield covers it and its failure skips nothing.
@@ -1316,6 +1379,7 @@ class AntonHarness:
                     deadline=False,
                 )
                 new_slugs, touched_slugs, turn_scope = changes.created, changes.touched, _units_scope()
+                turn_revisions = changes.revisions
                 if new_slugs:
                     await run_db(
                         partial(
@@ -1348,6 +1412,8 @@ class AntonHarness:
                 tool_messages=tool_messages,
                 interactive=interactive,
                 ui_locale=ui_locale,
+                docs=docs,
+                **({"scheduled": True} if schedule_id is not None else {}),
             )
             session, turn_scratch_dir, seed_info = built.session, built.turn_scratch_dir, built.seed_info
             if model_wait is not None:
@@ -1468,6 +1534,7 @@ class AntonHarness:
             artifacts_base,
             new_slugs=new_slugs,
             touched_slugs=touched_slugs,
+            revisions=turn_revisions,
             scope=turn_scope,
             project_id=str(conv_project_id) if conv_project_id else None,
             project_name=conv_project_name,
@@ -1690,10 +1757,18 @@ class AntonHarness:
         tool_messages: bool = False,
         interactive: bool = True,
         ui_locale: str | None = None,
+        docs: bool = False,
+        scheduled: bool = False,
     ) -> BuiltChatSession:
         """Build the same core runtime the Anton CLI uses, scoped to one project
         (_build_turn_session). The live-app stops its prompt tells ride on the
-        result; a build that fails hands them back (release_stop_notices)."""
+        result; a build that fails hands them back (release_stop_notices).
+
+        ``docs``: the client shows docs, so the doc tools are registered, with
+        the short docs section of the prompt (DOC_PROMPT, on ``list_docs``) and
+        the ``doc-tools`` skill that unlocks the rest. Without it the agent never
+        hears of docs and writes none the client can't show.
+        """
         notices: list[UUID] = []
         try:
             built = await self._build_turn_session(
@@ -1706,6 +1781,8 @@ class AntonHarness:
                 interactive=interactive,
                 ui_locale=ui_locale,
                 live_app_notices=notices,
+                docs=docs,
+                scheduled=scheduled,
             )
         except BaseException:
             if notices:
@@ -1735,6 +1812,8 @@ class AntonHarness:
         interactive: bool,
         live_app_notices: list[UUID],
         ui_locale: str | None = None,
+        docs: bool,
+        scheduled: bool = False,
     ) -> BuiltChatSession:
         """_build_chat_session's work. ``live_app_notices`` gets the launch
         records whose stop the turn's prompt tells, which the turn claimed
@@ -1759,6 +1838,7 @@ class AntonHarness:
             build_cowork_create_skill_draft_tool,
             scope_usage_notes,
         )
+        from .schedule_connector_reporting import build_blocked_connector_tool
         from .schedule_tools import build_schedule_tools
         CONNECT_DATASOURCE_TOOL = build_cowork_connect_datasource_tool()
         PUBLISH_TOOL = build_cowork_publish_tool()
@@ -1766,6 +1846,15 @@ class AntonHarness:
         REQUEST_CREDENTIALS_TOOL = build_cowork_request_credentials_tool()
         LABEL_CONNECTION_TOOL = build_cowork_label_connection_tool()
         CREATE_SKILL_DRAFT_TOOL = build_cowork_create_skill_draft_tool()
+        from .doc_tools import DocToolContext, build_doc_tools
+        doc_tool_ctx = DocToolContext(
+            artifacts_base=Path(conversation.project.path) / ".anton" / "artifacts",
+            conversation_id=str(conversation.id),
+            project_id=str(conversation.project_id) if conversation.project_id else None,
+            project_name=conversation.project.name,
+            project_label=display_label(conversation.project),
+        ) if docs else None
+        DOC_TOOLS = build_doc_tools(doc_tool_ctx) if doc_tool_ctx is not None else []
 
         try:
             from anton.core.datasources.data_vault import LocalDataVault
@@ -1806,12 +1895,22 @@ class AntonHarness:
         # skills others share with them after those (both linked into the
         # turn's scratch folder below).
         anton_settings.skills_extra_roots = [HOST_SKILLS_DIR]
+        if docs:
+            # The `doc-tools` skill unlocks the doc tools and holds the writing guide;
+            # a client without docs never hears of it.
+            from cowork.docs.prompt import DOC_SKILLS_ROOT
+
+            anton_settings.skills_extra_roots.append(DOC_SKILLS_ROOT)
 
         user = await run_on_unit_threads(get_user_settings)
         _overlay_user_settings(anton_settings, user)
 
         RECALL_HISTORY_TOOL = self._recall_history_tool(conversation, user)
-        elicitor = build_elicitor(str(conversation.id), interactive=interactive)
+        elicitor = build_elicitor(
+            str(conversation.id),
+            interactive=interactive,
+            write_approval=anton_settings.write_approval is True,
+        )
         # Asks the user's open preview whether an edited artifact runs. Only
         # where the cowork app tails the turn: a scheduled run or a channel
         # bot has no preview to answer, and would only wait out the timeout.
@@ -1829,6 +1928,8 @@ class AntonHarness:
             if interactive and elicitor is not None and channel_context is None
             else []
         )
+        if scheduled and not interactive and disabled_connections:
+            schedule_tools.append(build_blocked_connector_tool(disabled_connections))
 
         _apply_user_credentials(anton_settings, user)
 
@@ -1895,6 +1996,9 @@ class AntonHarness:
         # Read once: the prompt lists them, and the code sandbox grants their
         # folders read-only.
         attachment_rows = await _read_attachments(conversation, scope=current_settings_scope())
+        if doc_tool_ctx is not None:
+            # An attached image may go in a doc (copied beside it).
+            doc_tool_ctx.attached_files = frozenset(Path(a.path) for a in attachment_rows or [] if a.path)
         attachment_context = _attachment_context_for(attachment_rows, conversation=conversation)
         # Canonical order (ConversationService._MESSAGE_ORDER: seq, role, id);
         # the bare `conversation.messages` relationship is unordered and would
@@ -2105,6 +2209,10 @@ class AntonHarness:
                 integration_guidance += describe_project_pages(
                     service.picked_files_by_project(data_vault, conversation.project.name, engine="notion")
                 )
+            if not interactive and disabled_connections:
+                # A scheduled task left these out, so they're hidden from the
+                # turn; without a word the agent would just say it can't.
+                integration_guidance += _left_out_connections_guidance(disabled_connections)
 
             cells = extract_scratchpad_cells(history.events)
             os.environ["ANTON_SCRATCHPAD_PERSIST_SESSION"] = "true"
@@ -2369,6 +2477,7 @@ class AntonHarness:
                     REQUEST_CREDENTIALS_TOOL,
                     LABEL_CONNECTION_TOOL,
                     CREATE_SKILL_DRAFT_TOOL,
+                    *DOC_TOOLS,
                     # FETCH_SUBMISSION_TOOL,
                     # UPDATE_FORM_TOOL,
                     *([RECALL_HISTORY_TOOL] if RECALL_HISTORY_TOOL else []),

@@ -565,12 +565,13 @@ def test_republish_markdown_reuses_report_id(tmp_path, monkeypatch):
 def test_publish_rejects_unsupported_extension(tmp_path, monkeypatch):
     art = tmp_path / "art"
     art.mkdir()
-    txt = art / "notes.txt"
-    txt.write_text("plain")
+    # Text, PDF and Office files publish as pages of their own (ENG-4687); a zip doesn't.
+    bundle = art / "bundle.zip"
+    bundle.write_bytes(b"PK")
 
-    _wire_publish(monkeypatch, tmp_path, txt, "notes.txt")
-    with pytest.raises(ValueError, match="HTML and Markdown"):
-        publish.publish_artifact(txt, artifacts_base=tmp_path, api_key="key", publish_url="https://4nton.ai")
+    _wire_publish(monkeypatch, tmp_path, bundle, "bundle.zip")
+    with pytest.raises(ValueError, match="can be published"):
+        publish.publish_artifact(bundle, artifacts_base=tmp_path, api_key="key", publish_url="https://4nton.ai")
 
 
 def test_html_still_published_verbatim(tmp_path, monkeypatch):

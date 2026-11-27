@@ -162,6 +162,11 @@ def _request_wire_size(params: dict) -> int:
     return len(json.dumps(params, separators=(",", ":")).encode("utf-8"))
 
 
+def _unlock_skills(host_tools: list[dict] | None) -> set[str]:
+    """The skills these host tools wait for (``unlock_skill``)."""
+    return {spec["unlock_skill"] for spec in host_tools or () if spec.get("unlock_skill")}
+
+
 def _shed_skills(params: dict, *, size: int, budget: int, always_on: bool) -> int:
     """Drop the skills block's on-demand skills (or, with ``always_on``, its
     always-on ones) one at a time from the end of the block until the request
@@ -171,14 +176,17 @@ def _shed_skills(params: dict, *, size: int, budget: int, always_on: bool) -> in
     on-demand skills go in reverse slug order, and the always-on ones team
     skills first. The block itself stays, empty at worst: it is the pod's
     whole recallable set, so a turn that sheds skills has fewer, never a
-    fallback to a mounted skills tree."""
+    fallback to a mounted skills tree. A skill one of the request's host tools
+    waits for (``unlock_skill``) is never shed: without it that tool could
+    never be unlocked."""
     skills = params.get("skills")
     if size <= budget or not isinstance(skills, dict):
         return size
     skills = params["skills"] = dict(skills)
+    unlocking = _unlock_skills(params.get("host_tools"))
     ranked = [
         slug for slug, entry in skills.items()
-        if TurnSkillEntry.model_validate(entry).always_on is always_on
+        if slug not in unlocking and TurnSkillEntry.model_validate(entry).always_on is always_on
     ]
     for slug in reversed(ranked):
         if size <= budget:
@@ -353,7 +361,7 @@ async def _mint_oauth_block(*, org_id: str | None, user_id: str | None,
         )
         return None
     if disabled:
-        disabled_keys = {(d.get("engine"), d.get("name")) for d in disabled}
+        disabled_keys = {(d.get("engine"), d.get("name")) for d in disabled if d.get("datasource_id") is None}
         connections = [c for c in connections if (c.get("engine"), c.get("name")) not in disabled_keys]
     if not connections:
         return None
@@ -567,13 +575,32 @@ def _refuse_datasource_grants(reason: str, *, route: str) -> product_permissions
 
 
 def _datasource_connection_refs(
-    connections: list[dict], disabled: list[dict] | None, *, with_labels: bool = False
+    connections: list[dict], disabled: list[dict] | None, *, with_labels: bool = False, scheduled: bool = False,
 ) -> list[dict]:
     """The grant set: every verified connection auth listed, minus the
     conversation's disabled ones. A disabled entry carries ``engine`` and
-    ``name``; auth's ``connector_id`` is the same value, so the join is exact."""
+    ``name``; auth's ``connector_id`` is the same value, so the join is exact.
+
+    An entry also carrying a ``datasource_id`` is matched by that id, which
+    survives a rename. Once the id is gone from the listing, its datasource
+    was deleted, and the entry falls back to its name: one added again under
+    that name gets a new id and must stay left out."""
     disabled_keys = {
-        (entry.get("engine"), entry.get("name")) for entry in (disabled or []) if isinstance(entry, dict)
+        (entry.get("engine"), entry.get("name")) for entry in disabled or []
+        if isinstance(entry, dict) and entry.get("datasource_id") is None
+    }
+    disabled_ids = {
+        (entry.get("engine"), entry["datasource_id"]) for entry in disabled or []
+        if isinstance(entry, dict) and entry.get("datasource_id")
+    }
+    # Old saved exclusions lack a stable id. A renamed datasource may now
+    # have any label, so omit its engine's datasources until the list is saved again.
+    legacy_engines = {engine for engine, _ in disabled_keys} if scheduled else set()
+    listed_ids = {(c.get("connector_id"), c.get("id")) for c in connections if isinstance(c, dict)}
+    disabled_keys |= {
+        (entry.get("engine"), entry.get("name")) for entry in disabled or []
+        if isinstance(entry, dict) and entry.get("datasource_id")
+        and (entry.get("engine"), entry["datasource_id"]) not in listed_ids
     }
     refs: list[dict] = []
     seen: set[int] = set()
@@ -594,8 +621,6 @@ def _datasource_connection_refs(
             raise _refuse_datasource_grants(
                 "listing carries a connection without verified metadata", route=DATASOURCE_CONNECTIONS_ROUTE,
             )
-        if (connection.get("connector_id"), connection.get("name")) in disabled_keys:
-            continue
         if (
             isinstance(connection_id, bool)
             or not isinstance(connection_id, int)
@@ -609,6 +634,13 @@ def _datasource_connection_refs(
                 "listing carries a malformed or repeated connection reference", route=DATASOURCE_CONNECTIONS_ROUTE,
             )
         seen.add(connection_id)
+        engine = connection["connector_id"]
+        if (
+            (engine, connection_id) in disabled_ids
+            or engine in legacy_engines
+            or (engine, connection["name"]) in disabled_keys
+        ):
+            continue
         ref = {"connection_id": connection_id, "credential_version": credential_version}
         if with_labels:
             ref.update(_connection_labels(connection))
@@ -644,7 +676,7 @@ def _connection_labels(connection: dict) -> dict[str, str]:
 async def _mint_datasource_block(*, org_id: str | None, user_id: str | None,
                                  correlation_id: str, turn_key_id: str | None,
                                  disabled: list[dict] | None,
-                                 settings: TurnQueueSettings) -> dict | None:
+                                 settings: TurnQueueSettings, scheduled: bool = False) -> dict | None:
     """Register verified datasource grants before a datasource block is queued."""
     if not settings.datasource_enabled or not org_id or not user_id:
         return None
@@ -669,7 +701,9 @@ async def _mint_datasource_block(*, org_id: str | None, user_id: str | None,
             org_id, exc_info=True,
         )
         return None
-    refs = _datasource_connection_refs(connections, disabled, with_labels=settings.datasource_labels_enabled)
+    refs = _datasource_connection_refs(
+        connections, disabled, with_labels=settings.datasource_labels_enabled, scheduled=scheduled,
+    )
     if not refs:
         return None
     response = await register_datasource_grants(
@@ -717,7 +751,8 @@ def _custom_api_connection_refs(connections: list[dict], disabled: list[dict] | 
     Past MAX_CUSTOM_API_CONNECTIONS, the lowest ids are kept.
     """
     disabled_keys = {
-        (entry.get("engine"), entry.get("name")) for entry in (disabled or []) if isinstance(entry, dict)
+        (entry.get("engine"), entry.get("name")) for entry in (disabled or [])
+        if isinstance(entry, dict) and entry.get("datasource_id") is None
     }
     refs: list[dict] = []
     seen: set[int] = set()
@@ -1168,9 +1203,11 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
                                 disabled: list[dict] | None = None,
                                 started_at: str | None = None,
                                 interactive: bool = False,
+                                scheduled: bool = False,
                                 tool_messages: bool = False,
                                 connector_drafts: bool = False,
                                 preview_checks: bool = False,
+                                host_tools: list[dict] | None = None,
                                 ui_locale: str | None = None,
                                 reasoning_effort: str | None = None):
     """Mint, enqueue, then yield this turn's replies as (kind, data) tuples.
@@ -1192,6 +1229,13 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
     preview whether an edit runs (ENG-4227, turnqueue/preview_checks.py).
     Only with `interactive`: the answer reaches the pod on the stdin an
     interactive turn keeps open. Channel turns never.
+    `host_tools` are tools this server runs for the pod
+    (turnqueue/host_tools.py), sent only with `interactive`: their answers
+    reach the pod on the stdin an interactive turn keeps open, and only for
+    a persistent workspace: the doc tools write into the project's folder from
+    this server whatever the pod mounts, but without artifact.manage the
+    caller may not change artifacts, and the turn end records nothing for a
+    workspace that is not persistent. Channel turns never send them.
     `ui_locale` is the app's language (cowork.common.ui_locale), which the
     pod's anton replies in when the user's message does not say; None for a
     turn with no request behind it.
@@ -1285,6 +1329,7 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
                 turn_key_id=turn_key_id,
                 disabled=disabled,
                 settings=settings,
+                scheduled=scheduled,
             ),
             _mint_custom_api_block(
                 scope=scope, correlation_id=corr, turn_key_id=turn_key_id, disabled=disabled, settings=settings,
@@ -1379,12 +1424,18 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
     offer_connector_drafts = bool(
         connector_drafts and settings.connector_drafts_enabled and scope.org_mode and user_id
     )
+    offered_host_tools = host_tools if host_tools and interactive and workspace_mode == "persistent" else None
     params = {"input": input_text, "workspace_path": workspace_rel_path.lstrip("/"),
               "workspace_mode": workspace_mode,
               "model": model, "history": history or [], "llm": llm_block,
               # Web UI turns only: the pod then registers ask_user and takes
               # answers on stdin, which /answer feeds through Redis.
               "interactive": interactive,
+              # The runner owns this reporting tool. Only an actual scheduled
+              # turn gets excluded labels. Its connector blocks stay filtered.
+              **({"scheduled_excluded_connectors": [
+                  {"engine": connection["engine"], "name": connection["name"]} for connection in disabled
+              ]} if scheduled and disabled and not interactive else {}),
               # The cowork UI renders a tool's message to the user as an
               # agent message; without this the pod hands it to the agent.
               "tool_messages": tool_messages,
@@ -1394,6 +1445,8 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
               # stdin its answer comes back on (scratchpad-controller#134
               # relays it; an older controller drops it and the pod never asks).
               **({"preview_checks": True} if preview_checks and interactive else {}),
+              # Tools this server runs for the pod; their answers come back on stdin.
+              **({"host_tools": host_tools} if offered_host_tools else {}),
               # False when the organization opted out of Jev: the pod's
               # completion check then never asks it. A controller that
               # predates the field drops it, and the pod keeps Jev on.
@@ -1409,7 +1462,9 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
               **({"memory": memory_block} if memory_block else {}),
               # Only the skills the caller sees, and the pod's whole
               # recallable set, so always present, even empty.
-              "skills": turn_skills_wire(skills or {}),
+              # Less any skill only dropped host tools wait for: it would unlock nothing.
+              "skills": turn_skills_wire({slug: entry for slug, entry in (skills or {}).items()
+                                          if slug not in _unlock_skills(host_tools) - _unlock_skills(offered_host_tools)}),
               # Absent entirely (not an empty dict) when there's nothing to
               # offer — see _mint_oauth_block's docstring for why.
               **({"oauth": oauth_block} if oauth_block else {}),

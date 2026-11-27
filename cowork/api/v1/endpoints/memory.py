@@ -3,7 +3,7 @@ from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 
-from cowork.api.v1.permissions import AuthenticatedInOrgMode, require
+from cowork.api.v1.permissions import AuthenticatedInOrgMode, WindowProof, require
 from cowork.db.scoped import ScopedSession, TenantScope, get_tenant_scope
 from cowork.db.units import run_efs_unit
 from cowork.principal import Principal, get_principal
@@ -62,7 +62,7 @@ def memory_capabilities(
     return MemoryCapabilities(can_reset=person_may_reset_memory(scope))
 
 
-@router.put("/", response_model=MemoryResponse)
+@router.put("/", response_model=MemoryResponse, dependencies=[Depends(require(WindowProof))])
 async def update_memory(
     body: MemoryUpdateRequest,
     scope: Annotated[TenantScope, Depends(get_tenant_scope)],
@@ -96,7 +96,7 @@ async def update_memory(
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
 
 
-@router.delete("/")
+@router.delete("/", dependencies=[Depends(require(WindowProof))])
 async def delete_memory(
     body: MemoryDeleteRequest,
     scope: Annotated[TenantScope, Depends(get_tenant_scope)],
@@ -121,7 +121,7 @@ async def delete_memory(
     return {"ok": True}
 
 
-@router.delete("/all", response_model=MemoryReset)
+@router.delete("/all", response_model=MemoryReset, dependencies=[Depends(require(WindowProof))])
 async def reset_memory(
     scope: Annotated[TenantScope, Depends(get_tenant_scope)],
     principal: Principal | None = Depends(get_principal),

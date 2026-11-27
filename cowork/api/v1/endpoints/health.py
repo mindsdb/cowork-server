@@ -151,10 +151,14 @@ def health() -> dict:
     settings = get_user_settings()
     # Read once: `org_mode` and the `aid` gate are the same decision, and two
     # separate reads could in principle disagree within one response.
-    _org_mode = get_app_settings().tenancy_mode == "org"
+    app_settings = get_app_settings()
+    _org_mode = app_settings.tenancy_mode == "org"
     # Present only while this server holds the desktop app's secret: the app
     # then sends it on the routes that need it and pushes MCP tokens to memory.
-    protocol = {"app_secret_protocol": 1} if app_secret.get_app_secret() is not None else {}
+    # 2 while it holds the whole launch hand-off (cowork.app_secret), 1 for
+    # the app secret alone.
+    held = app_secret.held_protocol()
+    protocol = {"app_secret_protocol": held} if held is not None else {}
     return {
         "status": "ok",
         # Runtime feature handshake for desktop clients. A healthy HTTP server
@@ -182,6 +186,10 @@ def health() -> dict:
         "draft_links": get_app_settings().draft_links_enabled(),
         # Whether the Share panel offers "Public website" (MindsHub mode only).
         "artifact_websites": get_app_settings().artifact_websites_offered(),
+        # Whether the agent works on docs here: always on the desktop; in org
+        # mode only with remote docs and ask_user both on, because doc tools
+        # answer the pod on the stdin only an interactive turn keeps open.
+        "docs_enabled": (not _org_mode) or app_settings.remote_docs_available(),
         "minds_runtime_credential_required": _minds_runtime_credential_required(
             settings, org_mode=_org_mode
         ),

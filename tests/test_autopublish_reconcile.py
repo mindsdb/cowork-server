@@ -343,7 +343,8 @@ async def test_nothing_to_publish_mints_no_key(base, enabled, published, monkeyp
             pass
 
     monkeypatch.setattr(ap, "PublishKey", FakeKey)
-    _make(base, "data", files={"rows.csv": "a,b"}, meta={"slug": "data", "type": "dataset"})
+    # A CSV publishes as a page now (ENG-4687); an archive has nothing to publish.
+    _make(base, "data", files={"rows.zip": "PK"}, meta={"slug": "data", "type": "dataset"})
 
     out = await ap.autopublish_project_artifacts(base, ORG_SCOPE, project_id=PROJECT_ID, touched={"data"})
 

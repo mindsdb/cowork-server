@@ -40,6 +40,7 @@ def _health(*, tenancy_mode: str, websites: bool) -> dict:
     settings = SimpleNamespace(
         owner="", tenancy_mode=tenancy_mode, draft_links_enabled=lambda: False,
         artifact_websites_offered=lambda: tenancy_mode == "org" and websites,
+        remote_docs_available=lambda: False,
     )
     user = SimpleNamespace(
         config_status={},

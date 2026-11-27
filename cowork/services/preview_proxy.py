@@ -26,6 +26,7 @@ import httpx
 from starlette.requests import Request
 from starlette.responses import PlainTextResponse, Response, StreamingResponse
 
+from cowork import app_secret
 from cowork.code_sandbox import backends_off_message, code_sandbox_on
 from cowork.common.http_client import get_proxy_client
 from cowork.db.scoped import TenantScope
@@ -68,8 +69,18 @@ _CORS_RESPONSE_HEADERS = {
 }
 
 # Headers the upstream `httpx` request must not carry — `Content-Length`
-# is recomputed by httpx itself, and `Host` is rewritten below.
-_UPSTREAM_BLOCKED_REQUEST_HEADERS = {"content-length", "host"}
+# is recomputed by httpx itself, and `Host` is rewritten below. The other
+# three carry the app's own credentials: the window's bearer token, which
+# desktop main adds to the preview frame's requests to this server, the
+# window proof and the app secret. The backend runs the agent's code, so it
+# gets none of them.
+_UPSTREAM_BLOCKED_REQUEST_HEADERS = {
+    "content-length",
+    "host",
+    "authorization",
+    app_secret.WINDOW_PROOF_HEADER.lower(),
+    app_secret.HEADER.lower(),
+}
 
 
 def _read_backend_port(artifact_dir: Path) -> Optional[int]:

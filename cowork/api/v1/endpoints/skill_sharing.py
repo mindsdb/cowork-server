@@ -28,7 +28,7 @@ from cowork.api.v1.endpoints.skills import (
     _set_personal_skill_sharing,
     _skill_response,
 )
-from cowork.api.v1.permissions import Authenticated, AuthenticatedInOrgMode, require
+from cowork.api.v1.permissions import Authenticated, AuthenticatedInOrgMode, WindowProof, require
 from cowork.db.scoped import ScopedSession, TenantScope, get_tenant_scope
 from cowork.db.units import run_efs_unit
 from cowork.principal import Principal, get_principal
@@ -98,7 +98,7 @@ async def skill_sharing_capabilities(viewer: SkillViewerDep = None):
     ).model_dump(by_alias=True)
 
 
-@router.put("/{skill_id}/me", response_model=SkillResponse)
+@router.put("/{skill_id}/me", response_model=SkillResponse, dependencies=[Depends(require(WindowProof))])
 async def set_skill_enabled_for_me(
     skill_id: str,
     body: SkillEnabledForMeRequest,

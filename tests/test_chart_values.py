@@ -81,15 +81,18 @@ CAPABILITIES = "COWORK_DATASOURCE_CAPABILITIES"
 # Environments the release gate has switched datasource grants on in; the
 # gate's own change adds the environment here and sets both deployment scalars
 # in its values file.
-ENABLED_ENVIRONMENTS: frozenset[str] = frozenset({"staging"})
+ENABLED_ENVIRONMENTS: frozenset[str] = frozenset({"staging", "prod"})
 LABELS_FLAG = "COWORK_TURN_DATASOURCE_LABELS_ENABLED"
 DRAFTS_FLAG = "COWORK_TURN_CONNECTOR_DRAFTS_ENABLED"
 CUSTOM_API_FLAG = "COWORK_TURN_CUSTOM_API_ENABLED"
 # Environments where auth, the inference gateway and the pod's anton serve custom
 # API connections; the change that turns one on adds it here and to its values file.
-CUSTOM_API_ENVIRONMENTS: frozenset[str] = frozenset({"staging"})
+CUSTOM_API_ENVIRONMENTS: frozenset[str] = frozenset({"staging", "prod"})
 # The exact methods each enabled environment offers.
-OFFERED_METHODS: dict[str, frozenset[str]] = {"staging": frozenset({"mysql:host-password", "postgres:host-port"})}
+OFFERED_METHODS: dict[str, frozenset[str]] = {
+    "staging": frozenset({"mysql:host-password", "postgres:host-port"}),
+    "prod": frozenset({"mysql:host-password", "postgres:host-port"}),
+}
 # The draft host of each environment. cowork's web build frames exactly these
 # (src/shared/draft-link-origins.ts there) and refuses a link to any other.
 DRAFT_HOSTS = {
