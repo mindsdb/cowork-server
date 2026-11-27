@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+from urllib.parse import parse_qs, urlparse
 
 import httpx
 import pytest
@@ -168,10 +169,14 @@ class TestSwitchedOff:
         assert response.status_code == 403
         assert own_vault_for_scope(LOCAL_SCOPE).load("slack", name)["bot_token"] == "xoxb-1"
 
-    def test_starting_a_slack_sign_in_is_not_refused(self, sharepoint_stores, slack_off):
-        # The REST sign-in starts with the switch off; this one only lacks credentials.
+    def test_starting_a_slack_sign_in_asks_for_the_rest_scopes(self, sharepoint_stores, slack_off, monkeypatch):
+        monkeypatch.setenv("SLACK_CLIENT_ID", "123.456")
+        monkeypatch.setenv("SLACK_CLIENT_SECRET", "s3cret")
         response = self._client().post("/api/v1/connectors/oauth/slack/start", json={})
-        assert response.status_code != 404
+        assert response.status_code == 200, response.text
+        query = parse_qs(urlparse(response.json()["authUrl"]).query)
+        assert {"search:read", "chat:write"} <= set(query["scope"][0].split())
+        assert "search:read.public" not in query["scope"][0]
 
 
 def test_credentials_need_both_id_and_secret(monkeypatch):

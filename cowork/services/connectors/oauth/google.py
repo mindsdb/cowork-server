@@ -677,7 +677,7 @@ class OAuthService:
         if engine == "slack" and fields.get("_method") not in ("mcp", "browser_oauth_builtin"):
             # The hidden `oauth` method signs in with the user's own Slack app,
             # whose token may be shared with other integrations.
-            _log.debug("Not revoking %s/%s remotely: not an MCP sign-in", engine, name)
+            _log.debug("Not revoking %s/%s remotely: not our Slack app's sign-in", engine, name)
             return
         refresh, access = fields.get("refresh_token", "").strip(), fields.get("access_token", "").strip()
         # Slack's auth.revoke authenticates with the access token itself.
