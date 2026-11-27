@@ -3,6 +3,9 @@
 - ``POST /api/v1/connectors/teams/deliver`` posts a reply in a Teams thread, optionally @mentioning one member.
 - ``POST /api/v1/connectors/teams/status`` shows a status line under a message while its answer runs.
 - ``GET /api/v1/connectors/teams/member`` looks up a person in a conversation.
+- ``PUT`` and ``DELETE /api/v1/connectors/teams/contacts`` keep where to reach a person the proxy
+  paired, for a scheduled run's result posted to their Teams chat. The person goes in the body or
+  query, since the bearer and identity layers skip these routes by exact path.
 
 Each call is signed by the proxy (cowork/services/connectors/teams/bot.py, ``TeamsProxySignature``),
 and the routes skip the bearer and identity layers. With any Teams setting missing, or without the
@@ -11,6 +14,7 @@ Teams packages, they aren't mounted and Cowork starts as usual.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import Annotated
 
@@ -26,8 +30,10 @@ from cowork.services.connectors.teams.bot import (
     TeamsBot,
     TeamsProxySignature,
     TeamsSettings,
+    set_running_bot,
 )
 from cowork.services.connectors.teams.client import TeamsAuthError, teams_available
+from cowork.services.connectors.teams.delivery import forget_contact, save_contact
 
 logger = logging.getLogger(__name__)
 
@@ -59,6 +65,13 @@ class DeliverRequest(BaseModel):
     mention: Mention | None = None
     # The stream a status line opened: the reply closes it and takes its place.
     stream_id: str | None = Field(default=None, min_length=1)
+
+
+class ContactRequest(BaseModel):
+    user_id: str = Field(min_length=1, max_length=36)
+    tenant_id: str = Field(min_length=1, max_length=64)
+    aad_object_id: str = Field(min_length=1, max_length=64)
+    service_url: str = Field(min_length=1, max_length=512)
 
 
 class StatusRequest(BaseModel):
@@ -213,6 +226,17 @@ async def member(
     )
 
 
+@router.put("/contacts", status_code=status.HTTP_204_NO_CONTENT, dependencies=[Depends(require(TeamsProxySignature))])
+async def put_contact(body: ContactRequest, bot: Annotated[TeamsBot, Depends(_bot)]) -> None:
+    bot.check_service_url(body.service_url)
+    await asyncio.to_thread(save_contact, **body.model_dump())
+
+
+@router.delete("/contacts", status_code=status.HTTP_204_NO_CONTENT, dependencies=[Depends(require(TeamsProxySignature))])
+async def delete_contact(user_id: Annotated[str, Query(min_length=1, max_length=36)]) -> None:
+    await asyncio.to_thread(forget_contact, user_id)
+
+
 def install_teams_routes(app: FastAPI, exempt_paths: set[str], settings: TeamsSettings | None = None) -> bool:
     """Mount the routes when the bot is configured; returns whether it did.
 
@@ -241,6 +265,7 @@ def install_teams_routes(app: FastAPI, exempt_paths: set[str], settings: TeamsSe
             extra={"event": "teams_weak_key"},
         )
     app.state.teams_bot = TeamsBot(settings)
+    set_running_bot(app.state.teams_bot)
     app.include_router(router, prefix=ROUTE_PREFIX, tags=["connectors"])
     exempt_paths.update(f"{ROUTE_PREFIX}{route.path}" for route in router.routes)
     logger.info("Teams bot routes on", extra={"event": "teams_routes_on"})

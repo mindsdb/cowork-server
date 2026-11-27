@@ -38,6 +38,7 @@ SERVICE_URL = "https://smba.trafficmanager.net/amer/tenant-1/"
 DELIVER = "/api/v1/connectors/teams/deliver"
 MEMBER = "/api/v1/connectors/teams/member"
 STATUS = "/api/v1/connectors/teams/status"
+CONTACTS = "/api/v1/connectors/teams/contacts"
 
 
 def _settings(**overrides) -> TeamsSettings:
@@ -475,8 +476,8 @@ def test_the_client_is_created_once_and_closed(teams_on):
 def test_routes_mount_and_skip_the_bearer_layer_when_configured(teams_on):
     app, exempt = FastAPI(), set()
     assert install_teams_routes(app, exempt, _settings())
-    assert exempt == {DELIVER, MEMBER, STATUS}
-    assert {route.path for route in app.routes} >= {DELIVER, MEMBER, STATUS}
+    assert exempt == {DELIVER, MEMBER, STATUS, CONTACTS}
+    assert {route.path for route in app.routes} >= {DELIVER, MEMBER, STATUS, CONTACTS}
 
 
 def test_teams_stays_off_and_quiet_with_nothing_set(teams_on, caplog):

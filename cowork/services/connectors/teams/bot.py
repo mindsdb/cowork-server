@@ -61,6 +61,9 @@ class TeamsSettings(Settings):
     # Teams names the address to reply to in each message (serviceUrl), e.g.
     # https://smba.trafficmanager.net/amer/<tenant ID>/.
     service_hosts: Annotated[tuple[str, ...], NoDecode] = ("smba.trafficmanager.net",)
+    # The address people open the web UI at, for the link in a scheduled run's result posted to
+    # Teams; no link without it.
+    web_ui_url: str = ""
 
     @field_validator("service_hosts", mode="before")
     @classmethod
@@ -120,6 +123,7 @@ class TeamsBot:
     def __init__(self, settings: TeamsSettings, make_client: Callable[[], TeamsClient] | None = None) -> None:
         self.internal_key = settings.internal_key.get_secret_value().encode()
         self.service_hosts = frozenset(settings.service_hosts)
+        self.web_ui_url = settings.web_ui_url.rstrip("/")
         self._make_client = make_client or (
             lambda: TeamsClient(
                 settings.bot_app_id, settings.bot_app_secret.get_secret_value(), settings.tenant_id
@@ -188,3 +192,17 @@ def check(settings: TeamsSettings | None = None, make_client: Callable[[], Teams
         print("COWORK_TEAMS_INTERNAL_KEY is not set, so the proxy can't reach the Teams routes")
         return 1
     return 0
+
+
+# The bot the routes run with, for work that starts outside a request, such as a scheduled run's
+# result posted to Teams. None where Teams isn't set up.
+_running: TeamsBot | None = None
+
+
+def running_bot() -> TeamsBot | None:
+    return _running
+
+
+def set_running_bot(bot: TeamsBot | None) -> None:
+    global _running
+    _running = bot

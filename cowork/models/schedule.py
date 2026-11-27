@@ -83,6 +83,11 @@ class Schedule(BaseSQLModel, table=True):
     )
     org_id: str | None = Field(default=None, index=True, max_length=36, description="Owning organization; NULL on local/desktop rows")
     created_by: str | None = Field(default=None, max_length=36, description="User who created the row; NULL on local/desktop rows")
+    deliver_to_teams: bool = Field(
+        default=False,
+        sa_column_kwargs={"server_default": sa.false()},
+        description="Post each completed run's result to the owner's personal chat with the Teams bot",
+    )
 
     # Deleting a schedule takes its runs with it. Delete-orphan makes the ORM
     # issue the child DELETEs before the parent regardless of backend (SQLite
@@ -151,6 +156,14 @@ class ScheduleRun(BaseSQLModel, table=True):
         default=False,
         sa_column_kwargs={"server_default": sa.false()},
         description="A run-now that tries the task out: it leaves the failure streak unchanged",
+    )
+    teams_delivery: str | None = Field(
+        default=None,
+        max_length=16,
+        description=(
+            "Posting the result to the owner's Teams chat: sending | delivered | failed | unknown; "
+            "NULL when the schedule doesn't post to Teams. Tried once, never resent on its own"
+        ),
     )
     slot_at: datetime | None = Field(
         default=None,

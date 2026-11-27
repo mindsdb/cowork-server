@@ -136,6 +136,7 @@ def _create_schedule(scoped: ScopedSession, *, body: ScheduleCreateRequest, excl
             timezone=body.timezone,
             project_id=body.project_id,
             enabled=body.enabled,
+            deliver_to_teams=body.deliver_to_teams,
             disabled_connections=exclusions,
         )
     except ValueError as e:

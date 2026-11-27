@@ -731,6 +731,11 @@ async def lifespan(app: FastAPI):
             post_reaped_run_notices(recovery_session, [run.id for run in executed])
         finally:
             recovery_session.close()
+        from cowork.services.connectors.teams.delivery import forget_interrupted_deliveries
+
+        if interrupted := forget_interrupted_deliveries():
+            logger.warning("Teams deliveries a stop interrupted are unknown",
+                           extra={"event": "teams_deliveries_unknown", "count": interrupted})
     except Exception:
         logger.exception("scheduled-run boot recovery failed (non-fatal)")
     clock.begin("model_map_warm")
