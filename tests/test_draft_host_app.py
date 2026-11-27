@@ -96,19 +96,21 @@ def test_a_web_origin_that_is_not_bare_never_reaches_the_csp(draft_env, monkeypa
 
 
 def test_serves_the_draft_document_with_the_shim_and_the_draft_headers(client, seen):
-    response = client.get(f"/_t/{draft_token()}/index.html", headers=FETCH)
+    token = draft_token()
+    response = client.get(f"/_t/{token}/index.html", headers=FETCH)
 
     assert response.status_code == 200
-    assert response.text == prepare_preview_html(DOC, comments=False)
+    assert response.text == prepare_preview_html(DOC, comments=False, pdf_assets=f"/_t/{token}/_anton_pdf/")
     assert response.headers["content-type"].startswith("text/html")
     _assert_draft_headers(response)
 
 
 def test_the_comment_layer_follows_the_activation_flag(client, seen):
-    response = client.get(f"/_t/{draft_token()}/index.html?{ACTIVATION_PARAM}=1", headers=FETCH)
+    token = draft_token()
+    response = client.get(f"/_t/{token}/index.html?{ACTIVATION_PARAM}=1", headers=FETCH)
 
     assert response.status_code == 200
-    assert response.text == prepare_preview_html(DOC, comments=True)
+    assert response.text == prepare_preview_html(DOC, comments=True, pdf_assets=f"/_t/{token}/_anton_pdf/")
 
 
 def test_relative_assets_load_with_the_same_token(client, seen):

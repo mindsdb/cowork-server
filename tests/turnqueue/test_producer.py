@@ -1013,8 +1013,9 @@ def _timeout(request):
     lambda request: httpx.Response(403, json={"detail": "forbidden"}),
     lambda request: httpx.Response(400, json={"user_id": ["unknown"]}),
     lambda request: httpx.Response(503, text="unavailable"),
+    lambda request: httpx.Response(400, content=b'{"purpose":' + b"[" * 10_000 + b"]" * 10_000 + b"}"),
     _timeout,
-], ids=["403", "400-other-field", "503", "timeout"])
+], ids=["403", "400-other-field", "503", "400-nested-too-deep", "timeout"])
 async def test_any_other_connector_key_failure_leaves_mcp_connections_out(monkeypatch, handler):
     mint = _connector_mint_answered_by(monkeypatch, handler)
     # The module logger rather than caplog: another test in the suite

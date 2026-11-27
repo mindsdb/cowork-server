@@ -29,6 +29,7 @@ from anton.core.tools.connector_draft import ConnectorDraftBox, connector_draft_
 import cowork.handlers.responses as responses_mod
 from cowork.common import event_clock
 from cowork.handlers.responses import ResponsesHandler, _RemoteArtifactsDir
+from cowork.handlers.turn_errors import ALLOWANCE_EXHAUSTED_USER_MESSAGE, FREE_SERVING_PAUSED_USER_MESSAGE
 from cowork.services.artifact_identity import ListedIds
 from cowork.services.connectors.custom_connectors import CustomConnectorService
 from cowork.streaming.registry import TurnLifecycle
@@ -1678,15 +1679,12 @@ async def _remote_failure_frames(monkeypatch, failed_data):
         (
             "FreeServingPausedError: paused",
             "free_serving_paused",
-            (
-                "Free MindsHub Air is paused for everyone until the daily budget resets. "
-                "Add credits to keep working now."
-            ),
+            FREE_SERVING_PAUSED_USER_MESSAGE,
         ),
         (
             "AllowanceExhaustedError: exhausted",
             "included_allowance_exhausted",
-            "You have no free MindsHub Air allowance left. Add credits to keep working now.",
+            ALLOWANCE_EXHAUSTED_USER_MESSAGE,
         ),
     ],
 )
@@ -1774,7 +1772,7 @@ async def test_produce_remote_failure_without_reset_at_keeps_its_shape(monkeypat
     # An older worker sends none, so the frame stays exactly as before.
     frame, events = await _remote_failure_frames(monkeypatch, {
         "error": "FreeServingPausedError: paused", "code": "free_serving_paused",
-        "message": "Free MindsHub Air is paused.",
+        "message": "Free models are paused.",
     })
     assert "reset_at" not in frame
     assert "reset_at" not in events[-1]

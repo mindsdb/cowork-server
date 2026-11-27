@@ -308,6 +308,29 @@ async def test_listing_sends_the_turn_key_prefix_and_the_producer_identity(monke
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("call", ["datasource listing", "datasource grants", "custom API listing", "custom API grants"])
+async def test_an_answer_nested_too_deep_to_parse_is_a_permission_failure(monkeypatch, call):
+    from cowork.services.product_permissions import ProductPermissionUnavailable
+    from cowork.turnqueue import auth_keys
+
+    async def handler(request):
+        return httpx.Response(200, content=b"[" * 10_000 + b"]" * 10_000)
+
+    _over_mock_transport(monkeypatch, handler)
+    listing = {"org_id": "o1", "user_id": "u1", "turn_key_id": "mdb_prefix", "settings": _DatasourceSettings()}
+    grants = {**listing, "correlation_id": "r", "connection_ids": [7]}
+    run = {
+        "datasource listing": lambda: auth_keys.list_verified_datasource_connections(**listing),
+        "datasource grants": lambda: auth_keys.register_datasource_grants(**grants),
+        "custom API listing": lambda: auth_keys.list_custom_api_connections(**listing),
+        "custom API grants": lambda: auth_keys.register_custom_api_grants(**grants),
+    }[call]
+
+    with pytest.raises(ProductPermissionUnavailable):
+        await run()
+
+
+@pytest.mark.asyncio
 async def test_a_denied_listing_is_a_permission_failure_not_a_transport_error(monkeypatch):
     from cowork.services.product_permissions import ProductPermissionUnavailable
     from cowork.turnqueue.auth_keys import list_verified_datasource_connections

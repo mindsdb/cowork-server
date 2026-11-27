@@ -193,13 +193,13 @@ FAILURE_MESSAGES = {
     "model_unavailable": "This model is not available to your account. Choose another model.",
     "model_upstream_unavailable": "The model service is temporarily unavailable. Try again in a moment.",
     "rate_limited": "MindsHub is receiving requests from your organization too quickly. Wait a moment, then continue.",
-    "included_allowance_exhausted": "Your included allowance is used up. Add credits to continue now, or wait for it to refill.",
+    "included_allowance_exhausted": "You have no free allowance left. Add credits to continue now.",
     "window_allowance_exhausted": (
         "You've used your plan's allowance for now. Add credits to continue now, or wait for it to reset."
     ),
     "model_not_in_tier": "Your plan doesn't include this model. Upgrade your plan, add credits, or choose another model.",
     "free_air_daily_spend_fuse_exceeded": (
-        "Free MindsHub Air is paused until the daily budget resets. Add credits to continue now."
+        "Free models are paused until the daily budget resets. Add credits to continue now."
     ),
     "budget_exceeded": (
         "A spending budget is used up. An administrator can raise it in Budgets, "
