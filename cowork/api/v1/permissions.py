@@ -16,6 +16,8 @@ than "open" and "closed":
 ``SingleUserOnly``           refused wherever a scope can be one of many people
                              (``require_single_user``)
 ``PlatformSignature``        the calling platform's HMAC over the body
+``TeamsProxySignature``      the recording proxy's HMAC over method, target,
+                             timestamp and body (services/connectors/teams/bot.py)
 ``Authenticated``            a verified ``Principal``
 ``AuthenticatedInOrgMode``   a verified ``Principal``, in org mode only
 ``AuthenticatedOrgAdmin``    ... and org-admin standing

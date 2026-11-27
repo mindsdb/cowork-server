@@ -1,8 +1,8 @@
 # Teams client
 
-`cowork/channels/teams_client.py` makes cowork-server's outbound calls to Microsoft Teams: it gets
-the bot's token, replies in a thread and looks up a member. It isn't a channel plugin, and nothing
-calls it yet. Receiving messages comes with the Teams plugin.
+`cowork/services/connectors/teams/client.py` makes cowork-server's outbound calls to Microsoft
+Teams: it gets the bot's token, replies in a thread and looks up a member. The Teams connector's
+internal routes use it ([Teams connector on a self-hosted Cowork](TEAMS_BOT.md)).
 
 ## Where it runs
 
@@ -37,7 +37,7 @@ anywhere with the packages installed:
 import asyncio
 import os
 
-from cowork.channels.teams_client import TeamsClient, teams_available
+from cowork.services.connectors.teams.client import TeamsClient, teams_available
 
 
 async def main() -> None:
@@ -71,3 +71,6 @@ member = await client.get_member(service_url, conversation_id, member_id)
 
 Each call sends the bot's token to `service_url`. Check it against the allowed Teams hosts before
 calling, so a forged message can't send the token elsewhere.
+
+On a self-hosted Cowork, the client is used through two internal routes; see
+[Teams connector on a self-hosted Cowork](TEAMS_BOT.md).
