@@ -4,8 +4,8 @@ A cloud submission carries a database password. It must reach auth's
 encrypted store and nothing else: no staging store, no probe, no local vault,
 on the success path and on every refusal. Each org case runs with those paths
 booby-trapped, so a fallback that quietly saves the credential fails the test
-rather than passing it. A connector with no cloud datasource form takes the
-ordinary submission flow in org mode too, and never reaches the relay.
+rather than passing it. Any other built-in is refused in org mode before it
+is staged, since only this server's vault would keep it.
 
 The desktop cases at the bottom pin the other half: local mode still stages
 and probes exactly as before.
@@ -557,40 +557,67 @@ def test_an_org_stored_custom_connector_is_refused_before_it_is_staged(org_clien
     assert staged_in_org == [] and recorded == []
 
 
-def test_an_org_built_in_outside_the_database_category_takes_the_submission_flow(
-    org_client_with_local_flow, relay, monkeypatch
+@pytest.mark.parametrize(("connector_id", "method", "values"), [
+    ("linear", "personal-api-key", {"api_key": PASSWORD, "workspace_url": "acme"}),
+    ("hubspot", "private-app", {"access_token": PASSWORD}),
+    ("datadog", "api-key", {"api_key": PASSWORD, "application_key": "app-key", "region": "us1"}),
+], ids=["linear personal-api-key", "hubspot private-app", "datadog api-key"])
+def test_an_org_token_form_for_a_built_in_is_refused_before_it_is_staged(
+    org_client, relay, monkeypatch, tmp_path, caplog, connector_id, method, values
 ):
-    from cowork.api.v1.endpoints.connectors import submissions as submissions_endpoint
-    from cowork.services.connectors.submissions import store
+    """A token for a built-in that auth does not store would only be kept on
+    this server, which no org turn reads. It is refused before it is staged,
+    probed or saved, and no probe env file is written."""
+    from cowork.services.connectors import probe as probe_service
 
+    probe_dir = tmp_path / "probe"
+    monkeypatch.setattr(probe_service, "_probe_tmp_dir", lambda: probe_dir)
     recorded, _ = relay
-    staged: dict = {}
-    real_stage = store.stage
 
-    def record_stage(**kwargs):
-        staged.update(kwargs)
-        return real_stage(**kwargs)
+    with caplog.at_level(logging.DEBUG):
+        res = org_client.post(
+            PATH,
+            json=submission(connector_id=connector_id, method=method, values=values),
+            headers=AUTH_HEADERS,
+        )
 
-    class FakeProbeHandler:
-        def __init__(self, *, scope):
-            pass
-
-        async def run(self, *args):
-            yield "event: response.completed\ndata: {}\n\n"
-
-    monkeypatch.setattr(store, "stage", record_stage)
-    monkeypatch.setattr(submissions_endpoint, "ProbeHandler", FakeProbeHandler)
-    values = {"api_key": PASSWORD, "application_key": "app-key", "region": "us1"}
-
-    res = org_client_with_local_flow.post(
-        PATH,
-        json=submission(connector_id="datadog", method="api-key", values=values),
-        headers=AUTH_HEADERS,
+    assert res.status_code == 403
+    assert res.json()["detail"] == (
+        "This sign-in method is not available in the hosted app. "
+        "Use the connector's sign-in option instead."
     )
+    assert PASSWORD not in res.text and PASSWORD not in caplog.text
+    assert recorded == []
+    assert not probe_dir.exists() or list(probe_dir.iterdir()) == []
+
+
+REPLACES_PATH = "/api/v1/connectors/submissions/replaces"
+
+
+@pytest.fixture()
+def forbid_replaces_lookup(monkeypatch):
+    """Booby-trap the local vault reads behind ``/replaces``."""
+    from cowork.api.v1.endpoints.connectors import submissions as submissions_endpoint
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("an org-mode replaces lookup read the local vault")
+
+    monkeypatch.setattr(submissions_endpoint, "vault_for_scope", forbidden)
+    monkeypatch.setattr(submissions_endpoint, "connection_a_new_save_replaces", forbidden)
+
+
+@pytest.mark.parametrize("body", [
+    submission(connector_id="linear", method="personal-api-key", name="",
+               values={"api_key": PASSWORD, "workspace_url": "acme"}),
+    {"form_id": HANDCRAFTED_FORM["form_id"], "name": "", "form_spec": HANDCRAFTED_FORM,
+     "values": {"token": PASSWORD}, "skipped": []},
+], ids=["built-in token form", "handcrafted form"])
+def test_an_org_replaces_lookup_never_reads_the_local_vault(org_client, forbid_replaces_lookup, body):
+    """Nothing in org mode is saved locally, so no submission replaces a local record."""
+    res = org_client.post(REPLACES_PATH, json=body, headers=AUTH_HEADERS)
 
     assert res.status_code == 200
-    assert staged["connector_id"] == "datadog"
-    assert recorded == []
+    assert res.json() == {"replaces": None}
 
 
 def test_an_org_connector_unknown_to_the_registry_is_not_relayed(org_client_with_local_flow, relay):
