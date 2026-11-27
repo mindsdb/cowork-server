@@ -82,10 +82,10 @@ deployment:
     - name: COWORK_ORGANIZATION_SWITCH_ENABLED
       value: "true"
 
-    # Offers Slack's In-Browser Connect. Unset (prod), Slack shows only the
-    # bot-token method: the Slack app is internal to one workspace for now.
-    - name: SLACK_CONNECTOR_ENABLED
-      value: "true"
+    # SLACK_CONNECTOR_ENABLED (Slack's In-Browser Connect through its MCP
+    # server) stays unset everywhere while our Slack app is distributed
+    # outside the Marketplace: Slack's MCP refuses such an app, so In-Browser
+    # Connect signs in for Slack's REST API instead.
 
     # The agent's browser on the web: the browser router, served on this host
     # under /browser. Unset, the web app offers no browser; see README.md.

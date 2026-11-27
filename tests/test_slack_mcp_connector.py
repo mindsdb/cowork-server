@@ -90,25 +90,30 @@ class TestSpec:
             for method in ((raw.get("form") or {}).get("methods") or [])
             if (method.get("oauth") or {}).get("redirect_port") == 47297
         ]
-        assert users == [("slack", "mcp")]
+        assert sorted(users) == [("slack", "browser_oauth_builtin"), ("slack", "mcp")]
 
 
 class TestSwitchedOff:
-    """SLACK_CONNECTOR_ENABLED off, as in prod for now: the spec served to
-    clients shows the same methods as before the `mcp` method, and new
-    In-Browser Connect sign-ins are refused."""
+    """SLACK_CONNECTOR_ENABLED off, as while our Slack app is distributed
+    outside the Marketplace: In-Browser Connect signs in for REST instead,
+    and new MCP sign-ins are refused."""
 
-    def test_the_mcp_method_is_hidden_and_the_bot_token_is_the_default(self, slack_off):
+    def test_in_browser_connect_is_the_rest_method(self, slack_off):
         methods = _methods()
+        assert methods["browser_oauth_builtin"].label == "In-Browser Connect"
+        assert methods["browser_oauth_builtin"].hidden is False
+        assert methods["browser_oauth_builtin"].recommended is True
         assert methods["mcp"].hidden is True
         assert methods["mcp"].recommended is False
-        assert methods["bot-token"].recommended is True
-        assert methods["oauth"].hidden is False
+        assert methods["bot-token"].recommended is False
+        assert methods["bot-token"].hidden is False
+        assert methods["oauth"].hidden is True
 
     def test_switching_on_shows_the_mcp_method(self, slack_on):
         methods = _methods()
         assert methods["mcp"].hidden is False
         assert methods["mcp"].recommended is True
+        assert methods["browser_oauth_builtin"].hidden is True
         assert methods["bot-token"].recommended is False
         assert methods["oauth"].hidden is True
 
@@ -163,9 +168,10 @@ class TestSwitchedOff:
         assert response.status_code == 403
         assert own_vault_for_scope(LOCAL_SCOPE).load("slack", name)["bot_token"] == "xoxb-1"
 
-    def test_starting_a_slack_sign_in_is_refused(self, sharepoint_stores, slack_off):
+    def test_starting_a_slack_sign_in_is_not_refused(self, sharepoint_stores, slack_off):
+        # The REST sign-in starts with the switch off; this one only lacks credentials.
         response = self._client().post("/api/v1/connectors/oauth/slack/start", json={})
-        assert response.status_code == 404
+        assert response.status_code != 404
 
 
 def test_credentials_need_both_id_and_secret(monkeypatch):

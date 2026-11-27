@@ -30,6 +30,46 @@
     "logo_color": "#4A154B",
     "methods": [
       {
+        "id": "browser_oauth_builtin",
+        "label": "In-Browser Connect",
+        "description": "Opens Slack sign-in in your browser. No credentials required, just click Connect. Anton acts as you and can read and post wherever you can in the workspace you pick; it shows you a message and waits for your OK before posting. Until Slack approves our app, reading channel history is slow: Slack allows one request a minute.",
+        "recommended": true,
+        "hidden": false,
+        "fields": [],
+        "oauth": {
+          "auth_url": "https://slack.com/oauth/v2_user/authorize",
+          "token_url": "https://slack.com/api/oauth.v2.user.access",
+          "scopes": [
+            "channels:history",
+            "channels:read",
+            "groups:history",
+            "groups:read",
+            "im:history",
+            "im:read",
+            "mpim:history",
+            "mpim:read",
+            "search:read",
+            "files:read",
+            "reactions:read",
+            "emoji:read",
+            "users:read",
+            "users:read.email",
+            "chat:write",
+            "reactions:write",
+            "files:write",
+            "channels:write",
+            "groups:write",
+            "im:write",
+            "mpim:write"
+          ],
+          "service_id": "slack",
+          "supports_refresh": true,
+          "supports_revoke": true,
+          "redirect_host": "localhost",
+          "redirect_port": 47297
+        }
+      },
+      {
         "id": "mcp",
         "label": "In-Browser Connect",
         "description": "Opens Slack sign-in in your browser through Slack MCP, the same mechanism Claude's own Slack connector uses. No credentials required, just click Connect. Anton acts as you and can reach whatever you can reach in the workspace you pick. Anton can read; it posts or edits only when you allow it in Tool access. Code Projects posts an update only after you confirm it.",
@@ -159,5 +199,6 @@
     "logo_url": "logos/slack.svg"
   },
   "logo_url": "logos/slack.svg",
-  "featured": false
+  "featured": false,
+  "usage_notes": "A connection made with In-Browser Connect and no MCP tools gives you a Slack user token as `DS_SLACK_<CONNECTION>__ACCESS_TOKEN`; a bot-token connection gives `DS_SLACK_<CONNECTION>__BOT_TOKEN`. Call Slack's Web API at `https://slack.com/api/<method>` with `Authorization: Bearer <token>`. Every response has `ok`; when it is false, read `error`. Until Slack approves our app, `conversations.history` and `conversations.replies` allow one request a minute and return at most 15 messages each. So search first with `search.messages` (`query` uses Slack's search syntax, such as `in:#channel`, `from:@name`, `after:2026-01-31`), read history only for the channel or thread you need, make at most a few such calls in one answer, and tell the user when reading more would take minutes. On HTTP 429, wait the `Retry-After` seconds before trying again; never loop over many channels. Use `conversations.list` (`types=public_channel,private_channel`) to find channel ids. Messages name people by user id (`U…`, also inside `<@U…>` mentions); look each id up once with `users.info` and show the person's name, never the bare id. To read a file, download its `url_private_download` with the same `Authorization` header. The token can post as the user, and the message shows as theirs. Before any call that writes (`chat.postMessage`, `chat.update`, `reactions.add` and the like), show the user exactly what you will send and where, and wait for their OK in the conversation.\nA connection made with In-Browser Connect that does have Slack MCP tools uses those tools instead of raw HTTP calls."
 }
