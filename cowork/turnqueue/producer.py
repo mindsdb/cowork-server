@@ -1252,13 +1252,11 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
     pod's configured default.
     `memory_off` tells the controller this turn's settings say memory reads
     are off, so it mounts no global memory tier for the pod, on a new pod
-    and on a reused one whose mount disagrees. Without it (an older
-    controller, or this flag silently dropped) the pod still mounts the
-    person's global tier and anton reads it straight off disk, unaffected
-    by whether `memory` above carries project slots.
-    Deploy order: scratchpad-controller merges and deploys first, so this
-    flag is never silently ignored while it also removes the desktop's 501
-    refusal for "memory": "off"."""
+    and on a reused one whose mount disagrees. A controller that predates
+    this field drops it and keeps mounting the person's global tier, which
+    anton reads straight off disk unaffected by whether `memory` above
+    carries project slots: the desktop refusal for "memory": "off" only
+    comes off once this flag is honored end to end."""
     settings = TurnQueueSettings()
     scope = scope_for_identity(org_id=org_id, user_id=user_id)
     try:
