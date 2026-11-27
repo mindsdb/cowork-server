@@ -36,6 +36,18 @@ def _takes_api_key(c: dict) -> bool:
     return False
 
 
+# The Microsoft Teams (Bot) connector: listed only where the Teams bot is set up, which is only a
+# self-hosted Cowork, and never offered to the agent as a data source.
+TEAMS_BOT_CONNECTOR = "microsoft_teams_bot"
+
+
+def _teams_bot_listed() -> bool:
+    from cowork.services.connectors.teams.bot import TeamsSettings
+    from cowork.services.connectors.teams.client import teams_available
+
+    return teams_available() and not TeamsSettings().missing()
+
+
 def connector_metadata(c: dict) -> ConnectorMetadataResponse:
     """Return a raw connector spec's directory entry, defaults filled in."""
     return ConnectorMetadataResponse(
@@ -52,6 +64,7 @@ def connector_metadata(c: dict) -> ConnectorMetadataResponse:
         custom=c.get("custom", False),
         needs_rebuild=c.get("needs_rebuild", False),
         api_key=_takes_api_key(c),
+        bot=c.get("bot", False),
     )
 
 
@@ -95,7 +108,15 @@ class ConnectorSpecRegistry:
     def get_connectors(self) -> dict[str, dict]:
         if self._cache is None:
             self._cache = self._load_all()
+            # Decided once per load: the Teams settings come from the environment. Dropping it from
+            # the cache, rather than returning a filtered copy, keeps additions to the cache in it.
+            if not _teams_bot_listed():
+                self._cache.pop(TEAMS_BOT_CONNECTOR, None)
         return self._cache
+
+    def _data_connectors(self) -> list[dict]:
+        """The connectors the agent may offer to connect: every one but the bot, which holds no data."""
+        return [c for cid, c in self.get_connectors().items() if cid != TEAMS_BOT_CONNECTOR]
 
     def get_connector(self, connector_id: str) -> ConnectorSpecResponse | None:
         c = self.get_connectors().get(connector_id)
@@ -149,6 +170,7 @@ class ConnectorSpecRegistry:
             custom=c.get("custom", False),
             needs_rebuild=c.get("needs_rebuild", False),
             api_key=_takes_api_key(c),
+            bot=c.get("bot", False),
             keywords=c.get("keywords", []),
             form=form,
             check=c.get("check"),
@@ -166,7 +188,7 @@ class ConnectorSpecRegistry:
         nq = self._normalize(query)
         if not nq:
             return None
-        for c in self.get_connectors().values():
+        for c in self._data_connectors():
             if self._normalize(c.get("id", "")) == nq:
                 return c["id"]
             for alias in c.get("aliases", []):
@@ -203,7 +225,7 @@ class ConnectorSpecRegistry:
             )
 
         scored: list[tuple[float, str]] = []
-        for c in self.get_connectors().values():
+        for c in self._data_connectors():
             s = self._token_score(query, c)
             if s > 0:
                 scored.append((s, c["id"]))

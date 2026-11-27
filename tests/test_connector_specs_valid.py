@@ -166,7 +166,7 @@ def test_spec_id_matches_its_filename(path: Path):
     )
 
 
-def test_registry_loads_every_spec_file():
+def test_registry_loads_every_spec_file(monkeypatch):
     """The direct guard on the silent skip.
 
     `_load_all` swallows a parse failure, so a broken spec shows up only as a
@@ -177,6 +177,8 @@ def test_registry_loads_every_spec_file():
     `test_spec_id_matches_its_filename` above is what ties the two together, so
     a failure here means a genuine load failure rather than a naming drift.
     """
+    # Listed as where the Teams bot is set up, so its connector, hidden elsewhere, counts as loaded.
+    monkeypatch.setattr("cowork.services.connectors.specs._registry._teams_bot_listed", lambda: True)
     loaded = ConnectorSpecRegistry(SPECS_DIR).get_connectors()
     declared = {
         json.loads(p.read_text(encoding="utf-8")).get("id", p.stem) for p in SPEC_FILES

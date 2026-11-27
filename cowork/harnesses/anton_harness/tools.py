@@ -47,7 +47,7 @@ from cowork.services.connectors.custom_connectors import (
 )
 from cowork.services.connectors.persist import vault_for_scope
 from cowork.services.connectors.sharepoint import ENGINE as SHAREPOINT
-from cowork.services.connectors.specs._registry import ConnectorSpecRegistry, registry
+from cowork.services.connectors.specs._registry import TEAMS_BOT_CONNECTOR, ConnectorSpecRegistry, registry
 
 
 if TYPE_CHECKING:
@@ -670,6 +670,26 @@ def _sharepoint_instruction() -> str:
     )
 
 
+_TEAMS_BOT_INSTRUCTION = (
+    "Microsoft Teams (Bot) holds no data and isn't connected from chat. "
+    "The person connects it themselves in Connect Apps and Data."
+)
+
+
+async def _names_the_listed_teams_bot(cid: str, query: str) -> bool:
+    """Whether the lookup names Microsoft Teams (Bot) by id or alias, on an install that lists it."""
+    asked = {_lookup_normalize(value) for value in (cid, query) if value}
+
+    def named(catalog) -> bool:
+        bot = catalog.get_connectors().get(TEAMS_BOT_CONNECTOR)
+        if bot is None:
+            return False
+        names = {bot.get("id", ""), bot.get("label", ""), *bot.get("aliases", [])}
+        return bool(asked & {_lookup_normalize(name) for name in names if name})
+
+    return await _read_scope_catalog(named)
+
+
 async def _cowork_lookup_connector(session: Any, tc_input: dict) -> str:
     """Tool handler for `lookup_connector`.
 
@@ -687,6 +707,8 @@ async def _cowork_lookup_connector(session: Any, tc_input: dict) -> str:
 
     if not cid and not query:
         return "lookup_connector: provide either `id` (a connector slug) or `query` (a natural-language name)."
+    if await _names_the_listed_teams_bot(cid, query):
+        return json.dumps({"id": None, "match": "none", "message": _TEAMS_BOT_INSTRUCTION})
 
     def _present(connector: dict, confidence: float, stage: str) -> str:
         if connector.get("id") == SHAREPOINT:
@@ -918,8 +940,11 @@ async def _read_scope_catalog(read: Callable[[ConnectorSpecRegistry], T]) -> T:
 
 async def _scope_connectors() -> dict[str, dict]:
     """Return built-in and custom connector specs visible to this turn's scope,
-    as raw specs keyed by connector id."""
-    return await _read_scope_catalog(lambda catalog: dict(catalog.get_connectors()))
+    as raw specs keyed by connector id. Microsoft Teams (Bot) is never among them:
+    it holds no data, and only the person connects it, in Connect Apps and Data."""
+    return await _read_scope_catalog(lambda catalog: {
+        cid: c for cid, c in catalog.get_connectors().items() if cid != TEAMS_BOT_CONNECTOR
+    })
 
 
 async def scope_usage_notes(engines: Iterable[str]) -> dict[str, str]:
@@ -1035,6 +1060,8 @@ async def _cowork_request_credentials(session: Any, tc_input: dict) -> str:
         return f"request_credentials: {e}"
     if connector_id == SHAREPOINT:
         return f"request_credentials: {_sharepoint_instruction()}"
+    if connector_id == TEAMS_BOT_CONNECTOR:
+        return f"request_credentials: {_TEAMS_BOT_INSTRUCTION}"
     known = (await _scope_connectors()).get(connector_id)
     extends_name = spec.get("extends_connection")
     custom = bool(known and known.get("custom"))
