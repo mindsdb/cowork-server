@@ -42,9 +42,14 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 # does leak, and reads identically to this.
 #
 # Order matters: the sync must resolve the version before .git is gone.
+#
+# pdf.js is not committed. The wheel build hook fetches it, but uv may take
+# the project from its cache without running the hook, so it is fetched here
+# first; the hook then finds it in place.
 COPY . /app
 RUN --mount=type=cache,target=/root/.cache/uv \
-    uv sync --locked --no-dev \
+    python cowork/services/pdf_viewer/fetch_pdfjs.py \
+    && uv sync --locked --no-dev \
     && v="$(.venv/bin/python -c 'from importlib.metadata import version; print(version("cowork-server"))')" \
     && echo "cowork-server version: $v" \
     && case "$v" in 0.0.0*) \
