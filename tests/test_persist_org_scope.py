@@ -83,9 +83,15 @@ def test_a_save_with_no_scope_is_refused_under_org_tenancy(org_tenancy):
 
 @pytest.mark.parametrize("scope", [LOCAL_SCOPE, PERSON], ids=["operator scope", "personal scope"])
 def test_any_scope_is_refused_under_org_tenancy(org_tenancy, scope):
-    """No code path on an org deployment saves to this server's vault, whatever scope it holds."""
+    """persist_connection refuses any scope under org tenancy."""
     with pytest.raises(OrgLocalSaveRefused):
         persist_connection("linear", "personal-api-key", "", {"api_key": TOKEN}, vault=_UntouchableVault(), scope=scope)
+
+
+def test_an_org_scope_is_refused_under_local_tenancy(local_tenancy):
+    """The scope alone is enough: an org scope never saves to this server's vault."""
+    with pytest.raises(OrgLocalSaveRefused):
+        persist_connection("linear", "personal-api-key", "", {"api_key": TOKEN}, vault=_UntouchableVault(), scope=ORG)
 
 
 def test_a_save_with_no_scope_still_writes_on_the_desktop(local_tenancy):
