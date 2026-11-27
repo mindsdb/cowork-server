@@ -33,8 +33,29 @@ except ImportError:
 
 LOGIN_HOST = "https://login.microsoftonline.com"
 BOT_SCOPE = "https://api.botframework.com/.default"
+# Teams' extended markdown shows tables, headings, fenced code and task lists as an agent writes them;
+# its default markdown shows only bold, italic and links. The Teams SDK marks it public preview, so
+# "markdown" is the fallback if Microsoft changes it.
+TEXT_FORMAT = "extendedmarkdown"
+
 # Text that opens with a markdown block: a list item, heading, table, code block or quote.
 _STARTS_A_BLOCK = re.compile(r"( {4}|\t)|\s*([-*+][ \t]|\d+[.)][ \t]|#|\||```|~~~|>)")
+# A "<" that could open an HTML tag or comment: <img, <svg, </p>, <!--, <?xml.
+_TAG_START = re.compile(r"<(?=[A-Za-z/!?])")
+
+
+def without_images(text: str) -> str:
+    """TEXT with each markdown image turned into a plain link, and each HTML tag shown as text.
+
+    An agent's answer can carry text a document planted, and an image would make every reader's
+    Teams fetch its address, carrying whatever the answer put in it, without a click. That covers
+    <img>, <svg><image>, <video poster>, <picture>, <input type=image> and style="url(...)", so no
+    tag is let through. Code is filtered too: telling code apart the way Markdown does is easy to
+    get wrong (an unclosed ```, escaped backticks, a backtick inside an attribute), so in code an
+    image shows as a link and a tag starts with &lt;."""
+    return _TAG_START.sub("&lt;", re.sub(r"!+(?=\[)", "", text))
+
+
 # What Microsoft's client returns as an activity's id when Teams answered with an empty body.
 _NO_ID = "DO_NOT_USE_PLACEHOLDER_ID"
 
@@ -125,18 +146,21 @@ class TeamsClient:
         """Post ``text`` as a reply in the thread of ``activity_id``; returns the new message's id.
 
         ``mention``, a member's (id, name), @mentions them ahead of the text, so Teams notifies them.
-        ``stream_id``, from ``status``, posts it as that stream's final message instead.
+        ``stream_id``, from ``status``, posts it as that stream's final message instead. The text is
+        sent in Teams' extended markdown (TEXT_FORMAT).
         """
+        text = without_images(text)
         activity = MessageActivityInput(text=text)
         if mention:
             member_id, name = mention
             # The name is markup inside <at>; the entity's text must match the message's exactly.
-            tag = f"<at>{html.escape(name)}</at>"
+            tag = f"<at>{html.escape(name, quote=False)}</at>"
             # On a line of its own before a block, or Teams runs the block's first line into the name.
             gap = "\n\n" if _STARTS_A_BLOCK.match(text) else " "
             activity = MessageActivityInput(text=f"{tag}{gap}{text}").add_mention(
-                Account(id=member_id, name=name), text=html.escape(name), add_text=False
+                Account(id=member_id, name=name), text=html.escape(name, quote=False), add_text=False
             )
+        activity = activity.with_text_format(TEXT_FORMAT)
         if stream_id:
             activity.reply_to_id = activity_id
             activity.channel_data = ChannelData(stream_id=stream_id, stream_type="final")

