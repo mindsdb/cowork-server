@@ -1,10 +1,9 @@
-"""ENG-2094: the set of routes that answer with no credential at all, pinned.
+"""The set of routes that answer with no credential at all, pinned.
 
-Ported from auth's ``tests/unit/test_permission_declarations.py``
-(``_OPEN_BY_DESIGN_REASONS``, ENG-1563), which is the one mechanism of the
-three sibling front doors cowork-server did not have. The declaration in the
-route file says a route is open; nothing until now said the SET of open routes
-was reviewed. A pin closes that: route 13 cannot arrive without a diff that
+This is the open-by-design pin that MindsDB's sibling services already
+keep, the one mechanism of their front doors cowork-server did not have.
+The declaration in the route file says a route is open; nothing until now
+said the SET of open routes was reviewed. A pin closes that: route 13 cannot arrive without a diff that
 makes someone write down why, in the same commit, in a file whose only job is
 to be read.
 
@@ -23,13 +22,18 @@ Only ``OpenByDesign`` is pinned. The other non-identity declarations
 a check that refuses, so a route inheriting one of those from a router
 inherits a closed door. ``OpenByDesign`` is the
 only declaration where inheriting it is the hazard.
+
+A route that declares ``WindowProof`` and nothing else is pinned here too.
+Where no launch hand-off is held, the proof is a no-op and the route answers
+with no credential, and ``contradictory_routes`` keeps such a route from
+declaring ``OpenByDesign`` beside the proof.
 """
 from __future__ import annotations
 
 import pytest
 from fastapi.routing import APIRoute, APIWebSocketRoute
 
-from cowork.api.v1.permissions import OpenByDesign
+from cowork.api.v1.permissions import OpenByDesign, WindowProof
 from cowork.api.v1.route_walker import declared_permissions, route_key
 from cowork.server import create_app
 
@@ -70,7 +74,8 @@ OPEN_BY_DESIGN_REASONS: dict[tuple[str, tuple[str, ...]], str] = {
     ),
     ("/api/v1/settings/logout", ("POST",)): (
         "a no-op in org mode; the desktop half is loopback-gated by "
-        "require_local_in_desktop_mode"
+        "require_local_in_desktop_mode and asks for the window proof while the "
+        "server holds the launch hand-off"
     ),
     ("/api/v1/settings/install-status", ("GET",)): "a hardcoded stub; there is nothing to expose",
     ("/api/v1/integrations", ("GET",)): "a hardcoded stub returning an empty list",
@@ -129,7 +134,7 @@ def open_routes() -> set[tuple[str, tuple[str, ...]]]:
     for route in app.routes:
         if not isinstance(route, (APIRoute, APIWebSocketRoute)):
             continue
-        if {cls for cls in declared_permissions(route)} != {OpenByDesign}:
+        if {cls for cls in declared_permissions(route)} not in ({OpenByDesign}, {WindowProof}):
             continue
         path, methods = route_key(route)
         found.add((path, tuple(m for m in methods if m != "HEAD")))
@@ -175,7 +180,7 @@ def test_every_reason_stands_without_naming_a_layer_in_front(open_routes):
 def test_the_open_set_is_small_enough_to_read(open_routes):
     """A number someone notices moving.
 
-    mindshub_services pins its own route count for the same reason. The bound
+    Sibling services pin their own route counts for the same reason. The bound
     is deliberately loose — it is a tripwire for a bulk reclassification, not
     a budget to spend down.
     """

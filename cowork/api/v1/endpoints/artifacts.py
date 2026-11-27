@@ -35,7 +35,7 @@ from cowork.db.scoped import (
 )
 from cowork.db.session import get_session
 from cowork.principal import Principal, get_principal
-from cowork.api.v1.permissions import AuthenticatedInOrgMode, DesktopOnly, OpenByDesign, require
+from cowork.api.v1.permissions import AuthenticatedInOrgMode, DesktopOnly, OpenByDesign, WindowProof, require
 from cowork.api.v1.artifact_preview import (
     artifact_response_headers,
     html_preview_response,
@@ -1292,7 +1292,7 @@ async def preview_artifact(scope: ScopeDep, path: str = Query(...)):
         raise HTTPException(status_code=500, detail="Could not read artifact") from e
 
 
-@router.post("/preview-mount", dependencies=[Depends(require(DesktopOnly))])
+@router.post("/preview-mount", dependencies=[Depends(require(DesktopOnly)), Depends(require(WindowProof))])
 async def preview_mount_endpoint(req: _PathBody, request: Request, scope: ScopeDep):
     try:
         artifact = resolve_artifact_path(req.path, scope=scope)
@@ -1381,7 +1381,7 @@ def serve_artifact_file(
     return FileResponse(target, media_type=media_type, headers=artifact_response_headers(media_type))
 
 
-@router.post("/open", dependencies=[Depends(require(DesktopOnly))])
+@router.post("/open", dependencies=[Depends(require(DesktopOnly)), Depends(require(WindowProof))])
 async def open_artifact(req: _PathBody, scope: ScopeDep):
     from cowork.services.artifacts import _org_mode, _NO_EXEC_DETAIL
     # In org mode this always refuses; see _org_mode's docstring in services/artifacts.py.

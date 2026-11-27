@@ -30,7 +30,7 @@ from pydantic import BaseModel, Field
 from cowork.api.v1.artifact_scope import review_artifact_for_request, scoped_project_id_for_request
 from cowork.api.v1.content_disposition import attachment_disposition
 from cowork.api.v1.endpoints.artifact_workspace import ArtifactIdDep
-from cowork.api.v1.permissions import AuthenticatedInOrgMode, require
+from cowork.api.v1.permissions import AuthenticatedInOrgMode, WindowProof, require
 from cowork.db.scoped import SYSTEM_SCOPE, ScopedSession, TenantScope, get_tenant_scope
 from cowork.db.units import FilesystemBusy, run_db, run_efs
 from cowork.docs import republish
@@ -242,7 +242,7 @@ class _OpsBody(BaseModel):
     clientId: str | None = Field(default=None, max_length=100)
 
 
-@router.post("/{project_ref}/{artifact_id}/ops")
+@router.post("/{project_ref}/{artifact_id}/ops", dependencies=[Depends(require(WindowProof))])
 async def edit_doc(
     project_ref: str, artifact_id: ArtifactIdDep, body: _OpsBody, scope: TenantScope = Depends(get_tenant_scope)
 ):
@@ -407,7 +407,7 @@ class _RestoreBody(BaseModel):
     clientId: str | None = Field(default=None, max_length=100)
 
 
-@router.post("/{project_ref}/{artifact_id}/history/{rev}/restore")
+@router.post("/{project_ref}/{artifact_id}/history/{rev}/restore", dependencies=[Depends(require(WindowProof))])
 async def restore_version(
     project_ref: str,
     artifact_id: ArtifactIdDep,

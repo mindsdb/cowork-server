@@ -27,6 +27,7 @@ from fastapi import HTTPException
 from pydantic import SecretStr
 
 from cowork.code_sandbox import refuse_planted_links
+from cowork.common.launch_environment import launch_value
 from cowork.common.logger import log_context
 from cowork.common.minds_tls import minds_ssl_verify
 from cowork.common.paths import cowork_home, pod_local_only
@@ -92,7 +93,12 @@ from cowork.docs.store import DOC_HTML, is_doc_folder, is_doc_primary
 from cowork.schemas.export_child import PublishFileRequest, PublishMarkdownRequest
 from cowork.services import share_hooks
 from cowork.services.artifact_metadata import WIDGET_PUBLISH_REFUSAL, is_widget
-from cowork.services.file_page import PUBLISHABLE_FILE_SUFFIXES, published_file_name
+from cowork.services.file_page import (
+    DOCUMENT_VIEWER_PATH,
+    PUBLISHABLE_FILE_SUFFIXES,
+    VIEWER_BASE_PATTERN,
+    published_file_name,
+)
 from cowork.services.artifacts import (
     _content_mtime,
     _load_metadata,
@@ -1136,13 +1142,16 @@ def _render_file_to_html(path: Path, out_dir: Path, *, background: bool = False)
     if len(data) > PUBLISH_FILE_MAX_BYTES:
         raise FileNotPublishable(FILE_TOO_LARGE_MESSAGE)
     suffix = path.suffix.lower()
-    key = hashlib.sha256(b"file\0" + f"{suffix}\0{path.name}\0".encode() + data).hexdigest()
+    viewer_base = _document_viewer_base()
+    key = hashlib.sha256(
+        b"file\0" + f"{suffix}\0{path.name}\0{viewer_base}\0".encode() + data
+    ).hexdigest()
     page = _RENDERED_PAGES.page(key)
     if page is None:
         if background and _RENDERED_PAGES.was_refused(key):
             raise FileNotPublishable(FILE_NOT_CONVERTED_MESSAGE)
         try:
-            body = _publish_file_body(data, suffix=suffix, name=path.name)
+            body = _publish_file_body(data, suffix=suffix, name=path.name, viewer_base=viewer_base)
         except FileNotPublishable:
             _RENDERED_PAGES.refuse(key)
             raise
@@ -1154,7 +1163,62 @@ def _render_file_to_html(path: Path, out_dir: Path, *, background: bool = False)
     return out_path
 
 
-def _publish_file_body(data: bytes, *, suffix: str, name: str) -> str:
+# A MindsHub publish host's first label, `api` or `view`, becomes `cowork` for
+# the Cowork web app beside it: view.mindshub.ai is beside cowork.mindshub.ai,
+# api.staging.mindshub.ai beside cowork.staging.mindshub.ai, and a PR
+# environment's view-pr-cowork-<n>.dev.mindshub.ai beside
+# cowork-pr-cowork-<n>.dev.mindshub.ai.
+# Each segment is one separator then letters and digits, so a host has exactly
+# one way to match (no backtracking over runs of "-").
+_PUBLISH_HOST_LABEL = re.compile(r"^(?:api|view)((?:[.-][a-z0-9]+)*)\.mindshub\.ai$")
+
+
+def document_viewer_base(*, web_origin: str, publish_url: str, override: str = "") -> str:
+    """Where a shared document page loads the viewer's scripts from, or "" (ENG-4687).
+
+    *override* (``COWORK_DOCUMENT_VIEWER_URL``) wins. A page published to
+    MindsHub's own service (``is_mindshub_publish_url``) loads it from the
+    Cowork web app of that host's environment, so the page and the viewer
+    always come from the same environment, whatever the server's own settings
+    name. Otherwise the server's Cowork web app (``COWORK_WEB_ORIGIN``,
+    *web_origin*); with neither, pages of the file's text alone.
+    """
+    if override:
+        base = override if override.endswith("/") else override + "/"
+    else:
+        beside = None
+        if is_mindshub_publish_url(publish_url):
+            host = (urlparse(normalize_publish_url(publish_url)).hostname or "").lower()
+            beside = _PUBLISH_HOST_LABEL.match(host)
+        if beside:
+            origin = f"https://cowork{beside.group(1)}.mindshub.ai"
+        elif web_origin.startswith("https://"):
+            origin = web_origin.rstrip("/")
+        else:
+            return ""
+        base = origin + DOCUMENT_VIEWER_PATH
+    return base if re.match(VIEWER_BASE_PATTERN, base) else ""
+
+
+def _document_viewer_base() -> str:
+    """Where this server's shared document pages load the viewer from (ENG-4687,
+    ``file_page.document_viewer_base``), or "" for pages of text alone."""
+    # The viewer is an addition to a page that reads on its own, so settings
+    # that can't be read give that page, never a failed publish.
+    try:
+        publish_url, _api_key = _resolve_publish_endpoint(get_user_settings())
+        web_origin = get_app_settings().draft_frame_origin()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("shared document pages: no viewer, settings unreadable (%s)", type(exc).__name__)
+        return ""
+    return document_viewer_base(
+        web_origin=web_origin,
+        publish_url=publish_url,
+        override=(launch_value("COWORK_DOCUMENT_VIEWER_URL") or "").strip(),
+    )
+
+
+def _publish_file_body(data: bytes, *, suffix: str, name: str, viewer_base: str = "") -> str:
     """The page body ``file_page`` renders for a file, in a conversion process."""
     from cowork.services.artifact_export import conversion_limits
     from cowork.services.export_runner import (
@@ -1166,7 +1230,7 @@ def _publish_file_body(data: bytes, *, suffix: str, name: str) -> str:
 
     try:
         conversion = convert_in_child(
-            request=PublishFileRequest(suffix=suffix, name=name[:255]),
+            request=PublishFileRequest(suffix=suffix, name=name[:255], viewer_base=viewer_base),
             source=data,
             limits=conversion_limits(org_mode=_org_mode()),
         )

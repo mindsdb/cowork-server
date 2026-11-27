@@ -85,15 +85,16 @@ def test_metadata_only_folder_has_no_content(base):
     assert (d.action, d.reason) == (None, "no_content")
 
 
-def test_a_data_file_is_never_published_on_its_own(base):
-    """A CSV (or PDF, Word, ...) shares as a page only by its owner's choice
-    (ENG-4687): autopublish leaves an unshared one alone."""
+def test_a_file_shared_as_a_page_is_published_like_one(base):
+    """A CSV (or PDF, Word, ...) publishes as a page of its own (ENG-4687), so
+    autopublish takes it owner-only as it takes a web page: the viewer then
+    shows it in the same published state, with the same Share menu."""
     folder = _make(base, "data", files={"rows.csv": "a,b\n1,2"},
                    meta={"slug": "data", "type": "dataset"})
 
     d = needs_publish(folder, base)
 
-    assert (d.action, d.reason) == (None, "shared_on_request")
+    assert d.action == "new"
 
 
 def test_a_shared_data_file_keeps_in_step_like_a_page(base):

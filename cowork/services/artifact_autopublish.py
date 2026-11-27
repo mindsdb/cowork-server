@@ -32,7 +32,6 @@ from cowork.db.units import run_efs, run_efs_cleanup, run_on_unit_threads
 from cowork.schemas.artifact_access import OWNER_ONLY_ACCESS, ArtifactAccessRequest
 from cowork.services.artifact_locks import LOCKS_DIRNAME, acquire, refresh, release
 from cowork.services.artifact_publish_key import PublishKey
-from cowork.services.file_page import PUBLISHABLE_FILE_SUFFIXES
 from cowork.services.product_permissions import ProductPermissionDenied, ProductPermissionUnavailable
 from cowork.services.publish import (
     DatasourceApprovalRequired,
@@ -106,11 +105,6 @@ REASON_NO_CONTENT = "no_content"
 REASON_NOT_PUBLISHABLE = "not_publishable"
 REASON_UNPUBLISHED = "unpublished"
 REASON_UNCHANGED = "unchanged"
-# A file that isn't a web page (PDF, Word, ...: ENG-4687) is first shared only
-# by its owner's choice. Auto-publishing one would convert every data file a
-# turn writes, in the server's one conversion slot. Once shared, it keeps in
-# step like a page.
-REASON_SHARED_ON_REQUEST = "shared_on_request"
 # Another conversion held the server's one slot, so whether a Markdown page
 # changed is unknown: the project's self-heal asks again later.
 REASON_CONVERSION_BUSY = "conversion_busy"
@@ -190,8 +184,6 @@ def needs_publish(folder: Path, artifacts_base: Path) -> PublishDecision:
     entry = load_published_map(published_dir).get(published_key)
 
     if not isinstance(entry, dict) or not entry.get("report_id"):
-        if not is_fullstack and publish_target.suffix.lower() in PUBLISHABLE_FILE_SUFFIXES:
-            return PublishDecision(None, REASON_SHARED_ON_REQUEST, is_fullstack, current_mtime)
         return PublishDecision("new", None, is_fullstack, current_mtime)
     if entry.get("published") is False:
         # Explicitly unpublished: never resurrect it on our own. The pod can

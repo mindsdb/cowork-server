@@ -18,7 +18,7 @@ from anton.core.mcp.errors import McpEgressBlocked, McpHostUnresolved, McpTokenR
 from fastapi import APIRouter, Depends, HTTPException, status
 
 from cowork.api.v1.endpoints.connectors.connections import require_app_secret
-from cowork.api.v1.permissions import LoopbackDesktopOnly, require
+from cowork.api.v1.permissions import LoopbackDesktopOnly, WindowProof, require
 from cowork.db.scoped import TenantScope, get_tenant_scope
 from cowork.schemas.custom_mcp import AllowedToolsRequest, CheckUrlRequest, CreateCustomMcpRequest, CustomMcpSettings
 from cowork.services.connectors import app_held
@@ -32,7 +32,12 @@ from cowork.services.connectors.persist import (
 
 _log = logging.getLogger("cowork.connectors.custom_mcp")
 
-router = APIRouter(dependencies=[Depends(require(LoopbackDesktopOnly)), Depends(require_app_secret)])
+# The routes declare the app secret, not the router: a router's checks run
+# before a route's, and a write asks for the window proof first, so a caller
+# holding the bearer token alone is told the proof is what it lacks.
+router = APIRouter(dependencies=[Depends(require(LoopbackDesktopOnly))])
+_READ_GUARDS = [Depends(require_app_secret)]
+_WRITE_GUARDS = [Depends(require(WindowProof)), Depends(require_app_secret)]
 ScopeDep = Annotated[TenantScope, Depends(get_tenant_scope)]
 
 MISSING = {"error": "custom_connection_missing"}
@@ -100,14 +105,14 @@ def _held_values(settings: CustomMcpSettings) -> dict[str, Any]:
     return values
 
 
-@router.post("/check-url")
+@router.post("/check-url", dependencies=_READ_GUARDS)
 def check_url(body: CheckUrlRequest, scope: ScopeDep) -> dict[str, str]:
     """The canonical form of a server URL the user typed, or 422."""
     _require_protected(scope)
     return {"url": canonical_server_url(body.url)}
 
 
-@router.post("", status_code=status.HTTP_201_CREATED)
+@router.post("", status_code=status.HTTP_201_CREATED, dependencies=_WRITE_GUARDS)
 def create_connection(body: CreateCustomMcpRequest, scope: ScopeDep) -> dict[str, str]:
     """Create a custom MCP connection under the id the app drew, and hold its
     settings. 409 when the id exists: ids are never reused."""
@@ -126,7 +131,7 @@ def create_connection(body: CreateCustomMcpRequest, scope: ScopeDep) -> dict[str
     return {"id": body.id, "server_url": values["server_url"]}
 
 
-@router.put("/{name}/held")
+@router.put("/{name}/held", dependencies=_WRITE_GUARDS)
 def put_held(name: str, body: CustomMcpSettings, scope: ScopeDep) -> dict[str, str]:
     """Hold settings and token for an existing connection: at every server
     start, on reconnect and on refresh. 404 with its own body when the
@@ -137,7 +142,7 @@ def put_held(name: str, body: CustomMcpSettings, scope: ScopeDep) -> dict[str, s
     return {"server_url": entry.get("server_url", "")}
 
 
-@router.put("/{name}/allowed-tools")
+@router.put("/{name}/allowed-tools", dependencies=_WRITE_GUARDS)
 def put_allowed_tools(name: str, body: AllowedToolsRequest, scope: ScopeDep) -> dict[str, list[str]]:
     """Replace the tools Anton may use on this connection."""
     _require_protected(scope)
@@ -146,7 +151,7 @@ def put_allowed_tools(name: str, body: AllowedToolsRequest, scope: ScopeDep) -> 
     return {"allowed_tools": entry["allowed_tools"]}
 
 
-@router.get("/{name}/held-summary")
+@router.get("/{name}/held-summary", dependencies=_READ_GUARDS)
 def held_summary(name: str, scope: ScopeDep) -> dict[str, str]:
     """The label and server URL the detail panel shows, from memory."""
     _require_protected(scope)
@@ -155,7 +160,7 @@ def held_summary(name: str, scope: ScopeDep) -> dict[str, str]:
     return {"label": entry.get("label", ""), "server_url": entry.get("server_url", "")}
 
 
-@router.get("/{name}/tools")
+@router.get("/{name}/tools", dependencies=_READ_GUARDS)
 async def list_tools(name: str, scope: ScopeDep) -> dict[str, list[dict[str, Any]]]:
     """The server's tools with their read-only label and whether each is on."""
     _require_protected(scope)

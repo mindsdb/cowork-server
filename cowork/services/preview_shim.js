@@ -2,7 +2,7 @@
  * In-frame preview shim. Injected as the first script of every HTML artifact
  * preview (see preview_shim.py).
  *
- * Two independent halves:
+ * Three independent parts:
  *   1. An error reporter, installed ALWAYS. It is the only way a page's own
  *      failure reaches the user or the agent — the viewer never sees the
  *      frame's console. Report types: error (uncaught), resource (a file
@@ -16,6 +16,10 @@
  *      typically reads storage during top-level initialisation, so the throw
  *      aborts its script before any listener is bound and every control on
  *      the rendered page is dead.
+ *   3. PDF embeds, installed when the server passes the address of the
+ *      bundled pdf.js viewer (the draft host and the desktop draft route).
+ *      Browsers do not run their own PDF viewer in a sandboxed frame; the
+ *      shared code (pdf_viewer/embed.js) is spliced in by preview_shim.py.
  *
  * Verified by hand against a real browser. tests/test_preview_shim.py runs
  * the reporters in node against stand-in browser objects, which proves the
@@ -188,6 +192,9 @@
           return;
         }
         var node = ev.target || {};
+        /* A PDF element whose PDF the viewer shows fails on purpose
+           (pdfShownByViewer is set further down). */
+        if (pdfShownByViewer && pdfShownByViewer(node)) return;
         var tagName = node.tagName || '';
         var url = local(node.src || node.href || '');
         report('r|' + tagName + '|' + url, {
@@ -299,6 +306,33 @@
     }
   } catch (e) { /* XMLHttpRequest not patchable: no XHR reports */ }
 
+  /* Empty wherever the server serves no viewer files: nothing is replaced. */
+  var PDF_ASSETS = __PDF_ASSETS__;
+  var pdfShownByViewer = null;
+  if (PDF_ASSETS) {
+    try {
+      pdfShownByViewer = installPdfEmbeds(window, {
+        assets: function () { return window.location.origin + PDF_ASSETS; },
+        draft: true,
+        report: reportPdfFailure
+      }) || null;
+    } catch (e) {
+      reportPdfFailure(e);
+    }
+  }
+
+  function reportPdfFailure(err) {
+    var message = clip('PDF viewer: ' + local(err && err.message ? err.message : String(err)), MAX_TEXT);
+    report('x|' + message, {
+      type: 'error',
+      message: message,
+      file: '',
+      line: 0,
+      col: 0,
+      stack: ''
+    });
+  }
+
   /* View reporter. The app's inline editor is a separate frame built from the
      source, so it opens on the first slide or the top of the page. This tells
      the app where the user is in the preview, so the editor can open there
@@ -311,7 +345,7 @@
      click is kept when the DOM changed within SETTLE_MS after it. That keeps
      scrolling with the arrow keys and clicks on plain text out of the list.
      Inputs land on the page's own elements, named by a path of tag:index
-     steps from <body> (or from the nearest element with an id). Every value
+     steps from the body (or from the nearest element with an id). Every value
      is capped; the app validates them again, as untrusted data. */
   try {
     var NAV_KEYS = {
@@ -340,10 +374,10 @@
       return !!(el && el.matches && el.matches(LAYER_UI));
     };
 
-    /* tag:index steps up to <body>, the index counting same-tag siblings only
+    /* tag:index steps up to the body, the index counting same-tag siblings only
        (the comment layer's elements skipped), so the editor's copy of the
        page resolves the same element. An element with a unique id anchors
-       the path. '' for anything outside <body>. */
+       the path. '' for anything outside the body. */
     var pathOf = function (el) {
       var steps = [];
       while (el && el.nodeType === 1 && el !== document.body) {
@@ -489,7 +523,7 @@
       } catch (inner) { /* never break the page */ }
     }, { capture: true, passive: true });
 
-    /* Keeping the place across a reload the app made (ENG-4383). A save, a
+    /* Keeping the place across a reload the app made. A save, a
        quick edit or an agent change reloads the preview, which would open on
        the first slide again. The app keeps the last view this document
        reported and, once the reloaded document says document-start, sends it
@@ -774,10 +808,10 @@
     });
   } catch (e) { /* no view reports: the page still runs */ }
 
-  /* The app's light or dark theme, for a page shown inside a chat reply
-     (ENG-4684): the parent sends `theme` with mode 'light' or 'dark', on load
-     and whenever the app's theme changes, so unlike `restore` it is taken
-     every time. It lands as <html data-theme> and the root's color-scheme,
+  /* The app's light or dark theme, for a page shown inside a chat reply:
+     the parent sends `theme` with mode 'light' or 'dark', on load and
+     whenever the app's theme changes, so unlike `restore` it is taken every
+     time. It lands as the root element's data-theme and color-scheme,
      which a page styles from. The last mode is kept and set again once the
      document is parsed and loaded, so one that came before the page's own
      script ran (or that script overwrote) still holds. Only the parent window
@@ -808,7 +842,7 @@
     window.addEventListener('load', reapplyTheme);
   } catch (e) { /* no theme: the page keeps its own */ }
 
-  /* The page's own state, for a page shown inside a chat reply (ENG-4684):
+  /* The page's own state, for a page shown inside a chat reply:
      a checklist the user ticks, then confirms. `window.anton` is the page's
      side of it:
        setState(obj)          keep obj and post `state` to the app, which
@@ -914,8 +948,8 @@
     });
   } catch (e) { /* no page state: the page still runs */ }
 
-  /* What the page's form shows, for a page that never calls setState
-     (ENG-4684): a slider the user moved to 0.47 must still be something the
+  /* What the page's form shows, for a page that never calls setState:
+     a slider the user moved to 0.47 must still be something the
      agent can read. Every page reports its controls and its text as a
      `snapshot`, which the app saves beside state.json as snapshot.json:
        { type: 'snapshot', snapshot: {
@@ -1418,4 +1452,8 @@
       }
     });
   } catch (e) { /* cookie accessor is not redefinable here */ }
+
+  // installPdfEmbeds is called earlier; it relies on function-declaration
+  // hoisting, so embed.js must keep a single top-level function declaration.
+  /* pdf-embeds */
 })();

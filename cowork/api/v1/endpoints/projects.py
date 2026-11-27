@@ -8,7 +8,7 @@ from uuid import UUID, uuid4
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 
-from cowork.api.v1.permissions import AuthenticatedInOrgMode, require
+from cowork.api.v1.permissions import AuthenticatedInOrgMode, WindowProof, require
 from cowork.db.scoped import ScopedSession, TenantScopeDep
 from cowork.db.units import run_db, run_efs_unit
 from cowork.harnesses.memory.registry import MemorySlot
@@ -333,7 +333,7 @@ async def require_local_for_chosen_folder(
     "/",
     status_code=status.HTTP_201_CREATED,
     response_model=ProjectResponse,
-    dependencies=[Depends(require_local_for_chosen_folder)],
+    dependencies=[Depends(require(WindowProof)), Depends(require_local_for_chosen_folder)],
 )
 async def create_project(
     body: ProjectCreateRequest,
