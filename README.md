@@ -607,7 +607,7 @@ All endpoints live under `/api/v1/`. Key resource groups:
 | `/runtime-credential` | Desktop hand-overs, held in memory: the MindsHub credential, and the address and launch key of the app's own browser (write-only, loopback, outside MindsHub mode) |
 | `/browse` | The agent's browser: whether this deployment offers it to the caller and, on the web, a warm-up, viewer links, the person's approval of a held step and signing out of every site. See [The agent's browser](#the-agents-browser) |
 | `/hub/workspaces` | Which MindsHub workspace this person is working in |
-| `/hub/usage` | The caller's free Air allowance (as a proportion), subscription plan, balance, auto top up and credit spend, for the desktop's usage warnings. An organization with no free grant reads `freeTokens.limit` 0 and `freeTokens.resetsAt` null, since nothing refills. `plan` is `{tier, status, renewsAt, cancelAtPeriodEnd, windows: [{window, percentUsed, resetsAt}]}` from entitlements/me's `plan` block (ENG-4186), or null when auth sends none or one that does not parse |
+| `/hub/usage` | The organization's allowance as a proportion (Free's windows on Free, the plan's on Plus and Pro), subscription plan, balance, auto top up and credit spend, for the desktop's usage warnings. An organization with no free grant reads `freeTokens.limit` 0 and `freeTokens.resetsAt` null, since nothing refills. `plan` is `{tier, status, renewsAt, cancelAtPeriodEnd, windows: [{window, percentUsed, resetsAt}]}` from entitlements/me's `plan` block (ENG-4186), or null when auth sends none or one that does not parse |
 | `/hub/deletion-request` | The caller's request to delete their MindsHub account: `GET` answers the open request or 404, `POST` opens one (202). MindsHub's support deletes the account. 404 outside MindsHub mode |
 
 ### The desktop launch
@@ -848,7 +848,7 @@ taken on a shared file reaches no workspace at all, not even the minter's own.
 That check holds no session, deliberately: `preview-asset` serves every sub-asset
 a page pulls, and a session there is a database connection per image.
 
-### The default model is the one the free allowance covers
+### The default model is one the free allowance covers
 
 Every minds-cloud role defaults to `mindshub_air`, for all three roles: planning,
 coding and router. **MindsHub's catalog declares it**, in the

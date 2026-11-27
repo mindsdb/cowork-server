@@ -43,14 +43,15 @@ def offered_formats(*, org_mode: bool) -> list[str]:
 def _document(doc: Doc, fmt: str) -> bytes:
     """The doc as one HTML document for the inliner, its title first when no tab heading carries it.
 
-    A PDF gets the page's font; Word ignores CSS, so its document carries none.
+    A PDF gets the page's font and code colours; Word ignores CSS, so its
+    document carries none, and no code spans either.
     """
     title = html.escape(doc["title"])
     # A one-tab doc has no tab heading to carry its name; the export starts with it.
     title_html = f"<h1>{title}</h1>" if len(doc["tabs"]) == 1 else ""
     style = f"<style>{PDF_CSS}</style>" if fmt == "pdf" else ""
     return (f"<!DOCTYPE html><html><head><meta charset='utf-8'><title>{title}</title>{style}</head>"
-            f"<body>{title_html}{export_body_html(doc)}</body></html>").encode("utf-8")
+            f"<body>{title_html}{export_body_html(doc, highlight=fmt == "pdf")}</body></html>").encode("utf-8")
 
 
 def export_bytes(doc: Doc, fmt: str, *, folder: PinnedDir | None = None, org_mode: bool = False) -> bytes:

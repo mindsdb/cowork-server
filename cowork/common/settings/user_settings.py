@@ -1058,8 +1058,8 @@ class UserSettings(Settings):
         description=(
             "The most tokens the agent may spend on one request before it "
             "pauses and checks in with you. On MindsHub, every token the agent "
-            "reads or writes counts against your credits or your free MindsHub "
-            "Air allowance, including tokens re-read from cache, so a task that "
+            "reads or writes counts against your credits or your "
+            "allowance, including tokens re-read from cache, so a task that "
             "gets stuck can use up a large share of either without finishing. "
             "Raise it if you routinely give the agent "
             "big jobs; lower it to cap what any single request can cost. "
