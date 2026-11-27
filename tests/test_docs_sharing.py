@@ -32,6 +32,16 @@ def _settle(pending, timeout: float = 2.0) -> None:
         time.sleep(0.01)
 
 
+@pytest.fixture(autouse=True)
+def _no_republish_left_waiting():
+    """The republish debouncer is one for the process. A republish an earlier
+    test left waiting would fire during a later one, against that test's
+    stand-ins, so none crosses a test's edge."""
+    republish._republishes.cancel_all()
+    yield
+    republish._republishes.cancel_all()
+
+
 @pytest.fixture
 def folder(tmp_path):
     """A doc, shared at PAGE_URL."""
@@ -136,18 +146,34 @@ def test_a_republish_asks_whether_the_doc_is_still_shared_under_the_pages_publis
 
     folder = create_doc(tmp_path, title="Plan", markdown="Hi.", by="user").folder
     events = []
+    # The debouncer is the module's own: a republish another test in this
+    # worker scheduled can still fire under these fakes, so only this doc's
+    # steps are recorded, and nothing is left waiting from before.
+    republish._republishes.cancel_all()
+    page = str(folder / DOC_HTML)
 
     @contextlib.contextmanager
     def publish_lock(artifact, *, published_dir, publish_url, scope):
-        assert (artifact, published_dir) == (folder / DOC_HTML, folder)
-        events.append("lock")
+        mine = (artifact, published_dir) == (folder / DOC_HTML, folder)
+        if mine:
+            events.append("lock")
         yield
-        events.append("unlock")
+        if mine:
+            events.append("unlock")
+
+    def is_shared(f):
+        if f == folder:
+            events.append("shared?")
+        return True
+
+    def update_artifact(target, *, scope):
+        if target == page:
+            events.append("upload")
 
     monkeypatch.setattr(republish, "publication_owner", publish_lock)
     monkeypatch.setattr(republish, "desktop_publish_credential", lambda: ("key", "https://publish.test"))
-    monkeypatch.setattr(republish, "is_shared", lambda f: events.append("shared?") or True)
-    monkeypatch.setattr(republish, "update_artifact", lambda page, *, scope: events.append("upload"))
+    monkeypatch.setattr(republish, "is_shared", is_shared)
+    monkeypatch.setattr(republish, "update_artifact", update_artifact)
     monkeypatch.setattr(republish._republishes, "delay", 0.0)
     assert republish.schedule(folder)
     _settle(republish.pending)

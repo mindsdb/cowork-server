@@ -13,6 +13,7 @@ import signal
 import stat
 import threading
 import time
+from collections.abc import Callable
 from contextlib import asynccontextmanager
 from functools import partial
 from pathlib import Path
@@ -83,7 +84,7 @@ from cowork.common.settings.app_settings import (
 )
 from cowork.common.settings.secret_files import file_variable, process_secret
 from cowork.dev_setup import run_dev_setup
-from cowork.scheduler import start_scheduler, stop_scheduler, wait_for_scheduled_runs
+from cowork.scheduler import start_scheduler, stop_scheduler, wait_for_scheduled_notices, wait_for_scheduled_runs
 from cowork.services.artifact_autopublish import cancel_self_heals
 from cowork.services.artifact_heal_sweep import cancel_heal_sweep
 from cowork.services.pending_credential_clear import consume_pending_credential_clear
@@ -278,6 +279,7 @@ async def _end_remote_turns() -> None:
             "Scheduled runs still recording their outcome at shutdown",
             extra={"event": "shutdown_scheduled_runs_unfinished", "count": unfinished},
         )
+    await wait_for_scheduled_notices(timeout_seconds=remaining())
 
 
 def _log_cancelled_turns(cancelled: int) -> None:
@@ -576,6 +578,28 @@ def _warm_agent_runtime() -> None:
             logger.debug("agent runtime warm-up skipped %s", name, exc_info=True)
 
 
+async def _run_sealing_start_check(*, check: Callable[[], None]) -> None:
+    """Run a sealing start check off the event loop, and log why it refused.
+
+    Starlette hands a failed start to Uvicorn as traceback text, and the log
+    formatter keeps only that text's frames and exception classes
+    (structured_logging._event_schema), so without this line the operator's
+    log wouldn't say why Cowork stopped. A KeyFileError or SealedDataError
+    message names only paths, settings' names and records, never a value.
+    """
+    from cowork.common.encryption import KeyFileError
+    from cowork.services.sealing import SealedDataError
+
+    try:
+        await asyncio.to_thread(check)
+    except (KeyFileError, SealedDataError) as refusal:
+        logger.error(
+            "A sealing start check refused, so Cowork won't start",
+            extra={"event": "sealing_start_refused", "reason": str(refusal)},
+        )
+        raise
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     clock = _StartupClock()
@@ -588,13 +612,13 @@ async def lifespan(app: FastAPI):
     # sealed under a key file doesn't start without one.
     from cowork.services.sealing import refuse_sealed_state_without_key_file, refuse_unopenable_sealed_data
 
-    await asyncio.to_thread(refuse_sealed_state_without_key_file)
+    await _run_sealing_start_check(check=refuse_sealed_state_without_key_file)
     clock.begin("dev_setup")
     run_dev_setup()
     clock.begin("sealed_data_check")
     # After migrations, before anything serves: every sealed setting and
     # connection opens with the key file, or the start stops naming each one.
-    await asyncio.to_thread(refuse_unopenable_sealed_data)
+    await _run_sealing_start_check(check=refuse_unopenable_sealed_data)
     clock.begin("credential_clear")
     # After migrations and the .env seed, before anything reads a credential.
     app_settings = get_app_settings()
@@ -692,16 +716,19 @@ async def lifespan(app: FastAPI):
     try:
         from cowork.db.scoped import ScopedSession, SYSTEM_SCOPE
         from cowork.db.session import get_open_session
-        from cowork.scheduler import boot_reap_cutoff
+        from cowork.scheduler import boot_reap_cutoff, post_reaped_run_notices
         from cowork.services.schedules import ScheduleRunService
 
         recovery_session = ScopedSession(get_open_session(), SYSTEM_SCOPE)
         try:
+            executed: list = []
             reaped = ScheduleRunService(recovery_session).reap_orphaned_runs(
-                started_before=boot_reap_cutoff(),
+                started_before=boot_reap_cutoff(), executed=executed,
             )
             if reaped:
                 logger.warning("Reaped orphaned scheduled runs", extra={"event": "orphaned_runs_reaped", "count": reaped})
+            # Their owners hear the runs didn't finish, as the lease reaper's do.
+            post_reaped_run_notices(recovery_session, [run.id for run in executed])
         finally:
             recovery_session.close()
     except Exception:

@@ -139,7 +139,8 @@ def _page(*blocks: dict) -> str:
     doc = normalize_doc({"schema": SCHEMA, "title": "T", "rev": 1,
                          "tabs": [{"id": "t_1", "title": "T", "blocks": list(blocks)}]})
     page = doc_html(doc)
-    return page[page.index("<main"):]
+    # Block ids on the page are covered by test_docs_page_block_ids.
+    return re.sub(r' id="blk-[^"]*"', "", page[page.index("<main"):])
 
 
 def test_a_task_shows_the_editors_box_on_the_page():

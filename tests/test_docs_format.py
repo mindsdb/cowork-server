@@ -292,7 +292,8 @@ def _chart_figure(kind: str, series: list[dict]) -> str:
     doc = normalize_doc({"schema": SCHEMA, "title": "Charts", "rev": 1,
                          "tabs": [{"id": "t_1", "title": "Charts", "blocks": [chart]}]})
     page = doc_html(doc)
-    return page[page.index("<figure class='chart'>"):page.index("</figure>")]
+    start = re.search(r"<figure [^>]*class='chart'>", page).start()
+    return page[start:page.index("</figure>")]
 
 
 TWO_SERIES = [{"name": "2025", "values": [120, 80, -15]}, {"name": "2026", "values": [140, 95, 40]}]
@@ -394,5 +395,5 @@ def test_an_empty_paragraph_keeps_its_line_on_the_page_and_in_the_exports():
     doc = normalize_doc({"schema": SCHEMA, "title": "T", "rev": 1,
                          "tabs": [{"id": "t_1", "title": "T", "blocks": blocks}]})
     expected = "<p>First</p>\n<p><br></p>\n<p><br></p>\n<p>Second</p>"
-    assert expected in doc_html(doc)
+    assert expected in re.sub(r' id="blk-[^"]*"', "", doc_html(doc))
     assert expected in export_body_html(doc, highlight=False)

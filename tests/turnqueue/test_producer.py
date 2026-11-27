@@ -3197,6 +3197,25 @@ async def test_preview_checks_reaches_the_job_only_for_an_interactive_turn(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(("scheduled", "interactive", "expected"), [
+    (True, False, [{"engine": "gmail", "name": "Work mail"}]),
+    (False, False, None),
+    (True, True, None),
+])
+async def test_only_a_scheduled_job_carries_excluded_labels(monkeypatch, scheduled, interactive, expected):
+    fake = FakeRedis(replies=[("scratchpad:reply:conv-1", _reply("turn_completed", {}))])
+    monkeypatch.setattr(prod, "get_redis", lambda: fake)
+    monkeypatch.setattr(prod, "_new_correlation_id", lambda: "r")
+    await _drain(prod.stream_remote_replies(
+        conversation_id="conv-1", org_id=None, user_id=None, input_text="hi", model="m",
+        disabled=[{"engine": "gmail", "name": "Work mail", "extra": "never forwarded"}],
+        scheduled=scheduled, interactive=interactive,
+    ))
+    params = json.loads(fake.added[0][1]["payload"])["params"]
+    assert params.get("scheduled_excluded_connectors") == expected
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("interactive,host_tools,expected", [
     (True, [{"name": "read_doc", "description": "Read a doc.", "input_schema": {"type": "object"}}], True),
     (False, [{"name": "read_doc", "description": "Read a doc.", "input_schema": {"type": "object"}}], False),

@@ -16,7 +16,7 @@ from urllib.parse import quote
 from uuid import UUID
 
 import anyio
-from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, status
+from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, Response, status
 from fastapi.concurrency import run_in_threadpool
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import HTMLResponse, JSONResponse
@@ -51,9 +51,10 @@ from cowork.services.artifact_permissions import (
     with_export_formats,
 )
 from cowork.services import artifact_files
+from cowork.services import pdf_viewer
 from cowork.services.artifact_autopublish import job_budget_for, lock_ttl_for
 from cowork.services.preview_html import prepare_preview_html
-from cowork.services.quick_edit import direct_edit_available, quick_edit_available
+from cowork.services.quick_edit import direct_edit_available, edits_in_place, quick_edit_available
 from cowork.services.artifact_identity import opened_artifact_folder
 from cowork.services.artifact_metadata import WIDGET_PUBLISH_REFUSAL, ArtifactMetadata, is_widget
 from cowork.schemas.artifact_export import ExportRequest, ExportResult
@@ -88,8 +89,11 @@ from cowork.services.artifact_revisions import (
     current_source,
     current_workspace,
     finalize_agent_repair,
+    is_document,
     list_revisions,
     release_repairs_for_comment,
+    restore_revision,
+    revision_content,
     revision_with_content,
     save_source,
 )
@@ -112,6 +116,41 @@ _DRAFT_RESPONSE_HEADERS = {
     "Cache-Control": "private, no-store",
     "X-Content-Type-Options": "nosniff",
 }
+
+
+def _cors_headers(cors: bool) -> dict[str, str]:
+    return {"Access-Control-Allow-Origin": "*"} if cors else {}
+
+
+def _pdf_headers(cors: bool) -> dict[str, str]:
+    """For both answers of a PDF address: the bytes and the viewer page."""
+    return {"Vary": "Sec-Fetch-Dest", **_cors_headers(cors)}
+
+
+# The viewer's files change only with the server, so on the desktop /drafts
+# route, whose addresses carry no credential, the browser may reuse them for
+# every PDF of a page; after a server update it may use the old files for up
+# to an hour. The draft host keeps no-store: its addresses carry the token.
+_PDF_ASSET_CACHE_CONTROL = "private, max-age=3600"
+
+
+def _pdf_asset_response(name: str, *, cors: bool) -> Response:
+    """A file of the bundled PDF viewer, never one of the artifact."""
+    found = pdf_viewer.asset(name)
+    if found is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Artifact file not found")
+    body, content_type = found
+    headers = {**_DRAFT_RESPONSE_HEADERS, **_cors_headers(cors)}
+    if cors:
+        headers["Cache-Control"] = _PDF_ASSET_CACHE_CONTROL
+    return Response(body, media_type=content_type, headers=headers)
+
+
+def _pdf_viewer_page(rel_path: str, *, cors: bool) -> HTMLResponse:
+    page = prepare_preview_html(pdf_viewer.viewer_page(rel_path, draft=True), comments=False)
+    return HTMLResponse(page, headers={**_DRAFT_RESPONSE_HEADERS, **_pdf_headers(cors)})
+
+
 _LIVE_PUBLISH_TIMEOUT_S = 60.0
 _LIVE_PUBLISH_LOCK_TTL_S = lock_ttl_for(_LIVE_PUBLISH_TIMEOUT_S)
 # The stats tracking toggle waits only briefly for an in-flight publish:
@@ -235,7 +274,7 @@ def _recorded_source_selector(source, folder: Path, metadata: ArtifactMetadata) 
         return None
 
 
-def _preview_html_from_fd(fd: int, *, comments: bool) -> HTMLResponse | None:
+def _preview_html_from_fd(fd: int, *, comments: bool, pdf_assets: str | None = None) -> HTMLResponse | None:
     """Build the preview HTML from the already-authorized file descriptor."""
     payload = bytearray()
     try:
@@ -253,7 +292,7 @@ def _preview_html_from_fd(fd: int, *, comments: bool) -> HTMLResponse | None:
         except OSError:
             pass
     return HTMLResponse(
-        prepare_preview_html(html, comments=comments), headers=_DRAFT_RESPONSE_HEADERS
+        prepare_preview_html(html, comments=comments, pdf_assets=pdf_assets), headers=_DRAFT_RESPONSE_HEADERS
     )
 
 
@@ -360,6 +399,9 @@ def _draft_file_response(
     scope: TenantScope,
     comments: bool,
     download: bool = False,
+    pdf_assets: str | None = None,
+    cors: bool = False,
+    dest: str = "",
 ):
     """Check ``rel_path`` against the artifact the lookup found
     (``_draft_file_parts``), then open the draft file there and answer with it.
@@ -371,7 +413,18 @@ def _draft_file_response(
     ``download`` asks for the bytes; every other file, and HTML that is not
     UTF-8, streams from the pinned descriptor, read on the file store's
     threads in ``scope``.
+
+    PDFs in sandboxed previews, only where ``pdf_assets`` (the viewer's
+    address the shim gets in an HTML document) is set, that is on the draft
+    host and the desktop ``/drafts`` route: ``_anton_pdf/<file>`` is the
+    bundled pdf.js viewer (pdf_viewer/), and a navigation to a PDF (``dest``)
+    gets the viewer page instead of the bytes. ``cors`` lets the desktop frame
+    (opaque origin) read the viewer's files and the PDF.
     """
+    viewer = pdf_assets is not None
+    name = pdf_viewer.asset_name(rel_path) if viewer else None
+    if name is not None:
+        return _pdf_asset_response(name, cors=cors)
     parts = _draft_file_parts(rel_path, artifact.metadata)
     media_type = mimetypes.guess_type(parts[-1])[0] or "application/octet-stream"
     try:
@@ -384,18 +437,23 @@ def _draft_file_response(
             detail="Artifact file not found",
         ) from exc
     try:
+        # The draft host serves top-level opens itself, sandboxed, and a popup
+        # of the draft frame inherits the sandbox: a document gets the viewer too.
+        if viewer and not download and pdf_viewer.wants_viewer_page(media_type, dest, document=True):
+            resources.close()
+            return _pdf_viewer_page("/".join(parts), cors=cors)
         if not download and media_type == "text/html":
-            response = _preview_html_from_fd(fd, comments=comments)
+            response = _preview_html_from_fd(fd, comments=comments, pdf_assets=pdf_assets)
             if response is not None:
                 resources.close()
                 return response
         extra = (
             {"Content-Disposition": attachment_disposition(parts[-1])}
-            if download else None
+            if download else {}
         )
-        return _draft_stream(
-            resources, fd, file_stat.st_size, media_type, scope=scope, extra_headers=extra,
-        )
+        if viewer and media_type == pdf_viewer.PDF_TYPE:
+            extra |= _pdf_headers(cors)
+        return _draft_stream(resources, fd, file_stat.st_size, media_type, scope=scope, extra_headers=extra)
     except BaseException:
         resources.close()
         raise
@@ -654,7 +712,9 @@ async def _acquire_live_publish_lock(
         await asyncio.sleep(0.1)
 
 
-async def _current_capabilities(scope: TenantScope, capabilities: dict) -> dict:
+async def _current_capabilities(
+    scope: TenantScope, capabilities: dict, *, source_path: str | None = None
+) -> dict:
     """*capabilities* narrowed by the caller's current product permissions.
 
     ``canQuickEdit`` (ENG-4227): the viewer's chat bar is offered. It needs
@@ -663,6 +723,11 @@ async def _current_capabilities(scope: TenantScope, capabilities: dict) -> dict:
     anton predates it. ``quickEditDirect``: the bar can also edit directly,
     because a decisions model serves the caller's provider; without one the
     bar still shows and hands every message to the chat.
+
+    ``source_path`` is the tracked source the viewer has open. A document the
+    quick editor can't change itself (a PDF, or an OOXML package on an anton
+    without ``OOXML_EDITS``, ``quick_edit.edits_in_place``) keeps the bar,
+    as a shortcut into the chat, so ``quickEditDirect`` is false for it.
     """
     if not capabilities["canEdit"]:
         return {**capabilities, "canQuickEdit": False, "quickEditDirect": False}
@@ -677,7 +742,9 @@ async def _current_capabilities(scope: TenantScope, capabilities: dict) -> dict:
     }
     can_quick_edit = bool(can_address and quick_edit_available())
     current["canQuickEdit"] = can_quick_edit
-    current["quickEditDirect"] = can_quick_edit and await direct_edit_available(scope)
+    current["quickEditDirect"] = (
+        can_quick_edit and edits_in_place(source_path) and await direct_edit_available(scope)
+    )
     # The export route needs `artifact.manage` too, so it offers nothing here.
     if not can_edit and "exportFormats" in capabilities:
         current["exportFormats"] = []
@@ -805,6 +872,7 @@ async def artifact_source(
             with_display_limits(
                 with_export_formats(scope, owner_capabilities, export_source), metadata.display
             ),
+            source_path=result.get("path"),
         )
         return {**result, "capabilities": capabilities, "repair": repair}
     except FileNotFoundError as exc:
@@ -994,6 +1062,7 @@ async def artifact_review_entry(
             ),
             scope=scope,
         ),
+        source_path=(current_revision or {}).get("path"),
     )
     return {
         "artifactKey": artifact_key(artifact_id),
@@ -1959,6 +2028,14 @@ async def enable_artifact_comments(
     )
 
 
+def _revision_content_url(project_ref: str, artifact_id: str, revision_id: str) -> str:
+    """Where the app fetches a document revision's bytes (the route below)."""
+    return (
+        f"/api/v1/artifacts/workspace/{quote(project_ref, safe='')}/{quote(artifact_id, safe='')}"
+        f"/revisions/{quote(revision_id, safe='')}/content"
+    )
+
+
 @router.get("/workspace/{project_ref}/{artifact_id}/revisions/{revision_id}")
 async def artifact_revision(
     project_ref: str,
@@ -1966,40 +2043,44 @@ async def artifact_revision(
     revision_id: str,
     scope: ScopeDep,
 ):
+    """One revision with its text. A document's revision has no text: it
+    answers with its metadata and ``contentUrl``, where the viewer's document
+    preview fetches the bytes of that version."""
     _source, folder, _metadata, _capabilities = await _owner_workspace(
         scope, project_ref, artifact_id
     )
     try:
-        return await run_efs(partial(revision_with_content, folder, revision_id), scope=scope)
+        revision = await run_efs(partial(revision_with_content, folder, revision_id), scope=scope)
     except FileNotFoundError as exc:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=_not_found_detail(exc)) from exc
     except RevisionValidationError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
+    if is_document(revision.get("path")):
+        return {**revision, "contentUrl": _revision_content_url(project_ref, artifact_id, revision["id"])}
+    return revision
 
 
-def _restore_revision(
-    folder: Path,
-    metadata: ArtifactMetadata,
-    artifact_id: str,
+@router.get("/workspace/{project_ref}/{artifact_id}/revisions/{revision_id}/content")
+async def artifact_revision_content(
+    project_ref: str,
+    artifact_id: ArtifactIdDep,
     revision_id: str,
-    *,
-    expected_revision_id: str,
-    actor_id: str | None,
-) -> dict:
-    """A restore's file store work, in one hop: the old revision's content,
-    then its save as the new head."""
-    restored = revision_with_content(folder, revision_id)
-    return save_source(
-        folder,
-        metadata,
-        artifact_id,
-        content=restored["content"],
-        expected_revision_id=expected_revision_id,
-        rel_path=restored["path"],
-        actor_kind="manual",
-        actor_id=actor_id,
-        summary=f"Restored revision {restored['number']}",
+    scope: ScopeDep,
+):
+    """The saved bytes of a document revision, owner-authorized as the
+    revision GET is, with the file's Content-Type. Never cached: the bytes
+    are a private draft. A text revision answers 422 (its text is in the
+    revision GET)."""
+    _source, folder, _metadata, _capabilities = await _owner_workspace(
+        scope, project_ref, artifact_id
     )
+    try:
+        found = await run_efs(partial(revision_content, folder, revision_id), scope=scope)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=_not_found_detail(exc)) from exc
+    except RevisionValidationError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return Response(content=found.data, media_type=found.content_type, headers=_DRAFT_RESPONSE_HEADERS)
 
 
 @router.post(
@@ -2021,7 +2102,7 @@ async def restore_artifact_revision(
         actor_id = str(scope.user_id) if scope and scope.user_id else None
         saved = await run_efs(
             partial(
-                _restore_revision,
+                restore_revision,
                 folder,
                 metadata,
                 artifact_id,
@@ -2324,6 +2405,7 @@ async def serve_private_draft(
     # scope (and the artifact roots it discovers) as an HTTP parameter.
     scope: TenantScope = Depends(get_tenant_scope),
     download: Annotated[bool, Query()] = False,
+    sec_fetch_dest: Annotated[str, Header()] = "",
 ):
     """Authenticated draft preview with project/org containment and relative assets.
 
@@ -2344,8 +2426,28 @@ async def serve_private_draft(
     agree on what a raw query string like ``?download=0`` means; a direct
     call still controls the outcome through the keyword argument, since its
     bare ``request`` carries no query string of its own.
+
+    PDFs: ``sec_fetch_dest`` (the request's Sec-Fetch-Dest) picks the viewer
+    page for a frame navigating to a PDF. On desktop the preview frame has an
+    opaque origin and Electron adds the bearer to every request it makes, so
+    this route answers the viewer's files and PDFs with
+    ``Access-Control-Allow-Origin: *`` and gives the shim the viewer's
+    address; any desktop draft page can then read the PDFs of the user's other
+    drafts, which is accepted. In org mode this route serves only the legacy
+    srcdoc path, where nothing is replaced: it serves no viewer files and
+    answers a PDF with its bytes, as before.
     """
     project_selector, artifact_selector = _draft_selectors(project_ref, artifact_id)
+    desktop = get_app_settings().tenancy_mode != "org"
+    pdf_assets = None
+    if desktop:
+        from cowork.services.artifacts import draft_url_for
+
+        pdf_assets = draft_url_for(
+            project_id=None if project_selector == "local" else project_selector,
+            artifact_id=artifact_selector,
+            rel_path=pdf_viewer.ASSET_PREFIX,
+        )
     # A reviewer may read every file of the draft, so the path checks and the
     # open run in the lookup's own file store call.
     _artifact, response = await review_artifact_and_read(
@@ -2358,6 +2460,9 @@ async def serve_private_draft(
             scope=scope,
             comments=wants_comment_layer(request),
             download=download or wants_download(request),
+            pdf_assets=pdf_assets,
+            cors=desktop,
+            dest=sec_fetch_dest.strip().lower(),
         ),
     )
     return response

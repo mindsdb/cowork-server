@@ -152,13 +152,15 @@ _PY = {"type": "code", "language": "py", "code": "def f():\n    return 1"}
 
 
 def test_the_page_highlights_a_known_language():
-    page = doc_html(_doc(_PY))
-    assert "<pre><code class='hljs language-python'><span class=\"hljs-keyword\">def</span>" in page
+    page = doc_html(_doc({**_PY, "id": "b_code"}))
+    # The block keeps its anchor for comments, as every other block does.
+    assert ("<pre id=\"blk-b_code\"><code class='hljs language-python'><span class=\"hljs-keyword\">def</span>"
+            in page)
 
 
 def test_the_page_keeps_an_unknown_language_plain():
-    page = doc_html(_doc({"type": "code", "language": "java", "code": "int x = 1;"}))
-    assert "<pre><code>int x = 1;</code></pre>" in page
+    page = doc_html(_doc({"type": "code", "id": "b_code", "language": "java", "code": "int x = 1;"}))
+    assert "<pre id=\"blk-b_code\"><code>int x = 1;</code></pre>" in page
 
 
 def test_the_html_and_pdf_exports_are_highlighted_and_word_is_not():

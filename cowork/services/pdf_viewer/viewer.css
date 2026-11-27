@@ -1,0 +1,34 @@
+/* Layout of viewer.mjs around pdf.js's PDFViewer (pdf_viewer.css). */
+html, body { margin: 0; height: 100%; }
+body {
+  background: #e8e8ec;
+  color: #222;
+  font: 13px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+}
+[hidden] { display: none !important; }
+.anton-pdf-toolbar {
+  position: absolute; top: 0; left: 0; right: 0; z-index: 2;
+  box-sizing: border-box; height: 36px; padding: 0 8px;
+  display: flex; align-items: center; gap: 6px;
+  background: #f7f7f9; border-bottom: 1px solid #d0d0d8;
+}
+.anton-pdf-page { width: 4em; font: inherit; }
+.anton-pdf-count { color: #555; }
+.anton-pdf-spacer { flex: 1; }
+.anton-pdf-button {
+  min-width: 28px; height: 26px; padding: 0 8px; box-sizing: border-box;
+  display: inline-flex; align-items: center; justify-content: center;
+  border: 1px solid #c4c4cc; border-radius: 4px; background: #fff;
+  color: inherit; font: inherit; text-decoration: none; cursor: pointer;
+}
+/* PDFViewer needs an absolutely positioned container. The vertical scrollbar
+   is always there, so page-width does not change when it would appear. */
+.anton-pdf-container {
+  position: absolute; top: 36px; left: 0; right: 0; bottom: 0;
+  overflow-x: auto; overflow-y: scroll;
+}
+.anton-pdf-status {
+  position: absolute; top: 50%; left: 0; right: 0;
+  text-align: center; color: #666;
+}
+.anton-pdf-error { padding: 16px; font-size: 14px; }

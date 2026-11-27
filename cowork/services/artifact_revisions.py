@@ -15,7 +15,7 @@ import uuid
 from collections.abc import Iterator
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 from pydantic import ValidationError
@@ -80,7 +80,36 @@ try:  # anton's own limit, where the installed anton has it
 except ImportError:  # pragma: no cover - an anton from before ENG-4684
     INLINE_STATE_MAX_BYTES = 32 * 1024
 MAX_SOURCE_BYTES = 2_000_000
+# Documents (ENG-4687): the binary kinds of file_page.PUBLISHABLE_FILE_SUFFIXES.
+# A document primary is journalled like an editable source, so it gets
+# revisions, restore and the "Unshared changes" review, but its bytes are
+# never decoded as text: the source PUT refuses it (DocumentNotTextEditable)
+# and reads that return content leave it out.
+DOCUMENT_EXTENSIONS = frozenset({".pdf", ".docx", ".xlsx", ".pptx"})
+# The documents that are zip packages of XML parts, which anton's quick
+# editor can patch when it has OOXML_EDITS. A PDF is not one.
+OOXML_EXTENSIONS = frozenset({".docx", ".xlsx", ".pptx"})
+# What the Content-Type of a document revision's bytes is. Spelled out rather
+# than guessed, because mimetypes knows the OOXML types only where the host's
+# mime.types lists them.
+DOCUMENT_CONTENT_TYPES = {
+    ".pdf": "application/pdf",
+    ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    ".pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+}
+# Documents run far larger than page sources. This is the bound publishing
+# has for a file (publish.PUBLISH_FILE_MAX_BYTES), so a document the server
+# can share is one it can keep versions of. Text keeps MAX_SOURCE_BYTES.
+MAX_DOCUMENT_BYTES = 25 * 1024 * 1024
 MAX_REVISIONS = 80
+# The most the distinct blobs of an artifact's kept revisions may hold, on top
+# of MAX_REVISIONS. A count alone let 80 revisions of a 25 MB document keep
+# 2 GB per artifact; text can't reach it (80 x 2 MB is 160 MB), so in practice
+# this bounds documents, by the same rule for every kind. The head of each
+# path, the published revision and those an open repair names are kept past
+# it (_beyond_byte_budget).
+MAX_REVISION_BYTES = 250 * 1024 * 1024
 # Names inside the journal folder (artifact_journal.JOURNAL_DIRNAME).
 _MANIFEST = "manifest.json"
 _PENDING = "pending-source-write.json"
@@ -135,6 +164,33 @@ class RepairAlreadyPending(RevisionValidationError):
     def __init__(self, repair: dict):
         super().__init__("This artifact already has an agent repair awaiting review")
         self.repair = repair
+
+
+class DocumentNotTextEditable(RevisionValidationError):
+    """A text-only operation (the source PUT, Live edit's save) was asked of
+    a document. Its revisions come from the agent, quick edits and restore."""
+
+    def __init__(self) -> None:
+        super().__init__("A document can't be edited as text")
+
+
+def is_document(rel_path: str | None) -> bool:
+    """Whether *rel_path* names a document (DOCUMENT_EXTENSIONS)."""
+    return PurePosixPath(rel_path or "").suffix.lower() in DOCUMENT_EXTENSIONS
+
+
+def is_ooxml(rel_path: str | None) -> bool:
+    """Whether *rel_path* names an OOXML package (OOXML_EXTENSIONS)."""
+    return PurePosixPath(rel_path or "").suffix.lower() in OOXML_EXTENSIONS
+
+
+def document_content_type(rel_path: str) -> str:
+    return DOCUMENT_CONTENT_TYPES.get(PurePosixPath(rel_path).suffix.lower(), "application/octet-stream")
+
+
+def _max_bytes(rel_path: str) -> int:
+    """The largest source, or revision blob, the journal keeps at *rel_path*."""
+    return MAX_DOCUMENT_BYTES if is_document(rel_path) else MAX_SOURCE_BYTES
 
 
 def _now() -> str:
@@ -401,14 +457,17 @@ def resolve_source(
         # also refused below the top level, as the explicit-path gate does.
         from cowork.services.artifacts import _user_files
 
+        candidates = [
+            p for p in _user_files(folder)
+            if p.suffix.lower() in EDITABLE_EXTENSIONS | DOCUMENT_EXTENSIONS
+            and JOURNAL_DIRNAME not in p.relative_to(folder).parts
+        ]
+        # A text source wins over a document, so a folder that already had an
+        # editable source keeps it as its tracked one.
         target = min(
-            (
-                p for p in _user_files(folder)
-                if p.suffix.lower() in EDITABLE_EXTENSIONS
-                and JOURNAL_DIRNAME not in p.relative_to(folder).parts
-            ),
+            (p for p in candidates if p.suffix.lower() in EDITABLE_EXTENSIONS),
             default=None,
-        )
+        ) or min(candidates, default=None)
         if target is None:
             raise RevisionValidationError("Artifact has no editable source file")
     else:
@@ -438,7 +497,7 @@ def resolve_source(
     ):
         raise FileNotFoundError("Artifact source not found")
     relative = target.resolve(strict=False).relative_to(canonical_folder).as_posix()
-    if target.suffix.lower() not in EDITABLE_EXTENSIONS and not (
+    if target.suffix.lower() not in EDITABLE_EXTENSIONS | DOCUMENT_EXTENSIONS and not (
         inline_state and relative in INLINE_PAGE_FILES
     ):
         raise RevisionValidationError("This artifact type is not source-editable")
@@ -446,15 +505,20 @@ def resolve_source(
 
 
 def _read_source(target: Path) -> bytes:
-    """An editable source's bytes. One past MAX_SOURCE_BYTES is refused before
-    it's read, so a sparse file can't fill the server's memory."""
+    """An editable source's bytes. One past its bound (MAX_SOURCE_BYTES, or
+    MAX_DOCUMENT_BYTES for a document) is refused before it's read, so a
+    sparse file can't fill the server's memory."""
     fd = open_fd(target, os.O_RDONLY | O_NOFOLLOW | O_NONBLOCK)
     try:
         found = os.fstat(fd)
         if not stat.S_ISREG(found.st_mode):
             raise FileNotFoundError("Artifact source not found")
-        if found.st_size > MAX_SOURCE_BYTES:
-            raise RevisionValidationError("Artifact source is too large to edit")
+        if found.st_size > _max_bytes(target.name):
+            raise RevisionValidationError(
+                "Document is too large to keep revisions of"
+                if is_document(target.name)
+                else "Artifact source is too large to edit"
+            )
         return b"".join(read_bounded(fd, found.st_size))
     finally:
         os.close(fd)
@@ -483,7 +547,7 @@ def _refused_blob(reason: str) -> None:
     )
 
 
-def _blob_bytes(folder: Path, content_hash: str) -> bytes | None:
+def _blob_bytes(folder: Path, content_hash: str, *, max_bytes: int = MAX_SOURCE_BYTES) -> bytes | None:
     """The saved bytes of one revision, or None when there are none to trust.
 
     The manifest and the pending record that name a blob are files the agent's
@@ -491,7 +555,8 @@ def _blob_bytes(folder: Path, content_hash: str) -> bytes | None:
     artifact's own journal, and a name that isn't 64 lowercase hex characters
     is never opened: RevisionEntry checks it, and it is checked again here,
     where it names a file. The blob must be a regular file with one name, no
-    larger than an editable source, and its bytes must match its name.
+    larger than ``max_bytes`` (the bound of the source it was saved from), and
+    its bytes must match its name.
     Anything else answers None, as a missing blob does. A read that couldn't
     be made raises.
     """
@@ -499,7 +564,7 @@ def _blob_bytes(folder: Path, content_hash: str) -> bytes | None:
         _refused_blob("invalid_name")
         return None
     try:
-        content = read_journal_file(folder, _BLOBS, content_hash, max_bytes=MAX_SOURCE_BYTES)
+        content = read_journal_file(folder, _BLOBS, content_hash, max_bytes=max_bytes)
     except JournalFileRefused:
         # read_journal_file logged why.
         return None
@@ -513,20 +578,27 @@ def _store_blob(folder: Path, content_hash: str, content: bytes) -> None:
     """Save ``content``, whose sha256 is ``content_hash``, unless a blob the
     server can trust already holds it. A refused blob at that name is replaced
     by the server's own bytes; the name goes, not the file it pointed to."""
-    if _blob_bytes(folder, content_hash) is None:
+    # A blob holding these bytes is exactly their size, so that is its bound.
+    if _blob_bytes(folder, content_hash, max_bytes=len(content)) is None:
         write_journal_file(folder, _BLOBS, content_hash, content=content)
+
+
+def _revision_bytes(folder: Path, revision: RevisionEntry) -> bytes:
+    """A revision's saved bytes. A blob that is missing or refused answers as
+    a missing revision does, so a route returns 404 and none of it."""
+    content = _blob_bytes(folder, revision.content_hash, max_bytes=_max_bytes(revision.path))
+    if content is None:
+        raise FileNotFoundError("Revision not found")
+    return content
 
 
 def _content_for_revision(folder: Path, revision: RevisionEntry) -> str:
     """A revision's saved text. A blob that is missing, refused or not UTF-8
     answers as a missing revision does, so a route returns 404 and none of it."""
-    content = _blob_bytes(folder, revision.content_hash)
-    if content is not None:
-        try:
-            return content.decode("utf-8")
-        except UnicodeDecodeError:
-            pass
-    raise FileNotFoundError("Revision not found")
+    try:
+        return _revision_bytes(folder, revision).decode("utf-8")
+    except UnicodeDecodeError:
+        raise FileNotFoundError("Revision not found") from None
 
 
 def _new_revision(
@@ -570,6 +642,62 @@ def _prune_orphan_blobs(folder: Path, revisions: list[RevisionEntry]) -> None:
     except OSError:
         # The manifest is already durable; orphan cleanup is best-effort.
         pass
+
+
+def _protected_revision_ids(folder: Path, manifest: Manifest) -> set[str]:
+    """The revisions the byte budget never drops: the head of each path, the
+    one each live publish shows (so "Unshared changes" keeps its before side),
+    and those a queued or ready repair is based on or produced."""
+    from cowork.services.artifacts import load_published_map
+
+    protected = {head.id for path in {r.path for r in manifest.revisions} if (head := manifest.head(path))}
+    for repair in _repair_records(folder):
+        if repair.status in {"queued", "ready"}:
+            protected.update(i for i in (repair.base_revision_id, repair.revision_id) if i)
+    # The journal doesn't know which file is the primary, so each live entry
+    # protects its revision on every path it could name.
+    for published in load_published_map(folder).values():
+        for path in {r.path for r in manifest.revisions}:
+            revision = _published_entry_revision(manifest, published, path)
+            if revision is not None:
+                protected.add(revision.id)
+    return protected
+
+
+def _beyond_byte_budget(folder: Path, manifest: Manifest) -> set[str]:
+    """The ids of the oldest revisions to drop so the distinct blobs of those
+    kept hold at most MAX_REVISION_BYTES.
+
+    Protected revisions (_protected_revision_ids) are kept and counted first;
+    the rest are kept newest first until the next would pass the budget, and
+    every older one goes with it, so history stays one unbroken run. When the
+    protected set can't be read nothing is dropped: keeping too much is
+    cheaper than losing the published version's content.
+    """
+    revisions = manifest.revisions
+    sizes = {item.content_hash: item.size or 0 for item in revisions}
+    if sum(sizes.values()) <= MAX_REVISION_BYTES:
+        return set()
+    try:
+        protected = _protected_revision_ids(folder, manifest)
+    except Exception:
+        logger.warning("Could not tell which revisions to keep; kept them all", exc_info=True)
+        return set()
+    kept = {item.content_hash for item in revisions if item.id in protected}
+    total = sum(sizes[h] for h in kept)
+    dropped: set[str] = set()
+    full = False
+    for item in reversed(revisions):
+        if item.id in protected:
+            continue
+        if not full and (item.content_hash in kept or total + sizes[item.content_hash] <= MAX_REVISION_BYTES):
+            if item.content_hash not in kept:
+                kept.add(item.content_hash)
+                total += sizes[item.content_hash]
+            continue
+        full = True
+        dropped.add(item.id)
+    return dropped
 
 
 def _prune_revisions(revisions: list[RevisionEntry]) -> None:
@@ -618,6 +746,10 @@ def _persist_revision(
     pruned = len(revisions) > MAX_REVISIONS
     if pruned:
         _prune_revisions(revisions)
+    dropped = _beyond_byte_budget(folder, manifest)
+    if dropped:
+        revisions[:] = [item for item in revisions if item.id not in dropped]
+        pruned = True
     _write_manifest(folder, manifest)
     if pruned:
         _prune_orphan_blobs(folder, revisions)
@@ -776,7 +908,7 @@ def _recover_pending_source_write(folder: Path) -> None:
         _abandon_pending(folder, "invalid")
         return
     entry = pending.revision
-    content = _blob_bytes(folder, entry.content_hash)
+    content = _blob_bytes(folder, entry.content_hash, max_bytes=_max_bytes(pending.path))
     if content is None:
         _abandon_pending(folder, "blob_refused")
         return
@@ -860,15 +992,28 @@ def _commit_source_revision(
 
 @dataclass(frozen=True)
 class _Source:
-    """An editable source as read under the lock, with its head revision."""
+    """An editable source as read under the lock, with its head revision.
+
+    ``content`` is its text, or None for a document, which answers as
+    ``binary`` instead: its bytes are fetched from the revision content route,
+    never sent as text. ``data`` is the bytes either way."""
 
     artifact_id: str
     path: str
-    content: str
+    content: str | None
     content_type: str
     revision: RevisionEntry
+    data: bytes = b""
 
     def to_json(self) -> dict[str, Any]:
+        if self.content is None:
+            return {
+                "artifactId": self.artifact_id,
+                "path": self.path,
+                "binary": True,
+                "contentType": self.content_type,
+                "revision": self.revision.to_json(),
+            }
         return {
             "artifactId": self.artifact_id,
             "path": self.path,
@@ -880,12 +1025,15 @@ class _Source:
 
 @dataclass(frozen=True)
 class _RevisionText:
-    """One revision with its saved text."""
+    """One revision with its saved text; None for a document's, which has no
+    text to show and whose bytes the revision content route serves."""
 
     revision: RevisionEntry
-    content: str
+    content: str | None
 
     def to_json(self) -> dict[str, Any]:
+        if self.content is None:
+            return self.revision.to_json()
         return {**self.revision.to_json(), "content": self.content}
 
 
@@ -896,10 +1044,12 @@ def _current_source_locked(
     _recover_pending_source_write(folder)
     target, relative = resolve_source(folder, metadata, rel_path)
     content = _read_source(target)
-    try:
-        text = content.decode("utf-8")
-    except UnicodeDecodeError as exc:
-        raise RevisionValidationError("Artifact source is not UTF-8 text") from exc
+    text: str | None = None
+    if not is_document(relative):
+        try:
+            text = content.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise RevisionValidationError("Artifact source is not UTF-8 text") from exc
     manifest = _read_manifest(folder)
     latest = manifest.head(relative)
     if latest is None or latest.content_hash != _sha(content):
@@ -920,6 +1070,7 @@ def _current_source_locked(
         content=text,
         content_type=target.suffix.lower().lstrip("."),
         revision=latest,
+        data=content,
     )
 
 
@@ -949,6 +1100,93 @@ def current_workspace(
         return {**source.to_json(), "revisions": revisions}
 
 
+def _save_locked(
+    folder: Path,
+    metadata: ArtifactMetadata,
+    artifact_id: str,
+    *,
+    data: bytes,
+    expected_revision_id: str | None,
+    rel_path: str | None,
+    text_only: bool,
+    actor_kind: str,
+    actor_id: str | None,
+    summary: str,
+    conversation_id: str | None = None,
+    comment_thread_ids: list[str] | None = None,
+) -> tuple[str, RevisionEntry]:
+    """Write *data* as the source's new head, under the lock the caller holds:
+    the source path and the revision it now has (the head itself when *data*
+    is already there). ``text_only`` refuses a document, for the text editor's
+    save; a restore writes a document's bytes back."""
+    _recover_pending_source_write(folder)
+    target, relative = resolve_source(folder, metadata, rel_path)
+    if text_only and is_document(relative):
+        raise DocumentNotTextEditable()
+    if len(data) > _max_bytes(relative):
+        raise RevisionValidationError("Artifact source is too large to edit")
+    if relative in INLINE_PAGE_FILES and len(data) > INLINE_STATE_MAX_BYTES:
+        raise RevisionValidationError("Inline state is too large to save")
+    if relative in INLINE_PAGE_FILES and not os.path.lexists(target):
+        # The first save of an inline page's state or snapshot: it creates the file,
+        # and only a save that expects no revision may.
+        manifest = _read_manifest(folder)
+        head = manifest.head(relative)
+        if expected_revision_id is not None:
+            raise RevisionConflict(head.to_json() if head is not None else None)
+        entry = _commit_source_revision(
+            folder,
+            manifest,
+            target,
+            artifact_id=artifact_id,
+            rel_path=relative,
+            before_content=b"",
+            content=data,
+            actor_kind=actor_kind,
+            actor_id=actor_id,
+            summary=summary,
+            base_revision_id=head.id if head is not None else None,
+            conversation_id=conversation_id,
+            comment_thread_ids=comment_thread_ids,
+        )
+        return relative, entry
+    existing = _read_source(target)
+    manifest = _read_manifest(folder)
+    latest = manifest.head(relative)
+    if latest is None or latest.content_hash != _sha(existing):
+        latest = _append_revision(
+            folder,
+            manifest,
+            artifact_id=artifact_id,
+            rel_path=relative,
+            content=existing,
+            actor_kind="system",
+            actor_id=None,
+            summary="Captured concurrent draft change",
+            base_revision_id=latest.id if latest else None,
+        )
+    if latest.id != expected_revision_id:
+        raise RevisionConflict(latest.to_json())
+    if latest.content_hash == _sha(data):
+        return relative, latest
+    entry = _commit_source_revision(
+        folder,
+        manifest,
+        target,
+        artifact_id=artifact_id,
+        rel_path=relative,
+        before_content=existing,
+        content=data,
+        actor_kind=actor_kind,
+        actor_id=actor_id,
+        summary=summary,
+        base_revision_id=latest.id,
+        conversation_id=conversation_id,
+        comment_thread_ids=comment_thread_ids,
+    )
+    return relative, entry
+
+
 def save_source(
     folder: Path,
     metadata: ArtifactMetadata,
@@ -963,79 +1201,23 @@ def save_source(
     conversation_id: str | None = None,
     comment_thread_ids: list[str] | None = None,
 ) -> dict:
+    """Save edited text as the source's new head. A document is refused
+    (DocumentNotTextEditable): it has no text to edit."""
     encoded = content.encode("utf-8")
     if len(encoded) > MAX_SOURCE_BYTES:
         raise RevisionValidationError("Artifact source is too large to edit")
     with artifact_lock(folder):
-        _recover_pending_source_write(folder)
-        target, relative = resolve_source(folder, metadata, rel_path)
-        if relative in INLINE_PAGE_FILES and len(encoded) > INLINE_STATE_MAX_BYTES:
-            raise RevisionValidationError("Inline state is too large to save")
-        if relative in INLINE_PAGE_FILES and not os.path.lexists(target):
-            # The first save of an inline page's state or snapshot: it creates the file,
-            # and only a save that expects no revision may.
-            manifest = _read_manifest(folder)
-            head = manifest.head(relative)
-            if expected_revision_id is not None:
-                raise RevisionConflict(head.to_json() if head is not None else None)
-            entry = _commit_source_revision(
-                folder,
-                manifest,
-                target,
-                artifact_id=artifact_id,
-                rel_path=relative,
-                before_content=b"",
-                content=encoded,
-                actor_kind=actor_kind,
-                actor_id=actor_id,
-                summary=summary,
-                base_revision_id=head.id if head is not None else None,
-                conversation_id=conversation_id,
-                comment_thread_ids=comment_thread_ids,
-            )
-            return {
-                "artifactId": artifact_id,
-                "path": relative,
-                "content": content,
-                "revision": entry.to_json(),
-            }
-        existing = _read_source(target)
-        manifest = _read_manifest(folder)
-        latest = manifest.head(relative)
-        if latest is None or latest.content_hash != _sha(existing):
-            latest = _append_revision(
-                folder,
-                manifest,
-                artifact_id=artifact_id,
-                rel_path=relative,
-                content=existing,
-                actor_kind="system",
-                actor_id=None,
-                summary="Captured concurrent draft change",
-                base_revision_id=latest.id if latest else None,
-            )
-        if latest.id != expected_revision_id:
-            raise RevisionConflict(latest.to_json())
-        if latest.content_hash == _sha(encoded):
-            return {
-                "artifactId": artifact_id,
-                "path": relative,
-                "content": content,
-                "revision": latest.to_json(),
-            }
-
-        entry = _commit_source_revision(
+        relative, revision = _save_locked(
             folder,
-            manifest,
-            target,
-            artifact_id=artifact_id,
-            rel_path=relative,
-            before_content=existing,
-            content=encoded,
+            metadata,
+            artifact_id,
+            data=encoded,
+            expected_revision_id=expected_revision_id,
+            rel_path=rel_path,
+            text_only=True,
             actor_kind=actor_kind,
             actor_id=actor_id,
             summary=summary,
-            base_revision_id=latest.id,
             conversation_id=conversation_id,
             comment_thread_ids=comment_thread_ids,
         )
@@ -1043,8 +1225,54 @@ def save_source(
             "artifactId": artifact_id,
             "path": relative,
             "content": content,
-            "revision": entry.to_json(),
+            "revision": revision.to_json(),
         }
+
+
+def restore_revision(
+    folder: Path,
+    metadata: ArtifactMetadata,
+    artifact_id: str,
+    revision_id: str,
+    *,
+    expected_revision_id: str,
+    actor_id: str | None = None,
+) -> dict:
+    """Make an earlier revision's content the source's new head, with the
+    save's conflict rule (``expected_revision_id`` must be the head).
+
+    A text revision answers as the source PUT does, with its ``content``; a
+    document's bytes are written back as they were saved and it answers
+    ``binary`` instead."""
+    with artifact_lock(folder):
+        _recover_pending_source_write(folder)
+        revision = _read_manifest(folder).revision(revision_id)
+        if revision is None:
+            raise FileNotFoundError("Revision not found")
+        document = is_document(revision.path)
+        if document:
+            data = _revision_bytes(folder, revision)
+            content = None
+        else:
+            content = _content_for_revision(folder, revision)
+            data = content.encode("utf-8")
+            if len(data) > MAX_SOURCE_BYTES:
+                raise RevisionValidationError("Artifact source is too large to edit")
+        relative, saved = _save_locked(
+            folder,
+            metadata,
+            artifact_id,
+            data=data,
+            expected_revision_id=expected_revision_id,
+            rel_path=revision.path,
+            text_only=not document,
+            actor_kind="manual",
+            actor_id=actor_id,
+            summary=f"Restored revision {revision.number}",
+        )
+        if document:
+            return {"artifactId": artifact_id, "path": relative, "binary": True, "revision": saved.to_json()}
+        return {"artifactId": artifact_id, "path": relative, "content": content, "revision": saved.to_json()}
 
 
 def list_revisions(folder: Path, *, rel_path: str | None = None) -> list[dict]:
@@ -1062,13 +1290,45 @@ def _revision_with_content_locked(folder: Path, revision_id: str | None) -> _Rev
     revision = _read_manifest(folder).revision(revision_id)
     if revision is None:
         raise FileNotFoundError("Revision not found")
+    if is_document(revision.path):
+        # No text to show, and its bytes can be 25 MB: revision_content serves them.
+        return _RevisionText(revision=revision, content=None)
     return _RevisionText(revision=revision, content=_content_for_revision(folder, revision))
 
 
 def revision_with_content(folder: Path, revision_id: str) -> dict:
+    """One revision and its text; a document's revision is its metadata alone."""
     with artifact_lock(folder):
         _recover_pending_source_write(folder)
         return _revision_with_content_locked(folder, revision_id).to_json()
+
+
+@dataclass(frozen=True)
+class RevisionContent:
+    """A document revision's saved bytes, and what they are."""
+
+    path: str
+    content_type: str
+    data: bytes
+
+
+def revision_content(folder: Path, revision_id: str) -> RevisionContent:
+    """The saved bytes of a document revision, for the viewer's preview of an
+    earlier version. A text revision is refused: its content is in
+    revision_with_content, and serving page bytes from the API's own origin
+    is what the draft routes exist to avoid."""
+    with artifact_lock(folder):
+        _recover_pending_source_write(folder)
+        revision = _read_manifest(folder).revision(revision_id)
+        if revision is None:
+            raise FileNotFoundError("Revision not found")
+        if not is_document(revision.path):
+            raise RevisionValidationError("Only a document revision's bytes are served")
+        return RevisionContent(
+            path=revision.path,
+            content_type=document_content_type(revision.path),
+            data=_revision_bytes(folder, revision),
+        )
 
 
 def capture_agent_revision(
@@ -1094,7 +1354,8 @@ def capture_agent_revision(
             _recover_pending_source_write(folder)
             target, relative = resolve_source(folder, metadata)
             content = _read_source(target)
-            content.decode("utf-8")
+            if not is_document(relative):
+                content.decode("utf-8")
             manifest = _read_manifest(folder)
             latest = manifest.head(relative)
             latest_id = latest.id if latest else None
@@ -1244,10 +1505,11 @@ def record_quick_edit(
         _recover_pending_source_write(folder)
         target, relative = resolve_source(folder, metadata, rel_path)
         content = _read_source(target)
-        try:
-            content.decode("utf-8")
-        except UnicodeDecodeError as exc:
-            raise RevisionValidationError("Artifact source is not UTF-8 text") from exc
+        if not is_document(relative):
+            try:
+                content.decode("utf-8")
+            except UnicodeDecodeError as exc:
+                raise RevisionValidationError("Artifact source is not UTF-8 text") from exc
         manifest = _read_manifest(folder)
         head = manifest.head(relative)
         label = (QUICK_EDIT_SUMMARY_PREFIX + " ".join((summary or "").split())).strip()
@@ -1453,7 +1715,7 @@ def create_agent_repair(
             + "\n".join(preview_lines)
             + "\n"
         )
-    anchor = _anchor_line(selector, source.path, source.content)
+    anchor = _anchor_line(selector, source.path, source.content or "")
     # The app attaches a thread's images to the message that carries this
     # prompt, in the order the thread names them (services/comment_images.py).
     image_ids = comment_image_ids("\n".join(str(entry.get("text") or "") for entry in thread))
@@ -1681,8 +1943,12 @@ def finalize_agent_repair(
                 target,
                 artifact_id=artifact_id,
                 rel_path=relative,
-                before_content=source.content.encode("utf-8"),
-                content=before.content.encode("utf-8"),
+                before_content=source.data,
+                content=(
+                    _revision_bytes(folder, before.revision)
+                    if before.content is None
+                    else before.content.encode("utf-8")
+                ),
                 actor_kind="manual",
                 actor_id=actor_id,
                 summary="Rejected agent suggestion",
@@ -1721,8 +1987,9 @@ def head_revision_id(folder: Path, rel_path: str) -> str | None:
 def published_head_revision_id(folder: Path) -> str | None:
     """The revision a publish of *folder* is about to put live: its editable
     source's head, captured first when the file moved without one, as the
-    viewer reads it. None for a folder with no editable source (binary,
-    oversized). Never raises: a publish never fails over it."""
+    viewer reads it. A document primary has revisions too (ENG-4687), so its
+    publish records one. None for a folder with no versioned source (an image,
+    a CSV, an oversized file). Never raises: a publish never fails over it."""
     try:
         from cowork.services.artifact_identity import ensure_full_id
 
@@ -1749,9 +2016,18 @@ def published_revision(folder: Path, entry: object, rel_path: str | None) -> dic
         return None
     with artifact_lock(folder):
         manifest = _read_manifest(folder)
+    revision = _published_entry_revision(manifest, entry, rel_path)
+    return revision.to_json() if revision is not None else None
+
+
+def _published_entry_revision(manifest: Manifest, entry: object, rel_path: str) -> RevisionEntry | None:
+    """published_revision's choice, from a manifest already read: also what
+    the byte budget keeps (_protected_revision_ids)."""
+    if not isinstance(entry, dict) or not entry.get("report_id") or entry.get("published") is False:
+        return None
     recorded = manifest.revision(entry.get("published_revision_id"))
     if recorded is not None and recorded.path == rel_path:
-        return recorded.to_json()
+        return recorded
     published_mtime = entry.get("published_mtime")
     if not isinstance(published_mtime, (int, float)) or isinstance(published_mtime, bool):
         return None
@@ -1763,4 +2039,4 @@ def published_revision(folder: Path, entry: object, rel_path: str | None) -> dic
         created = _parse_timestamp(revision.created_at)
         if created is not None and created <= cutoff:
             best = revision
-    return best.to_json() if best is not None else None
+    return best

@@ -12,7 +12,17 @@ class Schedule(BaseSQLModel, table=True):
 
     title: str = Field(description="Display name for the schedule")
     prompt: str = Field(description="The prompt to run on each execution")
-    cadence: str = Field(description="Execution cadence: once | every_15_minutes | every_30_minutes | hourly | daily | weekdays | weekly")
+    cadence: str = Field(description="Execution cadence: once | every_15_minutes | every_30_minutes | hourly | daily | weekdays | weekly | monthly")
+    recurrence: dict | None = Field(
+        default=None,
+        sa_type=sa.JSON,  # type: ignore
+        description=(
+            "Weekly or monthly days to run on: {days: [mon..sun]}, {month_day: 1-31} "
+            "or {week: 1-4|-1, weekday: mon..sun}. NULL on other cadences, and on "
+            "a weekly task that runs on its next run's weekday. A monthly day "
+            "taken from the first run, not chosen, also holds _inferred_day: true"
+        ),
+    )
     timezone: str = Field(default="UTC", description="IANA timezone name")
     next_run_at: datetime = Field(
         sa_type=sa.DateTime(timezone=True),  # type: ignore
@@ -28,6 +38,14 @@ class Schedule(BaseSQLModel, table=True):
         description="Project context for execution",
     )
     model: str = Field(description="Model identifier to use for execution")
+    disabled_connections: list[dict] | None = Field(
+        default=None,
+        sa_type=sa.JSON,  # type: ignore
+        description=(
+            "Connections the task's runs can't use, as [{engine, name}], the shape a chat "
+            "turn mutes them in. NULL or empty: every connection, as a new task has"
+        ),
+    )
     last_run_at: datetime | None = Field(
         default=None,
         sa_type=sa.DateTime(timezone=True),  # type: ignore
