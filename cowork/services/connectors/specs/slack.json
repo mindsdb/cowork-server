@@ -56,9 +56,6 @@
             "users:read.email",
             "chat:write",
             "reactions:write",
-            "files:write",
-            "channels:write",
-            "groups:write",
             "im:write",
             "mpim:write"
           ],

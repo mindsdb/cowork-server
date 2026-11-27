@@ -66,8 +66,10 @@ class TestSpec:
         scopes = _rest_method().oauth.scopes
         assert {"search:read", "channels:history", "chat:write"} <= set(scopes)
 
-    def test_canvases_and_lists_are_left_out(self):
-        assert not [s for s in _rest_method().oauth.scopes if s.split(":")[0] in ("canvases", "lists")]
+    def test_it_leaves_out_scopes_posting_does_not_need(self):
+        scopes = set(_rest_method().oauth.scopes)
+        assert not [s for s in scopes if s.split(":")[0] in ("canvases", "lists")]
+        assert not scopes & {"channels:write", "groups:write", "files:write"}
 
     def test_it_signs_in_like_the_mcp_method(self):
         methods = {m.id: m for m in ConnectorSpecRegistry().get_connector("slack").form.methods}
