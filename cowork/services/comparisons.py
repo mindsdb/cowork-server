@@ -50,6 +50,7 @@ from cowork.models.comparison import Comparison, ComparisonSide, ComparisonVerdi
 from cowork.models.conversation import Conversation
 from cowork.models.message import Message
 from cowork.models.project import Project
+from cowork.schemas.comparisons import SideUsageSnapshot
 from cowork.schemas.responses import Role
 from cowork.services.projects import (
     ProjectNotFoundError,
@@ -170,11 +171,12 @@ class ComparisonService:
             read = usage.get(side.label)
             if read is None or not read.available:
                 continue
-            side.usage_snapshot = {
-                "estimated_cost_usd": read.estimated_cost_usd,
-                "tokens": read.input_tokens + read.output_tokens + read.cached_input_tokens + read.cache_write_tokens,
-                "partial": bool(read.truncated or read.unpriced_calls),
-            }
+            side.usage_snapshot = SideUsageSnapshot(
+                estimated_cost_usd=read.estimated_cost_usd,
+                tokens=read.input_tokens + read.output_tokens + read.cached_input_tokens + read.cache_write_tokens,
+                partial=bool(read.truncated or read.unpriced_calls),
+                included_calls=read.included_calls,
+            ).model_dump()
             self.session.add(side)
         self.session.commit()
 

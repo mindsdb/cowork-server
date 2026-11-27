@@ -6,6 +6,10 @@ and delegate calls included. The gateway answers with those calls, their tokens
 and a list-price estimate (``GET /v1/usage/sessions/{id}``); this module files
 each call under the side's turn it belongs to.
 
+The figures are paid usage only. A call that a plan window or the Free
+allowance covered whole comes marked ``included``, with no tokens and no price:
+it is counted, adds nothing to the tokens or the cost, and is not unpriced.
+
 Same rules as ``hub_usage``: the bearer is the caller's own, and the host is the
 operator's (``default_turn_minds_api_host``), never the tenant-settable
 ``minds_url``, so the credential only ever goes to this deployment's gateway.
@@ -19,12 +23,14 @@ from __future__ import annotations
 import asyncio
 import bisect
 import logging
+import math
 from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
 from typing import Any, Optional
 from urllib.parse import quote
 
 import httpx
+from pydantic import BaseModel, field_validator
 
 from cowork.schemas.comparisons import ComparisonUsageResponse, SideUsage, TurnUsage
 
@@ -102,10 +108,56 @@ def _count(value: Any) -> int:
     return value if isinstance(value, int) and not isinstance(value, bool) and value > 0 else 0
 
 
+class _UsageCall(BaseModel):
+    """One call in a session's usage, read field by field.
+
+    A value of the wrong type reads as missing (no timestamp, 0 tokens, no
+    price) instead of failing the side. ``included`` is true only when a plan
+    window or the Free allowance covered the whole call; a server that predates
+    the field sends none, which reads as false.
+    """
+
+    timestamp: Optional[datetime] = None
+    input_tokens: int = 0
+    output_tokens: int = 0
+    cached_input_tokens: int = 0
+    cache_write_tokens: int = 0
+    estimated_cost_usd: Optional[float] = None
+    included: bool = False
+
+    @field_validator("timestamp", mode="before")
+    @classmethod
+    def _utc(cls, value: Any) -> Optional[datetime]:
+        return _as_utc(value)
+
+    @field_validator(*_TOKEN_FIELDS, mode="before")
+    @classmethod
+    def _tokens(cls, value: Any) -> int:
+        return _count(value)
+
+    @field_validator("estimated_cost_usd", mode="before")
+    @classmethod
+    def _price(cls, value: Any) -> Optional[float]:
+        """A finite price, or None. A JSON integer too large for a float, NaN
+        or an infinity would fail the side or the route's JSON encoding."""
+        if not isinstance(value, (int, float)) or isinstance(value, bool):
+            return None
+        try:
+            price = float(value)
+        except OverflowError:
+            return None
+        return price if math.isfinite(price) else None
+
+    @field_validator("included", mode="before")
+    @classmethod
+    def _only_true(cls, value: Any) -> bool:
+        return value is True
+
+
 def side_usage(
+    *,
     turn_starts: list[datetime],
     payload: Optional[dict],
-    *,
     turn_limit: Optional[int] = None,
     clock_offset: Optional[timedelta] = None,
 ) -> SideUsage:
@@ -131,20 +183,25 @@ def side_usage(
     turns = [TurnUsage(turn=index + 1) for index in range(len(owned))]
     unpriced = 0
     last_read: datetime | None = None
-    for call in payload["requests"]:
-        if not isinstance(call, dict):
+    for raw in payload["requests"]:
+        if not isinstance(raw, dict):
             continue
-        at = _as_utc(call.get("timestamp"))
+        call = _UsageCall.model_validate(raw)
+        at = call.timestamp
         if at is not None and (last_read is None or at > last_read):
             last_read = at
         if at is None or (cutoff is not None and at >= cutoff):
             continue
         turn = turns[max(0, bisect.bisect_right(owned, at) - 1)]
+        if call.included:
+            # Paid for by a plan window or the Free allowance: counted, but
+            # neither paid usage nor unpriced, whatever figures it carries.
+            turn.included_calls += 1
+            continue
         for field in _TOKEN_FIELDS:
-            setattr(turn, field, getattr(turn, field) + _count(call.get(field)))
-        cost = call.get("estimated_cost_usd")
-        if isinstance(cost, (int, float)) and not isinstance(cost, bool):
-            turn.estimated_cost_usd = (turn.estimated_cost_usd or 0.0) + float(cost)
+            setattr(turn, field, getattr(turn, field) + getattr(call, field))
+        if call.estimated_cost_usd is not None:
+            turn.estimated_cost_usd = (turn.estimated_cost_usd or 0.0) + call.estimated_cost_usd
         else:
             turn.unpriced_calls += 1
             unpriced += 1
@@ -159,6 +216,7 @@ def side_usage(
         cache_write_tokens=sum(t.cache_write_tokens for t in turns),
         estimated_cost_usd=sum(priced) if priced else None,
         unpriced_calls=unpriced,
+        included_calls=sum(t.included_calls for t in turns),
         # The gateway returns a session's earliest calls up to its cap. Calls
         # past it only cut the comparison's figures short while they could
         # still fall inside the turns it owns, i.e. before a Continue.
@@ -176,7 +234,7 @@ async def comparison_usage(
     reads = await asyncio.gather(*(_gateway_usage(conversation_id, bearer_token) for _, conversation_id, _, _ in sides))
     return ComparisonUsageResponse(
         sides={
-            label: side_usage(starts, payload, turn_limit=limit, clock_offset=offset)
+            label: side_usage(turn_starts=starts, payload=payload, turn_limit=limit, clock_offset=offset)
             for (label, _, starts, limit), (payload, offset) in zip(sides, reads)
         }
     )

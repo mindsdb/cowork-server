@@ -63,6 +63,9 @@ class SideUsageSnapshot(CamelResponse):
     tokens: int = 0
     #: The figure leaves something out (unpriced calls, the gateway's cap).
     partial: bool = False
+    #: Calls a plan window or the Free allowance covered whole. They are in
+    #: neither the cost nor the tokens, and do not make the figure partial.
+    included_calls: int = 0
 
 
 class ComparisonVerdictResponse(CamelResponse):
@@ -92,6 +95,9 @@ class TurnUsage(CamelResponse):
     #: List-price estimate over this turn's priced calls; None when none were priced.
     estimated_cost_usd: float | None = None
     unpriced_calls: int = 0
+    #: Calls a plan window or the Free allowance covered whole. They add no
+    #: tokens and no cost, and are not unpriced.
+    included_calls: int = 0
 
 
 class SideUsage(CamelResponse):
@@ -105,6 +111,8 @@ class SideUsage(CamelResponse):
     cache_write_tokens: int = 0
     estimated_cost_usd: float | None = None
     unpriced_calls: int = 0
+    #: Calls a plan window or the Free allowance covered whole, over every turn.
+    included_calls: int = 0
     #: The gateway stopped at its row cap, so the totals are a floor.
     truncated: bool = False
 
