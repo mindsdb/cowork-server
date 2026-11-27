@@ -808,10 +808,10 @@
     });
   } catch (e) { /* no view reports: the page still runs */ }
 
-  /* The app's light or dark theme, for a page shown inside a chat reply
-     (ENG-4684): the parent sends `theme` with mode 'light' or 'dark', on load
-     and whenever the app's theme changes, so unlike `restore` it is taken
-     every time. It lands as <html data-theme> and the root's color-scheme,
+  /* The app's light or dark theme, for a page shown inside a chat reply:
+     the parent sends `theme` with mode 'light' or 'dark', on load and
+     whenever the app's theme changes, so unlike `restore` it is taken every
+     time. It lands as the root element's data-theme and color-scheme,
      which a page styles from. The last mode is kept and set again once the
      document is parsed and loaded, so one that came before the page's own
      script ran (or that script overwrote) still holds. Only the parent window

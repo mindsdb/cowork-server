@@ -882,7 +882,7 @@ def _run_theme(scenario: str) -> dict:
     node = shutil.which("node")
     if node is None:
         pytest.skip("node is not installed")
-    script = _VIEW_HARNESS.replace("__SHIM__", SHIM_JS.replace("__LINE_OFFSET__", "0")).replace(
+    script = _VIEW_HARNESS.replace("__SHIM__", _node_shim()).replace(
         "__SCENARIO__", _THEME + scenario
     )
     done = subprocess.run([node, "-e", script], capture_output=True, text=True, timeout=30, check=True)
@@ -958,7 +958,7 @@ def _run_state(scenario: str) -> dict:
     node = shutil.which("node")
     if node is None:
         pytest.skip("node is not installed")
-    script = _VIEW_HARNESS.replace("__SHIM__", SHIM_JS.replace("__LINE_OFFSET__", "0")).replace(
+    script = _VIEW_HARNESS.replace("__SHIM__", _node_shim()).replace(
         "__SCENARIO__", _STATE + scenario + "\nprobe({ warnings });"
     )
     done = subprocess.run([node, "-e", script], capture_output=True, text=True, timeout=30, check=True)
@@ -1209,7 +1209,7 @@ def _run_snapshot(scenario: str) -> dict:
     node = shutil.which("node")
     if node is None:
         pytest.skip("node is not installed")
-    script = _VIEW_HARNESS.replace("__SHIM__", SHIM_JS.replace("__LINE_OFFSET__", "0")).replace(
+    script = _VIEW_HARNESS.replace("__SHIM__", _node_shim()).replace(
         "__SCENARIO__", _STATE + _FORM + scenario + "\nprobe({ pageEvents });"
     )
     done = subprocess.run([node, "-e", script], capture_output=True, text=True, timeout=30, check=True)
