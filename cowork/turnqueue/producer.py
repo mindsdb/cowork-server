@@ -1209,7 +1209,8 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
                                 preview_checks: bool = False,
                                 host_tools: list[dict] | None = None,
                                 ui_locale: str | None = None,
-                                reasoning_effort: str | None = None):
+                                reasoning_effort: str | None = None,
+                                memory_off: bool = False):
     """Mint, enqueue, then yield this turn's replies as (kind, data) tuples.
 
     Yields turn_delta / turn_step / turn_memory in arrival order and ends with
@@ -1248,7 +1249,14 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
     one would let it fall back to a mounted org skills tree
     (cowork.handlers.responses.remote_turn_skills).
     `reasoning_effort` is the composer's pick for this turn; None leaves the
-    pod's configured default."""
+    pod's configured default.
+    `memory_off` tells the controller this turn's settings say memory reads
+    are off, so it mounts no global memory tier for the pod, on a new pod
+    and on a reused one whose mount disagrees. A controller that predates
+    this field drops it and keeps mounting the person's global tier, which
+    anton reads straight off disk unaffected by whether `memory` above
+    carries project slots: the desktop refusal for "memory": "off" only
+    comes off once this flag is honored end to end."""
     settings = TurnQueueSettings()
     scope = scope_for_identity(org_id=org_id, user_id=user_id)
     try:
@@ -1460,6 +1468,7 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
               # (mindsdb/scratchpad-controller#124, which merges first).
               **({"ui_locale": ui_locale} if ui_locale else {}),
               **({"memory": memory_block} if memory_block else {}),
+              **({"memory_off": True} if memory_off else {}),
               # Only the skills the caller sees, and the pod's whole
               # recallable set, so always present, even empty.
               # Less any skill only dropped host tools wait for: it would unlock nothing.

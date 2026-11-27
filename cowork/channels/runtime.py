@@ -37,6 +37,7 @@ from cowork.db.scoped import (
 from cowork.db.units import FilesystemBusy, conversation_writes, run_db, run_efs, run_efs_unit
 from cowork.handlers.responses import stage_remote_workspace
 from cowork.harnesses.base import ChannelContext, HarnessProvider, get_harness
+from cowork.harnesses.memory.policy import memory_reads_off
 from cowork.models.channel import ChannelBinding, ChannelSession
 from cowork.models.conversation import Conversation
 from cowork.models.message import Message as DBMessage
@@ -692,7 +693,7 @@ class AntonChannelRuntime:
     async def _turn_stream(
         self, harness: HarnessProvider, harness_id: str, scope: TenantScope,
         conversation: Conversation, blocks: list[dict], text: str,
-        channel_context: ChannelContext | None, turn_rows: list,
+        channel_context: ChannelContext | None, turn_rows: list, settings: UserSettings,
     ):
         """The one place a channel turn picks in-process vs remote-worker
         execution; the rest of _run_anton is identical either way."""
@@ -712,6 +713,12 @@ class AntonChannelRuntime:
             input_text=text,
             model=None,  # deployment default, same as browser turns with no override
             turn_rows=turn_rows,
+            # Read here, not in remote_turn_events: `settings` is this turn's
+            # own snapshot (_run_anton's use_turn_settings), not a scope that
+            # a unit test may drive with a bare stand-in.
+            memory_off=memory_reads_off(
+                memory_enabled=settings.memory_enabled, memory_mode=settings.memory_mode,
+            ),
         )
 
     async def _run_anton(
@@ -777,6 +784,7 @@ class AntonChannelRuntime:
 
             stream = await self._turn_stream(
                 harness, harness_id, scope, conversation, blocks, text, channel_context, turn_rows,
+                setup.settings,
             )
             remote_failure: RemoteTurnFailed | None = None
             try:

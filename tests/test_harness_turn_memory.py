@@ -8,7 +8,8 @@ Memory left shared is one deployment store: the base global tier and the
 current project's tier under it, never another project's. A turn with no
 person, and every turn while memory is off, reads none of it and writes
 nothing: two empty tiers in its scratch folder, memory off, no background
-passes, and the managed rules alone. The desktop is unchanged.
+passes, and the managed rules alone. The desktop's own MEMORY_ENABLED now
+gates reads the same way.
 """
 from __future__ import annotations
 
@@ -22,6 +23,7 @@ from uuid import UUID, uuid4
 import pytest
 from sqlalchemy import delete
 
+from cowork.common.settings import user_settings
 from cowork.common.settings.app_settings import get_app_settings
 from cowork.db.personal_resources import ALL_PERSONAL_RESOURCES, PersonalResource
 from cowork.db.scoped import LOCAL_SCOPE, TenantScope
@@ -283,6 +285,50 @@ async def test_memory_off_reads_and_writes_no_learned_memory(
 
 
 @pytest.mark.parametrize("resources", [ALL_PERSONAL_RESOURCES, WITHOUT_MEMORY], ids=["personal", "shared"])
+async def test_memory_mode_off_alone_reads_and_writes_no_learned_memory(
+    monkeypatch, trusted, managed_dir, caplog, resources
+):
+    """memory_mode "off" alone, MEMORY_ENABLED left true: the same empty
+    tiers and no-reads contract as MEMORY_ENABLED false above, so a person
+    who turned mode to Off without disabling memory outright gets the same
+    guarantee."""
+    from tests._fakes import MANAGED_RULE
+
+    _keep_memory(monkeypatch, resources)
+    person = _person(resources=resources)
+    personal_tier = trusted / "shared" / PARTITION / "memory" / "users" / SUB
+    shared = trusted / "base-memory"
+
+    def mode_off(_project_path: Path) -> None:
+        user_settings.get_user_settings().memory_mode = "off"
+
+    with _project_row(root=trusted, scope=person) as project:
+        _seed_learned(personal_tier, personal_tier / "projects" / str(project.id), tag="personal")
+        _seed_learned(shared, shared / "projects" / str(project.id), tag="shared")
+        _plant(Path(project.path))
+        project_memory = Path(project.path) / ".anton" / "memory"
+        before = _snapshot(personal_tier, shared, project_memory)
+        with caplog.at_level(logging.WARNING, logger=harness.__name__):
+            async with built_turn(
+                monkeypatch=monkeypatch, tmp_path=trusted, scope=person, project=project, before_build=mode_off,
+            ) as turn:
+                config, scratch = turn.config, turn.scratch
+                global_dir, project_dir = _tiers(config)
+                assert scratch is not None
+                assert global_dir.parent.parent == scratch and project_dir.parent.parent == scratch
+                assert config.cortex.mode == "off"
+                assert config.background_memory is False
+                assert turn.learns is False
+                context = await _everything_the_turn_reads(config)
+                assert list(global_dir.iterdir()) == [] and list(project_dir.iterdir()) == []
+                after = _snapshot(personal_tier, shared, project_memory)
+    assert MANAGED_RULE in context
+    for learned in ("personal ", "shared ", PLANTED_GLOBAL_RULE, PLANTED_PROJECT_RULE, PLANTED_PROFILE):
+        assert learned not in context
+    assert after == before
+
+
+@pytest.mark.parametrize("resources", [ALL_PERSONAL_RESOURCES, WITHOUT_MEMORY], ids=["personal", "shared"])
 async def test_memory_off_makes_no_memory_folder(monkeypatch, trusted, resources):
     """The empty tiers are picked before any real tier's folder is made."""
     _keep_memory(monkeypatch, resources)
@@ -343,23 +389,22 @@ async def test_the_desktop_keeps_the_base_tiers(monkeypatch, dirs):
         assert PLANTED_GLOBAL_RULE in context
 
 
-async def test_the_desktop_with_memory_disabled_still_reads_the_base_tiers(monkeypatch, dirs):
-    """The desktop keeps its own disabled-memory behavior: memory mode off over
-    the base tiers, which the turn still reads."""
+async def test_the_desktop_with_memory_disabled_reads_nothing(monkeypatch, dirs):
+    """MEMORY_ENABLED false now gates reads too: the turn gets two empty
+    tiers in its scratch folder, like the trusted-identity "memory off" case,
+    instead of the base tiers read-only."""
     monkeypatch.setenv("MEMORY_ENABLED", "false")
     async with _built(monkeypatch=monkeypatch, tmp_path=dirs, scope=None) as turn:
-        config, scratch, project = turn.config, turn.scratch, turn.project
+        config, scratch = turn.config, turn.scratch
         global_dir, project_dir = _tiers(config)
-        assert global_dir == dirs / "base-memory"
-        assert project_dir == Path(project.path) / ".anton" / "memory"
+        assert scratch is not None
+        assert global_dir.parent.parent == scratch and project_dir.parent.parent == scratch
         assert config.cortex.mode == "off"
-        assert config.background_memory is True
-        # It reads the base tiers, so its memory record keeps anton's `learned`.
-        assert turn.learns is True
-        assert scratch is None
+        assert config.background_memory is False
+        assert turn.learns is False
         context = await config.cortex.build_memory_context("how many?")
-        assert PLANTED_PROJECT_RULE in context
-        assert PLANTED_GLOBAL_RULE in context
+        assert PLANTED_PROJECT_RULE not in context
+        assert PLANTED_GLOBAL_RULE not in context
 
 
 def test_person_turn_memory_needs_a_person_only_when_identity_is_trusted(trusted, tmp_path):

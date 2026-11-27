@@ -260,7 +260,7 @@ async def test_unset_builds_a_real_harness_config_with_an_older_anton(monkeypatc
         (True, "copilot", True, False, "personal"),
         (True, "autopilot", True, True, "shared"),
         (False, "autopilot", True, False, "off"),
-        (True, "off", True, False, "personal"),
+        (True, "off", True, False, "off"),
         (True, "autopilot", False, False, "unavailable"),
     ],
 )

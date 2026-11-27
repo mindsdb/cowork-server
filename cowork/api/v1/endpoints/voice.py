@@ -22,9 +22,10 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, Field
 
 from cowork.api.v1.permissions import AuthenticatedInOrgMode, require
+from cowork.common.settings.user_settings import get_user_settings
 from cowork.db.scoped import TenantScope, get_tenant_scope
 from cowork.db.units import FilesystemBusy, run_efs
-from cowork.harnesses.memory.policy import resolve_memory_policy
+from cowork.harnesses.memory.policy import memory_reads_off
 from cowork.principal import mindshub_credential
 from cowork.services import voice, voice_operator
 from cowork.services.memory import build_turn_memory
@@ -47,7 +48,8 @@ def _person_memory(scope: TenantScope) -> dict[str, str]:
     """The person's own memory slots (profile, rules), unless memory is off.
     A read error leaves the call without memory rather than without a call."""
     try:
-        if resolve_memory_policy(scope=scope).off:
+        settings = get_user_settings(scope)
+        if memory_reads_off(memory_enabled=settings.memory_enabled, memory_mode=settings.memory_mode):
             return {}
         return build_turn_memory(scope).get("global", {})
     except Exception:

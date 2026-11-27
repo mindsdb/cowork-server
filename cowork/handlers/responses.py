@@ -63,7 +63,7 @@ from cowork.handlers.response_routing import (
 )
 from cowork.harnesses.anton_harness.agent_files import AgentFiles
 from cowork.harnesses.anton_harness.figure_sources import has_figures
-from cowork.harnesses.memory.policy import memory_policy
+from cowork.harnesses.memory.policy import memory_reads_off
 from cowork.schemas.figure_sources import EarlierAnswer, FigureSources
 from cowork.harnesses.anton_harness.stream_formatter import (
     ConnectorDrafted,
@@ -1007,18 +1007,6 @@ class ResponsesHandler:
         from cowork.services.content_safety import check_request
         await check_request(request, scope=self.scope)
 
-        # "memory": "off" runs the turn as MEMORY_ENABLED=false would. On a
-        # deployment where that still reads stored memory (memory_policy: the
-        # desktop), the question is refused rather than answered from memory.
-        if request.memory == "off" and not memory_policy(memory_enabled=False).off:
-            raise HTTPException(
-                status_code=501,
-                detail=(
-                    "This deployment can't keep one question from reading memory. "
-                    'Retry the request without "memory": "off".'
-                ),
-            )
-
         # Identity + the running build into the run's trace metadata;
         # server-derived keys win. The build stamp (ENG-1279) is what lets a
         # metric be attributed to a release instead of to a date on which
@@ -1106,6 +1094,11 @@ class ResponsesHandler:
         if request.browser == "off":
             off["browser_enabled"] = False
         turn_settings = start.settings.model_copy(update=off) if off else start.settings
+        # Read once, here, and threaded through: a direct call to the
+        # remote producer (tests included) has no ambient settings to read.
+        memory_off = memory_reads_off(
+            memory_enabled=turn_settings.memory_enabled, memory_mode=turn_settings.memory_mode,
+        )
         with use_turn_settings(self.scope, turn_settings):
             try:
                 route, turn_llm = await self._route_request(
@@ -1268,6 +1261,7 @@ class ResponsesHandler:
                         trace_metadata=metadata,
                         turn_llm=turn_llm,
                         first_take=first_take,
+                        memory_off=memory_off,
                         docs=_client_shows_docs(request),
                         remote_docs=remote_docs,
                     )
@@ -2514,6 +2508,7 @@ class ResponsesHandler:
         lifecycle: TurnLifecycle | None = None,
         turn_llm: dict | None = None,
         first_take: FirstTake | None = None,
+        memory_off: bool = False,
         docs: bool = False,
         remote_docs: bool = False,
     ):
@@ -2528,6 +2523,10 @@ class ResponsesHandler:
         either producer from persisting into truncated history; it defaults to
         a fresh one so a directly-called producer (tests) still has a flag to
         read.
+
+        `memory_off` is handle()'s own read of this turn's settings
+        (memory_reads_off), not re-read inside the remote producer: a direct
+        call to it, in tests among others, carries no ambient settings.
 
         `docs` reaches only the in-process turn. A remote turn's pod gets the
         doc tools when `remote_docs` says so (ResponsesHandler._remote_docs).
@@ -2550,6 +2549,7 @@ class ResponsesHandler:
                 turn_llm=turn_llm,
                 disabled=disabled,
                 first_take=first_take,
+                memory_off=memory_off,
                 # What the person typed, without the doc blocks ahead of it:
                 # the turn's question and its revision labels read this.
                 question_text=_typed_text(harness_input),
@@ -2777,7 +2777,7 @@ class ResponsesHandler:
             return
         try:
             settings = get_user_settings(session.scope)
-            if not settings.memory_enabled or settings.memory_mode == "off":
+            if memory_reads_off(memory_enabled=settings.memory_enabled, memory_mode=settings.memory_mode):
                 logger.info("[responses] memory is off; dropped %d memory entr(ies) for conversation %s",
                             len(entries), conv_id, extra=log_context(conversation_id=conv_id))
                 return
@@ -2983,6 +2983,7 @@ class ResponsesHandler:
         disabled: list[dict] | None = None,
         reasoning_effort: str | None = None,
         first_take: FirstTake | None = None,
+        memory_off: bool = False,
         remote_docs: bool = False,
         question_text: str | None = None,
     ) -> None:
@@ -3404,7 +3405,7 @@ class ResponsesHandler:
             # The project's memory it reads lives on the file store, so the
             # seed is read in a unit on the file store's threads.
             seed = await run_efs_unit(
-                partial(self._read_remote_turn_inputs, conv_id=conv_id, with_memory=True), scope=scope
+                partial(self._read_remote_turn_inputs, conv_id=conv_id, with_memory=not memory_off), scope=scope
             )
             # The skills the caller sees, the pod's whole recallable set
             # (remote_turn_skills); empty when they see none. It seeds the
@@ -3503,6 +3504,7 @@ class ResponsesHandler:
                 # a bounded, sheddable wire block. Skills travel as the
                 # caller's whole recallable set (remote_turn_skills).
                 memory=seed.memory,
+                memory_off=memory_off,
                 skills=with_docs_skill(skills) if doc_tools is not None else skills,
                 workspace=seed.workspace,
                 started_at=seed.started_at,

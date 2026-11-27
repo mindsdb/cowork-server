@@ -4,8 +4,7 @@ while every other question keeps memory.
 The handler runs it on a copy of the turn's settings snapshot with memory
 off, and the harness turns that into two empty tiers in the turn's scratch
 folder and no background passes (test_harness_turn_memory pins that half).
-A deployment where memory off still reads stored memory, the desktop, refuses
-the question instead of answering it from memory.
+The desktop answers it the same way; memory off now stops reads everywhere.
 """
 from __future__ import annotations
 
@@ -145,23 +144,21 @@ async def test_no_question_turns_memory_on_where_the_operator_turned_it_off(trus
     assert harness.seen == [TurnMemory(enabled=False, off=True)] * 3
 
 
-async def test_the_desktop_refuses_a_question_with_memory_off(monkeypatch):
-    """Without trusted identity headers, memory off still reads the base
-    tiers, so the question is refused before anything runs: no conversation
-    is saved for it."""
+async def test_the_desktop_answers_a_question_with_memory_off(monkeypatch):
+    """Without trusted identity headers, the request no longer gets refused
+    for "memory": "off": it runs with memory_enabled copied to False, same
+    as a trusted turn, and its conversation is saved. Whether the harness
+    actually reads nothing with that setting is test_harness_turn_memory's
+    own coverage, not this handler-level one."""
     harness = _SeesMemory()
     conversation = uuid4()
 
     answered = await _ask(monkeypatch, harness, headers={}, memory="off", conversation=str(conversation))
 
-    assert answered.status_code == 501, answered.text
-    assert answered.json()["detail"] == (
-        "This deployment can't keep one question from reading memory. "
-        'Retry the request without "memory": "off".'
-    )
-    assert harness.started == 0
+    assert answered.status_code == 200 and "response.completed" in answered.text, answered.text
+    assert harness.seen == [TurnMemory(enabled=False, off=False)]
     with Session(get_engine(get_app_settings().database.uri)) as raw:
-        assert raw.get(Conversation, conversation) is None
+        assert raw.get(Conversation, conversation) is not None
 
 
 async def test_the_desktop_answers_a_question_with_memory_on(monkeypatch):
