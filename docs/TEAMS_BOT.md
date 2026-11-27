@@ -28,7 +28,8 @@ log says why. Cowork starts either way.
 
 | Route | Does |
 |---|---|
-| `POST /api/v1/connectors/teams/deliver` | JSON `service_url`, `conversation_id`, `reply_to_id`, `text`. Posts `text` as a reply in that thread; answers `{"id": <new message id>}`. |
+| `POST /api/v1/connectors/teams/deliver` | JSON `service_url`, `conversation_id`, `reply_to_id`, `text`, and optionally `mention`: `{"id": <member's Teams id>, "name": <display name>}`. Posts `text` as a reply in that thread, starting with an @mention of that member when given, so Teams notifies them. With `stream_id` from the status route, the reply closes that stream and takes the status line's place, and answers that stream id when Teams gives the reply none; if Teams refuses (it closes a stream after 10 minutes), it goes out as a plain reply. Answers `{"id": <new message id>}`. |
+| `POST /api/v1/connectors/teams/status` | JSON `service_url`, `conversation_id`, `reply_to_id`, `text` (up to 1,000 characters), and for a later update `stream_id` and a rising `sequence`. Shows `text` as a Teams informative update under that message: a status line with no notification, replaced by each later update and by the reply that names its stream. Answers `{"stream_id": <id>}`, or `{"stream_id": null}` when Teams gave the first update no id: no stream opened, so the answer goes out as a plain reply. |
 | `GET /api/v1/connectors/teams/member` | Query `service_url`, `conversation_id`, `member_id`. Answers the person's `id`, `name`, `email`, `user_principal_name`, `aad_object_id` and `tenant_id`. |
 
 Both answer:

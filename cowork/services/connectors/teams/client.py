@@ -15,6 +15,8 @@ Cowork), so desktop installs import this module without them and
 from __future__ import annotations
 
 import asyncio
+import html
+import re
 from typing import Any
 
 import httpx
@@ -22,14 +24,23 @@ import httpx
 try:
     import msal
     from microsoft_teams.api.activities.message import MessageActivityInput
+    from microsoft_teams.api.activities.typing import TypingActivityInput
     from microsoft_teams.api.clients.conversation.client import ConversationClient
-    from microsoft_teams.api.models import TeamsChannelAccount
+    from microsoft_teams.api.models import Account, ChannelData, StreamInfoEntity, TeamsChannelAccount
     from microsoft_teams.common.http import Client, ClientOptions
 except ImportError:
     msal = None
 
 LOGIN_HOST = "https://login.microsoftonline.com"
 BOT_SCOPE = "https://api.botframework.com/.default"
+# Text that opens with a markdown block: a list item, heading, table, code block or quote.
+_STARTS_A_BLOCK = re.compile(r"( {4}|\t)|\s*([-*+][ \t]|\d+[.)][ \t]|#|\||```|~~~|>)")
+# What Microsoft's client returns as an activity's id when Teams answered with an empty body.
+_NO_ID = "DO_NOT_USE_PLACEHOLDER_ID"
+
+
+def _real_id(activity_id: str | None) -> str | None:
+    return activity_id if activity_id and activity_id != _NO_ID else None
 
 
 class TeamsUnavailableError(RuntimeError):
@@ -88,11 +99,52 @@ class TeamsClient:
         # _http shares one connection pool across calls instead of a new one per call.
         return ConversationClient(service_url, Client(ClientOptions(token=self.bot_token), _http=self._http))
 
-    async def reply(self, service_url: str, conversation_id: str, activity_id: str, text: str) -> str:
-        """Post ``text`` as a reply in the thread of ``activity_id``; returns the new message's id."""
-        sent = await self._conversations(service_url).reply_to_activity(
-            conversation_id, activity_id, MessageActivityInput(text=text)
-        )
+    async def status(
+        self, service_url: str, conversation_id: str, activity_id: str, text: str,
+        *, stream_id: str | None = None, sequence: int = 1,
+    ) -> str | None:
+        """Show ``text`` as an informative update under the message ``activity_id``: a status line,
+        not a message, with no notification. The first update opens a stream and returns its id;
+        later ones name it with a rising ``sequence``, and each replaces the one before. A reply
+        with that ``stream_id`` closes the stream and takes the status line's place.
+
+        Returns None when Teams gave the first update no id: no stream opened, so the answer goes
+        out as a plain reply.
+        """
+        update = TypingActivityInput(text=text, reply_to_id=activity_id)
+        update.channel_data = ChannelData(stream_id=stream_id, stream_type="informative", stream_sequence=sequence)
+        update.add_entity(StreamInfoEntity(stream_id=stream_id, stream_type="informative", stream_sequence=sequence))
+        sent = await self._conversations(service_url).create_activity(conversation_id, update)
+        # Teams answers a later update with an empty body, so it keeps the stream's first id.
+        return stream_id or _real_id(sent.id)
+
+    async def reply(
+        self, service_url: str, conversation_id: str, activity_id: str, text: str,
+        *, mention: tuple[str, str] | None = None, stream_id: str | None = None,
+    ) -> str:
+        """Post ``text`` as a reply in the thread of ``activity_id``; returns the new message's id.
+
+        ``mention``, a member's (id, name), @mentions them ahead of the text, so Teams notifies them.
+        ``stream_id``, from ``status``, posts it as that stream's final message instead.
+        """
+        activity = MessageActivityInput(text=text)
+        if mention:
+            member_id, name = mention
+            # The name is markup inside <at>; the entity's text must match the message's exactly.
+            tag = f"<at>{html.escape(name)}</at>"
+            # On a line of its own before a block, or Teams runs the block's first line into the name.
+            gap = "\n\n" if _STARTS_A_BLOCK.match(text) else " "
+            activity = MessageActivityInput(text=f"{tag}{gap}{text}").add_mention(
+                Account(id=member_id, name=name), text=html.escape(name), add_text=False
+            )
+        if stream_id:
+            activity.reply_to_id = activity_id
+            activity.channel_data = ChannelData(stream_id=stream_id, stream_type="final")
+            activity.add_entity(StreamInfoEntity(stream_id=stream_id, stream_type="final"))
+            sent = await self._conversations(service_url).create_activity(conversation_id, activity)
+            # Teams usually answers the stream's final message with an empty body.
+            return _real_id(sent.id) or stream_id
+        sent = await self._conversations(service_url).reply_to_activity(conversation_id, activity_id, activity)
         return sent.id
 
     async def get_member(self, service_url: str, conversation_id: str, member_id: str) -> TeamsChannelAccount:
