@@ -60,10 +60,8 @@ class OrgLocalSaveRefused(PermissionError):
 
 
 def _refuses_local_save(scope: "TenantScope | None") -> bool:
-    """True for an org scope, with or without an org id, and for no scope under org tenancy."""
-    if scope is not None:
-        return scope.org_mode
-    return get_app_settings().tenancy_mode == "org"
+    """True for an org scope, with or without an org id, and for any save under org tenancy."""
+    return (scope is not None and scope.org_mode) or get_app_settings().tenancy_mode == "org"
 
 
 def own_vault_root(scope: "TenantScope | None" = None) -> Path:
@@ -294,7 +292,7 @@ def persist_connection(
     that vault for.
 
     Raises ``OrgLocalSaveRefused`` before the vault is touched for an org
-    scope, or for no scope under org tenancy: an org's credentials live in
+    scope, and for any save under org tenancy: an org's credentials live in
     auth's data vault.
     """
     if _refuses_local_save(scope):

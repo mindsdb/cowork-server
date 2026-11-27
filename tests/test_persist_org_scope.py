@@ -2,8 +2,8 @@
 
 In org tenancy every connection lives in auth's data vault, and no org turn
 reads this server's. ``persist_connection`` refuses an org scope, with or
-without an org id, and a call with no scope under org tenancy, before the
-vault is touched. Each caller that can run in an org deployment answers with
+without an org id, and any save under org tenancy, before the vault is
+touched. Each caller that can run in an org deployment answers with
 the fixed refusal and saves nothing. A personal scope (self-hosted) and the
 desktop's local tenancy still save.
 """
@@ -18,7 +18,7 @@ from anton.core.datasources.data_vault import LocalDataVault
 
 from cowork.api.v1.endpoints.connectors import submissions as submissions_ep
 from cowork.common.settings.app_settings import OAuthSettings, get_app_settings
-from cowork.db.scoped import TenantScope
+from cowork.db.scoped import LOCAL_SCOPE, TenantScope
 from cowork.handlers import probe as probe_handler
 from cowork.handlers.probe import ProbeHandler
 from cowork.services.connectors.oauth.google import OAuthService
@@ -79,6 +79,13 @@ def test_an_org_scope_is_refused_before_the_vault_is_touched(org_tenancy, scope)
 def test_a_save_with_no_scope_is_refused_under_org_tenancy(org_tenancy):
     with pytest.raises(OrgLocalSaveRefused):
         persist_connection("linear", "personal-api-key", "", {"api_key": TOKEN}, vault=_UntouchableVault())
+
+
+@pytest.mark.parametrize("scope", [LOCAL_SCOPE, PERSON], ids=["operator scope", "personal scope"])
+def test_any_scope_is_refused_under_org_tenancy(org_tenancy, scope):
+    """No code path on an org deployment saves to this server's vault, whatever scope it holds."""
+    with pytest.raises(OrgLocalSaveRefused):
+        persist_connection("linear", "personal-api-key", "", {"api_key": TOKEN}, vault=_UntouchableVault(), scope=scope)
 
 
 def test_a_save_with_no_scope_still_writes_on_the_desktop(local_tenancy):
