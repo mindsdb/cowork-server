@@ -539,6 +539,8 @@ WRITES_WITHOUT_THE_PROOF: dict[tuple[str, tuple[str, ...]], str] = {
     ("/api/v1/connectors/custom-mcp/connections/{name}", ("DELETE",)): ORG_TENANCY_ONLY,
     ("/api/v1/connectors/custom-mcp/connections/{name}/reconnect", ("POST",)): ORG_TENANCY_ONLY,
     ("/api/v1/connectors/custom-mcp/connections/{name}/tools", ("PUT",)): ORG_TENANCY_ONLY,
+    # A built-in connector's web sign-in, finished in the member's own session.
+    ("/api/v1/connectors/oauth/finish", ("POST",)): ORG_TENANCY_ONLY,
     # The browser: on the web only, where it is the browser router's.
     ("/api/v1/browse/provision", ("POST",)): ORG_TENANCY_ONLY,
     ("/api/v1/browse/embed", ("POST",)): ORG_TENANCY_ONLY,
