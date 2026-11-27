@@ -27,10 +27,22 @@ A task has:
 - `title` and `prompt`. Each run starts a new conversation from `prompt` alone,
   with no other context, so write it as complete instructions.
 - `cadence`: `once`, `every_15_minutes`, `every_30_minutes`, `hourly`,
-  `daily`, `weekdays` or `weekly`. A server older than the 15 and 30 minute
+  `daily`, `weekdays`, `weekly` or `monthly`. A server older than the 15 and 30 minute
   cadences answers 422 for them.
 - `next_run_at`: the first run, ISO 8601 with a UTC offset. Recurring tasks
   repeat at that time of day, minute or weekday.
+- `recurrence` (optional): for weekly tasks, send days such as
+  `{"days": ["mon", "wed", "fri"]}`. Without a rule, a weekly task follows
+  the weekday of its next run. For monthly tasks, send `{"monthDay": 31}`
+  or a weekday rule such as `{"week": 1, "weekday": "mon"}`. Use `1` to
+  `4` for the first through fourth weekday or `-1` for the last. Without a
+  rule on creation, a monthly task uses the day of its first run. If a
+  month is too short for the chosen day, it runs on the month's last day.
+  The API rejects a rule that does not fit its cadence with HTTP 422.
+  Editing just the next date also moves an inferred monthly day. An
+  explicitly chosen rule stays in effect. Editing just the rule uses the
+  first matching slot after the edit at the saved local time of day. Send
+  `nextRunAt` with the rule to start later.
 - `timezone`: the IANA zone the cadence follows, such as `Europe/London`.
   Defaults to `UTC`.
 - `project_id` (optional): the project the runs belong to. Defaults to your

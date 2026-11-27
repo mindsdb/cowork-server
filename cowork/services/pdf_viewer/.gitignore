@@ -1,0 +1,3 @@
+# pdf.js, put here by fetch_pdfjs.py at build time.
+/pdfjs/
+/.pdfjs-*/

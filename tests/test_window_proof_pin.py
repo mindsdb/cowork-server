@@ -596,6 +596,9 @@ WRITES_WITHOUT_THE_PROOF: dict[tuple[str, tuple[str, ...]], str] = {
     ("/api/v1/projects/{project_name}/files/import/sharepoint", ("POST",)): CHANGES_THE_PERSONS_OWN_WORK,
     ("/api/v1/projects/{project_name}/skill_drafts/{slug}", ("DELETE",)): CHANGES_THE_PERSONS_OWN_WORK,
     ("/api/v1/projects/preview-mount-file", ("POST",)): CHANGES_NOTHING,
+    # Notices: reading the inbox off. Nothing the agent does waits on one.
+    ("/api/v1/notices/read-all", ("POST",)): "marks the person's notices read; no gate reads a notice's state",
+    ("/api/v1/notices/{notice_id}/read", ("POST",)): "marks one of the person's notices read; no gate reads it",
     # Schedules: these two only stop work. The rest ask for the proof.
     ("/api/v1/schedules/{schedule_id}", ("DELETE",)): STOPS_OR_NARROWS,
     ("/api/v1/schedules/{schedule_id}/pause", ("POST",)): STOPS_OR_NARROWS,

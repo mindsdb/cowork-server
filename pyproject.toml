@@ -237,6 +237,15 @@ fallback-version = "0.0.0-dev"
 
 [tool.hatch.build.targets.wheel]
 packages = ["cowork"]
+# pdf.js, put there by hatch_build.py and ignored by git.
+artifacts = ["cowork/services/pdf_viewer/pdfjs/"]
+
+[tool.hatch.build.targets.wheel.hooks.custom]
+
+[tool.uv]
+# uv reinstalls the editable project, and so reruns hatch_build.py, only when
+# a cache key changes; the pdf.js pin lives in fetch_pdfjs.py.
+cache-keys = [{ file = "pyproject.toml" }, { file = "cowork/services/pdf_viewer/fetch_pdfjs.py" }]
 
 [tool.cowork.release.allow-prerelease]
 # The exact pre-releases a production release may still name, in the lock and

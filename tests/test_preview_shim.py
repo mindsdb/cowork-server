@@ -14,6 +14,7 @@ import subprocess
 
 import pytest
 
+from cowork.services import pdf_viewer
 from cowork.services.preview_shim import SHIM_JS, _script_tag, inject_shim
 
 
@@ -71,6 +72,25 @@ def test_line_offset_matches_the_lines_the_injection_adds():
 def test_reporter_is_installed_before_the_storage_guard():
     # Diagnostics must survive a real origin, where the storage half returns early.
     assert SHIM_JS.index("addEventListener('error'") < SHIM_JS.index("nativeStorageWorks")
+
+
+def test_a_pdf_element_the_viewer_shows_is_not_reported_as_a_failed_file():
+    # Chrome fires error on the hidden original <object> of a replaced PDF.
+    element = (
+        "const element = (tagName, attrs) => ({ tagName, src: attrs.src || '',"
+        " getAttribute: (name) => (name in attrs ? attrs[name] : null) });\n"
+    )
+    fire = "listeners.error.forEach((fn) => fn({ target: %s }));\n"
+    scenario = (
+        element
+        + fire % "element('OBJECT', { data: 'report.pdf' })"
+        + fire % "element('EMBED', { src: 'docs/report.PDF' })"
+        + fire % "element('IMG', { src: 'chart.png' })"
+        + fire % "element('OBJECT', { data: 'chart.svg' })"
+    )
+    result = _run_pdf_shim("/_t/v1.x/_anton_pdf/", observer="record", scenario=scenario)
+    resources = [(m["tagName"], m["url"]) for m in result["posted"] if m.get("type") == "resource"]
+    assert resources == [("IMG", "chart.png"), ("OBJECT", "")]
 
 
 # Each reported field that can hold an address, and the value that feeds it.
@@ -247,11 +267,16 @@ __SCENARIO__
 """
 
 
+def _node_shim() -> str:
+    """SHIM_JS with the placeholders that prepare_preview_html fills, and no PDF viewer."""
+    return SHIM_JS.replace("__LINE_OFFSET__", "0").replace("__PDF_ASSETS__", '""')
+
+
 def _run_shim(scenario: str) -> dict:
     node = shutil.which("node")
     if node is None:
         pytest.skip("node is not installed")
-    script = _HARNESS.replace("__SHIM__", SHIM_JS.replace("__LINE_OFFSET__", "0")).replace("__SCENARIO__", scenario)
+    script = _HARNESS.replace("__SHIM__", _node_shim()).replace("__SCENARIO__", scenario)
     done = subprocess.run([node, "-e", script], capture_output=True, text=True, timeout=30, check=True)
     out = json.loads(done.stdout)
     assert out["posted"][0] == {"type": "document-start", "source": "anton-preview"}
@@ -367,6 +392,92 @@ def test_new_reports_still_count_against_the_report_cap():
     out = _run_shim("for (let i = 0; i < 40; i++) window.console.error(new Error('e' + i));")
     assert len(out["reports"]) == 20
 
+
+def test_pdf_embeds_are_spliced_into_the_shim():
+    assert pdf_viewer.EMBED_JS in SHIM_JS
+    assert pdf_viewer.EMBEDS_MARKER not in SHIM_JS
+
+
+def test_the_shim_carries_no_document_tags():
+    # comments_layer.inject_layer looks for the last </body>, the cowork
+    # renderer for the first <head>: inside the shim they would land in a script.
+    assert not re.search(r"</?(?:html|head|body)\b|<!doctype", SHIM_JS, re.I)
+
+
+def test_the_comment_layer_lands_after_the_shim_on_a_page_without_a_closing_body():
+    from cowork.services.preview_html import prepare_preview_html
+
+    out = prepare_preview_html("<html><head></head><body><p>text</p>", comments=True)
+    assert out.index("</script>") < out.index("anton-comments")
+
+
+def test_pdf_embeds_are_installed_after_the_reporter_and_before_the_storage_guard():
+    assert (
+        SHIM_JS.index("addEventListener('error'")
+        < SHIM_JS.index("installPdfEmbeds(window, {")
+        < SHIM_JS.index("var nativeStorageWorks")
+    )
+
+
+def test_a_shim_template_without_the_marker_is_refused():
+    with pytest.raises(ValueError, match="preview_shim.js"):
+        pdf_viewer.splice_embeds("(function () {})();", "preview_shim.js")
+
+
+def test_pdf_assets_are_filled_per_response():
+    html = "<html><head></head><body></body></html>"
+    with_assets = inject_shim(html, pdf_assets="/_t/v1.abc/_anton_pdf/")
+    assert 'var PDF_ASSETS = "/_t/v1.abc/_anton_pdf/";' in with_assets
+    assert 'var PDF_ASSETS = "";' in inject_shim(html)
+    assert "__PDF_ASSETS__" not in with_assets
+    # The value has no line break, so the line offset is the same.
+    assert with_assets.count("\n") == inject_shim(html).count("\n")
+
+
+def test_pdf_assets_cannot_close_the_script():
+    out = inject_shim("<head></head>", pdf_assets="</script><b>")
+    assert "</script><b>" not in out
+    assert chr(92) + "u003c/script>" in out
+
+
+def _run_pdf_shim(pdf_assets, *, observer, scenario=""):
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("node is not installed")
+    markup = inject_shim("<html><head></head></html>", pdf_assets=pdf_assets)
+    js = markup[markup.index("<script>") + len("<script>"): markup.rindex("</script>")]
+    harness = (
+        "const posted = []; const observed = []; const listeners = {};\n"
+        "globalThis.ErrorEvent = class ErrorEvent {};\n"
+        "class MO { constructor() { if (" + json.dumps(observer) + " === 'throw') throw new Error('no observer'); }"
+        " observe(target, options) { observed.push([...options.attributeFilter]); } }\n"
+        "const window = { location: { href: 'https://draft-staging.mindshub.co/_t/v1.x/index.html',"
+        " origin: 'https://draft-staging.mindshub.co' }, parent: { postMessage: (m) => posted.push(m) },"
+        " addEventListener(type, fn) { (listeners[type] = listeners[type] || []).push(fn); },"
+        " MutationObserver: MO, URL, Blob, navigator: {},"
+        " get localStorage() { throw new Error('SecurityError'); } };\n"
+        "window.document = { baseURI: window.location.href, addEventListener() {}, documentElement: null };\n"
+        "const document = window.document;\n"
+        + js
+        + "\n"
+        + scenario
+        + "\nprocess.stdout.write(JSON.stringify({ observed, posted,"
+        " storage: typeof Object.getOwnPropertyDescriptor(window, 'localStorage').value }));\n"
+    )
+    done = subprocess.run([node, "-e", harness], capture_output=True, text=True, timeout=30, check=True)
+    return json.loads(done.stdout)
+
+
+def test_the_shim_installs_pdf_embeds_only_with_an_address():
+    assert _run_pdf_shim("/_t/v1.x/_anton_pdf/", observer="record")["observed"] == [["src", "data", "type", "srcdoc"]]
+    assert _run_pdf_shim(None, observer="record")["observed"] == []
+
+
+def test_a_failing_pdf_embed_install_is_reported_and_the_shim_goes_on():
+    result = _run_pdf_shim("/_t/v1.x/_anton_pdf/", observer="throw")
+    errors = [m for m in result["posted"] if m.get("type") == "error"]
+    assert [e["message"] for e in errors] == ["PDF viewer: no observer"]
+    assert result["storage"] == "object", "the storage substitutes are still installed"
 
 # The view reporter, run in node against a stand-in DOM and a fake clock: what
 # the shim tells the app about where the user is, so the app's inline editor
@@ -488,9 +599,7 @@ def _views(scenario: str) -> list[dict]:
     node = shutil.which("node")
     if node is None:
         pytest.skip("node is not installed")
-    script = _VIEW_HARNESS.replace(
-        "__SHIM__", SHIM_JS.replace("__LINE_OFFSET__", "0")
-    ).replace("__SCENARIO__", scenario)
+    script = _VIEW_HARNESS.replace("__SHIM__", _node_shim()).replace("__SCENARIO__", scenario)
     done = subprocess.run(
         [node, "-e", script], capture_output=True, text=True, timeout=30, check=True
     )
@@ -636,9 +745,7 @@ def _run_restore(scenario: str) -> dict:
     node = shutil.which("node")
     if node is None:
         pytest.skip("node is not installed")
-    script = _VIEW_HARNESS.replace("__SHIM__", SHIM_JS.replace("__LINE_OFFSET__", "0")).replace(
-        "__SCENARIO__", _DECK + scenario
-    )
+    script = _VIEW_HARNESS.replace("__SHIM__", _node_shim()).replace("__SCENARIO__", _DECK + scenario)
     done = subprocess.run([node, "-e", script], capture_output=True, text=True, timeout=30, check=True)
     out = json.loads(done.stdout)
     out["restored"] = [m["status"] for m in out["posted"] if m["type"] == "view-restored"]

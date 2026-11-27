@@ -7,17 +7,23 @@ before it has already thrown.
 """
 from __future__ import annotations
 
+import json
 import re
 from pathlib import Path
 
+from cowork.services import pdf_viewer
 from cowork.services.comments_layer import script_tag
 
-SHIM_JS = Path(__file__).with_name("preview_shim.js").read_text(encoding="utf-8")
-
+_PDF_ASSETS_TOKEN = "__PDF_ASSETS__"
 _LINE_OFFSET_TOKEN = "__LINE_OFFSET__"
 _HEAD_OPEN_RE = re.compile(r"<head(?:\s[^>]*)?>", re.IGNORECASE)
 _HTML_OPEN_RE = re.compile(r"<html(?:\s[^>]*)?>", re.IGNORECASE)
 _DOCTYPE_RE = re.compile(r"<!doctype[^>]*>", re.IGNORECASE)
+
+
+SHIM_JS = pdf_viewer.splice_embeds(
+    Path(__file__).with_name("preview_shim.js").read_text(encoding="utf-8"), "preview_shim.js"
+)
 
 
 def _script_tag(shim_js: str, line_offset: int) -> str:
@@ -34,12 +40,24 @@ def _build_markup(shim_js: str) -> str:
     return _script_tag(shim_js, _script_tag(shim_js, 0).count("\n"))
 
 
-# Built once: SHIM_JS is a constant, and inject_shim runs in the hot preview path.
+# Built once: SHIM_JS is a constant, and inject_shim runs in the hot preview
+# path. Only the PDF viewer address is filled in per response.
 SHIM_MARKUP = _build_markup(SHIM_JS)
+if SHIM_MARKUP.count(_PDF_ASSETS_TOKEN) != 1:
+    raise ValueError("preview_shim.js must carry the PDF assets placeholder exactly once")
 
 
-def inject_shim(html: str) -> str:
+def _js_string(value: str) -> str:
+    """value as a JS string literal that cannot end the script element."""
+    return json.dumps(value).replace("<", chr(92) + "u003c")
+
+
+def inject_shim(html: str, *, pdf_assets: str | None = None) -> str:
     """Return ``html`` with the shim as its first script.
+
+    ``pdf_assets`` is the root-relative address of the bundled PDF viewer for
+    this document (``/_t/<token>/_anton_pdf/`` on the draft host); without it
+    the shim replaces no PDF embed.
 
     Placement, in order of preference: inside ``<head>``, after ``<html>``,
     after the doctype, at the very start. The doctype rule is not cosmetic —
@@ -54,8 +72,9 @@ def inject_shim(html: str) -> str:
     somewhere before the document ends; this function has to land before the
     page's own scripts run, which the first-match risk is accepted for.
     """
+    markup = SHIM_MARKUP.replace(_PDF_ASSETS_TOKEN, _js_string(pdf_assets or ""), 1)
     for pattern in (_HEAD_OPEN_RE, _HTML_OPEN_RE, _DOCTYPE_RE):
         match = pattern.search(html)
         if match:
-            return html[: match.end()] + SHIM_MARKUP + html[match.end() :]
-    return SHIM_MARKUP + html
+            return html[: match.end()] + markup + html[match.end() :]
+    return markup + html
