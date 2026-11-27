@@ -76,10 +76,11 @@ def draft_csp(frame_origin: str) -> str:
 
     ``frame_origin`` is the validated web origin (settings.draft_frame_origin);
     without one no page may frame a draft. The Cloudflare worker in front of
-    the host sets the same value at the edge.
+    the host sets the same value at the edge. connect-src adds jsDelivr, where
+    anton's pages load data files such as map atlases; it accepts no data.
     """
     ancestors = frame_origin or "'none'"
-    return f"{DRAFT_SANDBOX}; connect-src 'self'; frame-ancestors {ancestors}"
+    return f"{DRAFT_SANDBOX}; connect-src 'self' https://cdn.jsdelivr.net; frame-ancestors {ancestors}"
 
 
 def draft_response_headers(frame_origin: str) -> dict[str, str]:

@@ -29,7 +29,7 @@ DOC = "<html><head></head><body>draft body</body></html>"
 FETCH = {"Sec-Fetch-Site": "cross-site", "Sec-Fetch-Mode": "navigate", "Sec-Fetch-Dest": "iframe"}
 DRAFT_CSP = (
     "sandbox allow-scripts allow-popups allow-forms allow-modals; "
-    f"connect-src 'self'; frame-ancestors {WEB_ORIGIN}"
+    f"connect-src 'self' https://cdn.jsdelivr.net; frame-ancestors {WEB_ORIGIN}"
 )
 
 
