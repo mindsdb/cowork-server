@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import functools
+import hashlib
 import io
 import json
 import os
@@ -897,6 +898,14 @@ def test_{name}():
     asyncio.run({name}())
 ''')
         (root / "tests/test_empty.py").write_text('"""Collected module with no test cases."""\n')
+        table_path = root / "scripts/test_shard_timings.json"
+        table = json.loads(table_path.read_text())
+        for name, work in (("left é", 1000), ("right", 500), ("third", 200), ("fourth", 100)):
+            path = root / "tests" / f"test_{name}.py"
+            table["modules"][path.relative_to(root).as_posix()] = {
+                "source_sha256": hashlib.sha256(path.read_bytes()).hexdigest(), "cases": 1, "work_ms": work,
+            }
+        table_path.write_text(json.dumps(table))
 
     return _shard_evidence(inventory_suite, monkeypatch, prepare=prepare)
 
@@ -944,6 +953,7 @@ def test_shards_keep_the_whole_suite_guard(guarded_shards, monkeypatch):
     root, run, inputs, _, execute = guarded_shards
     packets = [sidecar(inputs / f"test-inventory-broad-shard-{index}-1234-1/inventory.json") for index in range(4)]
     evidence = [read_evidence(path) for path in packets]
+    assert "tests/test_left é.py" in evidence[0].collected_files
     assert all(len(packet.reached) == 1 and len(packet.workers) == 4 for packet in evidence)
     assert {leaf.leaf for packet in evidence for leaf in packet.reached} == {
         "*", "cowork/guard_probe.py:left", "cowork/guard_probe.py:third", "cowork/guard_probe.py:fourth"

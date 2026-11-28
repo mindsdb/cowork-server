@@ -36,7 +36,7 @@ from cowork.models.project import Project
 from cowork.principal import personal_partition_id
 from cowork.services.projects import ProjectService
 from _linked_folders import SECRET, LoggedRefusal, linked_folder_refusals, replace_with_link
-from test_artifact_export_route import padded_png
+from tests.support.artifacts.files import padded_png
 
 TOKEN = "partition-artifacts-test-token"
 DEPLOYMENT = "5f0c7d2e-8b1a-4c3e-9d4f-2a6b8c0e1f3a"

@@ -9,9 +9,11 @@ import hashlib
 import json
 import os
 from pathlib import Path, PurePosixPath
+import re
 import shutil
 import subprocess
 import sys
+import time
 
 from coverage import Coverage, CoverageData
 from coverage.exceptions import CoverageException
@@ -26,6 +28,9 @@ _SHARD_COUNT = 4
 _VARIABLE_CI_FIELDS = {"GITHUB_JOB", "GITHUB_RUN_ATTEMPT"}
 _HOST_RUNTIME_FIELDS = {"release", "logical_cpus"}
 _HOST_IMAGE_FIELDS = {"ImageOS", "ImageVersion"}
+_TIMINGS_PATH = Path(__file__).with_name("test_shard_timings.json")
+_ACTIVE_TEST_LOG_AFTER_SECONDS = 120
+_ACTIVE_TEST_POLL_SECONDS = 0.5
 
 
 def _require(condition: bool, message: str) -> None:
@@ -93,8 +98,70 @@ def _module_path(name: str) -> str:
     return name
 
 
+def _unique_timing_keys(pairs: list[tuple[str, object]]) -> dict:
+    """Reject ambiguous JSON keys before interpreting scheduling data."""
+    result = {}
+    for key, value in pairs:
+        _require(key not in result, "Duplicate timing key")
+        result[key] = value
+    return result
+
+
+def _timing_weights(counts: Counter) -> dict[str, int]:
+    """Read bounded source-matched costs; changed or unseen modules use per-case estimates."""
+    _require(not _TIMINGS_PATH.is_symlink() and _TIMINGS_PATH.is_file(), "Invalid timing table file")
+    _require(_TIMINGS_PATH.stat().st_size <= 2 * 1024 * 1024, "Timing table is too large")
+    table = json.loads(_TIMINGS_PATH.read_text(encoding="utf-8"), object_pairs_hook=_unique_timing_keys)
+
+    def keys(value, expected):
+        """Require an exact object shape without exposing malformed contents."""
+        _require(type(value) is dict and set(value) == set(expected), "Invalid timing object")
+
+    def integer(value, maximum):
+        """Reject booleans and nonintegral or out-of-range scheduling values."""
+        _require(type(value) is int and 1 <= value <= maximum, "Invalid timing integer")
+
+    def digest(value, length):
+        """Accept only canonical lowercase source digests."""
+        _require(type(value) is str and re.fullmatch(f"[0-9a-f]{{{length}}}", value) is not None,
+                 "Invalid timing digest")
+
+    keys(table, ("schema_version", "producer", "fallback_ms", "modules"))
+    _require(type(table["schema_version"]) is int and table["schema_version"] == 1, "Invalid timing schema")
+    integer(table["fallback_ms"], 86400000)
+    producer = table["producer"]
+    keys(producer, ("run_id", "attempt", "checkout_sha", "source_digest", "python", "platform", "cost_method"))
+    for field in ("run_id", "attempt"):
+        integer(producer[field], 2**63 - 1)
+    digest(producer["checkout_sha"], 40)
+    digest(producer["source_digest"], 64)
+    for field in ("python", "platform"):
+        _require(type(producer[field]) is str and 0 < len(producer[field]) <= 128, "Invalid timing runtime")
+    _require(producer["cost_method"] == "sum_setup_call_teardown_ms", "Invalid timing cost method")
+    entries = table["modules"]
+    _require(type(entries) is dict and len(entries) <= 10000, "Invalid timing modules")
+    root = Path.cwd().resolve() / "tests"
+    for name, entry in entries.items():
+        path = PurePosixPath(name)
+        _require(len(name) <= 512 and len(path.parts) > 1 and path.parts[0] == "tests" and
+                 path.as_posix() == name and ".." not in path.parts and "\\" not in name and ":" not in name and
+                 path.name.startswith("test_") and path.suffix == ".py" and Path(name).resolve().is_relative_to(root),
+                 "Invalid timing module path")
+        keys(entry, ("source_sha256", "cases", "work_ms"))
+        digest(entry["source_sha256"], 64)
+        integer(entry["cases"], 1000000)
+        integer(entry["work_ms"], 86400000)
+    weights = {}
+    for name, count in counts.items():
+        entry = entries.get(name)
+        weights[name] = count * table["fallback_ms"]
+        if count and entry and entry["cases"] == count and entry["source_sha256"] == hashlib.sha256(Path(name).read_bytes()).hexdigest():
+            weights[name] = entry["work_ms"]
+    return weights
+
+
 def partition(collection: Report, modules: Iterable[str] = ()) -> list[list[str]]:
-    """Assign every collected module once using descending case counts and stable ties."""
+    """Assign whole modules once using measured work, per-case fallback and stable ties."""
     validate(collection)
     selection = collection.invocation.selection
     _require(collection.mode == "collection" and collection.cohort == "broad" and
@@ -111,12 +178,13 @@ def partition(collection: Report, modules: Iterable[str] = ()) -> list[list[str]
         counts.setdefault(_module_path(skipped.nodeid), 0)
     for module in modules:
         counts.setdefault(_module_path(module), 0)
+    weights = _timing_weights(counts)
     groups: list[list[str]] = [[] for _ in range(_SHARD_COUNT)]
     totals = [0] * _SHARD_COUNT
-    for module in sorted(counts, key=lambda name: (-counts[name], name)):
+    for module in sorted(counts, key=lambda name: (-weights[name], name)):
         index = min(range(_SHARD_COUNT), key=lambda candidate: (totals[candidate], candidate))
         groups[index].append(module)
-        totals[index] += counts[module]
+        totals[index] += weights[module]
     _require(all(totals), "Every shard requires executable cases")
     return [sorted(group) for group in groups]
 
@@ -184,6 +252,46 @@ def _output(path: Path) -> Path:
     return path
 
 
+def _run_with_active_test_reporting(command: list[str], environment: dict[str, str], marker_dir: Path,
+                                    threshold: float = _ACTIVE_TEST_LOG_AFTER_SECONDS) -> int:
+    """Run pytest and report any worker test that remains active past the threshold."""
+    process = subprocess.Popen(command, env=environment)
+    active: dict[str, tuple[tuple[int, str], float, bool]] = {}
+    try:
+        while process.poll() is None:
+            now = time.monotonic()
+            present: set[str] = set()
+            try:
+                markers = list(marker_dir.glob("*.txt"))
+            except OSError:
+                markers = []
+            for marker in markers:
+                try:
+                    signature = (marker.stat().st_mtime_ns, marker.read_text(encoding="utf-8").rstrip("\n"))
+                except OSError:
+                    continue
+                present.add(marker.name)
+                previous = active.get(marker.name)
+                if previous is None or previous[0] != signature:
+                    active[marker.name] = (signature, now, False)
+                    continue
+                if now - previous[1] >= threshold and not previous[2]:
+                    print(f"COWORK_ACTIVE_TEST worker={marker.stem} nodeid={signature[1]}", flush=True)
+                    active[marker.name] = (signature, previous[1], True)
+            for name in active.keys() - present:
+                active.pop(name, None)
+            time.sleep(_ACTIVE_TEST_POLL_SECONDS)
+        return process.wait()
+    finally:
+        if process.poll() is None:
+            process.terminate()
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait()
+
+
 def run_shard(inputs: Path, output: Path, index: int) -> int:
     """Execute one complete module partition and propagate pytest's exit status."""
     _require(index in range(_SHARD_COUNT), "Invalid shard index")
@@ -198,6 +306,9 @@ def run_shard(inputs: Path, output: Path, index: int) -> int:
                *[f"--ignore={name}" for name in ignored], "-p", "scripts.pytest_inventory",
                f"--test-cohort=broad-shard-{index}", f"--test-inventory={output / 'inventory.json'}",
                f"--junitxml={output / 'junit.xml'}", "tests/"]
+    marker_dir = os.environ.get("COWORK_ACTIVE_TEST_DIR")
+    if marker_dir:
+        return _run_with_active_test_reporting(command, environment, Path(marker_dir))
     return subprocess.run(command, env=environment, check=False).returncode
 
 

@@ -93,10 +93,24 @@ jobs:
       - name: Run broad shard
         env:
           SHARD_INDEX: ${{ matrix.shard }}
+          COWORK_ACTIVE_TEST_DIR: ${{ runner.temp }}/active-tests-shard-${{ matrix.shard }}
         run: >-
           uv run --locked python -m scripts.test_shards run --index "$SHARD_INDEX"
           --inputs "$RUNNER_TEMP/test-inventory/inputs"
           --output "$RUNNER_TEMP/test-inventory/shard-$SHARD_INDEX"
+
+      - name: Report active tests after shard failure
+        if: failure()
+        env:
+          SHARD_INDEX: ${{ matrix.shard }}
+        run: |
+          marker_dir="$RUNNER_TEMP/active-tests-shard-$SHARD_INDEX"
+          for marker in "$marker_dir"/*.txt; do
+            [[ -f "$marker" ]] || continue
+            nodeid=""
+            IFS= read -r nodeid < "$marker" || true
+            printf 'COWORK_ACTIVE_TEST_MARKER file=%s nodeid=%s\n' "${marker##*/}" "$nodeid"
+          done
 
       - name: Check and summarize shard evidence
         if: always()
@@ -242,6 +256,8 @@ jobs:
           tests/test_export_child.py
           tests/test_publish_markdown.py
           -p scripts.pytest_inventory --test-cohort=desktop-export
+          -p scripts.pytest_liveness
+          --test-liveness-observations="$TEST_REPORT_DIR/liveness.json"
           --test-inventory="$TEST_REPORT_DIR/inventory.json"
           --junitxml="$TEST_REPORT_DIR/junit.xml"
 
@@ -259,5 +275,6 @@ jobs:
           path: |
             ${{ env.TEST_REPORT_DIR }}/inventory.json
             ${{ env.TEST_REPORT_DIR }}/junit.xml
+            ${{ env.TEST_REPORT_DIR }}/liveness.json
           if-no-files-found: error
           retention-days: 14

@@ -23,7 +23,6 @@ import pytest
 import yaml
 
 from cowork.common.paths import PinnedDir
-from cowork.common.settings.app_settings import get_app_settings
 from cowork.db.scoped import LOCAL_SCOPE, TenantScope
 from cowork.schemas.artifact_export import OmittedReason
 from cowork.schemas.export_child import ChildLimits
@@ -32,7 +31,8 @@ from cowork.services.artifact_export import ExportRefusal, ExportRefused, export
 from cowork.services.artifact_files import ArtifactFileRefused
 from cowork.services.artifact_metadata import ArtifactMetadata
 from cowork.services.artifacts import ProjectArtifacts
-from test_artifact_export_route import _snapshot, padded_png
+from tests.support.artifacts.files import _snapshot, padded_png
+from tests.support.artifacts.fixtures import local_mode as local_mode
 from test_artifact_files import _symlink
 from tests._no_fetch import no_fetch, recording_server
 
@@ -43,14 +43,6 @@ NO_FETCH_CASES = yaml.safe_load(
 SENTINEL = b"SENTINEL-OTHER-PARTITION-7f3a"
 _RELATIONSHIPS = "{http://schemas.openxmlformats.org/package/2006/relationships}Relationship"
 _HYPERLINK = "http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink"
-
-
-@pytest.fixture
-def local_mode(monkeypatch):
-    monkeypatch.setenv("COWORK_TENANCY_MODE", "local")
-    get_app_settings.cache_clear()
-    yield
-    get_app_settings.cache_clear()
 
 
 @pytest.fixture
