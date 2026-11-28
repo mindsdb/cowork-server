@@ -55,18 +55,18 @@ def connector_metadata(c: dict) -> ConnectorMetadataResponse:
     )
 
 
-def _without_slack_mcp(form: dict) -> dict:
-    """Slack's form while its `mcp` method is switched off, as it was before
-    that method: `mcp` hidden, the bot token the default, and the
-    bring-your-own-app `oauth` method visible again."""
+def _slack_form(form: dict, *, mcp_enabled: bool) -> dict:
+    """Slack's form with one of its two sign-ins shown under the same label:
+    the `mcp` method when Slack's MCP is switched on, else the REST method
+    (`browser_oauth_builtin`), which Slack allows for a distributed app.
+    The bring-your-own-app `oauth` method stays hidden either way."""
+    shown, hidden = ("mcp", "browser_oauth_builtin") if mcp_enabled else ("browser_oauth_builtin", "mcp")
     methods = []
     for method in form.get("methods") or []:
-        if isinstance(method, dict) and method.get("id") == "mcp":
+        if isinstance(method, dict) and method.get("id") == shown:
+            method = {**method, "hidden": False, "recommended": True}
+        elif isinstance(method, dict) and method.get("id") in (hidden, "oauth"):
             method = {**method, "hidden": True, "recommended": False}
-        elif isinstance(method, dict) and method.get("id") == "bot-token":
-            method = {**method, "recommended": True}
-        elif isinstance(method, dict) and method.get("id") == "oauth":
-            method = {**method, "hidden": False}
         methods.append(method)
     return {**form, "methods": methods}
 
@@ -133,8 +133,8 @@ class ConnectorSpecRegistry:
 
     def _to_connector_spec_response(self, c: dict) -> ConnectorSpecResponse:
         form = c.get("form", {})
-        if c.get("id") == "slack" and not OAuthSettings().slack_connector_enabled:
-            form = _without_slack_mcp(form)
+        if c.get("id") == "slack":
+            form = _slack_form(form, mcp_enabled=OAuthSettings().slack_connector_enabled)
         return ConnectorSpecResponse(
             id=c.get("id"),
             label=c.get("label", c.get("id", "")),

@@ -21,7 +21,7 @@ from cowork.schemas.connectors import (
     DirectSaveResponse,
     PatchPickedFilesBody,
 )
-from cowork.services.connectors import app_held
+from cowork.services.connectors import app_held, slack_rest
 from cowork.services.connectors.catalog import ConnectorCatalog
 from cowork.services.connectors.connections import ConnectionsService
 from cowork.services.connectors.custom_mcp import is_connection_id, is_custom_mcp
@@ -511,7 +511,7 @@ async def patch_access_mode(engine: str, name: str, body: PatchAccessModeBody, s
     every new connection defaults to "read" with no connect-time picker
     (see the HubSpot blueprint tab, Stage 0). No PKCE, no reconnect, no
     provider round-trip — a purely local write, same shape as
-    patch_picked_files above."""
+    patch_picked_files above. A Slack REST connection has no mode to change."""
     _refuse_custom_mcp(engine)
     if body.access_mode not in _ACCESS_MODES:
         raise HTTPException(
@@ -522,6 +522,10 @@ async def patch_access_mode(engine: str, name: str, body: PatchAccessModeBody, s
         return await auth_proxy.proxy_access_mode(engine, name, body.access_mode, request, OAuthSettings())
     _refuse_unchangeable(scope, engine, name)
     service = ConnectionsService(scope)
+    fields = service.runtime_fields(engine, name)
+    if fields is not None and slack_rest.is_slack_rest(engine, fields):
+        # Slack grants the token every scope the app has; no mode narrows it.
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="This Slack connection always reads and writes.")
     if app_held.active() and _method_of(service, engine, name) == "mcp":
         service.hold_app_held(engine, name, {"access_mode": body.access_mode})
         return {"ok": True, "access_mode": body.access_mode}

@@ -65,8 +65,6 @@ async def start_oauth(service: str, request: Request, scope: ScopeDep,
                        body: OAuthStartRequest = Body(default_factory=OAuthStartRequest)):
     if service not in OAUTH_SERVICES:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Unknown OAuth service: {service!r}")
-    if service == "slack" and not OAuthSettings().slack_connector_enabled:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Unknown OAuth service: {service!r}")
     if scope.org_mode:
         # auth runs the actual PKCE handshake in org mode — no LocalDataVault/
         # OAuthService touched at all on this branch. See cowork-server's

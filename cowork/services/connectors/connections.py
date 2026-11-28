@@ -6,7 +6,7 @@ from anton.core.datasources.data_vault import is_secret_key
 
 from cowork.db.scoped import TenantScope
 from cowork.schemas.connectors import ConnectionDetailResponse, ConnectionSummaryResponse
-from cowork.services.connectors import app_held
+from cowork.services.connectors import app_held, slack_rest
 from cowork.services.connectors.custom_mcp import is_custom_mcp
 from cowork.services.connectors.identity import (
     VAULT_KEEP_SENTINEL as _SENTINEL,
@@ -112,6 +112,8 @@ class ConnectionsService:
             # access mode describes it.
             if method == app_held.MCP_METHOD and not is_custom_mcp(engine):
                 access_mode = app_held.effective_access_mode(own_vault_root(self.scope), engine, name, fields)
+            elif slack_rest.is_slack_rest(engine, fields):
+                access_mode = slack_rest.ACCESS_MODE
             result.append(ConnectionSummaryResponse(
                 engine=engine,
                 name=name,

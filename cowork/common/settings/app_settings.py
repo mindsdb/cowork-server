@@ -683,8 +683,9 @@ class OAuthSettings(Settings):
 
     slack_client_id: str = Field(default="", validation_alias=AliasChoices("SLACK_CLIENT_ID"))
     slack_client_secret: str = Field(default="", validation_alias=AliasChoices("SLACK_CLIENT_SECRET"))
-    # Offers Slack's `mcp` method for new connections. Off hides it and refuses
-    # new sign-ins; existing connections of any method keep working.
+    # Offers Slack's `mcp` method for new connections. Off (the default, while
+    # our Slack app is distributed outside the Marketplace) shows the REST
+    # sign-in under the same label instead and refuses new MCP sign-ins.
     slack_connector_enabled: bool = Field(default=False, validation_alias=AliasChoices("SLACK_CONNECTOR_ENABLED"))
 
     # Browser-side key for the Google Picker widget (drive.file scope only
