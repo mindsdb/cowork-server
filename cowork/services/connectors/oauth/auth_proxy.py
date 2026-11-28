@@ -58,6 +58,7 @@ async def _relay(
     params: dict | None = None,
     json_body: dict | None = None,
     keep_code: bool = False,
+    code_key: str = "code",
 ) -> dict:
     url = f"{_auth_base_url(settings)}{path}"
     try:
@@ -79,18 +80,29 @@ async def _relay(
         try:
             body = resp.json()
             detail = body.get("detail", resp.text) if isinstance(body, dict) else resp.text
-        except ValueError:
+        except (ValueError, RecursionError):
             body, detail = None, resp.text
         # Datasource callers pass keep_code so auth's machine-readable code
         # (invalid_connection, stale_version) survives the hop; OAuth callers
         # do not, because auth's token view also returns a code and their
-        # error shape is already relied on.
-        if keep_code and isinstance(body, dict) and body.get("code"):
-            detail = {"code": body["code"], "message": detail}
+        # error shape is already relied on. auth's custom MCP routes name their
+        # code `error`; those callers pass code_key and get the same shape.
+        if keep_code and isinstance(body, dict) and body.get(code_key):
+            detail = {"code": body[code_key], "message": detail}
         raise HTTPException(status_code=resp.status_code, detail=detail)
     # Every route but disconnect returns a JSON object; disconnect's 204 has
-    # no body at all, so decoding it unconditionally would raise.
-    return resp.json() if resp.text else {}
+    # no body at all. Anything else is a broken answer, never a 500 here.
+    if not resp.text:
+        return {}
+    try:
+        body = resp.json()
+    except (ValueError, RecursionError):
+        body = None
+    if not isinstance(body, dict):
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY, detail="auth answered something other than a JSON object",
+        )
+    return body
 
 
 async def proxy_start(service: str, request: Request, settings: OAuthSettings, body: dict) -> dict:
@@ -249,4 +261,25 @@ async def proxy_custom_connection_list(request: Request, settings: OAuthSettings
 async def proxy_custom_connection_delete(connection_id: int, request: Request, settings: OAuthSettings) -> None:
     await _relay(
         "DELETE", f"/v1/custom-connections/{connection_id}", request=request, settings=settings, keep_code=True,
+    )
+
+
+# Custom MCP servers a member adds on web. Same relay and forwarded bearer; auth
+# runs the whole sign-in and answers its refusals as {"error", "detail"}, whose
+# code these callers keep. `name` is checked as a connection id by the caller.
+
+
+async def proxy_custom_mcp(
+    method: str, path: str, request: Request, settings: OAuthSettings, *,
+    params: dict | None = None, json_body: dict | None = None,
+) -> dict:
+    """Relay one call to auth's ``/v1/custom-mcp...`` routes, keeping auth's error code.
+
+    Input: the method, the path under ``/v1/custom-mcp``, the member's request
+    and an optional query or body. Output: auth's JSON answer, ``{}`` for a 204.
+    Raises ``HTTPException`` with auth's status and ``{"code", "message"}``.
+    """
+    return await _relay(
+        method, f"/v1/custom-mcp{path}", request=request, settings=settings,
+        params=params, json_body=json_body, keep_code=True, code_key="error",
     )

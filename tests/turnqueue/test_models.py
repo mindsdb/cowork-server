@@ -3,6 +3,7 @@ from pathlib import Path
 
 import pytest
 from anton.cloud_turn import contract
+from pydantic import ValidationError
 
 from cowork.turnqueue import models
 from cowork.turnqueue.models import TurnJob, TurnReply
@@ -229,3 +230,55 @@ def test_turn_job_refuses_a_malformed_custom_api_block_before_it_is_queued(custo
 def test_the_custom_reference_rules_match_the_pods():
     assert models._CUSTOM_CONNECTOR_ID_PATTERN.pattern == contract._CUSTOM_CONNECTOR_ID.pattern
     assert models._MAX_CONNECTION_LABEL_CHARS == contract._CUSTOM_NAME_MAX
+
+
+_MCP_TURN_BLOCK = json.loads(
+    (Path(__file__).resolve().parents[1] / "fixtures" / "custom_mcp_producer_v1.json").read_text(encoding="utf-8")
+)["turn_custom_mcp"]
+_MCP_REF = _MCP_TURN_BLOCK["connections"][0]
+
+
+def test_turn_job_carries_the_producer_contracts_custom_mcp_block():
+    job = TurnJob(op="anton_turn", conversation_id="c", correlation_id="r",
+                  reply_stream="scratchpad:reply:c", params={"input": "hi", "custom_mcp": _MCP_TURN_BLOCK})
+    assert TurnJob.model_validate_json(job.model_dump_json()).params["custom_mcp"] == _MCP_TURN_BLOCK
+
+
+@pytest.mark.parametrize(
+    "custom_mcp",
+    [
+        "cm",
+        {"connections": [_MCP_REF]},
+        {"protocol_version": 1, "connections": [_MCP_REF], "turn_key": "mdb_x.secret"},
+        {"protocol_version": 2, "connections": [_MCP_REF]},
+        {"protocol_version": True, "connections": [_MCP_REF]},
+        {"protocol_version": 1, "connections": []},
+        {"protocol_version": 1, "connections": [
+            {**_MCP_REF, "connection_id": i, "name": f"cm-{i:032x}"} for i in range(1, 27)]},
+        {"protocol_version": 1, "connections": [{**_MCP_REF, "connection_id": True}]},
+        {"protocol_version": 1, "connections": [{**_MCP_REF, "credential_version": 0}]},
+        {"protocol_version": 1, "connections": [{**_MCP_REF, "name": _MCP_REF["name"].upper()}]},
+        {"protocol_version": 1, "connections": [{**_MCP_REF, "name": _MCP_REF["name"] + "\n"}]},
+        {"protocol_version": 1, "connections": [{**_MCP_REF, "label": None}]},
+        {"protocol_version": 1, "connections": [{**_MCP_REF, "tools": []}]},
+        {"protocol_version": 1, "connections": [{**_MCP_REF, "tools": [{"name": "x"}]}]},
+        {"protocol_version": 1, "connections": [{**_MCP_REF, "access_token": "s"}]},
+        {"protocol_version": 1, "connections": [_MCP_REF, {**_MCP_REF, "name": "cm-" + "f" * 32}]},
+        {"protocol_version": 1, "connections": [_MCP_REF, {**_MCP_REF, "connection_id": 2}]},
+    ],
+    ids=["not_an_object", "no_version", "turn_key_still_sent", "other_version", "bool_version", "empty",
+         "over_the_cap", "bool_id", "zero_version", "uppercase_name", "name_with_newline", "label_not_text",
+         "no_tools", "tool_not_text", "secret_bearing_reference", "duplicate_id", "duplicate_name"],
+)
+def test_turn_job_refuses_a_malformed_custom_mcp_block_before_it_is_queued(custom_mcp):
+    with pytest.raises(ValidationError):
+        TurnJob(op="anton_turn", conversation_id="c", correlation_id="r",
+                reply_stream="scratchpad:reply:c", params={"input": "hi", "custom_mcp": custom_mcp})
+
+
+def test_the_custom_mcp_block_rules_match_the_pods():
+    assert models.CUSTOM_MCP_PROTOCOL_VERSION == contract.CUSTOM_MCP_PROTOCOL_VERSION
+    assert models.MAX_CUSTOM_MCP_CONNECTIONS == contract.MAX_CUSTOM_MCP_CONNECTIONS
+    assert models.MAX_CUSTOM_MCP_TOOLS == contract.CUSTOM_MCP_MAX_SWITCHED_ON_TOOLS
+    assert models.MAX_CUSTOM_MCP_BLOCK_BYTES == contract.CUSTOM_MCP_MAX_MEMBER_CEILING_BYTES
+    assert models._CUSTOM_MCP_CONNECTION_KEYS == contract._CUSTOM_MCP_CONNECTION_KEYS

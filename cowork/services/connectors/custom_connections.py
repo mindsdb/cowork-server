@@ -80,7 +80,7 @@ async def create_custom_connection(
         raise CustomConnectionUnavailable("auth is unreachable") from exc
     try:
         answer = response.json()
-    except ValueError as exc:
+    except (ValueError, RecursionError) as exc:
         raise CustomConnectionUnavailable("auth answered with a body this server cannot read") from exc
     if response.status_code >= 400:
         code = answer.get("code") if isinstance(answer, dict) else None

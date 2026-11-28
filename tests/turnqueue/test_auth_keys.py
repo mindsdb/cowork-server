@@ -163,6 +163,43 @@ async def test_workspace_refusal_without_a_workspace_sent_is_not_retried(monkeyp
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("status_code", [201, 400, 403, 404, 503])
+async def test_an_error_body_nested_too_deep_to_parse_fails_the_mint_as_unavailable(monkeypatch, forgotten, status_code):
+    """Every org turn mints a key; an answer the parser cannot read must fail as auth being unavailable."""
+    from cowork.services.product_permissions import ProductPermissionUnavailable
+
+    deep = b'{"code":' + b"[" * 10_000 + b"]" * 10_000 + b"}"
+    request = httpx.Request("POST", "http://auth.internal/internal/turn-keys/")
+    _sequenced_client(monkeypatch, [httpx.Response(status_code, content=deep, request=request)] * 2)
+
+    with pytest.raises(ProductPermissionUnavailable):
+        await mint_turn_key(
+            user_id="u1", org_id="o1", correlation_id="corr-1",
+            ttl_seconds=1200, settings=_Settings(), workspace_id="ws-1",
+        )
+
+    assert forgotten == []
+
+
+@pytest.mark.asyncio
+async def test_an_extend_refusal_nested_too_deep_to_parse_is_a_failed_extend(monkeypatch):
+    from cowork.turnqueue.auth_keys import extend_turn_key
+
+    deep = b'{"code":' + b"[" * 10_000 + b"]" * 10_000 + b"}"
+
+    class _Client:
+        def __init__(self, *a, **k): pass
+        async def __aenter__(self): return self
+        async def __aexit__(self, *a): return False
+        async def patch(self, url, json, headers):
+            return httpx.Response(409, content=deep)
+
+    monkeypatch.setattr(httpx, "AsyncClient", _Client)
+
+    assert await extend_turn_key(instance_id="i1", ttl_seconds=1200, settings=_Settings()) is False
+
+
+@pytest.mark.asyncio
 async def test_revoke_turn_key_uses_cluster_only_route(monkeypatch):
     captured = {}
 
@@ -268,6 +305,29 @@ async def test_listing_sends_the_turn_key_prefix_and_the_producer_identity(monke
     assert seen["headers"]["x-datasource-service-key"] == "producer-secret"
     assert "authorization" not in seen["headers"]
     assert "x-internal-auth" not in seen["headers"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("call", ["datasource listing", "datasource grants", "custom API listing", "custom API grants"])
+async def test_an_answer_nested_too_deep_to_parse_is_a_permission_failure(monkeypatch, call):
+    from cowork.services.product_permissions import ProductPermissionUnavailable
+    from cowork.turnqueue import auth_keys
+
+    async def handler(request):
+        return httpx.Response(200, content=b"[" * 10_000 + b"]" * 10_000)
+
+    _over_mock_transport(monkeypatch, handler)
+    listing = {"org_id": "o1", "user_id": "u1", "turn_key_id": "mdb_prefix", "settings": _DatasourceSettings()}
+    grants = {**listing, "correlation_id": "r", "connection_ids": [7]}
+    run = {
+        "datasource listing": lambda: auth_keys.list_verified_datasource_connections(**listing),
+        "datasource grants": lambda: auth_keys.register_datasource_grants(**grants),
+        "custom API listing": lambda: auth_keys.list_custom_api_connections(**listing),
+        "custom API grants": lambda: auth_keys.register_custom_api_grants(**grants),
+    }[call]
+
+    with pytest.raises(ProductPermissionUnavailable):
+        await run()
 
 
 @pytest.mark.asyncio
