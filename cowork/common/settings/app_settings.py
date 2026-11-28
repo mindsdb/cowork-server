@@ -812,7 +812,7 @@ class TurnQueueSettings(Settings):
     @property
     def needs_turn_key_id(self) -> bool:
         """Whether a turn key's public prefix is minted, which auth binds turn grants to."""
-        return self.datasource_enabled or self.custom_api_enabled
+        return self.datasource_enabled or self.custom_api_enabled or self.custom_mcp_enabled
 
     redis_url: str = Field(
         default="redis://localhost:6379/0",
@@ -1000,6 +1000,14 @@ class TurnQueueSettings(Settings):
             "anton that serve those connections are deployed."
         ),
     )  # COWORK_TURN_CUSTOM_API_ENABLED
+    custom_mcp_enabled: bool = Field(
+        default=False,
+        description=(
+            "Give a member's org-mode cloud turns the switched-on tools of the custom MCP "
+            "servers they added, and open the web routes that add and manage them. Keep "
+            "false until auth, the inference gateway and the pod's anton serve them."
+        ),
+    )  # COWORK_TURN_CUSTOM_MCP_ENABLED
     custom_connect_refused_domains: list[str] = Field(
         default=[
             "mindshub.ai", "mindshub.co", "mindsdb.com", "mindsdb.cloud", "mindscloud.ai",

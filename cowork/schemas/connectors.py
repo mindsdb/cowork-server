@@ -451,6 +451,9 @@ class ConnectionSummaryResponse(BaseModel):
     # connections are left shared, another person's base-vault entry the caller
     # didn't create (LayeredDataVault.is_shared).
     shared: bool = False
+    # A member's custom MCP server in org mode: the address auth stored, which
+    # the web panel shows. None for every other connection.
+    server_url: str | None = None
     # How it was connected ("mcp", "browser_oauth_builtin", ...), and for an
     # MCP connection its tool access ("read" | "write" | "none"), so the card
     # can show the access without fetching each connection's detail.

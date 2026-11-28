@@ -67,6 +67,8 @@ dependencies = [
     # 2.26.11.22.1rc1 asks Jev on the MindsHub the person is signed in to, not
     # only api.mindshub.ai (mindsdb/anton#837), so the artifact bar edits
     # directly on staging too (quickEditDirect).
+    # 2.26.11.24.1rc1 is the first with the cloud turn's custom MCP block
+    # (mindsdb/anton#823), which the turn producer builds.
     # Desktop installs the anton this lock names, so a production release
     # names a final anton, never a release candidate.
     "anton-agent>=2.26.11.26.1rc1,<3",

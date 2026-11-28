@@ -88,6 +88,7 @@ CUSTOM_API_FLAG = "COWORK_TURN_CUSTOM_API_ENABLED"
 # Environments where auth, the inference gateway and the pod's anton serve custom
 # API connections; the change that turns one on adds it here and to its values file.
 CUSTOM_API_ENVIRONMENTS: frozenset[str] = frozenset({"staging", "prod"})
+CUSTOM_MCP_FLAG = "COWORK_TURN_CUSTOM_MCP_ENABLED"
 # The exact methods each enabled environment offers.
 OFFERED_METHODS: dict[str, frozenset[str]] = {
     "staging": frozenset({"mysql:host-password", "postgres:host-port"}),
@@ -234,6 +235,21 @@ def test_custom_api_turns_are_off_in_the_code_and_the_base_and_on_only_where_lis
         assert _deployment(env_values).get("customApiTurnsEnabled") == expected, f"{env_values.name} flips custom API turns"
         assert not [e for e in _env(env_values) if e.name == CUSTOM_API_FLAG], (
             f"{env_values.name} declares {CUSTOM_API_FLAG}; set deployment.customApiTurnsEnabled instead"
+        )
+
+
+def test_custom_mcp_turns_are_off_in_the_code_the_base_and_every_environment(base, monkeypatch):
+    """Merging turns nothing on: each environment's own change, after auth's and the gateway's, sets it."""
+    monkeypatch.delenv(CUSTOM_MCP_FLAG, raising=False)
+    assert TurnQueueSettings().custom_mcp_enabled is False
+    assert _deployment(BASE)["customMcpTurnsEnabled"] == "false"
+    assert _entry(base, CUSTOM_MCP_FLAG).value == "{{ $.Values.customMcpTurnsEnabled }}"
+    for env_values in ENVIRONMENTS:
+        assert _deployment(env_values).get("customMcpTurnsEnabled") in (None, "false"), (
+            f"{env_values.name} turns custom MCP turns on"
+        )
+        assert not [e for e in _env(env_values) if e.name == CUSTOM_MCP_FLAG], (
+            f"{env_values.name} declares {CUSTOM_MCP_FLAG}; set deployment.customMcpTurnsEnabled instead"
         )
 
 

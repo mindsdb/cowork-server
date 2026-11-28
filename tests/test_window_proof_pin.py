@@ -533,6 +533,12 @@ WRITES_WITHOUT_THE_PROOF: dict[tuple[str, tuple[str, ...]], str] = {
     ("/api/v1/publish/stats", ("DELETE",)): CHANGES_THE_PERSONS_OWN_WORK,
     ("/api/v1/content-reports/", ("POST",)): ORG_TENANCY_ONLY,
     ("/api/v1/content-reports/artifact", ("POST",)): ORG_TENANCY_ONLY,
+    # A member's custom MCP servers on the web: org tenancy only, where auth holds the sign-in.
+    ("/api/v1/connectors/custom-mcp/connect", ("POST",)): ORG_TENANCY_ONLY,
+    ("/api/v1/connectors/custom-mcp/finish", ("POST",)): ORG_TENANCY_ONLY,
+    ("/api/v1/connectors/custom-mcp/connections/{name}", ("DELETE",)): ORG_TENANCY_ONLY,
+    ("/api/v1/connectors/custom-mcp/connections/{name}/reconnect", ("POST",)): ORG_TENANCY_ONLY,
+    ("/api/v1/connectors/custom-mcp/connections/{name}/tools", ("PUT",)): ORG_TENANCY_ONLY,
     # The browser: on the web only, where it is the browser router's.
     ("/api/v1/browse/provision", ("POST",)): ORG_TENANCY_ONLY,
     ("/api/v1/browse/embed", ("POST",)): ORG_TENANCY_ONLY,

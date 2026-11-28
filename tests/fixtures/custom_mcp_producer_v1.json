@@ -1,0 +1,122 @@
+{
+  "listing_request": {
+    "turn_key_id": "mdb_<runtime-turn-prefix>",
+    "user_id": "11111111-1111-4111-8111-111111111111",
+    "organization_id": "22222222-2222-4222-8222-222222222222"
+  },
+  "listing_response": {
+    "items": [
+      {
+        "id": 1,
+        "name": "cm-0123456789abcdef0123456789abcdef",
+        "label": "Issues",
+        "credential_version": 1,
+        "tools_revision": 1,
+        "tools": [
+          "{\"description\":\"\",\"input_schema\":{\"properties\":{},\"type\":\"object\"},\"name\":\"empty_schema\"}"
+        ]
+      }
+    ]
+  },
+  "grant_request": {
+    "turn_key_id": "mdb_<runtime-turn-prefix>",
+    "user_id": "11111111-1111-4111-8111-111111111111",
+    "organization_id": "22222222-2222-4222-8222-222222222222",
+    "correlation_id": "33333333-3333-4333-8333-333333333333",
+    "connection_ids": [
+      1
+    ]
+  },
+  "grant_response": {
+    "user_id": "11111111-1111-4111-8111-111111111111",
+    "organization_id": "22222222-2222-4222-8222-222222222222",
+    "turn_key_id": "mdb_<runtime-turn-prefix>",
+    "correlation_id": "33333333-3333-4333-8333-333333333333",
+    "audience": "custom-mcp",
+    "purpose": "call",
+    "grants": [
+      {
+        "id": "55555555-5555-4555-8555-555555555555",
+        "connection_id": 1,
+        "credential_version": 1,
+        "expires_at": "2026-09-18T12:30:00Z"
+      }
+    ]
+  },
+  "turn_custom_mcp": {
+    "protocol_version": 1,
+    "connections": [
+      {
+        "connection_id": 1,
+        "name": "cm-0123456789abcdef0123456789abcdef",
+        "label": "Issues",
+        "credential_version": 1,
+        "tools": [
+          "{\"description\":\"\",\"input_schema\":{\"properties\":{},\"type\":\"object\"},\"name\":\"empty_schema\"}"
+        ]
+      }
+    ]
+  },
+  "consumer_rules": [
+    "Each tool is a stored definition as a string. Pass it on untouched; anton parses it.",
+    "Drop the connections the conversation turned off, then register one grant per remaining connection.",
+    "credential_version in the block is the grant's.",
+    "When the listing or the grant fails, leave the whole block out and run the turn; never drop one connection."
+  ],
+  "errors": [
+    {
+      "route": "listing",
+      "status": 404,
+      "code": "identity_denied",
+      "meaning": "The turn key's member or organization is not live, or does not match the named ones."
+    },
+    {
+      "route": "grant",
+      "status": 401,
+      "code": "credential_denied",
+      "meaning": "The turn key is not this member's key for this turn."
+    },
+    {
+      "route": "grant",
+      "status": 404,
+      "code": "capability_denied",
+      "meaning": "A connection is not the member's signed-in custom server."
+    },
+    {
+      "route": "grant",
+      "status": 409,
+      "code": "conflict",
+      "meaning": "A retry of the turn names another connection set, or a connection was signed in again since."
+    },
+    {
+      "route": "grant",
+      "status": 422,
+      "code": "invalid_request",
+      "meaning": "The body does not describe a grant set."
+    },
+    {
+      "route": "grant",
+      "status": 429,
+      "code": "quota_exceeded",
+      "meaning": "The shared hourly turn quota of the member or the organization is used up."
+    },
+    {
+      "route": "both",
+      "status": 401,
+      "code": null,
+      "meaning": "The caller is not the producer identity, or the transport is not secure."
+    },
+    {
+      "route": "both",
+      "status": 503,
+      "code": "disabled",
+      "meaning": "Custom MCP servers are off on this deployment."
+    },
+    {
+      "route": "both",
+      "status": 503,
+      "code": "dependency_unavailable",
+      "meaning": "An unexpected failure; the log line carries its type and the request id only."
+    }
+  ]
+}

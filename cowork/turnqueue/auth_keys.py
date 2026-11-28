@@ -28,6 +28,7 @@ DATASOURCE_CONNECTIONS_ROUTE = "/internal/datasources/connections/"
 DATASOURCE_GRANTS_ROUTE = "/internal/datasources/turn-grants/"
 CUSTOM_CONNECTIONS_ROUTE = "/internal/custom-connections/"
 CUSTOM_GRANTS_ROUTE = "/internal/custom-connections/turn-grants/"
+CUSTOM_MCP_GRANTS_ROUTE = "/internal/custom-mcp/turn-grants/"
 
 # auth's turn-key mint refuses an expiry past its cap with a 400 whose detail
 # starts with this text, and with no error code. The text is the only sign of
@@ -41,7 +42,7 @@ def _error_code(resp: httpx.Response) -> str | None:
     """The ``code`` field of an error body, or None if it has none."""
     try:
         error = resp.json()
-    except ValueError:
+    except (ValueError, RecursionError):
         return None
     return error.get("code") if isinstance(error, dict) else None
 
@@ -67,7 +68,7 @@ def _refuses_the_lifetime(*, resp: httpx.Response) -> bool:
         return False
     try:
         body = resp.json()
-    except ValueError:
+    except (ValueError, RecursionError):
         return False
     detail = body.get("detail") if isinstance(body, dict) else None
     return isinstance(detail, str) and detail.startswith(TTL_REFUSAL_PREFIX)
@@ -142,7 +143,7 @@ async def _request_turn_key(*, user_id: str, org_id: str, correlation_id: str,
                 raise ProductPermissionDenied()
             resp.raise_for_status()
             result = resp.json()
-    except (httpx.HTTPError, TimeoutError, ValueError) as exc:
+    except (httpx.HTTPError, TimeoutError, ValueError, RecursionError) as exc:
         raise permission_unavailable(route=TURN_KEYS_ROUTE, cause=exc) from exc
     if not isinstance(result, dict) or not isinstance(result.get("key"), str) or not result["key"].strip():
         raise permission_unavailable(route=TURN_KEYS_ROUTE, cause="answer_without_key")
@@ -225,7 +226,7 @@ async def list_verified_datasource_connections(*, org_id: str, user_id: str, tur
             resp = await client.get(url, params=params, headers=headers)
             resp.raise_for_status()
             result = resp.json()
-    except (httpx.HTTPError, TimeoutError, ValueError) as exc:
+    except (httpx.HTTPError, TimeoutError, ValueError, RecursionError) as exc:
         raise permission_unavailable(route=DATASOURCE_CONNECTIONS_ROUTE, cause=exc) from exc
     if not isinstance(result, dict) or not isinstance(result.get("items"), list):
         raise permission_unavailable(route=DATASOURCE_CONNECTIONS_ROUTE, cause="answer_without_items")
@@ -263,7 +264,7 @@ async def register_datasource_grants(
             resp = await client.post(url, json=body, headers=headers)
             resp.raise_for_status()
             result = resp.json()
-    except (httpx.HTTPError, TimeoutError, ValueError) as exc:
+    except (httpx.HTTPError, TimeoutError, ValueError, RecursionError) as exc:
         raise permission_unavailable(route=DATASOURCE_GRANTS_ROUTE, cause=exc) from exc
     if not isinstance(result, dict):
         raise permission_unavailable(route=DATASOURCE_GRANTS_ROUTE, cause="answer_not_an_object")
@@ -294,7 +295,7 @@ async def list_custom_api_connections(*, org_id: str, user_id: str, turn_key_id:
             resp = await client.get(url, params=params, headers=_producer_headers(settings))
             resp.raise_for_status()
             result = resp.json()
-    except (httpx.HTTPError, TimeoutError, ValueError) as exc:
+    except (httpx.HTTPError, TimeoutError, ValueError, RecursionError) as exc:
         raise permission_unavailable(route=CUSTOM_CONNECTIONS_ROUTE, cause=exc) from exc
     if not isinstance(result, dict) or not isinstance(result.get("items"), list):
         raise permission_unavailable(route=CUSTOM_CONNECTIONS_ROUTE, cause="answer_without_items")
@@ -331,11 +332,109 @@ async def register_custom_api_grants(
             resp = await client.post(url, json=body, headers=_producer_headers(settings))
             resp.raise_for_status()
             result = resp.json()
-    except (httpx.HTTPError, TimeoutError, ValueError) as exc:
+    except (httpx.HTTPError, TimeoutError, ValueError, RecursionError) as exc:
         raise permission_unavailable(route=CUSTOM_GRANTS_ROUTE, cause=exc) from exc
     if not isinstance(result, dict):
         raise permission_unavailable(route=CUSTOM_GRANTS_ROUTE, cause="answer_not_an_object")
     return result
+
+
+#: Answers that mean auth or its proxy did not take the request; one retry is worth it.
+_FAST_FAILURE_STATUSES = frozenset({502, 503, 504})
+
+
+def auth_switched_off(response: httpx.Response) -> bool:
+    """Whether ``response`` is auth's 503 ``disabled``: its custom MCP switch is off, a settled answer.
+
+    Any other 503, a proxy's included, is not: its body is not auth's error object.
+    """
+    if response.status_code != 503:
+        return False
+    try:
+        body = response.json()
+    except (ValueError, RecursionError):
+        return False
+    return isinstance(body, dict) and body.get("code") == "disabled"
+
+
+async def _send_retrying_once(client: httpx.AsyncClient, method: str, url: str, **kwargs) -> httpx.Response:
+    """Send one request, and once more only when the first failed fast.
+
+    A fast failure is no connection at all, or a 502, 503 or 504 answer. A
+    timeout already spent the budget and a refusal would answer the same, so
+    neither is retried; nor is auth's switched-off answer, which would too.
+    Returns the last response; raises what httpx raises.
+    """
+    try:
+        resp = await client.request(method, url, **kwargs)
+    except httpx.ConnectError:
+        return await client.request(method, url, **kwargs)
+    if resp.status_code in _FAST_FAILURE_STATUSES and not auth_switched_off(resp):
+        return await client.request(method, url, **kwargs)
+    return resp
+
+
+async def _custom_mcp_call(method: str, path: str, *, settings, params: dict | None = None,
+                           json_body: dict | None = None) -> dict:
+    """One producer-key call to auth's internal custom MCP routes, as a JSON object.
+
+    Raises ``ProductPermissionUnavailable`` on any failure, refusal or timeout,
+    an unconfigured producer key included; an HTTP refusal is its cause, so the
+    caller can read the status. A body nested too deep to parse is a failure too.
+    """
+    if not settings.datasource_producer_key_id or not settings.datasource_producer_key:
+        raise permission_unavailable(route=path, cause="producer_key_not_configured")
+    url = f"{settings.auth_internal_base_url.rstrip('/')}{path}"
+    try:
+        async with httpx.AsyncClient(timeout=5.0, follow_redirects=False) as client:
+            resp = await _send_retrying_once(
+                client, method, url, params=params, json=json_body, headers=_producer_headers(settings),
+            )
+            resp.raise_for_status()
+            result = resp.json()
+    except (httpx.HTTPError, TimeoutError, ValueError, RecursionError) as exc:
+        raise permission_unavailable(route=path, cause=exc) from exc
+    if not isinstance(result, dict):
+        raise permission_unavailable(route=path, cause="answer_not_an_object")
+    return result
+
+
+async def list_custom_mcp_connections(*, org_id: str, user_id: str, turn_key_id: str, settings) -> dict:
+    """auth's answer listing the turn key owner's custom MCP servers with their switched-on definitions.
+
+    Auth derives the member from the live turn key named by ``turn_key_id``;
+    the ids are cross-checks. Returns the whole answer unread, so the caller
+    tells a malformed listing from one that did not arrive. Raises
+    ``ProductPermissionUnavailable`` when it did not arrive.
+    """
+    params = {"organization_id": org_id, "user_id": user_id, "turn_key_id": turn_key_id}
+    return await _custom_mcp_call("GET", "/internal/custom-mcp/connections/", settings=settings, params=params)
+
+
+async def register_custom_mcp_grants(
+    *,
+    user_id: str,
+    org_id: str,
+    correlation_id: str,
+    turn_key_id: str,
+    connection_ids: list[int],
+    settings,
+) -> dict:
+    """Bind grants for these custom MCP connections to the existing turn key, for the gateway to resolve.
+
+    Auth fixes the audience and purpose itself (``custom-mcp``, ``call``),
+    issues each grant at the connection's current credential version and
+    counts the turn in the shared hourly quota. Raises
+    ``ProductPermissionUnavailable`` on any refusal or failure.
+    """
+    body = {
+        "user_id": user_id,
+        "organization_id": org_id,
+        "correlation_id": correlation_id,
+        "turn_key_id": turn_key_id,
+        "connection_ids": connection_ids,
+    }
+    return await _custom_mcp_call("POST", CUSTOM_MCP_GRANTS_ROUTE, settings=settings, json_body=body)
 
 
 async def revoke_turn_key(*, instance_id: str, settings) -> None:
