@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from cowork.coding.contracts import PermissionMode, TerminalShellPreference
+from cowork.coding.contracts import PermissionMode, TerminalShellPreference, effective_permission_mode
 from cowork.coding.engines.base import EngineInputReference, EngineSessionConfig
 from cowork.coding.shells import resolve_shell, shell_environment
 from cowork.common.launch_environment import launch_value
@@ -255,15 +255,9 @@ STREAM_MAX_RETRIES = 2
 
 def prepare_launch(config: EngineSessionConfig, workspace: Path, endpoint: str) -> CodexLaunchConfig:
     """Translate Cowork runtime controls into one consistent Codex launch policy."""
-    permission = PermissionMode.read_only if config.task_mode == "plan" else config.permission_mode
+    permission = effective_permission_mode(config.permission_mode, config.task_mode, config.writes_allowed)
     resolved_approval = "never" if config.task_mode == "plan" else approval_policy(permission)
     resolved_reviewer = approvals_reviewer(permission)
-    if not config.writes_allowed and permission != PermissionMode.full_access:
-        # Like Codex on a folder it does not track: the sandbox reads only, and
-        # each write still asks the person. The automatic reviewer would grant
-        # those writes on its own, which is what holding them back prevents.
-        permission = PermissionMode.read_only
-        resolved_reviewer = "user"
     resolved_sandbox = sandbox_mode(permission)
     resolved_policy = sandbox_policy(
         permission,

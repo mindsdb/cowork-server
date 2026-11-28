@@ -110,6 +110,13 @@ Personality = Literal["none", "friendly", "pragmatic"]
 TaskMode = Literal["build", "plan"]
 
 
+def effective_permission_mode(mode: PermissionMode, task_mode: TaskMode, writes_allowed: bool) -> PermissionMode:
+    """The permission actually granted to the agent and to task checks."""
+    if task_mode == "plan" or (not writes_allowed and mode != PermissionMode.full_access):
+        return PermissionMode.read_only
+    return mode
+
+
 class TaskCapability(str, Enum):
     """Versioned user-visible operations an execution computer actually supports."""
 
@@ -506,6 +513,10 @@ class CodingSession(BaseModel):
     created_at: datetime = Field(default_factory=utc_now)
     updated_at: datetime = Field(default_factory=utc_now)
 
+    @property
+    def effective_permission_mode(self) -> PermissionMode:
+        return effective_permission_mode(self.permission_mode, self.task_mode, self.writes_allowed)
+
 
 class WorkspaceInspection(BaseModel):
     path: str
@@ -549,6 +560,8 @@ class GitState(BaseModel):
     detached: bool = False
     dirty: bool = False
     status_lines: list[str] = Field(default_factory=list)
+    # False when Git could not be asked, so ``dirty`` is unknown, not clean.
+    status_checked: bool = True
     worktree_path: str
     source_path: str
 

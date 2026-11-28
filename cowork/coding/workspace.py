@@ -4,20 +4,25 @@ import difflib
 import json
 import logging
 import os
+import re
+import shlex
 import shutil
 import stat
 import subprocess
 import sys
 import tempfile
 import threading
+from collections.abc import Callable
+from contextlib import ExitStack
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
-from typing import IO
+from typing import IO, TYPE_CHECKING
 
 from cowork.coding.contracts import (
     DiffFile,
     GitIdentity,
     GitState,
+    PermissionMode,
     WorkspaceInspection,
     WorkspaceKind,
     WorkspaceReasonCode,
@@ -28,6 +33,9 @@ from cowork.coding.pending_removals import PendingRemovals
 from cowork.coding.workspace_key import managed_key
 from cowork.common.paths import O_NOFOLLOW, open_fd
 from cowork.common.settings.app_settings import get_app_settings
+
+if TYPE_CHECKING:
+    from cowork.coding.check_sandbox import CheckPolicy
 
 logger = logging.getLogger(__name__)
 
@@ -56,6 +64,19 @@ class WorkspaceError(RuntimeError):
     def in_folder(cls, folder: str, exc: Exception) -> WorkspaceError:
         """``exc`` about one of a project's folders, named so the person knows which."""
         return cls(f"{folder}: {exc}", reason=getattr(exc, "reason", None), folder=folder)
+
+
+class UnsafeGitMetadata(WorkspaceError):
+    def __init__(self, common_dir: Path, detail: str) -> None:
+        super().__init__(detail)
+        self.common_dir = common_dir
+
+
+@dataclass(frozen=True)
+class RecordedCommit:
+    common_dir: Path
+    parent: str
+    revision: str
 
 
 class GitUnavailableError(WorkspaceError):
@@ -170,8 +191,57 @@ def _platform_config_args() -> tuple[str, ...]:
     return ()
 
 
+# Commands that read settings without running any program they name.
+_SETTINGS_ONLY_COMMANDS = {"config", "rev-parse", "var"}
+_FILTER_KEY = re.compile(r"^filter\..+\.(clean|smudge|process)$")
+
+
+def names_task_file(command: str, root: Path) -> bool:
+    """Whether a configured command runs a file inside ``root``.
+
+    The setting itself may be the person's, but a script it names in the
+    checkout is code the agent can edit.
+    """
+    try:
+        tokens = shlex.split(command)
+    except ValueError:
+        tokens = command.split()
+    top = root.resolve()
+    for token in tokens:
+        if not token or token.startswith("-") or "%" in token:
+            continue
+        path = Path(os.path.expanduser(token))
+        candidate = path if path.is_absolute() else top / path
+        try:
+            resolved = candidate.resolve()
+        except (OSError, RuntimeError):
+            continue
+        if resolved.exists() and (resolved == top or top in resolved.parents):
+            return True
+    return False
+
+
+def _host_safety_args(args: tuple[str, ...]) -> tuple[str, ...]:
+    """Keep Git from running repository hooks in the server's process.
+
+    A hook path can point into the task's own files (husky keeps hooks in
+    ``.husky``), and Git runs some hooks, such as ``post-index-change``,
+    from ordinary staging and status commands. Cowork runs the hooks it
+    supports itself, inside the task's sandbox. Only hook discovery sees
+    the repository's real hook path.
+    """
+    if args[:2] == ("rev-parse", "--git-path"):
+        return ()
+    # An fsmonitor setting names a program, which may live in the checkout.
+    return ("-c", f"core.hooksPath={os.devnull}", "-c", "core.fsmonitor=false")
+
+
 class GitRunner:
     """Shell-free Git boundary shared by macOS and Windows."""
+
+    # Where sandboxed reads keep the sandbox's own state, set by the manager
+    # that owns the coding root. Without one, each read uses a fresh folder.
+    sandbox_home: Path | None = None
 
     @staticmethod
     def _working_directory(path: Path) -> Path:
@@ -189,6 +259,58 @@ class GitRunner:
         if not resolved.is_dir():
             raise WorkspaceError("Choose an available local folder")
         return resolved
+
+    def _filter_settings(self, cwd: Path) -> tuple[tuple[str, ...], bool]:
+        """Disable checkout-based drivers and report whether other filters can still run."""
+        listed = self.run(cwd, "config", "--null", "--get-regexp", r"^filter\.", check=False)
+        if listed.returncode not in (0, 1):
+            raise WorkspaceError(listed.stderr.strip() or "Could not read Git filter configuration")
+        overrides: list[str] = []
+        active = False
+        for entry in listed.stdout.split("\0"):
+            key, _, value = entry.partition("\n")
+            if value and _FILTER_KEY.fullmatch(key):
+                if names_task_file(value, cwd):
+                    overrides += ["-c", f"{key}="]
+                else:
+                    active = True
+        return tuple(overrides), active
+
+    def filter_storage(self, cwd: Path, common: Path) -> list[Path]:
+        """Where an installed content filter may write, created if Git LFS will need it.
+
+        Git LFS makes its ``lfs`` folder the first time it stores a file. The
+        sandbox can only grant a folder that exists, and it keeps the rest of
+        a shared Git directory read-only, so that first write would fail.
+        """
+        from cowork.coding import check_sandbox
+
+        folder = common / "lfs"
+        if not os.path.lexists(folder) and self._tracks_lfs_files(cwd):
+            try:
+                folder.mkdir()
+            except OSError:
+                logger.warning("Could not create Git LFS storage in %s", common, exc_info=True)
+        return check_sandbox.filter_storage(common)
+
+    def _tracks_lfs_files(self, cwd: Path) -> bool:
+        """Whether Git assigns the ``lfs`` filter to any file in this checkout.
+
+        Installing Git LFS configures its filter for every repository on the
+        computer, so the setting alone says nothing about this one. Git is
+        asked about each path, because attributes also come from files
+        outside the checkout and a mention in a comment assigns nothing.
+        Neither command runs a filter.
+        """
+        configured = self.run(cwd, "config", "--get-regexp", r"^filter\.lfs\.(clean|smudge|process)$", check=False)
+        if configured.returncode != 0 or not configured.stdout.strip():
+            return False
+        listed = self.run(cwd, "ls-files", "-z", "--cached", "--others", "--exclude-standard", check=False)
+        if listed.returncode != 0 or not listed.stdout:
+            return False
+        assigned = self.run(cwd, "check-attr", "-z", "--stdin", "filter", input_text=listed.stdout, check=False)
+        # Each answer is a path, the attribute's name and its value.
+        return assigned.returncode == 0 and "lfs" in assigned.stdout.split("\0")[2::3]
 
     def run(
         self,
@@ -211,23 +333,67 @@ class GitRunner:
             # Project configuration cannot re-enable command-capable helpers
             # such as ``ext`` at the execution boundary.
             child_environment["GIT_ALLOW_PROTOCOL"] = ALLOWED_GIT_PROTOCOLS
-            result = subprocess.run(
-                ["git", *_platform_config_args(), *args],
-                # The directory is an explicit desktop capability selected by
-                # the user and validated above. Git is fixed, arguments are an
-                # argv array, and shell execution is disabled.
-                cwd=str(working_directory),  # lgtm[py/path-injection]
-                env=child_environment,
-                input=input_text,
-                stdin=stdin,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                capture_output=True,
-                check=False,
-                timeout=timeout,
-                shell=False,
+            drivers, active_filters = (), False
+            if args and args[0] not in _SETTINGS_ONLY_COMMANDS:
+                drivers, active_filters = self._filter_settings(working_directory)
+            sandboxed_read = args[:1] in {("status",), ("diff",)} and bool(
+                drivers or active_filters or (working_directory / ".gitmodules").exists()
             )
+            if sandboxed_read:
+                # A read keeps the repository's filters, so a required one
+                # still converts content. It runs them inside the sandbox.
+                drivers = ()
+            argv = ["git", *_platform_config_args(), *_host_safety_args(args), *drivers, *args]
+            with ExitStack() as resources:
+                output = subprocess.PIPE
+                if sandboxed_read:
+                    # A filter or a submodule can run project code. Outside a
+                    # task operation, Git reads get no writes or network.
+                    from cowork.coding import check_sandbox
+
+                    if sys.platform == "win32" and self.sandbox_home is not None:
+                        # The offline account setup marker belongs to CODEX_HOME.
+                        # Reuse it across reads to avoid repeating elevated setup.
+                        home = self.sandbox_home
+                    else:
+                        home = Path(resources.enter_context(tempfile.TemporaryDirectory(prefix="cowork-git-read-")))
+                    policy = check_sandbox.CheckPolicy.for_task(PermissionMode.read_only, False, sandbox_home=home)
+                    child_environment = check_sandbox.check_environment(os.environ)
+                    # Snapshot diffs use an isolated index and object store.
+                    for name in ("GIT_INDEX_FILE", "GIT_OBJECT_DIRECTORY", "GIT_ALTERNATE_OBJECT_DIRECTORIES"):
+                        if environment and name in environment:
+                            child_environment[name] = environment[name]
+                    child_environment.update({
+                        "GIT_OPTIONAL_LOCKS": "0", "GIT_TERMINAL_PROMPT": "0", "GIT_ALLOW_PROTOCOL": ALLOWED_GIT_PROTOCOLS,
+                    })
+                    child_environment = check_sandbox.sandbox_environment(child_environment, policy)
+                    # Stream snapshot patches to the caller's output file. Git
+                    # and its filters need no write access to the recovery folder.
+                    options = args[:args.index("--")] if "--" in args else args
+                    for option in options:
+                        if args[0] == "diff" and option.startswith("--output="):
+                            patch_path = working_directory / option.removeprefix("--output=")
+                            output = resources.enter_context(patch_path.open("wb"))
+                            argv.remove(option)
+                            break
+                    common = self.run(working_directory, "rev-parse", "--git-common-dir", check=False, environment=environment)
+                    storage = self.filter_storage(working_directory, (working_directory / common.stdout.strip()).resolve()) if common.returncode == 0 else []
+                    argv = check_sandbox.sandboxed_argv(argv, policy, (), storage=storage)
+                result = subprocess.run(
+                    argv,
+                    cwd=str(working_directory),  # lgtm[py/path-injection]
+                    env=child_environment,
+                    input=input_text,
+                    stdin=stdin,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    stdout=output,
+                    stderr=subprocess.PIPE,
+                    check=False,
+                    timeout=timeout,
+                    shell=False,
+                )
         except FileNotFoundError as exc:
             raise GitUnavailableError("Git is not installed or is not available on PATH") from exc
         except (OSError, subprocess.TimeoutExpired) as exc:
@@ -248,6 +414,8 @@ class WorkspaceManager:
         self.legacy_worktrees_root = root / "worktrees"
         self.snapshots_root = root / "snapshots"
         self.git = git or GitRunner()
+        if getattr(self.git, "sandbox_home", None) is None:
+            self.git.sandbox_home = root / "check-sandbox"
         self.local_copies = LocalCopyManager(root, self.worktrees_root)
         # Under the coding root so moving a task folder here is a same-disk rename.
         self.pending_removals = PendingRemovals(root / "pending-removal")
@@ -404,7 +572,9 @@ class WorkspaceManager:
                 warning=None if include_local_changes else inspection.warning,
             )
 
-    def git_state(self, source_path: str, workspace_path: str) -> GitState:
+    def git_state(
+        self, source_path: str, workspace_path: str, checks: CheckPolicy | None = None, *, committed: bool = False,
+    ) -> GitState:
         workspace = Path(workspace_path)
         root = self._git_root(workspace)
         if root is None:
@@ -412,14 +582,24 @@ class WorkspaceManager:
         branch_result = self.git.run(root, "symbolic-ref", "--short", "-q", "HEAD", check=False)
         branch = branch_result.stdout.strip() or None
         revision = self._head_revision(root)
-        status_lines = self._status_lines(root)
+        try:
+            status_lines = self._status_lines(root, checks)
+        except WorkspaceError:
+            if not committed:
+                raise
+            # The commit is already recorded, so an unreadable status must not
+            # report it as failed. A hook may have left changes behind, so the
+            # state says the rest is unknown instead of clean.
+            logger.warning("Could not read Git status after committing in %s", root, exc_info=True)
+            status_lines = None
         return GitState(
             is_git=True,
             branch=branch,
             revision=revision,
             detached=branch is None,
             dirty=bool(status_lines),
-            status_lines=status_lines,
+            status_lines=status_lines or [],
+            status_checked=status_lines is not None,
             worktree_path=str(root),
             source_path=source_path,
         )
@@ -537,6 +717,7 @@ class WorkspaceManager:
                 root,
                 "diff",
                 "--no-ext-diff",
+                "--no-textconv",
                 "--binary",
                 "--unified=3",
                 base_revision,
@@ -576,7 +757,7 @@ class WorkspaceManager:
             raise WorkspaceError("Review actions require a Git task workspace")
         with self._mutation_lock:
             if action == "stage":
-                self.git.run(root, "add", "--", path)
+                self._add(root, "--", path)
                 return
             if action == "unstage":
                 result = self.git.run(root, "restore", "--staged", "--", path, check=False)
@@ -672,17 +853,268 @@ class WorkspaceManager:
                 return resolved.stdout.strip()
         return None
 
-    def commit(self, workspace_path: str, message: str) -> GitState:
+    def commit(
+        self, workspace_path: str, message: str, checks: CheckPolicy | None = None, *,
+        workspace_kind: WorkspaceKind | None = None,
+        on_recorded: Callable[[RecordedCommit], None] | None = None,
+    ) -> GitState:
+        """Commit everything in the workspace.
+
+        Staging can run programs the repository names, such as a clean filter
+        script in the checkout, so with ``checks`` it runs under the task's
+        permissions, followed by the supported hooks. The commit itself is
+        then recorded on the host with Git plumbing that never reads the
+        working tree, so signing keeps the person's own environment.
+        """
         with self._mutation_lock:
             root = Path(workspace_path)
             if not message.strip():
                 raise WorkspaceError("Commit message cannot be empty")
+            if checks is not None and checks.read_only:
+                raise WorkspaceError("This task is read-only and cannot commit changes")
             # Before staging anything: a direct-folder task commits through
             # here without the project-level preflight.
             self.check_git_identity(str(root))
-            self.git.run(root, "add", "--all")
-            self.git.run(root, "commit", "-m", message.strip())
-            return self.git_state(str(root), str(root))
+            self.check_no_operation_in_progress(str(root))
+            with tempfile.TemporaryDirectory(prefix="cowork-commit-", ignore_cleanup_errors=True) as scratch:
+                message_file = Path(scratch) / "COMMIT_EDITMSG"
+                message_file.write_text(message.strip() + "\n", encoding="utf-8")
+                new_objects = Path(scratch).resolve() / "objects"
+                new_objects.mkdir()
+                if checks is None:
+                    self._add(root, "--all")
+                else:
+                    self._run_sandboxed_git_step(
+                        root, checks, "Staging", ["git", *_platform_config_args(), "add", "--all"], [root], workspace_kind,
+                        new_objects,
+                    )
+                if checks is not None:
+                    self._run_commit_hooks(root, message_file, checks, workspace_kind, new_objects)
+                record = self._record_commit(root, message_file.read_text(encoding="utf-8"))
+                if on_recorded is not None:
+                    on_recorded(record)
+            return self.git_state(str(root), str(root), checks, committed=True)
+
+    def check_no_operation_in_progress(self, workspace_path: str) -> None:
+        """Refuse to commit over a merge, cherry-pick, revert or rebase Git is in the middle of.
+
+        Cowork records a plain commit, which would drop the extra parent and
+        leave Git still reporting the operation.
+        """
+        root = Path(workspace_path)
+        for marker, operation in (
+            ("MERGE_HEAD", "merge"),
+            ("CHERRY_PICK_HEAD", "cherry-pick"),
+            ("REVERT_HEAD", "revert"),
+            ("rebase-merge", "rebase"),
+            ("rebase-apply", "rebase"),
+        ):
+            raw = self.git.run(root, "rev-parse", "--git-path", marker).stdout.strip()
+            path = Path(raw) if Path(raw).is_absolute() else root / raw
+            if path.exists():
+                raise WorkspaceError(f"A {operation} is in progress in {root.name}. Finish it with Git, then commit again.")
+
+    def _record_commit(self, root: Path, message: str) -> RecordedCommit:
+        """Commit the index without reading the working tree.
+
+        Git runs from an empty folder with the repository named explicitly,
+        so a signing program cannot pick up project code from the task's
+        folder through its own module or plugin lookup.
+        """
+        git_dir = self.git.run(root, "rev-parse", "--absolute-git-dir").stdout.strip()
+        with tempfile.TemporaryDirectory(prefix="cowork-record-", ignore_cleanup_errors=True) as neutral:
+            return self._record_commit_in(Path(neutral), {"GIT_DIR": git_dir}, root, message)
+
+    def _record_commit_in(self, cwd: Path, environment: dict[str, str], root: Path, message: str) -> RecordedCommit:
+        def git(*args: str, **kwargs):
+            return self.git.run(cwd, *args, environment=environment, **kwargs)
+
+        message = git("stripspace", input_text=message).stdout
+        if not message.strip():
+            raise WorkspaceError("Commit message cannot be empty")
+        index = self.git.run(root, "rev-parse", "--path-format=absolute", "--git-path", "index").stdout.strip()
+        tree = self._write_tree(root, Path(index))
+        parent = git("rev-parse", "--verify", "--quiet", "HEAD^{commit}", check=False).stdout.strip()
+        if parent and tree == git("rev-parse", f"{parent}^{{tree}}").stdout.strip():
+            raise WorkspaceError("There are no changes to commit")
+        arguments = ["commit-tree", tree, *(("-p", parent) if parent else ())]
+        signing = git("config", "--type=bool", "--get", "commit.gpgSign", check=False)
+        if signing.returncode not in (0, 1):
+            # Unset exits 1. Anything else is a setting Git itself would refuse
+            # to commit with, so it must not become an unsigned commit.
+            raise WorkspaceError(signing.stderr.strip() or "Could not read the commit signing setting")
+        if signing.stdout.strip() == "true":
+            self._refuse_task_signing_program(root)
+            arguments.append("-S")
+        revision = git(*arguments, input_text=message).stdout.strip()
+        subject = message.splitlines()[0][:200]
+        common = Path(git("rev-parse", "--path-format=absolute", "--git-common-dir").stdout.strip()).resolve()
+        git("update-ref", "-m", f"commit: {subject}", "HEAD", revision, *((parent,) if parent else ()))
+        return RecordedCommit(common, parent, revision)
+
+    def _refuse_task_signing_program(self, root: Path) -> None:
+        """Sign only with a program outside the task's own files."""
+        for key in ("gpg.program", "gpg.openpgp.program", "gpg.x509.program", "gpg.ssh.program", "gpg.ssh.defaultKeyCommand"):
+            value = self.git.run(root, "config", "--get", key, check=False).stdout.strip()
+            if value and names_task_file(value, root):
+                raise WorkspaceError(
+                    f"Commit signing runs {value!r} from this task's folder, so Cowork won't sign with it. "
+                    "Point the signing program outside the repository, or commit from a terminal."
+                )
+
+    def _run_commit_hooks(
+        self, root: Path, message_file: Path, checks: CheckPolicy, workspace_kind: WorkspaceKind | None,
+        new_objects: Path,
+    ) -> None:
+        from cowork.coding import check_sandbox
+
+        hooks = {name: check_sandbox.hook_path(self.git.run, root, name) for name in check_sandbox.SUPPORTED_COMMIT_HOOKS}
+        for name, path in hooks.items():
+            if path is None:
+                continue
+            arguments = (str(message_file),) if name == "commit-msg" else ()
+            self._run_sandboxed_git_step(
+                root, checks, f"The {name} hook", check_sandbox.hook_argv(path, *arguments), [root, message_file.parent],
+                workspace_kind, new_objects,
+            )
+
+    def _run_sandboxed_git_step(
+        self, root: Path, checks: CheckPolicy, label: str, argv: list[str], writable: list[Path],
+        workspace_kind: WorkspaceKind | None, new_objects: Path, *, environment: dict[str, str] | None = None,
+    ) -> None:
+        """Run a command that may change the index, under the task's permissions.
+
+        The step writes new Git objects to ``new_objects`` and only reads the
+        repository's own store. Cowork copies them in when the step ends.
+        """
+        from cowork.coding import check_sandbox
+
+        index = self.git.run(root, "rev-parse", "--git-path", "index").stdout.strip()
+        extra = environment or {}
+        environment = check_sandbox.check_environment(os.environ, cache_root=checks.cache_root)
+        environment.update({
+            "GIT_INDEX_FILE": str((root / index).resolve()),
+            **extra,
+            "GIT_EDITOR": ":",
+            "GIT_TERMINAL_PROMPT": "0",
+            "GIT_ALLOW_PROTOCOL": ALLOWED_GIT_PROTOCOLS,
+            # Git inside the sandbox runs no repository hook either.
+            "GIT_CONFIG_COUNT": "1",
+            "GIT_CONFIG_KEY_0": "core.hooksPath",
+            "GIT_CONFIG_VALUE_0": os.devnull,
+        })
+        directories = check_sandbox.git_directories(self.git.run, root)
+        # Before the grants are read, so a first Git LFS write has its folder.
+        self.git.filter_storage(root, directories.common)
+        environment.update({
+            "GIT_OBJECT_DIRECTORY": str(new_objects),
+            "GIT_ALTERNATE_OBJECT_DIRECTORIES": str(directories.common / "objects"),
+        })
+        # Local tasks may use linked worktrees the user created independently.
+        task_owned = workspace_kind == WorkspaceKind.git_worktree and directories.private != directories.common
+        before = directories.snapshot()
+        result, failure = None, None
+        try:
+            result = check_sandbox.run_sandboxed(
+                argv,
+                cwd=root,
+                policy=checks,
+                environment=environment,
+                writable=[*writable, new_objects],
+                git=directories,
+                timeout=check_sandbox.HOOK_TIMEOUT_SECONDS,
+            )
+        except subprocess.TimeoutExpired as exc:
+            failure = WorkspaceError(f"{label} did not finish in time")
+            failure.__cause__ = exc
+        except OSError as exc:
+            failure = WorkspaceError(f"{label} could not run: {exc}")
+            failure.__cause__ = exc
+        # However the step ended, a new control file must not reach a
+        # host-side Git command, where it would run code outside the sandbox.
+        # A task worktree's own Git directory has no other writer, so what
+        # appears there is removed. Anywhere else Cowork cannot tell who made
+        # it, so it leaves it in place and stops before running Git again.
+        planted, added_refs = directories.left_behind(before)
+        if task_owned:
+            for planted_path in planted:
+                if planted_path.is_dir() and not planted_path.is_symlink():
+                    force_remove(planted_path)
+                else:
+                    planted_path.unlink(missing_ok=True)
+        unexplained = sorted(str(path) for path in added_refs | (set() if task_owned else planted))
+        if unexplained:
+            raise UnsafeGitMetadata(
+                directories.common,
+                f"Git files appeared while {label.lower()} ran, so nothing was committed: {', '.join(unexplained)}. "
+                "Cowork left them in place. Remove any you didn't create, then commit again."
+            ) from failure
+        # Also after a failure: a formatter's stash may already name them.
+        self._keep_new_objects(root, new_objects)
+        if planted:
+            raise WorkspaceError(f"{label} tried to change Git's configuration, so nothing was committed") from failure
+        if failure is not None:
+            raise failure
+        if result.returncode != 0:
+            output = "\n".join(part.strip() for part in (result.stdout, result.stderr) if part.strip())
+            raise WorkspaceError((f"{label} failed" + (f":\n{output}" if output else ""))[:4_000])
+
+    def _add(self, root: Path, *args: str, environment: dict[str, str] | None = None) -> None:
+        """Stage files outside a commit.
+
+        A filter script in the task is code the agent can edit, so with one
+        configured the staging runs sandboxed with the filter in place. Host
+        Git would have to switch the filter off, which fails a required one.
+        """
+        scripted, _ = self.git._filter_settings(self.git._working_directory(root))
+        if not scripted:
+            self.git.run(root, "add", *args, environment=environment)
+            return
+        from cowork.coding.check_sandbox import CheckPolicy
+
+        # No task is at hand here, so this is the narrowest policy that can stage.
+        policy = CheckPolicy.for_task(PermissionMode.workspace, False, sandbox_home=self.root / "check-sandbox")
+        with tempfile.TemporaryDirectory(prefix="cowork-stage-", ignore_cleanup_errors=True) as scratch:
+            new_objects = Path(scratch).resolve() / "objects"
+            new_objects.mkdir()
+            self._run_sandboxed_git_step(
+                root, policy, "Staging", ["git", *_platform_config_args(), "add", *args], [root], None, new_objects,
+                environment=environment,
+            )
+
+    def _keep_new_objects(self, root: Path, new_objects: Path) -> None:
+        """Copy the objects a sandboxed step wrote into the repository.
+
+        Git repacks and unpacks them, which names each one by its real
+        content, so a step can add objects but never replace or remove one.
+        """
+        if new_objects.is_symlink() or not new_objects.is_dir():
+            raise WorkspaceError("The commit's new Git objects were moved, so nothing was committed")
+        # An alternates file would pull in objects from another store.
+        info = new_objects / "info"
+        if info.is_symlink() or info.is_file():
+            info.unlink()
+        else:
+            shutil.rmtree(info, ignore_errors=True)
+        store = {"GIT_OBJECT_DIRECTORY": str(new_objects)}
+        names = self.git.run(root, "cat-file", "--batch-all-objects", "--batch-check=%(objectname)", environment=store).stdout
+        if names.strip():
+            with tempfile.TemporaryDirectory(prefix="cowork-objects-", ignore_cleanup_errors=True) as packing:
+                pack = self.git.run(root, "pack-objects", "-q", str(Path(packing) / "new"), input_text=names, environment=store)
+                with (Path(packing) / f"new-{pack.stdout.strip()}.pack").open("rb") as handle:
+                    self.git.run(root, "unpack-objects", "-q", stdin=handle)
+        force_remove(new_objects)
+        new_objects.mkdir()
+
+    def check_policy(self, owner_id: str, permission_mode: PermissionMode, network_access: bool) -> CheckPolicy:
+        from cowork.coding.check_sandbox import CheckPolicy
+
+        return CheckPolicy.for_task(
+            permission_mode,
+            network_access,
+            cache_root=self.root / "check-caches" / managed_key(owner_id),
+            sandbox_home=self.root / "check-sandbox",
+        )
 
     def check_git_identity(self, workspace_path: str) -> None:
         """Raise GitIdentityMissingError unless Git can name an author for this repository.
@@ -732,16 +1164,15 @@ class WorkspaceManager:
             self.git.run(home, "config", "--global", "user.email", email.strip())
         return self.git_identity()
 
-    def commit_checkpoint(self, workspace_path: str) -> str:
-        root = Path(workspace_path)
-        revision = self._head_revision(root)
-        if revision is None:
-            raise WorkspaceError("This task repository has no commit to checkpoint")
-        return revision
+    def rollback_commit(self, workspace_path: str, record: RecordedCommit) -> None:
+        """Remove a task commit while retaining its file changes for retry.
 
-    def rollback_commit(self, workspace_path: str, revision: str) -> None:
-        """Remove a task commit while retaining its file changes for retry."""
-        self.git.run(Path(workspace_path), "reset", "--mixed", revision)
+        Like ``git reset --mixed``, but without refreshing the index from the
+        working tree, which can run a repository's filters on the host.
+        """
+        root = Path(workspace_path)
+        self.git.run(root, "update-ref", "-m", "rollback: cowork commit", "HEAD", record.parent, record.revision)
+        self.git.run(root, "read-tree", record.parent)
 
     def apply_to_source(self, session_id: str, source_path: str, workspace_path: str, base_revision: str | None) -> Path | None:
         with self._mutation_lock:
@@ -981,6 +1412,23 @@ class WorkspaceManager:
             if not any(part in _SELF_REBUILDING_CACHES for part in PurePosixPath(path.rstrip("/")).parts)
         ]
 
+    def _write_tree(self, root: Path, index: Path) -> str:
+        """Write an index as a tree without reading the working files.
+
+        Writing an index makes Git re-read any file whose timestamp matches
+        it, through the repository's filters. From an empty folder Git finds
+        no such file, so no filter runs on the host. It works on a copy,
+        because that rewrite would also make Git stop re-checking those
+        files, and a later status or staging could then miss an edit.
+        """
+        git_dir = self.git.run(root, "rev-parse", "--absolute-git-dir").stdout.strip()
+        with tempfile.TemporaryDirectory(prefix="cowork-tree-", ignore_cleanup_errors=True) as scratch:
+            copy, neutral = Path(scratch) / "index", Path(scratch) / "empty"
+            neutral.mkdir()
+            if index.is_file():
+                shutil.copy2(index, copy)
+            return self.git.run(neutral, "write-tree", environment={"GIT_DIR": git_dir, "GIT_INDEX_FILE": str(copy)}).stdout.strip()
+
     def _save_worktree_state(self, worktree: Path, head: str) -> tuple[str, str]:
         """Commit the staged state and the working files without touching the task's index.
 
@@ -998,12 +1446,12 @@ class WorkspaceManager:
             if index_path.is_file():
                 shutil.copy2(index_path, private)
             environment = {"GIT_INDEX_FILE": str(private), "GIT_OPTIONAL_LOCKS": "0", **identity}
-            index_tree = self.git.run(worktree, "write-tree", environment=environment).stdout.strip()
+            index_tree = self._write_tree(worktree, private)
             index_commit = self.git.run(
                 worktree, "commit-tree", index_tree, "-p", head, "-m", "Cowork: staged changes", environment=environment,
             ).stdout.strip()
-            self.git.run(worktree, "add", "--all", "--", ".", environment=environment)
-            files_tree = self.git.run(worktree, "write-tree", environment=environment).stdout.strip()
+            self._add(worktree, "--all", "--", ".", environment=environment)
+            files_tree = self._write_tree(worktree, private)
             files_commit = self.git.run(
                 worktree, "commit-tree", files_tree, "-p", index_commit, "-m", "Cowork: working files",
                 environment=environment,
@@ -1212,7 +1660,8 @@ class WorkspaceManager:
                 )
             patch = Path(temporary) / "snapshot.patch"
             self.git.run(
-                workspace, "diff", "--binary", f"--output={patch.resolve()}", base_revision, environment=environment,
+                workspace, "diff", "--no-ext-diff", "--no-textconv", "--binary", f"--output={patch.resolve()}", base_revision,
+                environment=environment,
             )
             size = patch.stat().st_size
             if not size:
@@ -1231,8 +1680,33 @@ class WorkspaceManager:
         with patch.open("rb") as handle:
             return self.git.run(cwd, "apply", *flags, "--whitespace=nowarn", "-", check=check, stdin=handle)
 
-    def _status_lines(self, root: Path) -> list[str]:
-        return [line for line in self.git.run(root, "status", "--porcelain=v1", "--untracked-files=all", environment={"GIT_OPTIONAL_LOCKS": "0"}).stdout.splitlines() if line]
+    def _status_lines(self, root: Path, checks: CheckPolicy | None = None) -> list[str]:
+        args = ("status", "--porcelain=v1", "--untracked-files=all")
+        if checks is None:
+            result = self.git.run(root, *args, environment={"GIT_OPTIONAL_LOCKS": "0"})
+        else:
+            # Status may invoke the same content filters as staging, before
+            # and after the commit. It does not need to update the index.
+            from cowork.coding import check_sandbox
+
+            environment = check_sandbox.check_environment(os.environ, cache_root=checks.cache_root)
+            environment.update({
+                "GIT_OPTIONAL_LOCKS": "0",
+                "GIT_TERMINAL_PROMPT": "0",
+                "GIT_ALLOW_PROTOCOL": ALLOWED_GIT_PROTOCOLS,
+            })
+            try:
+                result = check_sandbox.run_sandboxed(
+                    ["git", *_platform_config_args(), *_host_safety_args(args), *args],
+                    cwd=root, policy=checks, environment=environment, writable=[root],
+                    read_only=check_sandbox.git_metadata(root),
+                    storage=self.git.filter_storage(root, check_sandbox.git_directories(self.git.run, root).common),
+                )
+            except (OSError, subprocess.TimeoutExpired) as exc:
+                raise WorkspaceError(f"Could not check Git status: {exc}") from exc
+            if result.returncode:
+                raise WorkspaceError((result.stderr or "Could not check Git status").strip()[:4_000])
+        return result.stdout.splitlines()
 
     def source_change_paths(self, root: Path) -> list[str]:
         return [path for _, path in self._status_entries(root)]

@@ -314,10 +314,10 @@ def test_setup_commands_report_progress_while_they_run(tmp_path: Path, monkeypat
     running, finish = threading.Event(), threading.Event()
     run_one = project_workspaces.ProjectCommandRunner._run_one
 
-    def slow(command, workspace, environment):
+    def slow(command, workspace, environment, *args):
         running.set()
         assert finish.wait(timeout=5)
-        return run_one(command, workspace, environment)
+        return run_one(command, workspace, environment, *args)
 
     monkeypatch.setattr(project_workspaces.ProjectCommandRunner, "_run_one", staticmethod(slow))
     created = service.create_session(
@@ -543,4 +543,3 @@ def measure_before_discard(monkeypatch: pytest.MonkeyPatch, service: CodingServi
         discard(session_id)
 
     monkeypatch.setattr(service.workspaces, "discard_recovery", measure_then_discard)
-

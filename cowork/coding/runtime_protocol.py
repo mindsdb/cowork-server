@@ -16,6 +16,12 @@ from cowork.coding.control_models import (
 from cowork.coding.project_models import CodeProject
 
 
+# Older workers ignore added payload fields. A distinct operation name makes
+# them refuse these commands before calling a handler without a task policy.
+CHECK_POLICY_OPERATIONS = {"commit": "commit_v2", "validate": "validate_v2"}
+UNSUPPORTED_OPERATION = "The selected computer does not support that operation"
+
+
 class ComputerRegistrationRequest(BaseModel):
     protocol_version: str = RUNTIME_PROTOCOL_VERSION
     registration_token: str = Field(min_length=32, max_length=512)

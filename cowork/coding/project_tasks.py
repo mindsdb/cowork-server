@@ -117,8 +117,13 @@ class ProjectTaskOperations:
             session_id,
             "Wait for the active turn to finish before committing task changes",
         ) as session:
+            checks = self.project_workspaces.check_policy(
+                session.project_id or session.id,
+                session.effective_permission_mode,
+                session.network_access,
+            )
             if session.workspaces:
-                states = self.project_workspaces.commit(session.workspaces, message)
+                states = self.project_workspaces.commit(session.workspaces, message, checks)
                 if not states:
                     raise WorkspaceError("This project does not contain a Git folder")
                 self.emit(
@@ -133,7 +138,9 @@ class ProjectTaskOperations:
                 return states[0]
             if session.base_revision is None:
                 raise WorkspaceError("This task is not using a Git worktree")
-            state = self.workspaces.commit(session.workspace_path, message)
+            state = self.workspaces.commit(
+                session.workspace_path, message, checks, workspace_kind=session.workspace_kind,
+            )
             self.emit(
                 session.id,
                 CodingEvent(
@@ -198,6 +205,11 @@ class ProjectTaskOperations:
                 session.workspaces,
                 "validate",
                 session.allocated_ports,
+                policy=self.project_workspaces.check_policy(
+                    project.id,
+                    session.effective_permission_mode,
+                    session.network_access,
+                ),
             )
             for result in results:
                 self.emit(

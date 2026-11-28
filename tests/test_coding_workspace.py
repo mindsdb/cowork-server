@@ -525,12 +525,15 @@ def test_git_runner_rejects_an_unavailable_working_directory_before_spawning(
         GitRunner().run(tmp_path / "missing", "status")
 
 
+HOST_SAFETY = ["-c", f"core.hooksPath={os.devnull}", "-c", "core.fsmonitor=false"]
+
+
 @pytest.mark.parametrize(
     ("platform", "expected_prefix"),
     [
-        ("win32", ["git", "-c", "core.longpaths=true", "status"]),
-        ("darwin", ["git", "status"]),
-        ("linux", ["git", "status"]),
+        ("win32", ["git", "-c", "core.longpaths=true", *HOST_SAFETY, "status"]),
+        ("darwin", ["git", *HOST_SAFETY, "status"]),
+        ("linux", ["git", *HOST_SAFETY, "status"]),
     ],
 )
 def test_git_runner_enables_long_paths_only_on_windows(
@@ -547,7 +550,8 @@ def test_git_runner_enables_long_paths_only_on_windows(
 
     GitRunner().run(tmp_path, "status")
 
-    assert calls == [expected_prefix]
+    # The first call reads which drivers the repository configures.
+    assert calls[-1] == expected_prefix
 
 
 def test_local_folder_does_not_require_git_to_be_installed(
