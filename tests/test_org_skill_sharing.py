@@ -1805,6 +1805,24 @@ def test_the_request_sheds_on_demand_skills_before_always_on_ones(monkeypatch):
     assert _fit_request(params, "conv")["skills"] == {}
 
 
+def test_the_request_keeps_a_skill_a_host_tool_waits_for(monkeypatch):
+    """Shedding the skill a host tool unlocks with would leave that tool locked
+    for the whole turn, so it stays while the other on-demand skills go."""
+    from cowork.turnqueue import producer
+
+    monkeypatch.setattr(producer, "_MAX_REQUEST_BYTES", 2000)
+    monkeypatch.setattr(producer, "_REQUEST_BYTES_MARGIN", 0)
+    params = {
+        "input": "hi",
+        "host_tools": [{"name": "edit_doc", "unlock_skill": "doc-tools"}, {"name": "list_docs"}],
+        "skills": {
+            "doc-tools": {"files": {"SKILL.md": "d" * 1000}},
+            "big": {"files": {"SKILL.md": "b" * 3000}},
+        },
+    }
+    assert list(_fit_request(params, "conv")["skills"]) == ["doc-tools"]
+
+
 def test_the_request_sheds_on_demand_skills_one_at_a_time_before_project_memory(monkeypatch):
     """The lowest ranked on-demand skill (the block's last) goes first, then
     the next, and only once none is left does project memory go; the
@@ -1918,7 +1936,7 @@ def test_the_producer_sends_the_skills_block(monkeypatch):
         monkeypatch.setattr(producer, "_mint_datasource_block", datasource)
         gen = producer.stream_remote_replies(
             conversation_id="c", org_id=ORG_ID, user_id=BOB, input_text="hi", model="m",
-            llm={"api_key": "k"}, skills=skills,
+            llm=producer.TurnLlm(block={"api_key": "k"}, turn_key_id=None, ttl_seconds=1200), skills=skills,
         )
         with pytest.raises(RuntimeError):
             await gen.__anext__()

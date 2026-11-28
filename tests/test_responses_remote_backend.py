@@ -10,6 +10,7 @@ units run inline on fakes (inline_run_db) unless a test needs the real ones.
 from __future__ import annotations
 from tests._event_loop import on_the_event_loop
 from tests._logging_assertions import assert_log_fields
+from tests.turnqueue.test_producer import turn_key_details_from
 
 import asyncio
 import itertools
@@ -28,6 +29,7 @@ from anton.core.tools.connector_draft import ConnectorDraftBox, connector_draft_
 import cowork.handlers.responses as responses_mod
 from cowork.common import event_clock
 from cowork.handlers.responses import ResponsesHandler, _RemoteArtifactsDir
+from cowork.handlers.turn_errors import ALLOWANCE_EXHAUSTED_USER_MESSAGE, FREE_SERVING_PAUSED_USER_MESSAGE
 from cowork.services.artifact_identity import ListedIds
 from cowork.services.connectors.custom_connectors import CustomConnectorService
 from cowork.streaming.registry import TurnLifecycle
@@ -84,6 +86,7 @@ def _kwargs(**overrides) -> dict:
         trace_tags=None,
         trace_metadata=None,
         first_take=None,
+        docs=True,
     )
     base.update(overrides)
     return base
@@ -1676,15 +1679,12 @@ async def _remote_failure_frames(monkeypatch, failed_data):
         (
             "FreeServingPausedError: paused",
             "free_serving_paused",
-            (
-                "Free MindsHub Air is paused for everyone until the daily budget resets. "
-                "Add credits to keep working now."
-            ),
+            FREE_SERVING_PAUSED_USER_MESSAGE,
         ),
         (
             "AllowanceExhaustedError: exhausted",
             "included_allowance_exhausted",
-            "You have no free MindsHub Air allowance left. Add credits to keep working now.",
+            ALLOWANCE_EXHAUSTED_USER_MESSAGE,
         ),
     ],
 )
@@ -1772,7 +1772,7 @@ async def test_produce_remote_failure_without_reset_at_keeps_its_shape(monkeypat
     # An older worker sends none, so the frame stays exactly as before.
     frame, events = await _remote_failure_frames(monkeypatch, {
         "error": "FreeServingPausedError: paused", "code": "free_serving_paused",
-        "message": "Free MindsHub Air is paused.",
+        "message": "Free models are paused.",
     })
     assert "reset_at" not in frame
     assert "reset_at" not in events[-1]
@@ -4279,6 +4279,7 @@ async def test_the_selected_effort_reaches_the_queued_job_on_every_turn(monkeypa
         return []
 
     monkeypatch.setattr(prod, "mint_turn_key", mint)
+    monkeypatch.setattr(prod, "mint_turn_key_details", turn_key_details_from(mint))
     monkeypatch.setattr(prod, "list_active_connections", no_connections)
 
     async def allowed(scope, permission):
@@ -4298,6 +4299,47 @@ async def test_the_selected_effort_reaches_the_queued_job_on_every_turn(monkeypa
         )
     efforts = [job["params"].get("reasoning_effort", "absent") for job in redis.jobs]
     assert efforts == ["high", "high", "absent"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("key_ttl", "time_limit_sent"), [(1200, None), (6000, 3600)])
+async def test_the_gate_keys_lifetime_reaches_the_queued_job(monkeypatch, key_ttl, time_limit_sent):
+    """Handler to the real producer with the routing gate's key: the job's
+    time limit follows the lifetime auth gave that key, and nothing mints again."""
+    from unittest.mock import AsyncMock
+
+    monkeypatch.setenv("COWORK_TURN_TIME_LIMIT_SECONDS", "3600")
+    redis = _QueueRedis()
+    monkeypatch.setattr(prod, "get_redis", lambda: redis)
+    monkeypatch.setattr(prod, "mint_turn_key_details", AsyncMock(side_effect=AssertionError("minted again")))
+
+    async def no_connections(**kw):
+        return []
+
+    async def require(scope, permission):
+        return None
+
+    async def allowed(scope, permission):
+        return True
+
+    monkeypatch.setattr(prod, "list_active_connections", no_connections)
+    monkeypatch.setattr(prod, "require_product_permission", require)
+    monkeypatch.setattr(prod.product_permissions, "has_product_permission", allowed)
+    handler = _remote_handler(monkeypatch, {})
+    gate_key = {
+        "correlation_id": "corr-gate",
+        "llm": prod.TurnLlm(block={"provider": "minds-cloud", "api_key": "mdb_gate", "base_url": "http://gw/v1"},
+                            turn_key_id=None, ttl_seconds=key_ttl),
+    }
+
+    await handler._produce_remote(
+        conv_id=uuid4(), input_text="hi", original_content="hi", model="anton",
+        harness_id="anton", buffer=_FakeBuffer(), turn_llm=gate_key,
+    )
+
+    [job] = redis.jobs
+    assert job["params"]["llm"]["api_key"] == "mdb_gate"
+    assert job["params"]["limits"].get("max_turn_seconds") == time_limit_sent
 
 
 @pytest.mark.asyncio

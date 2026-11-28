@@ -3,10 +3,16 @@
 When COWORK_REQUIRE_AUTH is true the server validates every request (except
 OPTIONS preflight and the /health endpoint) against a shared secret token
 stored in ~/.cowork/.env as COWORK_AUTH_TOKEN.  If no token is set, one is
-auto-generated at startup and written back to that file so the desktop app
-can read it. With COWORK_TRUST_IDENTITY_HEADERS on, the token comes from the
-environment alone, and create_app removes any copy from that file
-(remove_auth_token).
+auto-generated at startup and written back to that file so a client started
+from a terminal, or a desktop app that predates the launch hand-off, can read
+it. A desktop app that hands the server its launch hand-off
+(cowork.app_secret, ``COWORK_APP_SECRET_STDIN=2``) gives the token on stdin
+instead: it stays in memory for that launch, the check is on whatever the
+settings say, and create_app removes any copy from that file
+(remove_auth_token). With COWORK_TRUST_IDENTITY_HEADERS on, or
+COWORK_AUTH_TOKEN_FILE set, the token comes from the process environment or
+the file COWORK_AUTH_TOKEN_FILE names alone, and create_app removes any copy
+from that file too.
 
 Defaults on in local/desktop tenancy (see AppSettings.require_auth) and stays
 off in org mode, where it isn't supported at all — see create_app()'s
@@ -147,9 +153,18 @@ def remove_auth_token(env_path: Path) -> bool:
 
 # ── private helpers ────────────────────────────────────────────────────────
 
-_TOKEN_RE = re.compile(r"^COWORK_AUTH_TOKEN\s*=\s*(.+)$", re.MULTILINE)
-# The whole line, as python-dotenv reads it: optional indent and `export`.
-_TOKEN_LINE_RE = re.compile(r"^[ \t]*(?:export[ \t]+)?COWORK_AUTH_TOKEN[ \t]*=.*(?:\r?\n|\Z)", re.MULTILINE)
+# `[ \t]*`, not `\s*`, which crosses a line break: an empty value would read
+# the next line as the token, and a write would replace that line with it.
+_TOKEN_RE = re.compile(r"^COWORK_AUTH_TOKEN[ \t]*=[ \t]*(.+)$", re.MULTILINE)
+# The whole line, as python-dotenv reads it: optional indent and `export`, and
+# the key bare or quoted, in any case. python-dotenv reads a single-quoted key,
+# and the settings read the name in any case. The desktop app's filter of the
+# same file (envForRenderer in cowork's src/main/server-auth.ts) drops the same
+# spellings, a double-quoted key included.
+_TOKEN_LINE_RE = re.compile(
+    r"""^[ \t]*(?:export[ \t]+)?(['"]?)COWORK_AUTH_TOKEN\1[ \t]*=.*(?:\r?\n|\Z)""",
+    re.MULTILINE | re.IGNORECASE,
+)
 
 
 def _read_token(env_path: Path) -> str:

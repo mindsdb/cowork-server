@@ -78,7 +78,7 @@
             "type": "password",
             "required": true,
             "secret": true,
-            "description": "Password for the Oracle database user. Stored securely in Anton's local vault."
+            "description": "Password for the Oracle database user. Stored locally with restricted file permissions."
           }
         ]
       },
@@ -129,7 +129,7 @@
             "type": "password",
             "required": true,
             "secret": true,
-            "description": "Password for the Oracle database user. Stored securely in Anton's local vault."
+            "description": "Password for the Oracle database user. Stored locally with restricted file permissions."
           }
         ]
       },
@@ -163,7 +163,7 @@
             "type": "password",
             "required": true,
             "secret": true,
-            "description": "Password for the Oracle database user. Stored securely in Anton's local vault."
+            "description": "Password for the Oracle database user. Stored locally with restricted file permissions."
           }
         ]
       }

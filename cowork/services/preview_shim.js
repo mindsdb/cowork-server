@@ -2,7 +2,7 @@
  * In-frame preview shim. Injected as the first script of every HTML artifact
  * preview (see preview_shim.py).
  *
- * Two independent halves:
+ * Three independent parts:
  *   1. An error reporter, installed ALWAYS. It is the only way a page's own
  *      failure reaches the user or the agent — the viewer never sees the
  *      frame's console. Report types: error (uncaught), resource (a file
@@ -16,6 +16,10 @@
  *      typically reads storage during top-level initialisation, so the throw
  *      aborts its script before any listener is bound and every control on
  *      the rendered page is dead.
+ *   3. PDF embeds, installed when the server passes the address of the
+ *      bundled pdf.js viewer (the draft host and the desktop draft route).
+ *      Browsers do not run their own PDF viewer in a sandboxed frame; the
+ *      shared code (pdf_viewer/embed.js) is spliced in by preview_shim.py.
  *
  * Verified by hand against a real browser. tests/test_preview_shim.py runs
  * the reporters in node against stand-in browser objects, which proves the
@@ -28,6 +32,15 @@
   // later and silently swallow every diagnostic this shim reports.
   var PARENT = window.parent, IS_TOP = window.parent === window;
   var TAG = 'anton-preview';
+  /* The tag on what the parent window sends in: a `restore`, a `theme`, a `state` and a `snapshot`. */
+  var PARENT_TAG = 'anton-preview-parent';
+  /* Shared by the view and state halves below. While a restore replays a
+     view, the page's setState calls are the replay's, not the user's, and
+     stay in the frame (the app hands the state again once the replay is
+     done). stateSets counts the page's setState calls, so an input the page
+     answered with one is known for a state edit: the state brings it back,
+     and replaying it too would undo it. */
+  var replaying = false, stateSets = 0;
   var LINE_OFFSET = __LINE_OFFSET__;
   var MAX_REPORTS = 20;
   /* What the new report types carry at most. The app and the server cut a
@@ -179,6 +192,9 @@
           return;
         }
         var node = ev.target || {};
+        /* A PDF element whose PDF the viewer shows fails on purpose
+           (pdfShownByViewer is set further down). */
+        if (pdfShownByViewer && pdfShownByViewer(node)) return;
         var tagName = node.tagName || '';
         var url = local(node.src || node.href || '');
         report('r|' + tagName + '|' + url, {
@@ -290,6 +306,33 @@
     }
   } catch (e) { /* XMLHttpRequest not patchable: no XHR reports */ }
 
+  /* Empty wherever the server serves no viewer files: nothing is replaced. */
+  var PDF_ASSETS = __PDF_ASSETS__;
+  var pdfShownByViewer = null;
+  if (PDF_ASSETS) {
+    try {
+      pdfShownByViewer = installPdfEmbeds(window, {
+        assets: function () { return window.location.origin + PDF_ASSETS; },
+        draft: true,
+        report: reportPdfFailure
+      }) || null;
+    } catch (e) {
+      reportPdfFailure(e);
+    }
+  }
+
+  function reportPdfFailure(err) {
+    var message = clip('PDF viewer: ' + local(err && err.message ? err.message : String(err)), MAX_TEXT);
+    report('x|' + message, {
+      type: 'error',
+      message: message,
+      file: '',
+      line: 0,
+      col: 0,
+      stack: ''
+    });
+  }
+
   /* View reporter. The app's inline editor is a separate frame built from the
      source, so it opens on the first slide or the top of the page. This tells
      the app where the user is in the preview, so the editor can open there
@@ -302,7 +345,7 @@
      click is kept when the DOM changed within SETTLE_MS after it. That keeps
      scrolling with the arrow keys and clicks on plain text out of the list.
      Inputs land on the page's own elements, named by a path of tag:index
-     steps from <body> (or from the nearest element with an id). Every value
+     steps from the body (or from the nearest element with an id). Every value
      is capped; the app validates them again, as untrusted data. */
   try {
     var NAV_KEYS = {
@@ -319,9 +362,9 @@
     var MAX_LABEL = 80, SETTLE_MS = 250;
     var ID_RE = /^[A-Za-z][\w.:-]{0,99}$/;
     var viewInputs = [], viewOverflow = false, scrolled = null, lastView = '';
-    /* True while a restore (below) replays a view: no report goes out and the
-       user's own input waits, so the page settles where the app asked. */
-    var replaying = false;
+    /* `replaying` (above) is true while a restore (below) replays a view: no
+       report goes out and the user's own input waits, so the page settles
+       where the app asked. */
     var viewTimers = [], scrollTimer = 0;
 
     var inLayer = function (el) {
@@ -331,10 +374,10 @@
       return !!(el && el.matches && el.matches(LAYER_UI));
     };
 
-    /* tag:index steps up to <body>, the index counting same-tag siblings only
+    /* tag:index steps up to the body, the index counting same-tag siblings only
        (the comment layer's elements skipped), so the editor's copy of the
        page resolves the same element. An element with a unique id anchors
-       the path. '' for anything outside <body>. */
+       the path. '' for anything outside the body. */
     var pathOf = function (el) {
       var steps = [];
       while (el && el.nodeType === 1 && el !== document.body) {
@@ -412,10 +455,12 @@
       viewTimers = [setTimeout(sendView, 150), setTimeout(sendView, 900)];
     };
 
-    /* Kept only when the page changed its DOM in response. */
+    /* Kept only when the page changed its DOM in response, and not when it
+       set its state in response: a ticked box is the page's state, which the
+       app hands back to a new document (window.anton below). */
     var record = function (input) {
       if (viewOverflow || typeof MutationObserver !== 'function' || !document.body) return;
-      var changed = false;
+      var changed = false, setsBefore = stateSets;
       var observer = new MutationObserver(function (list) {
         for (var i = 0; i < list.length; i++) {
           if (!inLayer(list[i].target)) { changed = true; return; }
@@ -427,7 +472,7 @@
       setTimeout(function () {
         try {
           observer.disconnect();
-          if (!changed) return;
+          if (!changed || stateSets !== setsBefore) return;
           if (viewInputs.length >= MAX_INPUTS) {
             viewOverflow = true;
             viewInputs = [];
@@ -478,7 +523,7 @@
       } catch (inner) { /* never break the page */ }
     }, { capture: true, passive: true });
 
-    /* Keeping the place across a reload the app made (ENG-4383). A save, a
+    /* Keeping the place across a reload the app made. A save, a
        quick edit or an agent change reloads the preview, which would open on
        the first slide again. The app keeps the last view this document
        reported and, once the reloaded document says document-start, sends it
@@ -492,7 +537,6 @@
        so the next report (and the next save's restore) carries the whole way
        there. One that did not land reloads the document, which then stays
        at its start: somewhere random is worse than the beginning. */
-    var PARENT_TAG = 'anton-preview-parent';
     var KEY_CODES = {
       ArrowLeft: 37, ArrowUp: 38, ArrowRight: 39, ArrowDown: 40,
       PageUp: 33, PageDown: 34, End: 35, Home: 36, ' ': 32
@@ -764,6 +808,458 @@
     });
   } catch (e) { /* no view reports: the page still runs */ }
 
+  /* The app's light or dark theme, for a page shown inside a chat reply:
+     the parent sends `theme` with mode 'light' or 'dark', on load and
+     whenever the app's theme changes, so unlike `restore` it is taken every
+     time. It lands as the root element's data-theme and color-scheme,
+     which a page styles from. The last mode is kept and set again once the
+     document is parsed and loaded, so one that came before the page's own
+     script ran (or that script overwrote) still holds. Only the parent window
+     may send it, with its own tag, and any other mode is ignored. */
+  try {
+    var THEMES = { light: 1, dark: 1 };
+    var theme = '';
+    var applyTheme = function () {
+      var root = document.documentElement;
+      if (!theme || !root) return;
+      root.dataset.theme = theme;
+      root.style.colorScheme = theme;
+    };
+    window.addEventListener('message', function (ev) {
+      try {
+        var data = ev.data;
+        if (IS_TOP || !ev.isTrusted || ev.source !== PARENT || !data || typeof data !== 'object') return;
+        if (data.source !== PARENT_TAG || data.type !== 'theme') return;
+        if (typeof data.mode !== 'string' || THEMES[data.mode] !== 1) return;
+        theme = data.mode;
+        applyTheme();
+      } catch (inner) { /* never break the page */ }
+    });
+    var reapplyTheme = function () {
+      try { applyTheme(); } catch (inner) { /* never break the page */ }
+    };
+    document.addEventListener('DOMContentLoaded', reapplyTheme);
+    window.addEventListener('load', reapplyTheme);
+  } catch (e) { /* no theme: the page keeps its own */ }
+
+  /* The page's own state, for a page shown inside a chat reply:
+     a checklist the user ticks, then confirms. `window.anton` is the page's
+     side of it:
+       setState(obj)          keep obj and post `state` to the app, which
+                              saves it; false (and a console warning) when
+                              obj isn't JSON or is over MAX_STATE serialized.
+                              Kept but not posted while a restore replays or
+                              while an onState callback runs (an echo).
+       getState()             the last state, set here or sent by the app
+                              (a copy; null before any)
+       onState(cb)            cb(state) for each state the app sends: the
+                              saved one, sent once the document starts, and
+                              any later one. One the app sent before cb was
+                              added is passed to it on the next tick.
+                              Returns a function that removes cb.
+       submit(obj?, message?) post `submit` with obj (or the last state) and
+                              an optional short message (MAX_MESSAGE
+                              characters, longer is cut): the user is done.
+     What the page gets back is always a copy, so it can't change the state
+     the shim holds without calling setState. The app's `state` comes with
+     the restore's checks and tag, and is taken every time. */
+  try {
+    /* anton's INLINE_STATE_MAX_BYTES, which the save route enforces too. */
+    var MAX_STATE = 32 * 1024;
+    var MAX_MESSAGE = 500;
+    var stateText = null;
+    var stateFromParent = false;
+    var stateListeners = [];
+    /* True while the page's onState callbacks take the app's state: a
+       setState they make echoes it, and is not sent back (another frame of
+       the artifact would hand it on, and the two would bounce it forever). */
+    var takingState = false;
+    /* The state as JSON text, or null (with the reason) when it can't be
+       one. Its size is counted in UTF-8 bytes, as it is saved. */
+    var stateJson = function (value) {
+      var text;
+      try { text = JSON.stringify(value); } catch (inner) { return { error: 'is not JSON-serializable' }; }
+      if (typeof text !== 'string') return { error: 'is not JSON-serializable' };
+      var bytes = typeof TextEncoder === 'function' ? new TextEncoder().encode(text).length : text.length;
+      if (bytes > MAX_STATE) return { error: 'is ' + bytes + ' bytes; the most is ' + MAX_STATE };
+      return { text: text };
+    };
+    var warn = function (what, reason) {
+      try { console.warn('anton.' + what + ': the state ' + reason + ', so it was not sent.'); } catch (inner) { /* no console */ }
+    };
+    var stateCopy = function () { return stateText === null ? null : JSON.parse(stateText); };
+    var tellListener = function (cb) {
+      takingState = true;
+      try { cb(stateCopy()); } catch (inner) { /* one listener's error is its own */ }
+      takingState = false;
+    };
+    var anton = {
+      setState: function (value) {
+        var json = stateJson(value);
+        if (json.error) { warn('setState', json.error); return false; }
+        stateText = json.text;
+        stateSets += 1;
+        if (replaying || takingState) return true;
+        /* `handed`: whether the app's state had reached the page yet. One set
+           before it did is the page's default, which the app's state
+           replaces. */
+        post({ type: 'state', state: JSON.parse(json.text), handed: stateFromParent });
+        return true;
+      },
+      getState: function () { return stateCopy(); },
+      onState: function (cb) {
+        if (typeof cb !== 'function') return function () {};
+        stateListeners.push(cb);
+        if (stateFromParent) {
+          setTimeout(function () { if (stateListeners.indexOf(cb) >= 0) tellListener(cb); }, 0);
+        }
+        return function () {
+          var at = stateListeners.indexOf(cb);
+          if (at >= 0) stateListeners.splice(at, 1);
+        };
+      },
+      submit: function (value, message) {
+        var text = stateText;
+        if (value !== undefined) {
+          var json = stateJson(value);
+          if (json.error) { warn('submit', json.error); return false; }
+          text = json.text;
+        }
+        stateText = text;
+        var payload = { type: 'submit', state: text === null ? null : JSON.parse(text) };
+        if (typeof message === 'string' && message) payload.message = message.slice(0, MAX_MESSAGE);
+        post(payload);
+        return true;
+      }
+    };
+    window.anton = Object.freeze(anton);
+    window.addEventListener('message', function (ev) {
+      try {
+        var data = ev.data;
+        if (IS_TOP || !ev.isTrusted || ev.source !== PARENT || !data || typeof data !== 'object') return;
+        if (data.source !== PARENT_TAG || data.type !== 'state') return;
+        var json = stateJson(data.state);
+        if (json.error) return;
+        stateText = json.text;
+        stateFromParent = true;
+        var listeners = stateListeners.slice();
+        for (var i = 0; i < listeners.length; i++) tellListener(listeners[i]);
+      } catch (inner) { /* never break the page */ }
+    });
+  } catch (e) { /* no page state: the page still runs */ }
+
+  /* What the page's form shows, for a page that never calls setState:
+     a slider the user moved to 0.47 must still be something the
+     agent can read. Every page reports its controls and its text as a
+     `snapshot`, which the app saves beside state.json as snapshot.json:
+       { type: 'snapshot', snapshot: {
+           controls: [{ label, name, type, value }],  at most MAX_CONTROLS
+           text } }                                   body text, MAX_PAGE_TEXT
+     `value` is a string, a checkbox's a boolean, a multi-select's an array of
+     strings; a radio group is one entry with the checked value ('' for none).
+     `name` is the control's name, else its id, else its path (pathOf above).
+     Sent MAX_WAIT ms after the user's last input or change, and once
+     FIRST_SEND_MS after load; never twice the same, and nothing inside the
+     comment layer counts.
+     The app sends the saved one back as {source: PARENT_TAG, type:
+     'snapshot', snapshot}. A page with an onState listener restores itself
+     from its state, so only one without puts the values back, by name, and
+     fires input and change so it reacts. Those events are not the user's:
+     nothing is sent for them. */
+  try {
+    var MAX_CONTROLS = 60, MAX_PAGE_TEXT = 2000, MAX_CONTROL_LABEL = 80;
+    var MAX_VALUE = 1000, MAX_NAME = 300, MAX_OPTIONS = 60, SHORT_TEXT = 200;
+    var SNAPSHOT_WAIT = 400, FIRST_SEND_MS = 1000;
+    /* The save's cap, as for state.json (INLINE_STATE_MAX_BYTES). */
+    var MAX_SNAPSHOT = 32 * 1024;
+    var SNAPSHOT_FIELDS = 'input, select, textarea';
+    var SKIPPED_TYPES = { password: 1, hidden: 1, file: 1 };
+    var snapshotLayer = '#act-mk, .act-hl, .act-pop, .act-menu';
+    var lastSnapshot = '', snapshotTimer = 0, applyingSnapshot = false, snapshotTaken = false;
+
+    var underLayer = function (el) {
+      return !!(el && el.closest && el.closest(snapshotLayer));
+    };
+    var isLayerNode = function (el) {
+      return !!(el && el.matches && el.matches(snapshotLayer));
+    };
+    var tracked = function (el) {
+      if (!el || el.nodeType !== 1 || !el.matches || !el.matches(SNAPSHOT_FIELDS)) return false;
+      if (el.localName === 'input' && SKIPPED_TYPES[String(el.type || 'text').toLowerCase()]) return false;
+      return !underLayer(el);
+    };
+    var controlType = function (el) {
+      if (el.localName === 'select') return el.multiple ? 'select-multiple' : 'select-one';
+      if (el.localName === 'textarea') return 'textarea';
+      return String(el.type || 'text').toLowerCase();
+    };
+    var controlName = function (el) {
+      var name = typeof el.name === 'string' && el.name ? el.name : (el.id || '');
+      if (!name && typeof pathOf === 'function') name = pathOf(el);
+      return String(name || '').slice(0, MAX_NAME);
+    };
+    /* A label's own words: the controls inside it (a select's options) left out. */
+    var wordsOf = function (node) {
+      if (!node) return '';
+      if (node.nodeType === 3) return String(node.nodeValue || '');
+      if (node.nodeType !== 1 || isLayerNode(node)) return '';
+      var tag = node.localName;
+      if (tag === 'input' || tag === 'select' || tag === 'textarea' || tag === 'script' || tag === 'style') return '';
+      var kids = node.childNodes;
+      if (!kids) return String(node.textContent || '');
+      var out = '';
+      for (var i = 0; i < kids.length; i++) out += ' ' + wordsOf(kids[i]);
+      return out;
+    };
+    var hasField = function (node) {
+      if (!node || node.nodeType !== 1) return false;
+      if (node.matches && node.matches(SNAPSHOT_FIELDS)) return true;
+      return !!(node.querySelector && node.querySelector(SNAPSHOT_FIELDS));
+    };
+    var before = function (node) {
+      return node.previousSibling !== undefined ? node.previousSibling : node.previousElementSibling;
+    };
+    /* The nearest short text before the control: a sibling, or one of its
+       parents' (three levels up). Another control on the way, or a long
+       passage, ends the search: what lies before it labels something else. */
+    var precedingText = function (el) {
+      var node = el;
+      for (var level = 0; level < 4 && node && node !== document.body; level++) {
+        for (var prev = before(node); prev; prev = before(prev)) {
+          if (prev.nodeType === 1 && (isLayerNode(prev) || prev.localName === 'script' || prev.localName === 'style')) continue;
+          if (hasField(prev)) return '';
+          var text = clip(wordsOf(prev), SHORT_TEXT + 1);
+          if (!text) continue;
+          return text.length > SHORT_TEXT ? '' : text;
+        }
+        node = node.parentElement;
+      }
+      return '';
+    };
+    var attr = function (el, name) {
+      var value = el.getAttribute ? el.getAttribute(name) : null;
+      return typeof value === 'string' ? value : '';
+    };
+    var labelOf = function (el) {
+      var text = '';
+      var id = el.id;
+      if (id) {
+        var labels = document.querySelectorAll('label');
+        for (var i = 0; i < labels.length && !text; i++) {
+          if (attr(labels[i], 'for') === id && !underLayer(labels[i])) text = clip(wordsOf(labels[i]), MAX_CONTROL_LABEL);
+        }
+      }
+      if (!text && el.parentElement && el.parentElement.closest) {
+        var wrap = el.parentElement.closest('label');
+        if (wrap) text = clip(wordsOf(wrap), MAX_CONTROL_LABEL);
+      }
+      if (!text) text = clip(attr(el, 'aria-label'), MAX_CONTROL_LABEL);
+      if (!text && attr(el, 'aria-labelledby')) {
+        var ids = attr(el, 'aria-labelledby').split(/\s+/), parts = [];
+        for (var j = 0; j < ids.length; j++) {
+          var named = ids[j] ? document.getElementById(ids[j]) : null;
+          if (named) parts.push(wordsOf(named));
+        }
+        text = clip(parts.join(' '), MAX_CONTROL_LABEL);
+      }
+      if (!text) text = clip(attr(el, 'placeholder'), MAX_CONTROL_LABEL);
+      if (!text) text = clip(precedingText(el), MAX_CONTROL_LABEL);
+      return text;
+    };
+    /* A radio group is named for its fieldset's legend or its radiogroup,
+       not for the first choice's own label. */
+    var groupLabel = function (el) {
+      var set = el.closest ? el.closest('fieldset') : null;
+      if (set && set.querySelector) {
+        var legend = set.querySelector('legend');
+        if (legend) {
+          var said = clip(wordsOf(legend), MAX_CONTROL_LABEL);
+          if (said) return said;
+        }
+      }
+      var group = el.closest ? el.closest('[role="radiogroup"]') : null;
+      if (group) {
+        var named = clip(attr(group, 'aria-label'), MAX_CONTROL_LABEL);
+        if (named) return named;
+      }
+      return labelOf(el);
+    };
+    var selectedValues = function (el) {
+      var out = [], options = el.options || [];
+      for (var i = 0; i < options.length && out.length < MAX_OPTIONS; i++) {
+        if (options[i].selected) out.push(String(options[i].value).slice(0, MAX_VALUE));
+      }
+      return out;
+    };
+    var fields = function () {
+      var nodes = document.querySelectorAll(SNAPSHOT_FIELDS), out = [];
+      for (var i = 0; i < nodes.length; i++) if (tracked(nodes[i])) out.push(nodes[i]);
+      return out;
+    };
+    var pageText = function () {
+      var body = document.body;
+      if (!body) return '';
+      var kids = body.childNodes, out = '';
+      if (!kids) return clip(body.innerText != null ? body.innerText : body.textContent, MAX_PAGE_TEXT);
+      for (var i = 0; i < kids.length && out.length <= MAX_PAGE_TEXT; i++) {
+        var kid = kids[i];
+        if (kid.nodeType === 3) out += ' ' + kid.nodeValue;
+        else if (kid.nodeType === 1 && !isLayerNode(kid) && kid.localName !== 'script' && kid.localName !== 'style') {
+          out += ' ' + (kid.innerText != null ? kid.innerText : kid.textContent);
+        }
+      }
+      return clip(out, MAX_PAGE_TEXT);
+    };
+    var buildSnapshot = function () {
+      var controls = [], groups = Object.create(null), list = fields();
+      for (var i = 0; i < list.length && controls.length < MAX_CONTROLS; i++) {
+        var el = list[i], type = controlType(el), name = controlName(el);
+        if (type === 'radio') {
+          var group = el.name ? 'n|' + el.name : 'p|' + name;
+          var entry = groups[group];
+          if (!entry) {
+            entry = groups[group] = { label: groupLabel(el), name: name, type: 'radio', value: '' };
+            controls.push(entry);
+          }
+          if (el.checked) entry.value = String(el.value).slice(0, MAX_VALUE);
+          continue;
+        }
+        var value;
+        if (type === 'checkbox') value = !!el.checked;
+        else if (type === 'select-multiple') value = selectedValues(el);
+        else value = String(el.value == null ? '' : el.value).slice(0, MAX_VALUE);
+        controls.push({ label: labelOf(el), name: name, type: type, value: value });
+      }
+      return { controls: controls, text: pageText() };
+    };
+    var bytesOf = function (text) {
+      return typeof TextEncoder === 'function' ? new TextEncoder().encode(text).length : text.length;
+    };
+    /* Over the save's cap the text goes first. */
+    var snapshotJson = function (snapshot) {
+      var text = JSON.stringify(snapshot);
+      if (bytesOf(text) > MAX_SNAPSHOT) { snapshot.text = ''; text = JSON.stringify(snapshot); }
+      return bytesOf(text) > MAX_SNAPSHOT ? null : text;
+    };
+    var sendSnapshot = function () {
+      try {
+        var text = snapshotJson(buildSnapshot());
+        if (text === null || text === lastSnapshot) return;
+        lastSnapshot = text;
+        post({ type: 'snapshot', snapshot: JSON.parse(text) });
+      } catch (inner) { /* never break the page */ }
+    };
+    var scheduleSnapshot = function () {
+      clearTimeout(snapshotTimer);
+      snapshotTimer = setTimeout(sendSnapshot, SNAPSHOT_WAIT);
+    };
+    var onField = function (ev) {
+      try {
+        if (applyingSnapshot || !tracked(ev.target)) return;
+        scheduleSnapshot();
+      } catch (inner) { /* never break the page */ }
+    };
+    window.addEventListener('input', onField, true);
+    window.addEventListener('change', onField, true);
+
+    var afterLoad = function (next) {
+      if (document.readyState === 'complete') { next(); return; }
+      var done = false;
+      var go = function () { if (!done) { done = true; next(); } };
+      window.addEventListener('load', go);
+    };
+    afterLoad(function () {
+      setTimeout(function () { if (!snapshotTaken) sendSnapshot(); }, FIRST_SEND_MS);
+    });
+
+    /* The app's snapshot, rebuilt from known fields; null when any part is off. */
+    var cleanSnapshot = function (raw) {
+      if (!raw || typeof raw !== 'object' || !Array.isArray(raw.controls)) return null;
+      if (raw.controls.length > MAX_CONTROLS) return null;
+      var out = [];
+      for (var i = 0; i < raw.controls.length; i++) {
+        var item = raw.controls[i];
+        if (!item || typeof item !== 'object' || typeof item.name !== 'string' || !item.name ||
+          item.name.length > MAX_NAME || typeof item.type !== 'string') return null;
+        var value = item.value;
+        if (Array.isArray(value)) {
+          if (value.length > MAX_OPTIONS) return null;
+          for (var v = 0; v < value.length; v++) if (typeof value[v] !== 'string') return null;
+        } else if (typeof value !== 'string' && typeof value !== 'boolean') {
+          return null;
+        }
+        out.push({ name: item.name, type: item.type, value: value });
+      }
+      return out;
+    };
+    var dispatchField = function (el, type) {
+      var ev;
+      if (typeof Event === 'function') ev = new Event(type, { bubbles: true });
+      else { ev = document.createEvent('Event'); ev.initEvent(type, true, false); }
+      el.dispatchEvent(ev);
+    };
+    /* Sets one saved control on the page; the elements it changed. */
+    var applyControl = function (saved, list) {
+      var changed = [];
+      for (var i = 0; i < list.length; i++) {
+        var el = list[i], type = controlType(el);
+        if (el.name !== saved.name && el.id !== saved.name && controlName(el) !== saved.name) continue;
+        if (type === 'radio') {
+          if (typeof saved.value !== 'string') continue;
+          var on = String(el.value) === saved.value;
+          if (!!el.checked !== on) { el.checked = on; if (on) changed.push(el); }
+        } else if (type === 'checkbox') {
+          if (typeof saved.value !== 'boolean' || !!el.checked === saved.value) continue;
+          el.checked = saved.value;
+          changed.push(el);
+        } else if (type === 'select-multiple') {
+          if (!Array.isArray(saved.value)) continue;
+          var options = el.options || [], moved = false;
+          for (var o = 0; o < options.length; o++) {
+            var pick = saved.value.indexOf(String(options[o].value)) >= 0;
+            if (!!options[o].selected !== pick) { options[o].selected = pick; moved = true; }
+          }
+          if (moved) changed.push(el);
+        } else {
+          if (typeof saved.value !== 'string' || String(el.value) === saved.value) continue;
+          el.value = saved.value;
+          changed.push(el);
+        }
+      }
+      return changed;
+    };
+    var restoreSnapshot = function (saved) {
+      afterLoad(function () {
+        try {
+          /* A page that takes its state restores itself from it. */
+          if (stateListeners && stateListeners.length > 0) return;
+          var list = fields(), changed = [];
+          for (var i = 0; i < saved.length; i++) changed = changed.concat(applyControl(saved[i], list));
+          applyingSnapshot = true;
+          try {
+            for (var c = 0; c < changed.length; c++) { dispatchField(changed[c], 'input'); dispatchField(changed[c], 'change'); }
+          } finally {
+            applyingSnapshot = false;
+          }
+          /* What the app just sent is what it has: not sent back. */
+          clearTimeout(snapshotTimer);
+          lastSnapshot = snapshotJson(buildSnapshot()) || '';
+        } catch (inner) { applyingSnapshot = false; }
+      });
+    };
+    window.addEventListener('message', function (ev) {
+      try {
+        var data = ev.data;
+        if (IS_TOP || !ev.isTrusted || ev.source !== PARENT || !data || typeof data !== 'object') return;
+        if (data.source !== PARENT_TAG || data.type !== 'snapshot') return;
+        var saved = cleanSnapshot(data.snapshot);
+        if (!saved) return;
+        snapshotTaken = true;
+        restoreSnapshot(saved);
+      } catch (inner) { /* never break the page */ }
+    });
+  } catch (e) { /* no snapshot: the page still runs */ }
+
   var nativeStorageWorks = true;
   try { void window.localStorage; } catch (e) { nativeStorageWorks = false; }
   /* One probe stands for the whole opaque-origin condition: where localStorage
@@ -956,4 +1452,8 @@
       }
     });
   } catch (e) { /* cookie accessor is not redefinable here */ }
+
+  // installPdfEmbeds is called earlier; it relies on function-declaration
+  // hoisting, so embed.js must keep a single top-level function declaration.
+  /* pdf-embeds */
 })();

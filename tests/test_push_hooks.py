@@ -225,12 +225,15 @@ async def test_a_share_pushes_each_named_person_but_never_the_sharer(pushes):
     hooks.artifact_shared(
         org_id=ORG, sharer_id=OWNER, sharer_name="owner@example.com",
         recipient_ids=[OTHER, OWNER, OTHER], artifact_title="Q3", url="https://view.example/r/1",
+        artifact_ref="project/artifact",
     )
     await _drained()
     ((org_id, user_id, payload),) = pushes
     assert (org_id, user_id) == (ORG, OTHER)
     assert payload.kind == PushKind.ARTIFACT_SHARED
     assert payload.title == "owner@example.com shared “Q3” with you"
+    assert payload.apns_body()["artifact_ref"] == "project/artifact"
+    assert payload.fcm_message("device")["message"]["data"]["artifact_ref"] == "project/artifact"
     assert payload.url == "https://view.example/r/1" and payload.path is None
 
 

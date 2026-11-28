@@ -413,9 +413,10 @@ def test_update_endpoint_delegates(tmp_path: Path):
 
     captured = {}
 
-    def _fake_update(path, *, scope):
+    def _fake_update(path, *, scope, approved_datasources=None):
         captured["path"] = path
         captured["scope"] = scope
+        captured["approved_datasources"] = approved_datasources
         return {"status": "ok", "url": "https://4nton.ai/a/uuid-1"}
 
     with patch.object(publish_ep, "_update", _fake_update):
@@ -425,6 +426,7 @@ def test_update_endpoint_delegates(tmp_path: Path):
     assert captured["path"] == "/some/art"
     # The request's own scope, which resolves the path; no person here.
     assert captured["scope"] == LOCAL_SCOPE
+    assert captured["approved_datasources"] is None
 
 
 def test_update_endpoint_404_when_not_published(tmp_path: Path):
@@ -436,7 +438,7 @@ def test_update_endpoint_404_when_not_published(tmp_path: Path):
     app.include_router(publish_ep.router, prefix="/api/v1/publish")
     client = TestClient(app)
 
-    def _raise(path, *, scope):
+    def _raise(path, *, scope, approved_datasources=None):
         raise FileNotFoundError("No published version to update")
 
     with patch.object(publish_ep, "_update", _raise):
@@ -789,3 +791,39 @@ def test_publish_answer_names_its_page_only_under_result(tmp_path: Path):
     assert answer["result"]["report_id"] == "rid-top"
     assert "reportId" not in answer
     assert "report_id" not in answer
+
+
+def test_content_clock_ignores_inline_state_json(tmp_path: Path):
+    """ENG-4684: saving an inline page's picks must not look like a page edit,
+    or every open frame reloads, saves again and reloads again."""
+    from cowork.services.artifacts import content_mtime_ns
+
+    (tmp_path / "metadata.json").write_text(
+        json.dumps({"slug": "picks", "type": "html-app", "display": "inline"})
+    )
+    page = tmp_path / "index.html"
+    page.write_text("<p>hi</p>")
+    _touch(page, 1000)
+    state = tmp_path / "state.json"
+    state.write_text('{"picked": ["a"]}')
+    _touch(state, 5000)
+    assert _content_mtime(tmp_path) == 1000
+    assert content_mtime_ns(tmp_path) == 1000 * 1_000_000_000
+
+
+def test_content_clock_ignores_inline_snapshot_json(tmp_path: Path):
+    """ENG-4684: the form snapshot the shim reports is saved on every change,
+    like state.json, and is no page edit either."""
+    from cowork.services.artifacts import content_mtime_ns
+
+    (tmp_path / "metadata.json").write_text(
+        json.dumps({"slug": "picks", "type": "html-app", "display": "inline"})
+    )
+    page = tmp_path / "index.html"
+    page.write_text("<p>hi</p>")
+    _touch(page, 1000)
+    snapshot = tmp_path / "snapshot.json"
+    snapshot.write_text('{"controls": [], "text": ""}')
+    _touch(snapshot, 6000)
+    assert _content_mtime(tmp_path) == 1000
+    assert content_mtime_ns(tmp_path) == 1000 * 1_000_000_000

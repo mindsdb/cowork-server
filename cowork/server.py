@@ -13,6 +13,7 @@ import signal
 import stat
 import threading
 import time
+from collections.abc import Callable
 from contextlib import asynccontextmanager
 from functools import partial
 from pathlib import Path
@@ -20,6 +21,7 @@ from types import FrameType
 
 import psutil
 from fastapi import FastAPI
+from fastapi.exception_handlers import http_exception_handler
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.exc import TimeoutError as PoolTimeoutError
@@ -29,6 +31,7 @@ from cowork.api.v1.route_walker import contradictory_routes, route_key, undeclar
 from cowork.api.v1.router import api_router as v1_router
 from starlette.responses import JSONResponse
 
+from cowork import app_secret
 from cowork.auth_middleware import (
     BearerTokenMiddleware,
     ensure_auth_token,
@@ -62,22 +65,26 @@ from cowork.managed import (
 from cowork.shared_skills import read_shared_skills, shared_skills_file
 from cowork.principal import TrustedHeaderMiddleware
 from cowork.services.live_apps import live_app_slot_paths
+from cowork.services.product_permissions import ProductPermissionUnavailable, report_permission_unavailable
 from cowork.schemas.refusals import TURN_IN_PROGRESS, Refusal
 from cowork.services.connectors.layered_vault import SharedConnectionError
+from cowork.services.connectors.sealed_vault import RecordTooLargeError, ReservedFieldError, SealedRecordError
 from cowork.streaming import ServerShuttingDown, TurnInProgress, registry
 from cowork.streaming.registry import TURN_SHUTDOWN_GRACE_SECONDS
 from cowork.streaming.turn_claim import TurnClaimUnavailable
 from cowork.common.request_logging import RequestLoggingApp
 from cowork.common.logger import find_database_error, relayed_error, setup_logging
 from cowork.common.paths import O_NONBLOCK, dir_open, dir_scandir, dir_stat, pinned_dir
+from cowork.common.launch_environment import launch_value
 from cowork.common.paths import cowork_home
 from cowork.common.settings.app_settings import (
     TurnQueueSettings,
     get_app_settings,
     get_export_pdf_settings,
 )
+from cowork.common.settings.secret_files import file_variable, process_secret
 from cowork.dev_setup import run_dev_setup
-from cowork.scheduler import start_scheduler, stop_scheduler, wait_for_scheduled_runs
+from cowork.scheduler import start_scheduler, stop_scheduler, wait_for_scheduled_notices, wait_for_scheduled_runs
 from cowork.services.artifact_autopublish import cancel_self_heals
 from cowork.services.artifact_heal_sweep import cancel_heal_sweep
 from cowork.services.pending_credential_clear import consume_pending_credential_clear
@@ -272,6 +279,7 @@ async def _end_remote_turns() -> None:
             "Scheduled runs still recording their outcome at shutdown",
             extra={"event": "shutdown_scheduled_runs_unfinished", "count": unfinished},
         )
+    await wait_for_scheduled_notices(timeout_seconds=remaining())
 
 
 def _log_cancelled_turns(cancelled: int) -> None:
@@ -570,6 +578,28 @@ def _warm_agent_runtime() -> None:
             logger.debug("agent runtime warm-up skipped %s", name, exc_info=True)
 
 
+async def _run_sealing_start_check(*, check: Callable[[], None]) -> None:
+    """Run a sealing start check off the event loop, and log why it refused.
+
+    Starlette hands a failed start to Uvicorn as traceback text, and the log
+    formatter keeps only that text's frames and exception classes
+    (structured_logging._event_schema), so without this line the operator's
+    log wouldn't say why Cowork stopped. A KeyFileError or SealedDataError
+    message names only paths, settings' names and records, never a value.
+    """
+    from cowork.common.encryption import KeyFileError
+    from cowork.services.sealing import SealedDataError
+
+    try:
+        await asyncio.to_thread(check)
+    except (KeyFileError, SealedDataError) as refusal:
+        logger.error(
+            "A sealing start check refused, so Cowork won't start",
+            extra={"event": "sealing_start_refused", "reason": str(refusal)},
+        )
+        raise
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     clock = _StartupClock()
@@ -577,8 +607,18 @@ async def lifespan(app: FastAPI):
     # still log it as running once _SLOW_STEP_S passed. The end of the task
     # that runs the lifespan stops that timer.
     asyncio.current_task().add_done_callback(lambda _task: clock.stop_timer())
+    clock.begin("sealing_check")
+    # Before anything reads a setting or could make a legacy key: a deployment
+    # sealed under a key file doesn't start without one.
+    from cowork.services.sealing import refuse_sealed_state_without_key_file, refuse_unopenable_sealed_data
+
+    await _run_sealing_start_check(check=refuse_sealed_state_without_key_file)
     clock.begin("dev_setup")
     run_dev_setup()
+    clock.begin("sealed_data_check")
+    # After migrations, before anything serves: every sealed setting and
+    # connection opens with the key file, or the start stops naming each one.
+    await _run_sealing_start_check(check=refuse_unopenable_sealed_data)
     clock.begin("credential_clear")
     # After migrations and the .env seed, before anything reads a credential.
     app_settings = get_app_settings()
@@ -676,16 +716,19 @@ async def lifespan(app: FastAPI):
     try:
         from cowork.db.scoped import ScopedSession, SYSTEM_SCOPE
         from cowork.db.session import get_open_session
-        from cowork.scheduler import boot_reap_cutoff
+        from cowork.scheduler import boot_reap_cutoff, post_reaped_run_notices
         from cowork.services.schedules import ScheduleRunService
 
         recovery_session = ScopedSession(get_open_session(), SYSTEM_SCOPE)
         try:
+            executed: list = []
             reaped = ScheduleRunService(recovery_session).reap_orphaned_runs(
-                started_before=boot_reap_cutoff(),
+                started_before=boot_reap_cutoff(), executed=executed,
             )
             if reaped:
                 logger.warning("Reaped orphaned scheduled runs", extra={"event": "orphaned_runs_reaped", "count": reaped})
+            # Their owners hear the runs didn't finish, as the lease reaper's do.
+            post_reaped_run_notices(recovery_session, [run.id for run in executed])
         finally:
             recovery_session.close()
     except Exception:
@@ -700,7 +743,21 @@ async def lifespan(app: FastAPI):
     clock.begin("scheduler_and_channels")
     start_scheduler()
     await _start_channels(app)
+    # Shared docs catch up on what was still waiting when the app quit (see
+    # cowork.docs.sync; on a background thread, so boot never waits).
+    from cowork.docs import sync as shared_docs
+
+    shared_docs.start()
+    from cowork.docs.relay import start_doc_relay, stop_doc_relay
+    from cowork.docs.publish_queue import (
+        pause_doc_publish_worker,
+        start_doc_publish_worker,
+        stop_doc_publish_worker,
+    )
+
     clock.begin("draft_listener")
+    app.state.doc_relay = None
+    app.state.doc_publish_worker = None
     app.state.channel_ingress_reconciler = None
     app.state.artifact_owner_backfill = None
     app.state.artifact_location_backfill = None
@@ -737,6 +794,10 @@ async def lifespan(app: FastAPI):
         _end_remote_turns_on_sigterm()
     watchdog = None
     try:
+        # Doc events reach the other replicas' editors; only where replicas share Redis.
+        app.state.doc_relay = start_doc_relay()
+        # Shared doc pages follow their edits; only on an org deployment with Redis.
+        app.state.doc_publish_worker = start_doc_publish_worker()
         draft_listener = await start_draft_listener()
         clock.finished()
         # Last, once nothing left in startup blocks the loop on purpose.
@@ -744,9 +805,12 @@ async def lifespan(app: FastAPI):
         watchdog.start()
         yield
     finally:
+        # Turns still draining queue their pages for the other replicas; this
+        # replica stops taking new uploads it would have to abandon.
+        await pause_doc_publish_worker(getattr(app.state, "doc_publish_worker", None))
         if watchdog is not None:
             watchdog.stop()
-        # First, so no draft request is still reading files or the database
+        # Early, so no draft request is still reading files or the database
         # while the steps below close them.
         await stop_draft_listener(draft_listener)
         from cowork.channels.webhooks import drain_background_tasks
@@ -782,10 +846,23 @@ async def lifespan(app: FastAPI):
         # After the turn drains above, whose endings may each have started a
         # push, and the scheduled runs, which push when they finish.
         await drain_push_notifications()
+        shared_docs.stop()
+        await stop_doc_relay(getattr(app.state, "doc_relay", None))
         # After both turn drains above: each turn they unwound has queued the
-        # close of its scratchpad processes, and those must finish before the
-        # event loop stops.
-        await drain_scratchpad_closes()
+        # close of its scratchpad processes, and its last doc writes their
+        # pages. The worker's stop runs inside the closes' wait: the pod's
+        # grace period has no room for a wait of its own.
+        closes, worker_stop = await asyncio.gather(
+            drain_scratchpad_closes(),
+            stop_doc_publish_worker(getattr(app.state, "doc_publish_worker", None)),
+            return_exceptions=True,
+        )
+        if isinstance(worker_stop, BaseException):
+            logger.warning("doc_publish", exc_info=worker_stop, extra={
+                "event": "doc_publish", "outcome": "stop_failed", "error_type": type(worker_stop).__name__})
+        if isinstance(closes, BaseException):
+            # As before the gather: a failed wait for the closes ends the teardown.
+            raise closes
         await app.state.channel_adapters.shutdown()
         get_coding_service().close_all()
         shutdown_launched_backends()
@@ -944,6 +1021,16 @@ def create_app() -> FastAPI:
     # PDF export settings come from the process environment alone. An engine
     # other than "render", or "render" without an http(s) URL, stops the start.
     get_export_pdf_settings()
+    # So does COWORK_KEY_FILE: a key file that is missing, unreadable or
+    # malformed stops the start, naming the cause and never a key.
+    from cowork.common.encryption import sealing_keys, warn_ignored_key_settings
+
+    sealing_keys()
+    warn_ignored_key_settings(
+        master_key=settings.master_key,
+        master_key_path_set="master_key_path" in settings.model_fields_set,
+        code_sandbox=settings.code_sandbox,
+    )
 
     from cowork.deployment_identity import initialize_deployment_identity
 
@@ -1006,6 +1093,15 @@ def create_app() -> FastAPI:
         )
         return _server_busy(retry_after=busy_retry_seconds(), status_code=FilesystemBusy.status_code)
 
+    # A permission auth could not verify, answered 503 as any HTTPException
+    # is. The line saying why is logged here, where a person gets the answer,
+    # not where it was raised: a turn that goes on without what auth couldn't
+    # confirm logs its own line instead.
+    @app.exception_handler(ProductPermissionUnavailable)
+    async def _permission_unavailable(request, exc):
+        report_permission_unavailable(exc)
+        return await http_exception_handler(request, exc)
+
     # A question that reached a replica already ending its turns for a
     # shutdown (RunRegistry.close). Refused as a busy server is: the client
     # waits Retry-After, and its retry reaches another replica, which the
@@ -1039,10 +1135,37 @@ def create_app() -> FastAPI:
     async def _shared_connection(request, exc: SharedConnectionError):
         return JSONResponse({"detail": exc.detail}, status_code=403)
 
+    # A sealed connection whose record won't open, read by a request: a list,
+    # a delete, or a turn's scrubbing registration. Its message names the
+    # connection and the cause, never a value.
+    @app.exception_handler(SealedRecordError)
+    async def _sealed_connection_unopenable(request, exc: SealedRecordError):
+        logger.error(
+            "A saved connection can't be opened",
+            extra={"event": "sealed_connection_unopenable", "connection": exc.connection, "reason": exc.cause},
+        )
+        return JSONResponse({"detail": str(exc)}, status_code=409)
+
+    # A save whose sealed record would be larger than the vault reads back
+    # (SealedDataVault.save). Its message names the connection and the sizes.
+    @app.exception_handler(RecordTooLargeError)
+    async def _record_too_large(request, exc: RecordTooLargeError):
+        return JSONResponse({"detail": str(exc)}, status_code=422)
+
+    # A save with a key file whose values hold a field named like the sealed
+    # mark (SealedDataVault.save). Its message names the connection and the
+    # field, never a value.
+    @app.exception_handler(ReservedFieldError)
+    async def _reserved_field(request, exc: ReservedFieldError):
+        return JSONResponse({"detail": str(exc)}, status_code=422)
+
     # Bearer-token auth. On by default in local mode (see AppSettings.
-    # require_auth). Token is auto-generated on first startup when
-    # COWORK_AUTH_TOKEN is not set, then persisted to <cowork_home>/.env so
-    # the desktop app and subsequent server runs share the same secret.
+    # require_auth), and always on while the server holds the desktop app's
+    # launch hand-off (cowork.app_secret.held_handoff), whose token lives in
+    # memory for this launch only. Otherwise the token is auto-generated on
+    # first startup when COWORK_AUTH_TOKEN is not set, then persisted to
+    # <cowork_home>/.env so a client started from a terminal and later server
+    # runs share the same secret.
     #
     # Registered BEFORE CORS so CORS ends up the outer layer (Starlette applies
     # the last-added middleware outermost): a 401 from the auth layer still
@@ -1119,13 +1242,19 @@ def create_app() -> FastAPI:
                 f"COWORK_MANAGED_DIR's shared registry is malformed: {error}. "
                 "Fix or remove the file; a missing one shares nothing."
             ) from error
-        from anton.core.datasources.data_vault import LocalDataVault
+        from cowork.services.connectors.persist import data_vault_at
 
+        try:
+            managed_connections = str(len(data_vault_at(managed.vault_dir).list_connections()))
+        except SealedRecordError:
+            # The lifespan's sealed-data check names every record that won't
+            # open (refuse_unopenable_sealed_data); this count leaves it to that.
+            managed_connections = "an unknown number of"
         logger.info(
-            "managed folder: %s (%d skills, %d connections, %d shared connections)",
+            "managed folder: %s (%d skills, %s connections, %d shared connections)",
             managed.root,
             len(managed.skill_slugs()),
-            len(LocalDataVault(managed.vault_dir).list_connections()),
+            managed_connections,
             len(shared_connections.root),
         )
 
@@ -1201,42 +1330,64 @@ def create_app() -> FastAPI:
         else:
             logger.info("storage: org-keyed shared root at %s", settings.storage.shared_root)
 
-    if settings.require_auth:
-        # The token is mirrored into cowork_home()/.env so a desktop user can
-        # read it back. On an org deployment cowork_home() is shared storage
-        # that every organization's agent pod can read and write, so mirroring
-        # a bearer token there would publish it to every tenant and let any of
-        # them overwrite it. Inert today only because require_auth defaults off
-        # and no values file sets it; guarded so turning it on is not a trap.
+    handoff = app_secret.held_handoff()
+    if settings.require_auth or handoff is not None:
+        # Outside a launch hand-off the token is mirrored into
+        # cowork_home()/.env so a desktop app that predates the hand-off, or a
+        # client started from a terminal, can read it back. On an org
+        # deployment cowork_home() is shared storage that every
+        # organization's agent pod can read and write, so mirroring a bearer
+        # token there would publish it to every tenant and let any of them
+        # overwrite it. Inert today only because require_auth defaults off and
+        # no values file sets it; guarded so turning it on is not a trap. A
+        # desktop launch that holds the hand-off is refused too: only the
+        # .env file, which agent code can write, could have named org tenancy
+        # there. cowork.cli.main refuses that launch first, with a line the
+        # desktop shows; this covers a caller that builds the app directly.
         if settings.tenancy_mode == "org":
             raise RuntimeError(
-                "COWORK_REQUIRE_AUTH is not supported in org tenancy mode: the bearer token "
-                "would be mirrored into shared storage readable by every organization. "
+                "COWORK_REQUIRE_AUTH is not supported in org tenancy mode, nor is the desktop "
+                "app's launch hand-off: the bearer token would be mirrored into shared storage "
+                "readable by every organization, and the desktop always runs local tenancy. "
                 "Org deployments authenticate at the ingress instead."
             )
         env_path = cowork_home() / ".env"
-        if settings.trust_identity_headers:
+        if handoff is not None:
+            # The desktop app handed this launch its token on stdin
+            # (cowork.app_secret.read_handoff_from_stdin). It stays in memory:
+            # nothing generates, mirrors or reads a token from cowork-home's
+            # .env, which agent code can read and write, and a copy an
+            # earlier launch wrote there is removed.
+            token = handoff.auth_token
+            remove_auth_token(env_path)
+        elif settings.trust_identity_headers or launch_value(file_variable(name="COWORK_AUTH_TOKEN")):
             # With identity headers on, the token acts as any person, and the
             # desktop app, which reads the copy in cowork-home's .env, never
-            # runs here. The token comes from the process environment alone,
-            # never settings.auth_token, which cowork-home's .env also fills,
-            # and a copy an earlier start wrote there is removed.
-            token = os.environ.get("COWORK_AUTH_TOKEN", "")
+            # runs here. A token in the file COWORK_AUTH_TOKEN_FILE names is
+            # kept off the disk the same way, with identity headers on or off.
+            # The token comes from the process environment alone, or that
+            # file, never settings.auth_token, which cowork-home's .env also
+            # fills, and a copy an earlier start wrote there is removed. A
+            # local launch has moved both variables out of os.environ by now,
+            # so both reads go through launch_value.
+            token = process_secret(name="COWORK_AUTH_TOKEN")
             if not token:
                 raise RuntimeError(
-                    "COWORK_TRUST_IDENTITY_HEADERS needs COWORK_AUTH_TOKEN in the server's "
-                    "environment: with identity headers on, the token acts as any person, "
-                    "so Cowork neither generates it nor keeps a copy in cowork-home's .env. "
-                    "Set COWORK_AUTH_TOKEN where the server starts."
+                    "COWORK_TRUST_IDENTITY_HEADERS needs COWORK_AUTH_TOKEN or COWORK_AUTH_TOKEN_FILE "
+                    "in the server's environment: with identity headers on, the token acts as any "
+                    "person, so Cowork neither generates it nor keeps a copy in cowork-home's .env. "
+                    "Set one of them where the server starts."
                 )
             remove_auth_token(env_path)
         else:
             token = settings.auth_token or ensure_auth_token(env_path)
             sync_auth_token(env_path, token)
-        # Codex has a separate, process-local inference credential, not the
-        # desktop's API token. These exact routes retain their own constant-time
-        # credential check and LoopbackDesktopOnly guard. Do not exempt the
-        # coding prefix: that would expose task/filesystem APIs to the agent.
+        # Codex has a separate inference credential, not the desktop's API
+        # token: each engine session's own `inference` capability token
+        # (cowork.capability_tokens). These exact routes check it themselves
+        # (coding._require_inference_client) behind the LoopbackDesktopOnly
+        # guard. Do not exempt the coding prefix: that would expose
+        # task/filesystem APIs to the agent.
         channel_webhook_paths.update(
             f"/api/v1/coding/inference/{path}" for path in INFERENCE_PATHS
         )

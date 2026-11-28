@@ -42,7 +42,6 @@ failover without failing the call in flight:
 from __future__ import annotations
 
 import asyncio
-import os
 import time
 from collections.abc import Awaitable, Callable, Iterator
 from contextlib import contextmanager
@@ -65,6 +64,8 @@ from redis.exceptions import (
 from redis.exceptions import ConnectionError as RedisConnectionError
 from redis.exceptions import TimeoutError as RedisTimeoutError
 from redis.retry import Retry as SyncRetry
+
+from cowork.common.launch_environment import launch_value
 
 T = TypeVar("T")
 
@@ -105,7 +106,8 @@ _sync_connections_opened: ContextVar[int] = ContextVar("cowork_redis_sync_connec
 
 
 def _url() -> str:
-    return os.environ.get("COWORK_TURN_REDIS_URL", "redis://localhost:6379/0")
+    url = launch_value("COWORK_TURN_REDIS_URL")
+    return "redis://localhost:6379/0" if url is None else url
 
 
 def cancel_flag_key(correlation_id: str) -> str:

@@ -186,6 +186,9 @@ def _record_usage(session: ScopedSession, *, comparison_id: UUID, usage: dict) -
 async def get_comparison_usage(comparison_id: UUID, request: Request, scope: ScopeDep):
     """Tokens and list-price cost per turn for each side, read from the gateway as the caller.
 
+    The figures are paid usage only: a call a plan window or the Free allowance
+    covered adds to ``includedCalls`` and to nothing else.
+
     The comparison is read in one unit and the cost kept in another, so no
     pooled connection is held while the gateway answers."""
     sides = await run_db(partial(_usage_sides, comparison_id=comparison_id), scope=scope)

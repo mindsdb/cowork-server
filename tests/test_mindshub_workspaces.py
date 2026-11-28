@@ -526,6 +526,8 @@ def test_the_read_goes_to_the_operator_auth_host_with_the_callers_own_bearer(
     """
     monkeypatch.setenv("ENV", "staging")
     monkeypatch.setenv("POD_NAMESPACE", "")
+    monkeypatch.delenv("AUTH_SERVICE_BASE_URL", raising=False)
+    monkeypatch.delenv("COWORK_TURN_AUTH_INTERNAL_BASE_URL", raising=False)
     # A tenant-settable value an org admin controls. Nothing here may read it.
     SettingService(session, LOCAL_SCOPE).upsert_setting(
         "minds_url", "https://attacker.test/v1"
@@ -564,6 +566,67 @@ def test_the_read_goes_to_the_operator_auth_host_with_the_callers_own_bearer(
     assert url == "https://auth.staging.mindshub.ai/v1/organizations/current/workspaces/"
     assert headers["Authorization"] == "Bearer jwt-abc"
     assert "attacker.test" not in url
+
+
+@pytest.mark.parametrize(
+    "service_base,internal_base,expected",
+    [
+        # A desktop install sets neither: the public host.
+        (None, None, "https://auth.staging.mindshub.ai/v1"),
+        # The hosted chart sets the turn-auth base, and the reads follow it.
+        (None, "http://auth:80", "http://auth:80/v1"),
+        (None, "http://auth:80/", "http://auth:80/v1"),
+        # The relay's own name wins over the turn-auth fallback, as it does there.
+        ("http://auth-relay:80", "http://auth:80", "http://auth-relay:80/v1"),
+    ],
+)
+def test_a_hosted_deployment_reads_mindshub_inside_the_cluster(
+    monkeypatch, service_base, internal_base, expected
+):
+    """Through the public host, every hosted user's read leaves from the
+    cluster's one egress address, and Cloudflare's per-IP rate limit refuses
+    them all together once they pass its ceiling. The deployment's internal auth
+    base keeps them inside the cluster. Asserted on the URL the transport built,
+    with the caller's own bearer."""
+    monkeypatch.setenv("ENV", "staging")
+    monkeypatch.setenv("POD_NAMESPACE", "")
+    for name, value in (
+        ("AUTH_SERVICE_BASE_URL", service_base),
+        ("COWORK_TURN_AUTH_INTERNAL_BASE_URL", internal_base),
+    ):
+        if value is None:
+            monkeypatch.delenv(name, raising=False)
+        else:
+            monkeypatch.setenv(name, value)
+    seen: list[tuple[str, dict]] = []
+
+    class FakeResponse:
+        status_code = 200
+
+        @staticmethod
+        def json():
+            return {"ok": True}
+
+    class FakeClient:
+        def __init__(self, **_kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_exc):
+            return False
+
+        async def get(self, url, headers=None):
+            seen.append((url, headers or {}))
+            return FakeResponse()
+
+    monkeypatch.setattr(mindshub_client.httpx, "AsyncClient", FakeClient)
+
+    reply = asyncio.run(mindshub_client.get_mindshub_reply(mindshub_client.ENTITLEMENTS_PATH, "jwt-abc"))
+
+    assert reply.answer is mindshub_client.MindsHubAnswer.OK
+    assert seen == [(f"{expected}/entitlements/me/", {"Authorization": "Bearer jwt-abc"})]
 
 
 def test_the_route_answers_the_same_view_its_builder_does(session, calls):

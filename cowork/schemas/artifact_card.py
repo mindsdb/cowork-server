@@ -45,6 +45,13 @@ class ArtifactCard(BaseModel):
     folder: str
     path: str
     primary: str | None
+    # "inline" or "widget" for an artifact the chat reply shows live
+    # (metadata.json `display`, artifact_metadata.INLINE_DISPLAYS); set only
+    # then, so other cards carry no key.
+    display: str | None = None
+    # On an inline or widget card, the primary's revision the card shows: the head
+    # revision while it still matches the file. Set only then.
+    revision_id: str | None = None
     project_id: str | None
     project_name: str
     origin_conversation_id: str
@@ -65,6 +72,9 @@ class ArtifactCard(BaseModel):
     draft_url: str = ""
     capabilities: dict | None = None
     received_from: dict | None = None
+    # A doc (cowork.docs) only: "doc", and the rendered page it is shared as.
+    format: str | None = None
+    html_path: str | None = None
 
     @model_serializer(mode="wrap")
     def _set_fields_only(

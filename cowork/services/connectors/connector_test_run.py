@@ -20,7 +20,6 @@ import html
 import ipaddress
 import json
 import logging
-import os
 import posixpath
 import re
 import socket
@@ -31,6 +30,7 @@ from urllib.parse import quote, quote_plus, unquote, urlsplit
 
 import httpx
 
+from cowork.common.launch_environment import launch_value
 from cowork.common.settings.app_settings import get_app_settings
 from cowork.services.connectors.custom_connectors import PLACEHOLDER
 from cowork.services.connectors.egress import (
@@ -133,12 +133,14 @@ class ConnectorTestOutcome:
 def private_allowlist() -> tuple[frozenset[str], tuple[ipaddress.IPv4Network | ipaddress.IPv6Network, ...]]:
     """The operator's private hosts and ranges, from the process environment.
 
-    Read once and only from ``os.environ``: never from ``<COWORK_HOME>/.env``
-    or settings, which code the agent runs can write.
+    Read once and only from the process environment the server started with
+    (``launch_value``, which also holds what a local launch moved out of
+    ``os.environ``): never from ``<COWORK_HOME>/.env`` or settings, which code
+    the agent runs can write.
     """
     hosts: set[str] = set()
     networks = []
-    for entry in (os.environ.get(ALLOWLIST_ENV) or "").split(","):
+    for entry in (launch_value(ALLOWLIST_ENV) or "").split(","):
         entry = entry.strip()
         if not entry:
             continue

@@ -133,6 +133,44 @@ async def test_list_returns_own_org_artifacts(session, tmp_path, org_mode):
     assert "dash" in [c["slug"] for c in cards]
 
 
+async def test_shared_preview_finds_an_older_image_by_reference_over_http(session, tmp_path, org_mode):
+    from cowork.server import create_app
+    from cowork.services.artifact_draft_review import disable_draft_review, enable_draft_review
+
+    row, folder = _project_with_artifact(session, tmp_path, name="charts", org_id=ORG_A, slug="old-image")
+    (folder / "index.html").unlink()
+    (folder / "chart.png").write_bytes(b"png")
+    (folder / "metadata.json").write_text(json.dumps({"slug": "old-image", "name": "Old chart", "type": "file"}))
+    artifact_id, _ = ensure_full_id(folder)
+    for index in range(ep.LIST_CARDS):
+        newer = folder.parent / f"newer-{index}"
+        newer.mkdir()
+        (newer / "index.html").write_text("Newer")
+        (newer / "metadata.json").write_text(json.dumps({"slug": newer.name, "name": newer.name, "type": "html-app"}))
+    owner = TenantScope(org_mode=True, org_id=ORG_A, user_id=USER_A)
+    recent = await ep.list_artifacts(owner, project_id=None, project_path=None)
+    assert len(recent) == ep.LIST_CARDS and artifact_id not in [card["id"] for card in recent]
+    client = TestClient(create_app())
+    path = "/api/v1/artifacts/shared-preview"
+    headers = {"X-Organization-Id": ORG_A, "X-User-Id": USER_A2}
+    other_org = {**headers, "X-Organization-Id": ORG_B}
+    ref = {"project_id": str(row.id), "artifact_id": artifact_id}
+    assert client.post(path, json=ref).status_code == 401
+    assert client.post(path, headers=headers, json=ref).status_code == 404
+    assert client.post(path, headers=headers, json={"url": "https://view.example/a/old/"}).status_code == 422
+
+    enable_draft_review(folder, org_id=ORG_A, enabled_by=USER_A)
+    response = client.post(path, headers=headers, json=ref)
+    assert response.status_code == 200, response.text
+    preview = response.json()
+    assert preview["id"] == artifact_id and preview["capabilities"]["canEdit"] is False
+    assert preview["ext"] == ".png" and preview["draftUrl"].endswith("/chart.png")
+    assert client.post(path, headers=other_org, json=ref).status_code == 404
+
+    assert disable_draft_review(folder)
+    assert client.post(path, headers=headers, json=ref).status_code == 404
+
+
 async def test_list_hides_other_org_artifacts(session, tmp_path, org_mode):
     _project_with_artifact(session, tmp_path, name="mine", org_id=ORG_A, slug="dash")
     _project_with_artifact(session, tmp_path, name="theirs", org_id=ORG_B, slug="secret")

@@ -38,7 +38,8 @@ from cowork.schemas.schedules import (
     ScheduleState,
     ScheduleUpdateRequest,
 )
-from cowork.services.schedules import ScheduleService
+from cowork.schedule_timing import WEEKDAY_NAMES
+from cowork.services.schedules import _INFERRED_DAY, InvalidSchedule, ScheduleService, edited_timing, settled_timing
 
 logger = get_logger(__name__)
 
@@ -54,8 +55,26 @@ _CADENCE_DESCRIPTION = (
     "'once' runs a single time at next_run_at. 'every_15_minutes' and 'every_30_minutes' "
     "repeat that often from next_run_at. 'hourly', 'daily', 'weekdays' (Mon-Fri) and "
     "'weekly' repeat from next_run_at: at that minute past each hour, at that time of day, "
-    "or on that weekday at that time."
+    "or on that weekday at that time. 'weekly' with `recurrence.days` runs on each of those "
+    "days instead. 'monthly' runs once a month at next_run_at's time, on `recurrence.monthDay` "
+    "or on the `recurrence.week`-th `recurrence.weekday`, or on next_run_at's day of the "
+    "month when `recurrence` is left out."
 )
+
+_RECURRENCE_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "description": (
+        "Weekly or monthly only, one rule: {days: [mon..sun]} for weekly; {monthDay: 1-31} "
+        "(a shorter month runs on its last day) or {week: 1-4 or -1 for the last, weekday: "
+        "mon..sun} for monthly. The first run moves to the first day the rule allows."
+    ),
+    "properties": {
+        "days": {"type": "array", "items": {"type": "string", "enum": list(WEEKDAY_NAMES)}},
+        "monthDay": {"type": "integer", "minimum": 1, "maximum": 31},
+        "week": {"type": "integer", "enum": [1, 2, 3, 4, -1]},
+        "weekday": {"type": "string", "enum": list(WEEKDAY_NAMES)},
+    },
+}
 
 _MANAGE_SCHEMA: dict[str, Any] = {
     "type": "object",
@@ -74,6 +93,7 @@ _MANAGE_SCHEMA: dict[str, Any] = {
             ),
         },
         "cadence": {"type": "string", "enum": [c.value for c in Cadence], "description": _CADENCE_DESCRIPTION},
+        "recurrence": _RECURRENCE_SCHEMA,
         "next_run_at": {
             "type": "string",
             "description": "First (or next) run, ISO 8601 with a UTC offset, e.g. 2026-10-27T09:00:00+00:00. Must be in the future.",
@@ -92,6 +112,8 @@ _PROMPT = """\
 SCHEDULED TASKS:
 - `{list_tool}` shows the user's scheduled tasks. `{manage_tool}` creates, changes, pauses, resumes or \
 deletes one. Use the schedule_id `{list_tool}` returns; never guess one.
+- The task list shows excluded connectors. To change them, direct the user to that task's settings \
+on the Scheduled Tasks page. Changing the task's prompt does not change its connector exclusions.
 - The user approves every change on a confirmation card the tool shows them, and nothing changes \
 unless they confirm it there. So call the tool rather than asking "shall I?" in chat. Ask first only \
 when you don't know what to run, how often, or when. If they cancel, nothing was changed: ask what \
@@ -106,8 +128,8 @@ at that time. timezone is an IANA name. This device's timezone is {device_tz}: u
 names another.
 - Unless the user specifies a later start, choose the next occurrence of the requested cadence \
 in their timezone. For example, hourly at 11:48 starts at 12:00 that day. Convert the UTC message \
-time to that timezone first; never reuse a UTC clock reading with a local offset. For a daily \
-or weekly request without a time of day, ask for the missing time. Preserve explicit delayed starts.
+time to that timezone first; never reuse a UTC clock reading with a local offset. For a daily, \
+weekly or monthly request without a time of day, ask for the missing time. Preserve explicit delayed starts.
 - Tasks created here belong to this chat's project and run on the account's default model."""
 
 
@@ -129,14 +151,17 @@ def _units_scope():
 
 
 def _summary(schedule) -> dict:
+    recurrence = schedule.recurrence
     schedule = ScheduleResponse.model_validate(schedule)
     return {
         "schedule_id": str(schedule.id),
         "title": schedule.title,
         "prompt": schedule.prompt,
         "cadence": str(getattr(schedule.cadence, "value", schedule.cadence)),
+        "recurrence": recurrence,
         "timezone": schedule.timezone,
         "next_run_at": ensure_utc(schedule.next_run_at).isoformat(),
+        "disabled_connections": [entry.model_dump() for entry in schedule.disabled_connections or []],
         "state": schedule.state.value,
         "paused": schedule.state in {ScheduleState.paused, ScheduleState.auto_paused},
     }
@@ -155,6 +180,7 @@ def _create_unit(session: ScopedSession, *, body: ScheduleCreateRequest, project
         title=body.title,
         prompt=body.prompt,
         cadence=body.cadence,
+        recurrence=body.recurrence.stored() if body.recurrence else None,
         next_run_at=body.next_run_at,
         model=DEFAULT_MODEL_SENTINEL,
         timezone=body.timezone,
@@ -163,8 +189,8 @@ def _create_unit(session: ScopedSession, *, body: ScheduleCreateRequest, project
     ))
 
 
-def _update_unit(session: ScopedSession, *, schedule_id: UUID, changes: dict) -> dict:
-    return _summary(ScheduleService(session).update_schedule(schedule_id, **changes))
+def _update_unit(session: ScopedSession, *, schedule_id: UUID, changes: dict, shown_at: datetime) -> dict:
+    return _summary(ScheduleService(session).update_schedule(schedule_id, now=shown_at, **changes))
 
 
 def _pause_unit(session: ScopedSession, *, schedule_id: UUID) -> dict:
@@ -255,7 +281,7 @@ def _fields(tc_input: dict, names: tuple[str, ...]) -> dict:
 
 
 def _create_request(tc_input: dict) -> ScheduleCreateRequest:
-    fields = _fields(tc_input, ("title", "prompt", "cadence", "next_run_at", "timezone"))
+    fields = _fields(tc_input, ("title", "prompt", "cadence", "recurrence", "next_run_at", "timezone"))
     missing = [name for name in ("prompt", "cadence", "next_run_at", "timezone") if name not in fields]
     if missing:
         raise _Invalid(f"create needs {', '.join(f'`{m}`' for m in missing)}.")
@@ -272,9 +298,11 @@ def _create_request(tc_input: dict) -> ScheduleCreateRequest:
 
 
 def _update_changes(tc_input: dict) -> dict:
-    fields = _fields(tc_input, ("title", "prompt", "cadence", "next_run_at", "timezone"))
+    fields = _fields(tc_input, ("title", "prompt", "cadence", "recurrence", "next_run_at", "timezone"))
     if not fields:
-        raise _Invalid("update needs at least one of `title`, `prompt`, `cadence`, `next_run_at`, `timezone`.")
+        raise _Invalid(
+            "update needs at least one of `title`, `prompt`, `cadence`, `recurrence`, `next_run_at`, `timezone`."
+        )
     try:
         body = ScheduleUpdateRequest.model_validate(fields)
     except ValidationError as exc:
@@ -288,6 +316,18 @@ def _update_changes(tc_input: dict) -> dict:
     if body.next_run_at is not None:
         _check_next_run(body.next_run_at)
     return body.model_dump(exclude_none=True)
+
+
+def _settle_preview(preview: dict) -> None:
+    """Show the rule and first run as the save will store them."""
+    try:
+        preview["recurrence"], first = settled_timing(
+            preview["cadence"], preview.get("recurrence"),
+            datetime.fromisoformat(preview["next_run_at"]), preview["timezone"],
+        )
+    except InvalidSchedule as exc:
+        raise _Invalid(f"`recurrence`: {exc}.")
+    preview["next_run_at"] = ensure_utc(first).isoformat()
 
 
 def _schedule_id(tc_input: dict) -> UUID:
@@ -317,9 +357,36 @@ def _clock(at: datetime) -> str:
     return at.strftime("%H:%M")
 
 
-def describe_cadence(cadence: str, at: datetime, tz_name: str) -> str:
+_DAY_NAMES = dict(zip(WEEKDAY_NAMES, ("Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday")))
+_WEEK_NAMES = {1: "first", 2: "second", 3: "third", 4: "fourth", -1: "last"}
+
+
+def _ordinal(day: int) -> str:
+    suffix = "th" if 10 <= day % 100 <= 20 else {1: "st", 2: "nd", 3: "rd"}.get(day % 10, "th")
+    return f"{day}{suffix}"
+
+
+def _rule_text(cadence: str, recurrence: dict | None, local: datetime) -> str | None:
+    rule = recurrence or {}
+    if cadence == Cadence.weekly.value and rule.get("days"):
+        names = [_DAY_NAMES[day] for day in rule["days"]]
+        days = names[0] if len(names) == 1 else f"{', '.join(names[:-1])} and {names[-1]}"
+        return f"Every {days} at {_clock(local)}"
+    if cadence == Cadence.monthly.value:
+        if rule.get("week") is not None and rule.get("weekday"):
+            return f"The {_WEEK_NAMES[rule['week']]} {_DAY_NAMES[rule['weekday']]} of every month at {_clock(local)}"
+        day = rule.get("month_day") or local.day
+        shorter_month = ", or the last day of a shorter month," if day > 28 else ""
+        return f"The {_ordinal(day)} of every month{shorter_month} at {_clock(local)}"
+    return None
+
+
+def describe_cadence(cadence: str, at: datetime, tz_name: str, recurrence: dict | None = None) -> str:
     """How often, in words, at the task's local time."""
     local = _local(at, tz_name)
+    ruled = _rule_text(cadence, recurrence, local)
+    if ruled:
+        return f"{ruled} ({tz_name})"
     text = {
         Cadence.once.value: "Once",
         Cadence.every_15_minutes.value: "Every 15 minutes",
@@ -345,7 +412,7 @@ def _quoted(text: str) -> str:
 def _task_lines(task: dict, *, starts_label: str) -> list[str]:
     at = datetime.fromisoformat(task["next_run_at"])
     return [
-        f"- **How often:** {describe_cadence(task['cadence'], at, task['timezone'])}",
+        f"- **How often:** {describe_cadence(task['cadence'], at, task['timezone'], task.get('recurrence'))}",
         f"- **{starts_label}:** {describe_start(at, task['timezone'])}",
         "",
         "**What runs** (in a new conversation each time, without this chat's context):",
@@ -358,6 +425,7 @@ _CHANGE_LABELS = {
     "title": "title",
     "prompt": "what runs",
     "cadence": "how often",
+    "recurrence": "which days",
     "timezone": "timezone",
     "next_run_at": "start time",
 }
@@ -376,7 +444,7 @@ def _show_resume_catch_up(preview: dict, *, runs_now: bool) -> None:
 
     missed, future = count_missed_occurrences(
         preview["cadence"], datetime.fromisoformat(preview["next_run_at"]), preview["timezone"],
-        now=datetime.now(timezone.utc),
+        now=datetime.now(timezone.utc), recurrence=preview.get("recurrence"),
     )
     if missed == 0:
         return
@@ -405,7 +473,7 @@ def card_prompt(action: str, task: dict, *, before: dict | None = None) -> str:
         lines = [
             f"**Pause “{title}”?**", "",
             "It won't run again until it's resumed. It stays on the Scheduled Tasks page.", "",
-            f"- **How often:** {describe_cadence(task['cadence'], datetime.fromisoformat(task['next_run_at']), task['timezone'])}",
+            f"- **How often:** {describe_cadence(task['cadence'], datetime.fromisoformat(task['next_run_at']), task['timezone'], task.get('recurrence'))}",
         ]
     elif action == "resume":
         lines = [f"**Resume “{title}”?**", ""]
@@ -482,15 +550,24 @@ _NOT_CONFIRMED = {
 # ---------------------------------------------------------------------------
 
 
+def _shown(task: dict) -> dict:
+    """The task as the agent reads it. Whether a monthly day was chosen or
+    taken from the first run is the service's bookkeeping, not part of the rule."""
+    rule = task.get("recurrence")
+    if not rule or _INFERRED_DAY not in rule:
+        return task
+    return {**task, "recurrence": {key: value for key, value in rule.items() if key != _INFERRED_DAY}}
+
+
 def _result(message: str, task: dict | None = None) -> str:
-    return json.dumps({"result": message, **({"task": task} if task else {})})
+    return json.dumps({"result": message, **({"task": _shown(task)} if task else {})})
 
 
 async def _list_tasks(_session: Any, _tc_input: dict) -> str:
     tasks = await run_db(_list_unit, scope=_units_scope())
     if not tasks:
         return json.dumps({"tasks": [], "result": "The user has no scheduled tasks."})
-    return json.dumps({"tasks": tasks})
+    return json.dumps({"tasks": [_shown(task) for task in tasks]})
 
 
 async def _manage_task(session: Any, tc_input: dict, *, project_id: UUID | None) -> str:
@@ -503,8 +580,10 @@ async def _manage_task(session: Any, tc_input: dict, *, project_id: UUID | None)
             body = _create_request(tc_input)
             preview = {
                 "title": body.title, "prompt": body.prompt, "cadence": body.cadence.value,
+                "recurrence": body.recurrence.stored() if body.recurrence else None,
                 "timezone": body.timezone, "next_run_at": ensure_utc(body.next_run_at).isoformat(),
             }
+            _settle_preview(preview)
             apply = partial(_create_unit, body=body, project_id=project_id)
             before = None
         else:
@@ -521,9 +600,22 @@ async def _manage_task(session: Any, tc_input: dict, *, project_id: UUID | None)
                 _check_weekday_start(
                     preview["cadence"], datetime.fromisoformat(preview["next_run_at"]), preview["timezone"],
                 )
+                # The save works the first run out from this same moment, so
+                # a card answered after that run's time still saves it.
+                shown_at = datetime.now(timezone.utc)
+                if any(field in changes for field in ("cadence", "recurrence", "next_run_at", "timezone")):
+                    try:
+                        preview["recurrence"], first = edited_timing(
+                            cadence=before["cadence"], recurrence=before.get("recurrence"),
+                            next_run_at=datetime.fromisoformat(before["next_run_at"]),
+                            timezone_name=before["timezone"], changes=changes, now=shown_at,
+                        )
+                    except InvalidSchedule as exc:
+                        raise _Invalid(f"`recurrence`: {exc}.") from exc
+                    preview["next_run_at"] = ensure_utc(first).isoformat()
                 if preview == before:
                     return _result("Those values are what the task already has, so there's nothing to change.", before)
-                apply = partial(_update_unit, schedule_id=schedule_id, changes=changes)
+                apply = partial(_update_unit, schedule_id=schedule_id, changes=changes, shown_at=shown_at)
             elif action == "pause":
                 if before["paused"]:
                     return _result("This task is already paused.", before)
@@ -590,7 +682,10 @@ def build_schedule_tools(*, project_id: UUID | None) -> list:
     return [
         ToolDef(
             name=LIST_TOOL_NAME,
-            description="List the user's scheduled tasks: id, title, prompt, cadence, timezone, next run, and state (active, paused, auto_paused, missed, or done).",
+            description=(
+                "List the user's scheduled tasks with their IDs, prompts, timing, state, "
+                "and excluded connectors."
+            ),
             input_schema=_LIST_SCHEMA,
             handler=_list_tasks,
         ),

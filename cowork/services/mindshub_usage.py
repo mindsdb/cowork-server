@@ -1,7 +1,8 @@
 """MindsHub usage, read on behalf of the caller.
 
-Three MindsHub reads behind one route: ``GET /v1/entitlements/me/`` for the free
-Air allowance and the subscription plan, ``GET /v1/wallet/`` for the paid balance and auto top up, and
+Three MindsHub reads behind one route: ``GET /v1/entitlements/me/`` for the
+organization's allowance (Free's windows on Free, the plan's on Plus and Pro)
+and the subscription plan, ``GET /v1/wallet/`` for the paid balance and auto top up, and
 ``GET /v1/usage/summary/`` for what the period's credit spend adds up to (the
 same figure the console's "Credit spend this period" shows).
 The desktop shows them above the composer and in Settings so a person sees
@@ -9,7 +10,7 @@ The desktop shows them above the composer and in Settings so a person sees
 
 Same rules as ``mindshub_workspaces``: the sidecar makes the call because
 MindsHub's ingress does not allow Cowork origins, the bearer is the caller's own, and the
-host is the operator's (``default_minds_auth_host``), never the tenant-settable
+host is the operator's (``mindshub_client.mindshub_v1``), never the tenant-settable
 ``minds_url``. Transport and cache come from ``mindshub_client``.
 
 The cache is per credential, not per org or per user id: the allowance and
@@ -22,9 +23,9 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import math
 from typing import Any, Optional
 
+from cowork.common.numeric import finite_float
 from cowork.schemas.mindshub_usage import (
     PLAN_STATUSES,
     PLAN_TIERS,
@@ -117,13 +118,8 @@ def _parse_free_tokens(payload: Any) -> Optional[MindsHubFreeTokens]:
     # and hand the caller a full allowance on a malformed body. A JSON integer
     # too large for a float raises rather than clamping, which would take the
     # whole usage route down with it.
-    if not isinstance(percent, (int, float)) or isinstance(percent, bool):
-        return None
-    try:
-        percent = float(percent)
-    except (OverflowError, ValueError):
-        return None
-    if not math.isfinite(percent):
+    percent = finite_float(percent)
+    if percent is None:
         return None
 
     percent = max(0.0, min(100.0, percent))
@@ -150,13 +146,8 @@ def _percent_used(value: Any) -> Optional[int]:
     an integer too large for a float would otherwise slip through as a full or
     an empty window.
     """
-    if not isinstance(value, (int, float)) or isinstance(value, bool):
-        return None
-    try:
-        number = float(value)
-    except (OverflowError, ValueError):
-        return None
-    if not math.isfinite(number):
+    number = finite_float(value)
+    if number is None:
         return None
     return int(round(max(0.0, min(100.0, number))))
 
