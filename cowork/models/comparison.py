@@ -80,7 +80,7 @@ class ComparisonSide(BaseSQLModel, table=True):
     usage_snapshot: dict | None = Field(
         default=None,
         sa_type=sa.JSON,  # type: ignore
-        description="Last-read estimated cost and tokens: estimated_cost_usd, tokens, partial",
+        description="Last-read estimated cost and tokens: estimated_cost_usd, tokens, partial, included_calls",
     )
     org_id: str | None = Field(default=None, max_length=36, description="Owning organization; NULL on local/desktop rows")
     created_by: str | None = Field(default=None, max_length=36, description="User who created the row; NULL on local/desktop rows")
