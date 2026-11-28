@@ -16,7 +16,6 @@ run, a channel bot, or a turn without questions (see AntonHarness).
 from __future__ import annotations
 
 import json
-import uuid
 from datetime import datetime, timezone
 from functools import partial
 from typing import Any
@@ -501,34 +500,17 @@ async def confirm(session: Any, action: str, prompt: str) -> str:
     """Show the confirmation card. Returns "confirmed", "cancelled",
     "timeout", "unavailable" or "error"; only "confirmed" lets the change run.
 
-    The same card as the write-approval gate's: two buttons, no typed answer,
-    no default, and outside the model's question budget because the tool asks
-    it, not the model.
+    See `confirm_card`.
     """
-    from anton.core.interaction.elicit import AskOption, AskRequest, elicit
+    from .confirm_card import confirm_card
 
-    label, detail = _CONFIRM_LABELS[action]
-    request = AskRequest(
+    return await confirm_card(
+        session,
+        key="schedule",
         prompt=prompt,
-        options=(
-            AskOption(value="confirm", label=label, detail=detail),
-            AskOption(value="cancel", label="Cancel", detail="Leave scheduled tasks as they are"),
-        ),
-        allow_custom=False,
-        timeout_s=getattr(getattr(session, "elicitor", None), "timeout_s", None),
+        confirm=("confirm", *_CONFIRM_LABELS[action]),
+        cancel_detail="Leave scheduled tasks as they are",
     )
-    try:
-        answer = await elicit(session, f"schedule:{uuid.uuid4().hex}", request, counted=False)
-    except Exception as exc:
-        logger.warning("scheduled task confirmation failed (%s)", type(exc).__name__)
-        return "error"
-    if answer.status == "answered" and answer.values == ("confirm",):
-        return "confirmed"
-    if answer.status in ("answered", "cancelled"):
-        return "cancelled"
-    if answer.status in ("timeout", "unavailable"):
-        return answer.status
-    return "error"
 
 
 _NOT_CONFIRMED = {
