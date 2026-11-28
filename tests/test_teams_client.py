@@ -67,14 +67,21 @@ class StandInLogin:
 
 
 class StandInTeams:
-    """The Teams service: records requests and answers replies and member lookups."""
+    """The Teams service: records requests and answers replies and member lookups.
 
-    def __init__(self) -> None:
+    Like Teams, it answers a stream's later posts with an empty body; ``empty`` makes every post's
+    answer empty."""
+
+    def __init__(self, *, empty: bool = False) -> None:
         self.requests: list[httpx.Request] = []
+        self.empty = empty
 
     def handler(self, request: httpx.Request) -> httpx.Response:
         self.requests.append(request)
         if request.method == "POST" and request.url.path.endswith("/activities"):
+            stream_id = (json.loads(request.content).get("channelData") or {}).get("streamId")
+            if self.empty or stream_id:
+                return httpx.Response(201, json={})
             return httpx.Response(201, json={"id": "reply-1"})
         if request.method == "GET" and "/members/" in request.url.path:
             return httpx.Response(200, json={
@@ -148,6 +155,108 @@ async def test_reply_posts_to_the_thread_with_the_bot_token(sdk):
     assert body["type"] == "message"
     assert body["replyToId"] == "42"
     assert body["text"] == "Hello from MindsHub"
+    await client.aclose()
+
+
+async def test_reply_can_mention_the_asker_so_teams_notifies_them(sdk):
+    teams = StandInTeams()
+    client = _client(sdk, StandInLogin(), teams)
+
+    await client.reply(SERVICE_URL, "19:channel;messageid=42", "42", "Which region?", mention=("29:ana", "Ana López"))
+
+    body = json.loads(teams.requests[0].content)
+    assert body["text"] == "<at>Ana López</at> Which region?"
+    assert body["entities"] == [
+        {"type": "mention", "mentioned": {"id": "29:ana", "name": "Ana López"}, "text": "<at>Ana López</at>"}
+    ]
+    await client.aclose()
+
+
+@pytest.mark.parametrize("text", [
+    "- Part 1\n- Part 2", "1. First", "## Sales", "| a | b |", "```\ncode\n```", "> quoted",
+    "-\tPart 1", "1.\tFirst", "~~~\ncode\n~~~", "    indented code",
+])
+async def test_a_mention_goes_on_its_own_line_before_a_block(sdk, text):
+    teams = StandInTeams()
+    client = _client(sdk, StandInLogin(), teams)
+
+    await client.reply(SERVICE_URL, "19:channel;messageid=42", "42", text, mention=("29:ana", "Ana"))
+
+    assert json.loads(teams.requests[0].content)["text"] == f"<at>Ana</at>\n\n{text}"
+    await client.aclose()
+
+
+async def test_a_mentioned_name_cant_add_markup(sdk):
+    teams = StandInTeams()
+    client = _client(sdk, StandInLogin(), teams)
+
+    await client.reply(SERVICE_URL, "19:channel;messageid=42", "42", "Done", mention=("29:x", "<b>Eve</b>"))
+
+    body = json.loads(teams.requests[0].content)
+    assert body["text"] == "<at>&lt;b&gt;Eve&lt;/b&gt;</at> Done"
+    assert body["entities"][0]["text"] == "<at>&lt;b&gt;Eve&lt;/b&gt;</at>"
+    await client.aclose()
+
+
+async def test_a_reply_without_a_mention_has_no_mention_entity(sdk):
+    teams = StandInTeams()
+    client = _client(sdk, StandInLogin(), teams)
+
+    await client.reply(SERVICE_URL, "19:channel;messageid=42", "42", "Hello")
+
+    body = json.loads(teams.requests[0].content)
+    assert body["text"] == "Hello"
+    assert not any(entity.get("type") == "mention" for entity in body.get("entities") or [])
+    await client.aclose()
+
+
+async def test_status_opens_an_informative_stream_under_the_message(sdk):
+    teams = StandInTeams()
+    client = _client(sdk, StandInLogin(), teams)
+
+    stream_id = await client.status(SERVICE_URL, "19:channel;messageid=42", "42", "Working on it…")
+    same = await client.status(SERVICE_URL, "19:channel;messageid=42", "42", "Still working on it…",
+                               stream_id=stream_id, sequence=2)
+
+    assert (stream_id, same) == ("reply-1", "reply-1")
+    first, second = (json.loads(r.content) for r in teams.requests)
+    assert teams.requests[0].url.path == "/amer/v3/conversations/19:channel;messageid=42/activities"
+    assert (first["type"], first["replyToId"], first["text"]) == ("typing", "42", "Working on it…")
+    assert first["entities"] == [{"type": "streaminfo", "streamType": "informative", "streamSequence": 1}]
+    assert first["channelData"] == {"streamType": "informative", "streamSequence": 1}
+    assert second["entities"] == [
+        {"type": "streaminfo", "streamId": "reply-1", "streamType": "informative", "streamSequence": 2}
+    ]
+    assert second["channelData"] == {"streamId": "reply-1", "streamType": "informative", "streamSequence": 2}
+    await client.aclose()
+
+
+async def test_a_first_update_teams_gives_no_id_opens_no_stream(sdk):
+    client = _client(sdk, StandInLogin(), StandInTeams(empty=True))
+
+    assert await client.status(SERVICE_URL, "19:channel;messageid=42", "42", "Working on it…") is None
+    await client.aclose()
+
+
+async def test_a_stream_reply_returns_the_stream_id_when_teams_gives_none(sdk):
+    client = _client(sdk, StandInLogin(), StandInTeams())
+
+    assert await client.reply(SERVICE_URL, "19:channel;messageid=42", "42", "The answer", stream_id="s-1") == "s-1"
+    await client.aclose()
+
+
+async def test_a_reply_with_a_stream_is_its_final_message(sdk):
+    teams = StandInTeams()
+    client = _client(sdk, StandInLogin(), teams)
+
+    await client.reply(SERVICE_URL, "19:channel;messageid=42", "42", "The answer", mention=("29:ana", "Ana"),
+                       stream_id="s-1")
+
+    body = json.loads(teams.requests[0].content)
+    assert (body["type"], body["replyToId"], body["text"]) == ("message", "42", "<at>Ana</at> The answer")
+    assert {"type": "streaminfo", "streamId": "s-1", "streamType": "final"} in body["entities"]
+    assert any(entity["type"] == "mention" for entity in body["entities"])
+    assert body["channelData"]["streamType"] == "final"
     await client.aclose()
 
 

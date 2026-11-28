@@ -1,6 +1,7 @@
 """The Teams connector's internal routes, which only the recording proxy calls:
 
-- ``POST /api/v1/connectors/teams/deliver`` posts a reply in a Teams thread.
+- ``POST /api/v1/connectors/teams/deliver`` posts a reply in a Teams thread, optionally @mentioning one member.
+- ``POST /api/v1/connectors/teams/status`` shows a status line under a message while its answer runs.
 - ``GET /api/v1/connectors/teams/member`` looks up a person in a conversation.
 
 Each call is signed by the proxy (cowork/services/connectors/teams/bot.py, ``TeamsProxySignature``),
@@ -12,6 +13,8 @@ from __future__ import annotations
 
 import logging
 from typing import Annotated
+
+import httpx
 
 from fastapi import APIRouter, Depends, FastAPI, HTTPException, Query, Request, status
 from fastapi.routing import APIRoute
@@ -41,11 +44,36 @@ MAX_BODY_BYTES = 256 * 1024
 TEAMS_ID = r"^[^/?#%\\\s]*[^/?#%\\\s.][^/?#%\\\s]*$"
 
 
+class Mention(BaseModel):
+    """A conversation member to @mention, by their Teams id (``29:...``) and display name."""
+
+    id: str = Field(min_length=1)
+    name: str = Field(min_length=1, max_length=256)
+
+
 class DeliverRequest(BaseModel):
     service_url: str
     conversation_id: str = Field(min_length=1, pattern=TEAMS_ID)
     reply_to_id: str = Field(min_length=1, pattern=TEAMS_ID)
     text: str = Field(min_length=1, max_length=MAX_TEXT_CHARS)
+    mention: Mention | None = None
+    # The stream a status line opened: the reply closes it and takes its place.
+    stream_id: str | None = Field(default=None, min_length=1)
+
+
+class StatusRequest(BaseModel):
+    service_url: str
+    conversation_id: str = Field(min_length=1, pattern=TEAMS_ID)
+    reply_to_id: str = Field(min_length=1, pattern=TEAMS_ID)
+    # Teams takes at most 1,000 characters for an informative update.
+    text: str = Field(min_length=1, max_length=1000)
+    stream_id: str | None = Field(default=None, min_length=1)
+    sequence: int = Field(default=1, ge=1)
+
+
+class StatusResponse(BaseModel):
+    # None when Teams opened no stream; the answer then goes out as a plain reply.
+    stream_id: str | None
 
 
 class DeliverResponse(BaseModel):
@@ -93,7 +121,21 @@ def _bot(request: Request) -> TeamsBot:
     return request.app.state.teams_bot
 
 
-async def _call_teams(bot: TeamsBot, what: str, call):
+class _StreamRefused(Exception):
+    """Teams refused to close a stream with the reply."""
+
+
+def _refused_stream(error: Exception) -> bool:
+    # Teams answers a closed or disallowed stream (it closes one after 10 minutes,
+    # ContentStreamNotAllowed) with a 4xx. A timeout (a 408 too) or a 5xx may come after
+    # Teams posted the reply, and a 401 or 429 wouldn't take a plain reply either.
+    if not isinstance(error, httpx.HTTPStatusError):
+        return False
+    code = error.response.status_code
+    return 400 <= code < 500 and code not in (401, 408, 429)
+
+
+async def _call_teams(bot: TeamsBot, what: str, call, *, stream: bool = False):
     try:
         return await call(await bot.client())
     except TeamsAuthError as error:
@@ -105,6 +147,8 @@ async def _call_teams(bot: TeamsBot, what: str, call):
         )
         raise HTTPException(status.HTTP_502_BAD_GATEWAY, "Microsoft refused the bot's credentials") from None
     except Exception as error:
+        if stream and _refused_stream(error):
+            raise _StreamRefused from None
         # Only the type: an error from the Teams service can echo the request.
         logger.warning(
             "Teams call failed", extra={"event": "teams_call_failed", "operation": what, "error_type": type(error).__name__}
@@ -115,12 +159,34 @@ async def _call_teams(bot: TeamsBot, what: str, call):
 @router.post("/deliver", response_model=DeliverResponse, dependencies=[Depends(require(TeamsProxySignature))])
 async def deliver(body: DeliverRequest, bot: Annotated[TeamsBot, Depends(_bot)]) -> DeliverResponse:
     bot.check_service_url(body.service_url)
-    message_id = await _call_teams(
+    mention = (body.mention.id, body.mention.name) if body.mention else None
+
+    def post(stream_id: str | None):
+        return lambda client: client.reply(
+            body.service_url, body.conversation_id, body.reply_to_id, body.text, mention=mention, stream_id=stream_id,
+        )
+
+    if body.stream_id:
+        try:
+            return DeliverResponse(id=await _call_teams(bot, "stream reply", post(body.stream_id), stream=True))
+        except _StreamRefused:
+            # The answer still goes out, as a plain reply.
+            pass
+    return DeliverResponse(id=await _call_teams(bot, "reply", post(None)))
+
+
+@router.post("/status", response_model=StatusResponse, dependencies=[Depends(require(TeamsProxySignature))])
+async def status_line(body: StatusRequest, bot: Annotated[TeamsBot, Depends(_bot)]) -> StatusResponse:
+    bot.check_service_url(body.service_url)
+    stream_id = await _call_teams(
         bot,
-        "reply",
-        lambda client: client.reply(body.service_url, body.conversation_id, body.reply_to_id, body.text),
+        "status",
+        lambda client: client.status(
+            body.service_url, body.conversation_id, body.reply_to_id, body.text,
+            stream_id=body.stream_id, sequence=body.sequence,
+        ),
     )
-    return DeliverResponse(id=message_id)
+    return StatusResponse(stream_id=stream_id)
 
 
 @router.get("/member", response_model=MemberResponse, dependencies=[Depends(require(TeamsProxySignature))])
