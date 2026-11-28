@@ -20,6 +20,29 @@ def _fresh_status_cache():
     voice._status_cache.clear()
 
 
+@pytest.fixture(autouse=True)
+def zdr(monkeypatch):
+    """ZDR off unless a test sets ``state.on``; ``state.asked`` holds each bearer it was read with."""
+    from types import SimpleNamespace
+
+    from cowork.api.v1.endpoints import voice as voice_ep
+
+    from cowork.services.mindshub_zdr import ZdrState
+
+    state = SimpleNamespace(on=False, asked=[])
+
+    async def _zdr_state(*, bearer_token, org_id, user_id):
+        state.asked.append(bearer_token)
+        if isinstance(state.on, Exception):
+            raise state.on
+        if isinstance(state.on, ZdrState):
+            return state.on
+        return ZdrState.ON if state.on else ZdrState.OFF
+
+    monkeypatch.setattr(voice_ep, "zdr_state", _zdr_state)
+    return state
+
+
 @pytest.fixture
 def inference(monkeypatch):
     """MindsHub Inference: answers with `inference.answer`; records each request."""
@@ -210,6 +233,57 @@ async def test_status_lists_the_voices_a_call_can_speak_in(inference):
     assert status["defaultVoice"] == voice.DEFAULT_VOICE
     assert status["voices"][0] == {"name": "cinder", "style": voice.VOICE_STYLES["cinder"]}
     assert [v["name"] for v in status["voices"]] == list(voice.VOICE_STYLES)
+
+
+async def test_under_zdr_voice_is_unavailable_and_inference_is_not_asked(inference, zdr):
+    zdr.on = True
+    response = await _call("GET", "/status")
+    assert response.json()["available"] is False
+    assert inference.seen == []
+    assert zdr.asked == ["user-jwt"]
+
+
+@pytest.mark.parametrize("on", [True, RuntimeError("auth down")])
+async def test_under_zdr_a_session_is_refused_before_mindshub_hears_anything(inference, zdr, on):
+    zdr.on = on
+    response = await _call("POST", "/session", json={"sdp": "v=0"})
+    assert response.status_code == 403
+    assert response.json()["detail"]["code"] == "zdr_restricted"
+    assert inference.seen == []
+
+
+@pytest.mark.parametrize(("on", "says_zdr"), [
+    (True, True),
+    (RuntimeError("auth down"), False),
+    ("unknown", False),
+])
+@pytest.mark.parametrize("path", ["/session", "/operate"])
+async def test_only_a_known_zdr_names_zdr_in_the_refusal(inference, zdr, on, says_zdr, path):
+    from cowork.services.mindshub_zdr import ZdrState
+
+    zdr.on = ZdrState.UNKNOWN if on == "unknown" else on
+    body = {"sdp": "v=0"} if path == "/session" else {"messages": [{"role": "user", "content": "hi"}]}
+    response = await _call("POST", path, json=body)
+    assert response.status_code == 403
+    message = response.json()["detail"]["message"]
+    assert ("zero data retention" in message) is says_zdr
+    assert inference.seen == []
+
+
+@pytest.mark.parametrize(("on", "message"), [
+    (True, "Dictation isn't available while zero data retention is on."),
+    ("unknown", "Dictation is unavailable right now. Try again shortly."),
+    (RuntimeError("auth down"), "Dictation is unavailable right now. Try again shortly."),
+])
+async def test_under_zdr_dictation_is_refused_in_its_own_words(inference, zdr, on, message):
+    # Dictation's audio goes to the same non-ZDR voice model as a call.
+    from cowork.services.mindshub_zdr import ZdrState
+
+    zdr.on = ZdrState.UNKNOWN if on == "unknown" else on
+    response = await _call("POST", "/session", json={"sdp": "v=0", "mode": "dictation"})
+    assert response.status_code == 403
+    assert response.json()["detail"] == {"code": "zdr_restricted", "message": message}
+    assert inference.seen == []
 
 
 async def test_dictation_only_listens_and_reads_no_memory(inference, monkeypatch):

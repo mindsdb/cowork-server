@@ -25,6 +25,8 @@ from cowork.streaming.registry import RunHandle, registry
 
 CID = "conv-addon-test"
 TARGET = jev_route.JevTarget.mindshub("https://minds.example/v1/", "turn-key")
+# The real ZDR read; the autouse fixture stubs it off for every other test.
+_REAL_ZDR_ON = addon_route._zdr_on
 
 
 class _Response:
@@ -100,6 +102,13 @@ class _Session:
 
 @pytest.fixture(autouse=True)
 def _clean_globals(monkeypatch):
+    zdr_asked: list[str] = []
+
+    async def _zdr_off(scope, org_bearer):
+        zdr_asked.append(org_bearer)
+        return False
+
+    monkeypatch.setattr(addon_route, "_zdr_on", _zdr_off)
     monkeypatch.setenv("COWORK_TURN_ADDON_ROUTING_ENABLED", "true")
     yield
     addons.reset()
@@ -277,6 +286,62 @@ async def test_a_jev_error_queues(client, session, jev, scripted):
 async def test_no_decision_model_queues_as_jev_off(client, session, monkeypatch):
     monkeypatch.setattr(addon_route, "_jev_target", lambda scope, queue_settings=None: None)
     assert _post(client).json() == {"status": "queued", "reason": "jev_off"}
+
+
+async def test_zdr_queues_without_asking_jev_on_mindshub(client, session, jev, monkeypatch):
+    # Under ZDR MindsHub refuses Jev, so the message is queued without asking it.
+    captured: dict = {}
+    jev(_Client(response=_Response(200, _verdict(p_add=0.9)), captured=captured))
+    asked = []
+
+    async def _zdr_on(scope, org_bearer):
+        asked.append(org_bearer)
+        return True
+
+    monkeypatch.setattr(addon_route, "_zdr_on", _zdr_on)
+    resp = client.post(
+        "/api/v1/responses/addon", json={"conversation_id": CID, "text": "actually use the sales DB"},
+        headers={"Authorization": "Bearer caller-token"},
+    )
+
+    assert resp.json() == {"status": "queued", "reason": "zdr_on"}
+    assert captured == {}
+    assert session.inputs == []
+    assert asked == ["caller-token"]
+
+
+async def test_zdr_still_asks_the_organizations_own_decision_model(client, session, jev, monkeypatch):
+    own = jev_route.JevTarget(url="https://own.example/decide", api_key="own-key")
+    monkeypatch.setattr(addon_route, "_jev_target", lambda scope, queue_settings=None: (own, "jev"))
+    jev(_Client(response=_Response(200, _verdict(p_add=0.9))))
+
+    async def _zdr_on(scope, org_bearer):
+        raise AssertionError("an own decision model is not on MindsHub, so ZDR isn't read")
+
+    monkeypatch.setattr(addon_route, "_zdr_on", _zdr_on)
+    assert _post(client).json()["status"] == "added"
+
+
+async def test_zdr_does_not_stop_the_persons_own_add(client, session, monkeypatch):
+    async def _zdr_on(scope, org_bearer):
+        return True
+
+    monkeypatch.setattr(addon_route, "_zdr_on", _zdr_on)
+    assert _post(client, force=True).json()["status"] == "added"
+
+
+@pytest.mark.parametrize("read", [True, RuntimeError("auth down")])
+async def test_the_zdr_read_counts_unknown_as_on(monkeypatch, read):
+    from cowork.services import mindshub_zdr
+
+    async def zdr_on_for(**kwargs):
+        if isinstance(read, Exception):
+            raise read
+        return read
+
+    monkeypatch.setattr(mindshub_zdr, "zdr_on_for", zdr_on_for)
+    monkeypatch.setattr("cowork.common.settings.user_settings.get_user_settings", lambda scope: SimpleNamespace())
+    assert await _REAL_ZDR_ON(None, "tok") is True
 
 
 async def test_force_adds_without_asking_jev(client, session, jev):

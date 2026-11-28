@@ -271,7 +271,7 @@ async def test_real_probe_handler_keeps_sse_outcome_but_sanitizes_iteration_erro
         form=SimpleNamespace(form_id="probe-form", model_dump=lambda: {"form_id": "probe-form"})))
     monkeypatch.setattr(handler_module, "_read_probe_settings",
                         lambda _session: SimpleNamespace(resolved_planning_provider=None))
-    monkeypatch.setattr("cowork.services.providers.web_tool_kwargs_for", lambda _: {})
+    monkeypatch.setattr("cowork.services.providers.web_tool_kwargs_for", lambda _, **__: {})
     monkeypatch.setattr(handler_module.ProbeHandler, "_build_llm_client", lambda *a, **kw: object())
     monkeypatch.setattr(handler_module, "CredentialProbe", lambda **kw: SimpleNamespace(run=failed_probe))
     logged = owned_logger(handler_module.__name__)

@@ -324,7 +324,7 @@ def _owned(monkeypatch, artifact):
     monkeypatch.setattr(workspace_ep, "_sync_live_artifact", awaitable(lambda *_a, **_k: None))
     monkeypatch.setattr(workspace_ep, "has_product_permission", awaitable(lambda scope, permission: True))
     monkeypatch.setattr(workspace_ep, "quick_edit_available", lambda: True)
-    monkeypatch.setattr(workspace_ep, "direct_edit_available", awaitable(lambda scope: True))
+    monkeypatch.setattr(workspace_ep, "direct_edit_available", awaitable(lambda scope, **_: True))
 
 
 def _ooxml_edits(monkeypatch, on: bool):
@@ -384,7 +384,7 @@ def test_the_workspace_of_a_page_keeps_its_shape(client, html_artifact, monkeypa
 async def test_the_quick_edit_capability_follows_the_document_kind(monkeypatch, primary, ooxml_flag, expected):
     monkeypatch.setattr(workspace_ep, "has_product_permission", awaitable(lambda scope, permission: True))
     monkeypatch.setattr(workspace_ep, "quick_edit_available", lambda: True)
-    monkeypatch.setattr(workspace_ep, "direct_edit_available", awaitable(lambda scope: True))
+    monkeypatch.setattr(workspace_ep, "direct_edit_available", awaitable(lambda scope, **_: True))
     _ooxml_edits(monkeypatch, ooxml_flag)
 
     current = await workspace_ep._current_capabilities(LOCAL_SCOPE, dict(OWNER), source_path=primary)
@@ -506,6 +506,7 @@ def _quick_edits(monkeypatch, artifact, anton: _Anton):
         awaitable(lambda anton, scope: ("the-user", Decisions(available=True, model="jev-1.13.0"))),
     )
     monkeypatch.setattr(quick_ep, "_model_choice", awaitable(lambda *_a: (None, None)))
+    monkeypatch.setattr(quick_edit_service, "zdr_blocks", awaitable(lambda *_a, **_k: False))
 
 
 def _events(text: str) -> list[tuple[str, dict]]:

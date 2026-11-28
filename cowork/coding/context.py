@@ -191,6 +191,9 @@ FAILURE_MESSAGES = {
         "Your sign-in does not match this server. Sign in again, or switch back to the environment you signed into."
     ),
     "model_unavailable": "This model is not available to your account. Choose another model.",
+    "zdr_restricted": (
+        "Zero data retention is on for your organization, so this model isn't available. Choose another model."
+    ),
     "model_upstream_unavailable": "The model service is temporarily unavailable. Try again in a moment.",
     "rate_limited": "MindsHub is receiving requests from your organization too quickly. Wait a moment, then continue.",
     "included_allowance_exhausted": "You have no free allowance left. Add credits to continue now.",

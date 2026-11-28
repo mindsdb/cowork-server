@@ -16,7 +16,7 @@ from sqlalchemy.exc import TimeoutError as PoolTimeoutError
 
 from cowork.code_sandbox import build_cell_sandbox, code_sandbox_on, probe_workspaces_dir
 from cowork.common.logger import log_context
-from cowork.common.settings.user_settings import UserSettings
+from cowork.common.settings.user_settings import Provider, UserSettings
 from cowork.handlers.turn_errors import server_busy_message
 from cowork.schemas.connectors import ConnectorSpecResponse
 from cowork.schemas.responses import Role
@@ -181,8 +181,25 @@ class ProbeHandler:
     checked out on the event loop.
     """
 
-    def __init__(self, *, scope: TenantScope) -> None:
+    def __init__(self, *, scope: TenantScope, mindshub_bearer: str = "") -> None:
         self.scope = scope
+        # The caller's bearer on the web, for reading the org's ZDR.
+        self.mindshub_bearer = mindshub_bearer
+
+    async def _zdr_known_on(self, settings: UserSettings) -> bool:
+        """Whether ZDR is known on, read only when planning or coding is on MindsHub.
+        A failed read is False: it only decides web search, which MindsHub drops under ZDR anyway."""
+        coding = getattr(settings, "resolved_coding_provider", None)
+        if Provider.MINDS_CLOUD not in (settings.resolved_planning_provider, coding):
+            return False
+        from cowork.services.mindshub_zdr import ZdrState, zdr_state_for
+
+        try:
+            state = await zdr_state_for(scope=self.scope, settings=settings, org_bearer=self.mindshub_bearer)
+        except Exception:
+            logger.warning("Could not read ZDR for the probe", exc_info=True)
+            return False
+        return state is ZdrState.ON
 
     async def run(
         self,
@@ -529,6 +546,7 @@ class ProbeHandler:
                 logger.exception("Could not build workspace for probe")
 
             llm_client = None
+            scratchpad_web_search_off = False
             init_error = "Could not initialize the probe (workspace or LLM client unavailable)."
             settings_busy = False
             try:
@@ -537,7 +555,12 @@ class ProbeHandler:
                 # Capture the client and its web policy together, before the
                 # yields below let a settings update run ahead of the probe.
                 settings = await run_db(_read_probe_settings, scope=self.scope)
-                web_tools = web_tool_kwargs_for(settings.resolved_planning_provider)
+                zdr_on = await self._zdr_known_on(settings)
+                web_tools = web_tool_kwargs_for(settings.resolved_planning_provider, zdr_on=zdr_on)
+                # The scratchpad's web_search() runs on the coding model.
+                scratchpad_web_search_off = (
+                    zdr_on and getattr(settings, "resolved_coding_provider", None) is Provider.MINDS_CLOUD
+                )
                 llm_client = self._build_llm_client(settings=settings)
             except PoolTimeoutError:
                 # The form says so, with the wait, so the user submits it
@@ -594,6 +617,7 @@ class ProbeHandler:
                 usage_notes=usage_notes,
                 notes_define_pass=notes_define_pass,
                 web_tool_kwargs=web_tools,
+                scratchpad_web_search_off=scratchpad_web_search_off,
                 saved_fields=sorted(saved_only_fields),
                 cell_sandbox=cell_sandbox,
             )

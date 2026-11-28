@@ -45,6 +45,7 @@ from cowork.services import decisions_proxy, product_permissions
 from cowork.services.connectors.custom_connectors import MemberTurnTemplate, member_turn_templates
 from cowork.services.connectors.notion_pages import describe_project_pages
 from cowork.services.connectors.specs._registry import registry
+from cowork.services.mindshub_teams import ZdrState
 from cowork.services.product_permissions import require_product_permission
 from cowork.turnqueue.auth_keys import (
     CUSTOM_GRANTS_ROUTE,
@@ -86,6 +87,8 @@ from cowork.turnqueue.redis_client import (
 from cowork.common.settings.app_settings import TurnQueueSettings, default_turn_minds_api_host
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from cowork.common.settings.user_settings import UserSettings
 
 logger = logging.getLogger(__name__)
@@ -255,9 +258,20 @@ def _new_correlation_id() -> str:
     return str(uuid.uuid4())
 
 
+def turn_coding_model(user_settings) -> str | None:
+    """The caller's resolved coding model when it runs on MindsHub, else None.
+    Resolved like the desktop's, so a model the org can't use is swapped for one it can."""
+    from cowork.common.settings.user_settings import Provider
+
+    if getattr(user_settings, "resolved_coding_provider", None) is not Provider.MINDS_CLOUD:
+        return None
+    return user_settings.resolved_coding_model
+
+
 async def mint_llm_block(*, org_id: str | None, user_id: str | None,
                          correlation_id: str, settings: TurnQueueSettings,
-                         workspace_id: str | None = None, ttl_seconds: int | None = None) -> dict:
+                         workspace_id: str | None = None, ttl_seconds: int | None = None,
+                         coding_model: str | None = None) -> dict:
     """Mint a short-TTL MindsHub turn key and build the job's `llm` block.
 
     The mint call is authenticated with the internal shared secret
@@ -276,16 +290,16 @@ async def mint_llm_block(*, org_id: str | None, user_id: str | None,
         ttl_seconds=ttl_seconds or settings.turn_key_lifetime_seconds, settings=settings,
         workspace_id=workspace_id,
     )
-    return _build_llm_block(api_key, settings)
+    return _build_llm_block(api_key, settings, coding_model)
 
 
-def _build_llm_block(api_key: str, settings: TurnQueueSettings) -> dict:
+def _build_llm_block(api_key: str, settings: TurnQueueSettings, user_coding_model: str | None = None) -> dict:
     base_url = settings.minds_base_url or minds_chat_base_url(default_turn_minds_api_host())
     block = {"provider": "minds-cloud", "api_key": api_key, "base_url": base_url}
-    # Must be a MINDS alias (the pod runs on minds-cloud). Default to the
-    # free-bucket model: a fresh org has no wallet balance, so premium 402s.
+    # Must be a MINDS alias (the pod runs on minds-cloud). The deployment override wins, then the
+    # caller's resolved coding model, then the free-bucket model. Anton also summarizes on it.
     from cowork.common.settings.app_settings import MINDS_FREE_MODEL
-    coding_model = settings.minds_coding_model or MINDS_FREE_MODEL
+    coding_model = settings.minds_coding_model or user_coding_model or MINDS_FREE_MODEL
     if coding_model:
         block["coding_model"] = coding_model
     return block
@@ -305,7 +319,7 @@ class TurnLlm(NamedTuple):
 
 async def mint_turn_llm(
     *, org_id: str | None, user_id: str | None, correlation_id: str, settings: TurnQueueSettings,
-    workspace_id: str | None = None,
+    workspace_id: str | None = None, coding_model: str | None = None,
 ) -> TurnLlm:
     """Mint a turn's key for its lifetime and build the job's `llm` block.
 
@@ -321,7 +335,7 @@ async def mint_turn_llm(
         workspace_id=workspace_id,
     )
     return TurnLlm(
-        block=_build_llm_block(minted.key, settings),
+        block=_build_llm_block(minted.key, settings, coding_model),
         turn_key_id=minted.prefix if settings.needs_turn_key_id else None,
         ttl_seconds=minted.ttl_seconds,
     )
@@ -1088,9 +1102,12 @@ _SLOW_SCOPE_MS = 1000
 
 
 async def _scoped_browser_block(
-    *, scope, conversation_id: str, turn_key: str, project_id: str | None,
+    *, scope, conversation_id: str, turn_key: str, project_id: str | None, zdr_on: bool | None = None,
 ) -> dict | None:
     """The job's browser block, or None when the turn gets no browser.
+
+    *zdr_on*: the handler's ZDR answer; None reads it with the turn key when the
+    browser would ask Jev on MindsHub, which ZDR rules out.
 
     Wherever the web has a router, every turn's key is scoped with it before
     the job is queued, since the router turns a key it hasn't scoped away and
@@ -1111,9 +1128,14 @@ async def _scoped_browser_block(
     router = browser.router_url()
     if not router or not turn_key:
         return None
+    from cowork.services.mindshub_zdr import browser_zdr_on
+
+    user_settings = await run_on_unit_threads(partial(get_user_settings, scope))
+    if zdr_on is None:
+        zdr_on = await browser_zdr_on(scope=scope, settings=user_settings, turn_key=turn_key)
     config = browser.turn_block(
-        await run_on_unit_threads(partial(get_user_settings, scope)),
-        user_id=scope.user_id, conversation_id=conversation_id, project_id=project_id,
+        user_settings,
+        user_id=scope.user_id, conversation_id=conversation_id, project_id=project_id, zdr_on=zdr_on,
     )
     started = time.monotonic()
     try:
@@ -1209,7 +1231,9 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
                                 preview_checks: bool = False,
                                 host_tools: list[dict] | None = None,
                                 ui_locale: str | None = None,
-                                reasoning_effort: str | None = None):
+                                reasoning_effort: str | None = None,
+                                zdr: ZdrState | None = None,
+                                note_zdr: Callable[[ZdrState], None] | None = None):
     """Mint, enqueue, then yield this turn's replies as (kind, data) tuples.
 
     Yields turn_delta / turn_step / turn_memory in arrival order and ends with
@@ -1248,7 +1272,9 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
     one would let it fall back to a mounted org skills tree
     (cowork.handlers.responses.remote_turn_skills).
     `reasoning_effort` is the composer's pick for this turn; None leaves the
-    pod's configured default."""
+    pod's configured default.
+    `zdr` is the caller's ZDR state when the handler already has it; None reads it here.
+    `note_zdr` is handed the state the turn ran with, for its push."""
     settings = TurnQueueSettings()
     scope = scope_for_identity(org_id=org_id, user_id=user_id)
     try:
@@ -1307,7 +1333,7 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
             # turn-key mint is known here and revoked rather than left live.
             llm_result, oauth_result = await asyncio.gather(
                 mint_turn_llm(org_id=org_id, user_id=user_id, correlation_id=corr, settings=settings,
-                              workspace_id=workspace_id),
+                              workspace_id=workspace_id, coding_model=turn_coding_model(user_settings)),
                 oauth_connections_coro,
                 return_exceptions=True,
             )
@@ -1385,6 +1411,7 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
     browser_block = await _scoped_browser_block(
         scope=scope, conversation_id=conversation_id, turn_key=llm_block.get("api_key", ""),
         project_id=workspace.project_id if workspace is not None else None,
+        zdr_on=None if zdr is None else zdr is not ZdrState.OFF,
     )
     browser_block = await _admit_decisions_proxy(
         r, browser_block, turn_key=llm_block.get("api_key", ""), turn_key_ttl_seconds=key_ttl_seconds,
@@ -1417,6 +1444,22 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
     turn_settings = await run_on_unit_threads(partial(get_user_settings, scope))
     jev_decisions = getattr(turn_settings, "jev_decisions_enabled", True) is not False
     jev_classify = getattr(turn_settings, "jev_classify_enabled", True) is not False
+    # Under ZDR MindsHub refuses Jev and drops native web search, so the pod neither checks
+    # completion nor classifies with Jev, and its scratchpad has no web_search(). Read even with Jev off.
+    if zdr is None:
+        from cowork.services.mindshub_zdr import zdr_state_for
+
+        try:
+            zdr = await zdr_state_for(scope=scope, settings=turn_settings, turn_key=llm_block.get("api_key", ""))
+        except Exception:
+            logger.warning("Could not read ZDR for the remote turn", exc_info=True)
+            zdr = ZdrState.UNKNOWN
+    if note_zdr is not None:
+        note_zdr(zdr)
+    # Unknown counts as on: it only skips Jev and the browser's MindsHub steps.
+    zdr_on = zdr is not ZdrState.OFF
+    jev_decisions = jev_decisions and not zdr_on
+    jev_classify = jev_classify and not zdr_on
     # A key shorter than the time-limited window comes from an auth that
     # refused that window (auth_keys._request_turn_key), so the turn runs
     # untimed: no "Keep going" ask the key couldn't outlive.
@@ -1455,6 +1498,9 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
               # Jev: the pod's scratchpad then has no classify(). A controller
               # that predates the field drops it, and the pod keeps it on.
               "jev_classify": jev_classify,
+              # False when ZDR is known on: the pod's scratchpad then has no web_search().
+              # A controller that doesn't relay it yet, or an older pod, keeps the helper.
+              "web_search": zdr is not ZdrState.ON,
               # The app's language (ENG-4149), read by anton's TurnRequestV1.
               # Absent without one. scratchpad-controller relays it to the pod
               # (mindsdb/scratchpad-controller#124, which merges first).

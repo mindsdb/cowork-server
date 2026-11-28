@@ -23,6 +23,7 @@ from cowork.handlers.response_routing import (
     decide_route,
 )
 from cowork.handlers.responses import ResponsesHandler
+from cowork.services.mindshub_teams import ZdrState
 from cowork.streaming.registry import TurnLifecycle
 from cowork.turnqueue.producer import TurnLlm
 
@@ -135,6 +136,34 @@ async def test_a_refused_or_failed_jev_falls_back_to_the_llm_gate(monkeypatch, e
 
 
 @pytest.mark.asyncio
+async def test_a_failed_jev_skips_the_llm_gate_when_it_may_not_fall_back():
+    """Under ZDR the LLM gate's MindsHub model is refused: the turn goes to the agent."""
+    decision = await decide_route(**_route_kwargs(
+        _GREETING, jev=_jev(jev_route.JevRoute(error="http_500")),
+        binding_factory=lambda: pytest.fail("LLM gate asked"),
+        jev_may_fall_back=_says(False),
+    ))
+
+    assert (decision.route, decision.reason, decision.fallback) == (DELEGATED_AGENTIC, "jev_http_500", True)
+
+
+@pytest.mark.asyncio
+async def test_a_decided_jev_never_asks_whether_it_may_fall_back():
+    decision = await decide_route(**_route_kwargs(
+        _GREETING, jev=_jev(jev_route.JevRoute(direct=True, p_direct=0.9)),
+        jev_may_fall_back=lambda: pytest.fail("asked whether it may fall back"),
+    ))
+
+    assert decision.reason == "jev_direct"
+
+
+def _says(value):
+    async def answer():
+        return value
+    return answer
+
+
+@pytest.mark.asyncio
 async def test_the_llm_gate_fallback_keeps_the_prior_tools_rule():
     """The LLM gate was measured with the structural rule, so its fallback
     keeps it: a follow-up to tool work runs the agent."""
@@ -180,12 +209,13 @@ async def test_the_llm_gate_keeps_the_prior_tools_rule():
 # ── ResponsesHandler._jev_gate ─────────────────────────────────────────────
 
 
-def _settings(*, planning=Provider.MINDS_CLOUD, enabled=True, model="opus-5-5", own=None):
+def _settings(*, planning=Provider.MINDS_CLOUD, enabled=True, model="opus-5-5", own=None, router=None):
     from pydantic import SecretStr
 
     own = own or {}
     return SimpleNamespace(
         resolved_planning_provider=planning,
+        resolved_router_provider=router or planning,
         jev_decisions_enabled=enabled,
         minds_url="https://api.mindshub.ai",
         resolved_planning_model=model,
@@ -252,13 +282,132 @@ async def test_jev_gate_asks_on_the_turns_key(monkeypatch, turn_llm, stored_key,
     assert (seen["model"], seen["timeout_seconds"], seen["min_p_direct"]) == ("jev", 3.0, 0.5)
 
 
+# ── ResponsesHandler._turn_gate (ZDR) ──────────────────────────────────────
+
+_OWN = {"url": "https://own.example/decide", "key": "own-key"}
+
+
+def _zdr(monkeypatch, on: bool) -> list[str]:
+    """ZDR's answer for every caller; returns the bearers it was asked with."""
+    import cowork.handlers.responses as responses
+
+    asked = []
+
+    async def zdr_state(*, bearer_token, org_id, user_id):
+        asked.append(bearer_token)
+        return ZdrState.ON if on else ZdrState.OFF
+
+    monkeypatch.setattr(responses.mindshub_zdr, "zdr_state", zdr_state)
+    return asked
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("on", "gated"), [(True, False), (False, True)])
+async def test_turn_gate_skips_jev_under_zdr(monkeypatch, on, gated):
+    handler = _gate(monkeypatch, _settings(), stored_key="k")
+    asked = _zdr(monkeypatch, on)
+
+    jev, may_fall_back = await handler._turn_gate(None)
+
+    assert callable(jev) is gated
+    assert (jev == "zdr_on") is on
+    assert may_fall_back is None
+    assert asked == ["k"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("settings", [_settings(planning=Provider.ANTHROPIC), _settings(enabled=False)])
+async def test_turn_gate_reads_no_zdr_for_the_llm_gate_or_jev_off(monkeypatch, settings):
+    handler = _gate(monkeypatch, settings, stored_key="k")
+    asked = _zdr(monkeypatch, True)
+
+    jev, _may_fall_back = await handler._turn_gate(None)
+
+    assert jev in (None, "off")
+    assert asked == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("on", [True, False])
+async def test_turn_gate_keeps_the_orgs_own_model_but_not_the_llm_fallback_under_zdr(monkeypatch, on):
+    handler = _gate(monkeypatch, _settings(own=_OWN), stored_key="k")
+    asked = _zdr(monkeypatch, on)
+
+    jev, may_fall_back = await handler._turn_gate(None)
+
+    assert callable(jev)
+    # Read only when the decision fails, so a working own model costs no auth call.
+    assert asked == []
+    assert await may_fall_back() is not on
+
+
+@pytest.mark.asyncio
+async def test_turn_gate_lets_the_own_model_fall_back_off_mindshub(monkeypatch):
+    handler = _gate(monkeypatch, _settings(own=_OWN, router=Provider.ANTHROPIC), stored_key="k")
+    _zdr(monkeypatch, True)
+
+    jev, may_fall_back = await handler._turn_gate(None)
+
+    assert callable(jev) and may_fall_back is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("org_mode", "bearer", "turn_llm", "expected"), [
+    # The web asks as the caller.
+    (True, "caller-jwt", {"llm": {"api_key": "turn"}}, "caller-jwt"),
+    # A turn with no caller present (a scheduled run) asks on its minted key.
+    (True, "", {"llm": {"api_key": "turn"}}, "turn"),
+    # The desktop asks on its MindsHub key; the loopback bearer is never sent.
+    (False, "loopback-token", None, "stored"),
+])
+async def test_zdr_on_asks_with_the_callers_credential(monkeypatch, org_mode, bearer, turn_llm, expected):
+    from cowork.db.scoped import TenantScope
+
+    handler = _gate(monkeypatch, _settings(), stored_key="stored")
+    handler.scope = TenantScope(org_mode=org_mode, org_id="o" if org_mode else None)
+    handler.mindshub_bearer = bearer
+    asked = _zdr(monkeypatch, False)
+
+    assert await handler.zdr_on(turn_llm) is False
+    assert asked == [expected]
+
+
+def _turn_gate(jev, may_fall_back=None):
+    async def turn_gate(_turn_llm):
+        return jev, may_fall_back
+    return turn_gate
+
+
+@pytest.mark.asyncio
+async def test_route_request_under_zdr_runs_the_agent_without_a_gate(monkeypatch):
+    import cowork.handlers.responses as responses
+
+    handler = ResponsesHandler()
+    handler.harness_name = "anton"
+    handler._turn_gate = _turn_gate("zdr_on")
+
+    async def no_gate(**_kwargs):
+        pytest.fail("the gate must not run under ZDR")
+
+    monkeypatch.setattr(responses, "decide_route", no_gate)
+    decision, _turn_llm = await handler._route_request(
+        conversation_id=None,
+        gate_rows=[],
+        harness_input=[{"type": "text", "text": "hi"}],
+        has_attachments=False,
+        has_disabled_connections=False,
+    )
+
+    assert (decision.route, decision.reason) == (DELEGATED_AGENTIC, "zdr_on")
+
+
 @pytest.mark.asyncio
 async def test_route_request_with_jev_off_runs_the_agent_without_a_gate(monkeypatch):
     import cowork.handlers.responses as responses
 
     handler = ResponsesHandler()
     handler.harness_name = "anton"
-    handler._jev_gate = lambda _turn_llm: "off"
+    handler._turn_gate = _turn_gate("off")
 
     async def no_gate(**_kwargs):
         pytest.fail("the gate must not run when Jev is off")
@@ -282,7 +431,8 @@ async def test_route_request_hands_the_jev_gate_to_decide_route(monkeypatch):
     handler = ResponsesHandler()
     handler.harness_name = "anton"
     ask = _jev(jev_route.JevRoute(direct=True, p_direct=0.9))
-    handler._jev_gate = lambda _turn_llm: ask
+    may_fall_back = _says(False)
+    handler._turn_gate = _turn_gate(ask, may_fall_back)
     seen = {}
 
     async def fake_decide_route(**kwargs):
@@ -299,7 +449,49 @@ async def test_route_request_hands_the_jev_gate_to_decide_route(monkeypatch):
     )
 
     assert seen["jev"] is ask
+    assert seen["jev_may_fall_back"] is may_fall_back
     assert decision.reason == "jev_direct"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("may_fall_back", [False, True])
+async def test_a_doc_open_turn_skips_the_llm_gate_when_it_may_not_fall_back(monkeypatch, may_fall_back):
+    """A doc-open turn goes to the LLM gate instead of the org's own model; under ZDR
+    that gate's MindsHub model is refused, so the agent decides."""
+    import cowork.handlers.responses as responses
+
+    handler = ResponsesHandler()
+    handler.harness_name = "anton"
+    asked = []
+
+    async def fall_back():
+        asked.append(True)
+        return may_fall_back
+
+    handler._turn_gate = _turn_gate(_jev(jev_route.JevRoute(direct=True, p_direct=0.9)), fall_back)
+    seen = {}
+
+    async def fake_decide_route(**kwargs):
+        seen.update(kwargs)
+        return RouteDecision(route=DIRECT_CONTEXT, reason="llm_direct")
+
+    monkeypatch.setattr(responses, "decide_route", fake_decide_route)
+    decision, _turn_llm = await handler._route_request(
+        conversation_id=None,
+        gate_rows=[],
+        harness_input=[{"type": "text", "text": "hi"}],
+        has_attachments=False,
+        has_disabled_connections=False,
+        doc_open=True,
+    )
+
+    assert asked == [True]
+    if may_fall_back:
+        assert seen["jev"] is None
+        assert decision.reason == "llm_direct"
+    else:
+        assert seen == {}
+        assert (decision.route, decision.reason) == (DELEGATED_AGENTIC, "zdr_on")
 
 
 # ── direct_answer ──────────────────────────────────────────────────────────
@@ -816,6 +1008,54 @@ def test_jev_opt_out_turns_off_antons_completion_check(enabled, verifier_jev):
     assert ("verifier_jev" in applied) is (not enabled)
 
 
+def test_zdr_turns_off_antons_completion_check_whatever_the_switch():
+    # Under ZDR MindsHub refuses Jev, so an org that left the switch on still sends it nothing.
+    from anton.config.settings import AntonSettings
+
+    from cowork.common.settings.user_settings import UserSettings
+    from cowork.harnesses.anton_harness.harness import _overlay_user_settings
+
+    anton = AntonSettings(_env_file=None)
+    applied = _overlay_user_settings(anton, UserSettings.model_validate({"jev_decisions_enabled": True}), zdr=ZdrState.UNKNOWN)
+
+    assert anton.verifier_jev == "off"
+    assert "verifier_jev" in applied
+
+
+@pytest.mark.asyncio
+async def test_an_in_process_turn_asks_zdr_with_the_stored_key(monkeypatch):
+    from cowork.harnesses.anton_harness import harness
+    from cowork.services import mindshub_zdr
+
+    asked = {}
+
+    async def zdr_state_for(**kwargs):
+        asked.update(kwargs)
+        return ZdrState.ON
+
+    monkeypatch.setattr(mindshub_zdr, "zdr_state_for", zdr_state_for)
+    user = object()
+
+    assert await harness._turn_zdr_state(user) is ZdrState.ON
+    assert asked["settings"] is user
+    assert "org_bearer" not in asked and "turn_key" not in asked
+
+
+@pytest.mark.asyncio
+async def test_an_in_process_turns_failed_zdr_read_is_unknown(monkeypatch):
+    # Unknown, not on: the browser still treats it as on, web search doesn't.
+    from cowork.harnesses.anton_harness import harness
+    from cowork.services import mindshub_zdr
+
+    async def zdr_state_for(**kwargs):
+        raise RuntimeError("auth down")
+
+    monkeypatch.setattr(mindshub_zdr, "zdr_state_for", zdr_state_for)
+
+    assert await harness._turn_zdr_state(object()) is ZdrState.UNKNOWN
+    assert await harness._turn_zdr_on(object()) is True
+
+
 @pytest.mark.parametrize(("enabled", "classify_jev"), [(False, "off"), (True, "on")])
 def test_jev_classify_opt_out_reaches_anton(enabled, classify_jev):
     """A settings object with the field stands in for an anton that has it;
@@ -831,6 +1071,55 @@ def test_jev_classify_opt_out_reaches_anton(enabled, classify_jev):
     assert anton.classify_jev == classify_jev
     assert ("classify_jev" in applied) is (not enabled)
     assert anton.verifier_jev == "on"
+
+
+def test_zdr_turns_off_classify_whatever_the_switch():
+    from types import SimpleNamespace
+
+    from cowork.common.settings.user_settings import UserSettings
+    from cowork.harnesses.anton_harness.harness import _overlay_user_settings
+
+    anton = SimpleNamespace(classify_jev="on", verifier_jev="on")
+    applied = _overlay_user_settings(anton, UserSettings.model_validate({"jev_classify_enabled": True}), zdr=ZdrState.UNKNOWN)
+
+    assert anton.classify_jev == "off"
+    assert "classify_jev" in applied
+
+
+@pytest.mark.parametrize(("zdr", "coding", "web_search"), [
+    (ZdrState.ON, "minds_cloud", "off"),
+    (ZdrState.OFF, "minds_cloud", "on"),
+    # A failed read keeps web search: only a known ZDR turns it off.
+    (ZdrState.UNKNOWN, "minds_cloud", "on"),
+    # BYOK coding: MindsHub's ZDR doesn't drop that provider's web search.
+    (ZdrState.ON, "anthropic", "on"),
+])
+def test_zdr_turns_off_the_scratchpads_web_search(zdr, coding, web_search):
+    from types import SimpleNamespace
+
+    from cowork.common.settings.user_settings import UserSettings
+    from cowork.harnesses.anton_harness.harness import _overlay_user_settings
+
+    anton = SimpleNamespace(scratchpad_web_search="on", classify_jev="on", verifier_jev="on")
+    user = UserSettings.model_validate({"coding_provider": coding, "minds_cloud_api_key": "k"})
+    applied = _overlay_user_settings(anton, user, zdr=zdr)
+
+    assert anton.scratchpad_web_search == web_search
+    assert ("scratchpad_web_search" in applied) is (web_search == "off")
+
+
+def test_an_anton_without_the_web_search_switch_is_left_alone():
+    from types import SimpleNamespace
+
+    from cowork.common.settings.user_settings import UserSettings
+    from cowork.harnesses.anton_harness.harness import _overlay_user_settings
+
+    anton = SimpleNamespace(classify_jev="on", verifier_jev="on")
+    user = UserSettings.model_validate({"coding_provider": "minds_cloud", "minds_cloud_api_key": "k"})
+    applied = _overlay_user_settings(anton, user, zdr=ZdrState.ON)
+
+    assert not hasattr(anton, "scratchpad_web_search")
+    assert "scratchpad_web_search" not in applied
 
 
 def test_an_anton_without_classify_is_left_alone():
@@ -1214,6 +1503,16 @@ def test_the_direct_answer_honors_the_servers_web_tool_switches(monkeypatch, env
     assert _allowed_web_tools(Provider.MINDS_CLOUD) == allowed
 
 
+def test_the_direct_answer_on_mindshub_has_no_web_tools_under_zdr(monkeypatch):
+    from cowork.handlers.responses import _allowed_web_tools
+
+    for name in ("ANTON_WEB_SEARCH_ENABLED", "ANTON_WEB_FETCH_ENABLED", "ANTON_INTERNET_RESEARCH_ENABLED"):
+        monkeypatch.delenv(name, raising=False)
+
+    assert _allowed_web_tools(Provider.MINDS_CLOUD, zdr_on=True) == frozenset()
+    assert _allowed_web_tools(Provider.ANTHROPIC, zdr_on=True) == {"web_search", "web_fetch"}
+
+
 @pytest.mark.asyncio
 async def test_jev_reads_long_replies_whole_within_its_budget():
     """The target case: headline numbers stated past the gate's 1,500 chars
@@ -1386,3 +1685,60 @@ async def test_complete_answer_delegates_what_a_streamed_answer_could_only_log(m
     provider = _Provider([_text("Revenue was $4.81M. "), *ending])
 
     assert await direct_answer.complete_answer(_binding(provider), history=_RECALL) is None
+
+
+@pytest.mark.asyncio
+async def test_the_remote_turns_zdr_read_never_fails_the_turn(monkeypatch):
+    # No credential: left to the producer. A failing read: None, not an exception.
+    from cowork.db.scoped import TenantScope
+
+    handler = ResponsesHandler()
+    handler.scope = TenantScope(org_mode=True, org_id="o", user_id="u")
+    handler.mindshub_bearer = ""
+    assert await handler._zdr_state_quietly(None) is None
+
+    async def broken(*_args, **_kwargs):
+        raise RuntimeError("auth down")
+
+    monkeypatch.setattr(handler, "zdr_state", broken)
+    handler.mindshub_bearer = "jwt"
+    assert await handler._zdr_state_quietly(None) is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("on", "tools"), [(True, frozenset()), (False, {"web_search", "web_fetch"})])
+async def test_a_desktop_direct_answer_reads_zdr_with_the_stored_key(monkeypatch, on, tools):
+    # The desktop has no caller bearer or minted key, so it asks on its stored MindsHub key.
+    from cowork.db.scoped import LOCAL_SCOPE
+    from cowork.handlers.responses import _allowed_web_tools
+
+    handler = _gate(monkeypatch, _settings(), stored_key="stored")
+    handler.scope = LOCAL_SCOPE
+    asked = _zdr(monkeypatch, on)
+
+    state = await handler._direct_answer_zdr()
+
+    assert asked == ["stored"]
+    assert _allowed_web_tools(Provider.MINDS_CLOUD, zdr_on=state is ZdrState.ON) == tools
+
+
+@pytest.mark.asyncio
+async def test_a_direct_answer_off_mindshub_reads_no_zdr(monkeypatch):
+    from cowork.db.scoped import LOCAL_SCOPE
+
+    handler = _gate(monkeypatch, _settings(planning=Provider.ANTHROPIC), stored_key="stored")
+    handler.scope = LOCAL_SCOPE
+    asked = _zdr(monkeypatch, True)
+
+    assert await handler._direct_answer_zdr() is None
+    assert asked == []
+
+
+@pytest.mark.asyncio
+async def test_a_direct_answer_reuses_the_turns_zdr_read(monkeypatch):
+    handler = _gate(monkeypatch, _settings(), stored_key="stored")
+    handler.turn_zdr = ZdrState.OFF
+    asked = _zdr(monkeypatch, True)
+
+    assert await handler._direct_answer_zdr() is ZdrState.OFF
+    assert asked == []

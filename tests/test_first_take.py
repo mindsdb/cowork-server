@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from types import SimpleNamespace
 
 import pytest
 
@@ -374,6 +375,28 @@ async def test_switched_off_or_not_asked_for_means_none(monkeypatch):
     assert handler.first_take is None
 
 
+@pytest.mark.parametrize(("provider", "zdr", "starts"), [
+    ("minds_cloud", True, False),
+    ("minds_cloud", False, True),
+    ("anthropic", True, True),
+])
+@pytest.mark.asyncio
+async def test_zdr_skips_it_when_the_gate_model_is_on_mindshub(monkeypatch, provider, zdr, starts):
+    # The take runs on the gate's model, which MindsHub refuses under ZDR.
+    import cowork.handlers.responses as responses
+    from cowork.common.settings.user_settings import Provider
+
+    settings = SimpleNamespace(resolved_router_provider=Provider(provider))
+    monkeypatch.setattr(responses, "get_user_settings", lambda *_args, **_kwargs: settings)
+    handler = _handler()
+
+    async def zdr_on(*_args, **_kwargs):
+        return zdr
+
+    monkeypatch.setattr(handler, "zdr_on", zdr_on)
+    assert await handler._first_take_allowed(None) is starts
+
+
 @pytest.mark.asyncio
 async def test_attachments_never_start_one(monkeypatch):
     handler = _handler()
@@ -578,6 +601,8 @@ async def test_shared_openai_provider_keeps_streams_and_trace_contexts_separate(
         )
         assert decision.text == "Hello."
         assert sorted(initial_calls) == ["cowork-first-take", "cowork-gate"]
+        # The gate can finish before the take retries, since its settings read now leaves the loop.
+        await _settle()
         assert len(calls) == 4
         assert closed == ["cowork-gate"]
         handler.first_take.cancel()

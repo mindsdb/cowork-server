@@ -63,6 +63,7 @@ def test_the_free_stops_speak_of_free_models_and_name_none(code: str, message: s
         ('unexpected status 400 Bad Request: {"error": {"code": "included_allowance_exhausted", "message": "x"}}', "included_allowance_exhausted"),
         ('unexpected status 400 Bad Request: {"error": {"code": "free_air_daily_spend_fuse_exceeded", "message": "x"}}', "free_air_daily_spend_fuse_exceeded"),
         ('unexpected status 400 Bad Request: {"error": {"code": "budget_exceeded", "message": "x"}}', "budget_exceeded"),
+        ('unexpected status 400 Bad Request: {"error": {"code": "zdr_restricted", "message": "x"}}', "zdr_restricted"),
         ('unexpected status 400 Bad Request: {"error": {"code": "window_allowance_exhausted", "message": "x"}}', "window_allowance_exhausted"),
         ('unexpected status 400 Bad Request: {"error": {"code": "model_not_in_tier", "message": "x"}}', "model_not_in_tier"),
     ],
@@ -177,3 +178,10 @@ def test_a_malformed_budget_model_is_dropped() -> None:
 
     assert "budget_model" not in failure.event_data()
     assert "Other models still work" not in failure.message
+
+
+def test_a_zdr_refusal_says_so_and_does_not_ask_to_sign_in() -> None:
+    raw = 'unexpected status 400 Bad Request: {"error": {"code": "zdr_restricted", "message": "x"}}'
+    failure = classify_engine_failure(raw, CREDS, model="gpt")
+    assert failure.code == "zdr_restricted"
+    assert "Zero data retention" in failure.message and "sign in" not in failure.message.lower()

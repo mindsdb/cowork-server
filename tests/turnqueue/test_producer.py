@@ -13,6 +13,7 @@ from cowork.turnqueue.redis_client import cancel_flag_key
 
 from cowork.handlers import turn_errors as te
 from cowork.services import providers as pv
+from cowork.services.mindshub_teams import ZdrState
 from cowork.turnqueue import producer as prod
 from cowork.turnqueue.auth_keys import DATASOURCE_CONNECTIONS_ROUTE, DATASOURCE_GRANTS_ROUTE, MintedTurnKey
 
@@ -1617,6 +1618,44 @@ async def test_mint_llm_block_coding_model_override():
 
 
 @pytest.mark.asyncio
+async def test_mint_llm_block_uses_the_callers_coding_model():
+    # The pod's coding calls and its summaries run on the caller's resolved coding model.
+    from cowork.common.settings.app_settings import TurnQueueSettings
+
+    settings = TurnQueueSettings(minds_base_url="https://x/v1", minds_coding_model="")
+    block = await prod.mint_llm_block(
+        org_id="o", user_id="u", correlation_id="c", settings=settings, coding_model="kimi",
+    )
+    assert block["coding_model"] == "kimi"
+
+
+@pytest.mark.asyncio
+async def test_the_deployment_override_beats_the_callers_coding_model():
+    from cowork.common.settings.app_settings import TurnQueueSettings
+
+    settings = TurnQueueSettings(minds_base_url="https://x/v1", minds_coding_model="sonnet")
+    block = await prod.mint_llm_block(
+        org_id="o", user_id="u", correlation_id="c", settings=settings, coding_model="kimi",
+    )
+    assert block["coding_model"] == "sonnet"
+
+
+@pytest.mark.parametrize(
+    ("provider", "model", "expected"),
+    [("minds_cloud", "kimi", "kimi"), ("anthropic", "claude-haiku-4-5-20251001", None)],
+)
+def test_turn_coding_model_only_names_a_mindshub_model(provider, model, expected):
+    # The pod runs on MindsHub, so a coding model on another provider is never sent.
+    from types import SimpleNamespace
+
+    from cowork.common.settings.user_settings import Provider
+
+    user_settings = SimpleNamespace(resolved_coding_provider=Provider(provider), resolved_coding_model=model)
+    assert prod.turn_coding_model(user_settings) == expected
+    assert prod.turn_coding_model(None) is None
+
+
+@pytest.mark.asyncio
 async def test_mint_llm_block_uses_base_url_override():
     """An explicit minds_base_url (per-PR / non-standard env) overrides the
     env-slug derivation, so the pod calls the right environment's inference."""
@@ -2761,7 +2800,12 @@ def browser_router(monkeypatch, org_deployment):
     when it was made; ``refuse`` makes the next one fail."""
     from cowork.common.settings import user_settings
     from cowork.common.settings.app_settings import get_app_settings
-    from cowork.services import browser
+    from cowork.services import browser, mindshub_zdr
+
+    async def _zdr_off(**kwargs):
+        return False
+
+    monkeypatch.setattr(mindshub_zdr, "browser_zdr_on", _zdr_off)
 
     monkeypatch.setenv("COWORK_BROWSER_ROUTER_URL", ROUTER)
     get_app_settings.cache_clear()
@@ -2795,6 +2839,26 @@ async def _web_turn(*, user_id="u1", project_id="proj-1"):
         conversation_id="conv-1", org_id="o1", user_id=user_id, input_text="hi", model="mindshub_air",
         workspace=workspace,
     ))
+
+
+@pytest.mark.asyncio
+async def test_under_zdr_a_web_turn_gets_no_browser_jev_would_drive(browser_router, monkeypatch):
+    """MindsHub refuses Jev under ZDR: the key is still scoped, to no session, and the job has no browser."""
+    from cowork.services import mindshub_zdr
+
+    asked = []
+
+    async def _zdr_on(**kwargs):
+        asked.append(kwargs["turn_key"])
+        return True
+
+    monkeypatch.setattr(mindshub_zdr, "browser_zdr_on", _zdr_on)
+    await _web_turn()
+
+    [(turn_key, config, _queued)] = browser_router.scoped
+    assert (turn_key, config) == ("mdb_turnkey", None)
+    assert "browser" not in json.loads(browser_router.fake.added[0][1]["payload"])["params"]
+    assert asked == ["mdb_turnkey"]
 
 
 @pytest.mark.asyncio
@@ -2978,9 +3042,101 @@ async def test_the_job_carries_the_organizations_jev_opt_out(monkeypatch, enable
     monkeypatch.setattr(prod, "get_redis", lambda: fake)
     monkeypatch.setattr(prod, "_new_correlation_id", lambda: "r")
     await _drain(prod.stream_remote_replies(
-        conversation_id="conv-1", org_id=None, user_id=None, input_text="hi", model="m"))
+        conversation_id="conv-1", org_id=None, user_id=None, input_text="hi", model="m", zdr=ZdrState.OFF))
 
     assert json.loads(fake.added[0][1]["payload"])["params"]["jev_decisions"] is enabled
+
+
+@pytest.mark.parametrize(("handed", "read", "sent"), [
+    (ZdrState.ON, None, False),
+    (ZdrState.OFF, None, True),
+    (None, ZdrState.ON, False),
+    (None, ZdrState.OFF, True),
+])
+@pytest.mark.asyncio
+async def test_zdr_keeps_the_pods_completion_check_and_classify_off_jev(monkeypatch, handed, read, sent):
+    # Under ZDR MindsHub refuses Jev, so neither asks it; the handler's answer is used, else it's read with the turn key.
+    from cowork.common.settings import user_settings
+    from cowork.services import mindshub_zdr
+
+    monkeypatch.setattr(
+        user_settings, "get_user_settings",
+        lambda scope: SimpleNamespace(limits_enabled=False, resolved_planning_model="m", hub_workspace_id="", jev_decisions_enabled=True,
+                                      jev_classify_enabled=True),
+    )
+    asked = []
+
+    async def zdr_state_for(**kwargs):
+        asked.append(kwargs["turn_key"])
+        return read
+
+    monkeypatch.setattr(mindshub_zdr, "zdr_state_for", zdr_state_for)
+    fake = FakeRedis(replies=[("scratchpad:reply:conv-1", _reply("turn_completed", {}))])
+    monkeypatch.setattr(prod, "get_redis", lambda: fake)
+    monkeypatch.setattr(prod, "_new_correlation_id", lambda: "r")
+    noted = []
+    await _drain(prod.stream_remote_replies(
+        conversation_id="conv-1", org_id=None, user_id=None, input_text="hi", model="m", zdr=handed,
+        note_zdr=noted.append))
+
+    params = json.loads(fake.added[0][1]["payload"])["params"]
+    assert params["jev_decisions"] is sent
+    assert params["jev_classify"] is sent
+    assert params["web_search"] is sent
+    assert asked == ([] if handed is not None else ["mdb_turnkey"])
+    # The state the turn ran with is handed back for its push.
+    assert noted == [handed or read]
+
+
+@pytest.mark.parametrize(("read", "sent"), [
+    (ZdrState.ON, False), (ZdrState.OFF, True), (ZdrState.UNKNOWN, True), (RuntimeError("down"), True),
+])
+@pytest.mark.asyncio
+async def test_zdr_turns_off_the_pods_web_search_even_with_jev_opted_out(monkeypatch, read, sent):
+    # web_search() follows ZDR alone, so ZDR is read even when Jev is already off; only a known on turns it off.
+    from cowork.common.settings import user_settings
+    from cowork.services import mindshub_zdr
+
+    monkeypatch.setattr(
+        user_settings, "get_user_settings",
+        lambda scope: SimpleNamespace(limits_enabled=False, resolved_planning_model="m", hub_workspace_id="",
+                                      jev_decisions_enabled=False, jev_classify_enabled=False),
+    )
+
+    async def zdr_state_for(**kwargs):
+        if isinstance(read, Exception):
+            raise read
+        return read
+
+    monkeypatch.setattr(mindshub_zdr, "zdr_state_for", zdr_state_for)
+    fake = FakeRedis(replies=[("scratchpad:reply:conv-1", _reply("turn_completed", {}))])
+    monkeypatch.setattr(prod, "get_redis", lambda: fake)
+    monkeypatch.setattr(prod, "_new_correlation_id", lambda: "r")
+    await _drain(prod.stream_remote_replies(
+        conversation_id="conv-1", org_id=None, user_id=None, input_text="hi", model="m"))
+
+    params = json.loads(fake.added[0][1]["payload"])["params"]
+    assert params["web_search"] is sent
+    assert params["jev_classify"] is False and params["jev_decisions"] is False
+
+
+@pytest.mark.asyncio
+async def test_an_unknown_zdr_keeps_jev_off_but_web_search_on(monkeypatch):
+    from cowork.common.settings import user_settings
+
+    monkeypatch.setattr(
+        user_settings, "get_user_settings",
+        lambda scope: SimpleNamespace(limits_enabled=False, resolved_planning_model="m", hub_workspace_id="",
+                                      jev_decisions_enabled=True, jev_classify_enabled=True),
+    )
+    fake = FakeRedis(replies=[("scratchpad:reply:conv-1", _reply("turn_completed", {}))])
+    monkeypatch.setattr(prod, "get_redis", lambda: fake)
+    monkeypatch.setattr(prod, "_new_correlation_id", lambda: "r")
+    await _drain(prod.stream_remote_replies(
+        conversation_id="conv-1", org_id=None, user_id=None, input_text="hi", model="m", zdr=ZdrState.UNKNOWN))
+
+    params = json.loads(fake.added[0][1]["payload"])["params"]
+    assert (params["jev_decisions"], params["jev_classify"], params["web_search"]) == (False, False, True)
 
 
 @pytest.mark.parametrize("enabled", [True, False])
@@ -2996,7 +3152,7 @@ async def test_the_job_carries_the_organizations_classify_switch(monkeypatch, en
     monkeypatch.setattr(prod, "get_redis", lambda: fake)
     monkeypatch.setattr(prod, "_new_correlation_id", lambda: "r")
     await _drain(prod.stream_remote_replies(
-        conversation_id="conv-1", org_id=None, user_id=None, input_text="hi", model="m"))
+        conversation_id="conv-1", org_id=None, user_id=None, input_text="hi", model="m", zdr=ZdrState.OFF))
 
     params = json.loads(fake.added[0][1]["payload"])["params"]
     assert params["jev_classify"] is enabled

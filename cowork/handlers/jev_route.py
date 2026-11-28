@@ -237,7 +237,7 @@ def _mode_without_own_model(*, settings) -> Literal["jev", "off", "llm"]:
 DecisionsModel = Literal["mindshub", "own"]
 
 
-def decisions_model(settings) -> "DecisionsModel | None":
+def decisions_model(settings, *, zdr_on: bool = False) -> "DecisionsModel | None":
     """What picks the shared browser's steps: the organization's own decision
     model ("own"), Jev on MindsHub for an LLM on MindsHub that the
     organization didn't turn Jev off for ("mindshub"), or None. The same
@@ -247,18 +247,26 @@ def decisions_model(settings) -> "DecisionsModel | None":
     (`browser.own_model_reaches_browser`): where it can't, the browser never
     asks it, so this answers what the browser asks instead. Without one every
     browser step goes back to the LLM, which is too slow to offer, so the
-    browser is off (`decisions_available`)."""
+    browser is off (`decisions_available`). Under ZDR (*zdr_on*) MindsHub refuses
+    Jev, so only the organization's own model counts."""
     from cowork.services.browser import own_model_reaches_browser
 
     target = own_decision_target(settings)
     if target is not None and is_web_address(url=target.url) and own_model_reaches_browser():
         return "own"
+    if zdr_on:
+        return None
     return "mindshub" if _mode_without_own_model(settings=settings) == "jev" else None
 
 
-def decisions_available(settings) -> bool:
+def decisions_available(settings, *, zdr_on: bool = False) -> bool:
     """Whether the shared browser may run: it needs a decisions model."""
-    return decisions_model(settings) is not None
+    return decisions_model(settings, zdr_on=zdr_on) is not None
+
+
+def browser_needs_zdr(settings) -> bool:
+    """Whether the browser's decisions model hangs on ZDR: it would be Jev on MindsHub."""
+    return decisions_model(settings) == "mindshub"
 
 
 async def probe(target: JevTarget, *, model: str, timeout_seconds: float) -> JevRoute:

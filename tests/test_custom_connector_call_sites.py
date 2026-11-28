@@ -70,7 +70,7 @@ def staged(monkeypatch):
     monkeypatch.setattr(submissions_endpoints.store, "stage", lambda **kw: calls.append(kw) or "sub_test")
 
     class _NoProbe:
-        def __init__(self, *, scope):
+        def __init__(self, *, scope, **_):
             pass
 
         async def run(self, *args):

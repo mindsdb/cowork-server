@@ -126,7 +126,7 @@ def test_handler_hands_the_resolved_notes_to_the_probe(monkeypatch):
         probe_handler, "_read_probe_settings",
         lambda _session: SimpleNamespace(resolved_planning_provider=None),
     )
-    monkeypatch.setattr("cowork.services.providers.web_tool_kwargs_for", lambda _provider: {})
+    monkeypatch.setattr("cowork.services.providers.web_tool_kwargs_for", lambda _provider, **_: {})
     monkeypatch.setattr(
         probe_handler.ConnectorCatalog, "usage_notes_for",
         lambda self, engines: {e: f"NOTE-{e}" for e in engines},
@@ -191,7 +191,7 @@ def _probe_kwargs(monkeypatch, *, connector_id, form_spec, catalog=(None, False)
         probe_handler, "_read_probe_settings",
         lambda _session: SimpleNamespace(resolved_planning_provider=None),
     )
-    monkeypatch.setattr("cowork.services.providers.web_tool_kwargs_for", lambda _provider: {})
+    monkeypatch.setattr("cowork.services.providers.web_tool_kwargs_for", lambda _provider, **_: {})
     monkeypatch.setattr("anton.workspace.Workspace", lambda path: SimpleNamespace(path=path))
     if vault is not None:
         monkeypatch.setattr(probe_handler, "vault_for_scope", lambda _scope: vault)

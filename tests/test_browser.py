@@ -208,9 +208,34 @@ def decisions(monkeypatch):
     from cowork.handlers import jev_route
 
     state = SimpleNamespace(model="mindshub", mindshub=True, own=None)
-    monkeypatch.setattr(jev_route, "decisions_model", lambda settings: state.model)
+    monkeypatch.setattr(jev_route, "decisions_model", lambda settings, zdr_on=False: None if zdr_on else state.model)
     monkeypatch.setattr(jev_route, "own_decision_target", lambda settings: state.own)
     monkeypatch.setattr(svc, "llm_on_mindshub", lambda settings: state.mindshub)
+    return state
+
+
+@pytest.fixture(autouse=True)
+def zdr_off(monkeypatch):
+    """ZDR off unless a test turns it on; set ``state.on`` to change it."""
+    from cowork.harnesses.anton_harness import harness
+    from cowork.services import mindshub_zdr
+
+    state = SimpleNamespace(on=False)
+
+    async def _browser_zdr_on(**kwargs):
+        return bool(state.on)
+
+    async def _browser_zdr_state(**kwargs):
+        if isinstance(state.on, mindshub_zdr.ZdrState):
+            return state.on
+        return mindshub_zdr.ZdrState.ON if state.on else mindshub_zdr.ZdrState.OFF
+
+    async def _turn_zdr_on(user):
+        return bool(state.on)
+
+    monkeypatch.setattr(mindshub_zdr, "browser_zdr_on", _browser_zdr_on)
+    monkeypatch.setattr(mindshub_zdr, "browser_zdr_state", _browser_zdr_state)
+    monkeypatch.setattr(harness, "_turn_zdr_on", _turn_zdr_on)
     return state
 
 
@@ -598,6 +623,16 @@ def test_without_a_decisions_model_no_turn_gets_the_browser(app_browser, web, de
     assert svc.turn_block(on, user_id="u", conversation_id="c", project_id=None) is None
 
 
+def test_under_zdr_no_turn_gets_a_browser_jev_would_drive(app_browser, web, decisions, zdr_off):
+    """MindsHub refuses Jev under ZDR, so a browser whose steps it would pick stays off."""
+    from cowork.harnesses.anton_harness.harness import _browser_config
+
+    zdr_off.on = True
+    on = SimpleNamespace(browser_enabled=True)
+    assert asyncio.run(_browser_config(on, channel_context=None, conversation_id="c", project_id=None)) is None
+    assert svc.turn_block(on, user_id="u", conversation_id="c", project_id=None, zdr_on=True) is None
+
+
 def test_a_web_turn_asks_the_organizations_own_model_through_this_server(web, decisions, monkeypatch):
     """The pod must not hold the organization's key: its block names this
     server's proxy and the model name, with no key, and anton reads it back."""
@@ -832,6 +867,32 @@ def test_desktop_status_says_what_picks_the_steps(client, decisions):
     )
 
 
+def test_under_zdr_desktop_status_reads_the_browser_as_off(client, decisions, zdr_off):
+    runtime_credential.set_browser_host(APP_BROWSER)
+    assert client.put("/api/v1/settings/browser_enabled", json={"value": "true"}).status_code == 200
+    zdr_off.on = True
+    answer = client.get("/api/v1/browse/status").json()
+    assert (answer["enabled"], answer["decisions_model"]) == (False, None)
+
+
+def test_under_zdr_the_browser_cant_be_turned_on_with_only_jev(client, decisions, zdr_off):
+    runtime_credential.set_browser_host(APP_BROWSER)
+    zdr_off.on = True
+    response = client.put("/api/v1/settings/browser_enabled", json={"value": "true"})
+    assert response.status_code == 400
+    assert "zero data retention" in response.json()["detail"]
+
+
+def test_an_unreadable_zdr_keeps_the_browser_off_without_naming_zdr(client, decisions, zdr_off):
+    from cowork.services.mindshub_zdr import ZdrState
+
+    runtime_credential.set_browser_host(APP_BROWSER)
+    zdr_off.on = ZdrState.UNKNOWN
+    response = client.put("/api/v1/settings/browser_enabled", json={"value": "true"})
+    assert response.status_code == 400
+    assert "zero data retention" not in response.json()["detail"]
+
+
 def test_on_the_web_only_an_organization_admin_may_set_up_a_decisions_model(web_client, router, mindshub):
     from cowork.principal import ORG_MANAGE_ROLE
 
@@ -864,11 +925,30 @@ def test_a_channel_turn_gets_no_browser(app_browser):
     assert asyncio.run(_browser_config(on, channel_context=None, conversation_id="c", project_id=None)).in_app
 
 
+@pytest.mark.parametrize(
+    ("turn_zdr", "runs"), [("off", True), ("on", False), ("unknown", False)],
+)
+def test_the_turns_zdr_read_decides_the_browser_over_a_fresh_read(zdr_off, turn_zdr, runs):
+    """The handler's read wins: a fresh stored-key read that says ON (or can't tell) doesn't
+    turn the browser off for a non-ZDR org."""
+    from cowork.harnesses.anton_harness.harness import _browser_config
+    from cowork.services.mindshub_teams import ZdrState
+
+    zdr_off.on = True
+    runtime_credential.set_browser_host(APP_BROWSER)
+    on = SimpleNamespace(browser_enabled=True)
+    config = asyncio.run(_browser_config(
+        on, channel_context=None, conversation_id="c", project_id=None, zdr=ZdrState(turn_zdr),
+    ))
+    assert (config is not None) is runs
+
+
 def test_the_session_builder_passes_the_channel_to_the_browser():
     from cowork.harnesses.anton_harness import harness
 
     source = inspect.getsource(harness.AntonHarness._build_turn_session)
     assert re.search(r"turn_browser = await _browser_config\(\s*user, channel_context=channel_context,", source)
+    assert "project_id=conversation.project_id, zdr=zdr," in source
     assert "browser=turn_browser," in source
     assert "supported_kwargs(ChatSessionConfig, browser=" not in source
 

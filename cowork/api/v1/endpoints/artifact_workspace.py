@@ -42,7 +42,7 @@ from cowork.common.settings.app_settings import default_draft_env_label, get_app
 from cowork.db.scoped import TenantScope, get_tenant_scope
 from cowork.db.units import FilesystemBusy, run_db, run_efs, run_on_unit_threads
 from cowork.draft_host.token import DRAFT_TTL_SECONDS, issue_draft_token
-from cowork.principal import Principal, get_principal
+from cowork.principal import Principal, caller_bearer, get_principal
 from cowork.services.product_permissions import has_product_permission, require_product_permission
 from cowork.services.artifact_permissions import (
     artifact_capabilities,
@@ -713,7 +713,7 @@ async def _acquire_live_publish_lock(
 
 
 async def _current_capabilities(
-    scope: TenantScope, capabilities: dict, *, source_path: str | None = None
+    scope: TenantScope, capabilities: dict, *, source_path: str | None = None, org_bearer: str = ""
 ) -> dict:
     """*capabilities* narrowed by the caller's current product permissions.
 
@@ -743,7 +743,9 @@ async def _current_capabilities(
     can_quick_edit = bool(can_address and quick_edit_available())
     current["canQuickEdit"] = can_quick_edit
     current["quickEditDirect"] = (
-        can_quick_edit and edits_in_place(source_path) and await direct_edit_available(scope)
+        can_quick_edit
+        and edits_in_place(source_path)
+        and await direct_edit_available(scope, org_bearer=org_bearer)
     )
     # The export route needs `artifact.manage` too, so it offers nothing here.
     if not can_edit and "exportFormats" in capabilities:
@@ -847,6 +849,7 @@ async def artifact_source(
     # scope (and the artifact roots it discovers) as an HTTP parameter.
     scope: TenantScope = Depends(get_tenant_scope),
     path: str | None = Query(default=None, max_length=1000),
+    request: Request = None,
 ):
     """Authenticated source + revision token for Desktop and Cowork SaaS.
 
@@ -873,6 +876,7 @@ async def artifact_source(
                 with_export_formats(scope, owner_capabilities, export_source), metadata.display
             ),
             source_path=result.get("path"),
+            org_bearer=caller_bearer(request),
         )
         return {**result, "capabilities": capabilities, "repair": repair}
     except FileNotFoundError as exc:
@@ -1035,6 +1039,7 @@ async def artifact_review_entry(
     # Spell out the dependency so SAST does not treat the server-derived
     # scope (and the artifact roots it discovers) as an HTTP parameter.
     scope: TenantScope = Depends(get_tenant_scope),
+    request: Request = None,
 ):
     """What a reviewer needs to comment, and nothing that reveals the source.
 
@@ -1063,6 +1068,7 @@ async def artifact_review_entry(
             scope=scope,
         ),
         source_path=(current_revision or {}).get("path"),
+        org_bearer=caller_bearer(request),
     )
     return {
         "artifactKey": artifact_key(artifact_id),
@@ -1510,23 +1516,51 @@ async def artifact_audience(
     )
 
 
-def _push_share(scope, principal: Principal | None, notices: list, *, artifact_ref: str) -> None:
+def _push_share(
+    scope, principal: Principal | None, notices: list, *, artifact_ref: str, bearer_token: str,
+) -> None:
     """Push the people the save asked to notify, the ones MindsHub emails:
     individuals by id only. People named by address alone, and the members
     of a team or the whole organization a share opens to, get no push, as
-    they get no email. Never raises."""
+    they get no email. Returns at once: the ZDR read and the pushes run on a
+    detached task, so they never hold the publish lock or the response.
+    Never raises."""
     try:
+        from cowork.services.push.dispatch import push_enabled, spawn
+
+        org_id = scope.org_id if scope.org_mode else None
+        if not org_id or not any(notice.recipients.user_ids for notice in notices) or not push_enabled():
+            return
+        spawn(_send_share_push(
+            org_id=org_id, user_id=scope.user_id or "",
+            sharer_id=principal.user_id if principal else None,
+            sharer_name=principal.email if principal else None,
+            notices=list(notices), artifact_ref=artifact_ref, bearer_token=bearer_token,
+        ))
+    except Exception:
+        logger.warning("Could not push an artifact share", exc_info=True, extra={"event": "push_share_failed"})
+
+
+async def _send_share_push(
+    *, org_id: str, user_id: str, sharer_id: str | None, sharer_name: str | None,
+    notices: list, artifact_ref: str, bearer_token: str,
+) -> None:
+    """Read ZDR as the sharer (unknown leaves the title out), then push. Never raises."""
+    try:
+        from cowork.services.mindshub_zdr import zdr_state_quietly
         from cowork.services.push.hooks import artifact_shared
 
+        zdr = await zdr_state_quietly(bearer_token=bearer_token, org_id=org_id, user_id=user_id)
         for notice in notices:
             artifact_shared(
-                org_id=scope.org_id if scope.org_mode else None,
-                sharer_id=principal.user_id if principal else None,
-                sharer_name=principal.email if principal else None,
+                org_id=org_id,
+                sharer_id=sharer_id,
+                sharer_name=sharer_name,
                 recipient_ids=notice.recipients.user_ids,
                 artifact_title=notice.artifact_title,
                 url=notice.artifact_url,
                 artifact_ref=artifact_ref,
+                zdr=zdr,
             )
     except Exception:
         logger.warning("Could not push an artifact share", exc_info=True, extra={"event": "push_share_failed"})
@@ -1591,7 +1625,7 @@ async def set_artifact_access(
     return await _publish_live(
         scope, source, folder, artifact_id,
         plan=plan, notify=notify or None, owner_save=True, principal=principal,
-        failure_log="Could not change access for artifact %s",
+        failure_log="Could not change access for artifact %s", bearer_token=caller_bearer(request),
     )
 
 
@@ -1606,6 +1640,7 @@ async def _publish_live(
     owner_save: bool,
     principal: Principal | None,
     failure_log: str,
+    bearer_token: str = "",
 ):
     """Publish *folder* now, under its live publish lock, as the owner asked:
     the access and stored rule come from *plan*, run under the lock. Shared by
@@ -1657,7 +1692,10 @@ async def _publish_live(
                 ),
                 timeout=_LIVE_PUBLISH_TIMEOUT_S,
             )
-            _push_share(scope, principal, notices, artifact_ref=f"{source.project_id}/{artifact_id}")
+            _push_share(
+                scope, principal, notices, artifact_ref=f"{source.project_id}/{artifact_id}",
+                bearer_token=bearer_token,
+            )
             return published
         except asyncio.TimeoutError as exc:
             publish_abandoned = True
@@ -1951,6 +1989,7 @@ async def enable_artifact_comments(
     project_ref: str,
     artifact_id: ArtifactIdDep,
     scope: ScopeDep,
+    request: Request = None,
 ) -> CommentsAccessResponse:
     """Turn on draft comments for the artifact's owner.
 
@@ -1983,7 +2022,7 @@ async def enable_artifact_comments(
             status_code=status.HTTP_409_CONFLICT,
             detail="Sharing is off while models are being compared. Continue with this side to share it.",
         )
-    capabilities = await _current_capabilities(scope, capabilities)
+    capabilities = await _current_capabilities(scope, capabilities, org_bearer=caller_bearer(request))
     review_scope = None
     if scope.org_mode:
         # `_owner_workspace` already refused anyone but the owner, so the owner is

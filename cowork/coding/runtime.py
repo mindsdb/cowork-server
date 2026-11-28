@@ -34,6 +34,13 @@ def engine_workspace_path(session: CodingSession) -> str:
     return session.workspace_path
 
 
+def _zdr_known_on(credentials: EngineCredentials) -> bool:
+    """Codex runs on MindsHub, which drops web search under ZDR: asked only for a session that wants it."""
+    from cowork.services.mindshub_zdr import zdr_known_on_blocking
+
+    return zdr_known_on_blocking(bearer_token=credentials.minds_api_key)
+
+
 class RuntimeManager:
     """Own persistent engine runtimes and task terminals.
 
@@ -96,7 +103,7 @@ class RuntimeManager:
                     service_tier=None if session.service_tier == "standard" else session.service_tier,
                     personality=session.personality,
                     network_access=session.network_access,
-                    web_search=session.web_search,
+                    web_search=session.web_search and not _zdr_known_on(credentials),
                     additional_dirs=tuple(session.additional_dirs),
                     writes_allowed=session.writes_allowed,
                     developer_instructions=session.developer_instructions,

@@ -294,7 +294,7 @@ def test_an_embedding_row_cannot_claim_a_role(monkeypatch):
 
 # The keys every endpoint test writes, so each one tears down exactly what it set
 # and the next test starts from a genuinely fresh install.
-_TOUCHED = ("minds_api_key", "minds_model_enabled", "minds_role_defaults")
+_TOUCHED = ("minds_api_key", "minds_model_enabled", "minds_role_defaults", "jev_decisions_enabled")
 
 
 def _stub_listing(monkeypatch, *, ids, enabled=None, role_defaults=None):
@@ -697,15 +697,67 @@ def test_settings_are_told_which_gate_decides_turns(monkeypatch):
         role_defaults={"planning": "sonnet", "coding": "haiku", "router": "kimi"},
     )
 
+    async def zdr_off(**_kwargs):
+        return False
+
+    monkeypatch.setattr("cowork.services.mindshub_zdr.zdr_on_for", zdr_off)
     with _Endpoint() as endpoint:
         payload = endpoint.call()
 
     # `decisions`: what picks the shared browser's steps.
     assert payload["routing"] == {
-        "mode": "jev", "routerProvider": "minds-cloud", "decisions": "mindshub", "canSetDecisionModel": True,
+        "mode": "jev", "routerProvider": "minds-cloud", "decisions": "mindshub", "canSetDecisionModel": True, "zdr": False,
     }
     # Kept for UIs that predate `routing`.
     assert "gate" in payload
+
+
+def test_settings_are_told_zdr_with_jev_switched_off(monkeypatch):
+    """Classify and voice run on MindsHub without Jev gating turns, so the flag goes out there too."""
+    _stub_listing(
+        monkeypatch,
+        ids=["mindshub_air", "kimi"],
+        enabled={"mindshub_air": False, "kimi": True},
+        role_defaults={"planning": "kimi", "coding": "kimi", "router": "kimi"},
+    )
+
+    async def zdr_on(**kwargs):
+        return True
+
+    monkeypatch.setattr("cowork.services.mindshub_zdr.zdr_on_for", zdr_on)
+    with _Endpoint() as endpoint:
+        from cowork.services.settings import SettingService
+
+        SettingService(endpoint.session).upsert_setting("jev_decisions_enabled", "false")
+        payload = endpoint.call()
+
+    assert payload["routing"]["mode"] == "off"
+    assert payload["routing"]["zdr"] is True
+
+
+def test_settings_are_told_when_zdr_keeps_jev_off(monkeypatch):
+    """Under ZDR turns skip Jev, so Settings can show the switch off and disabled."""
+    _stub_listing(
+        monkeypatch,
+        ids=["mindshub_air", "kimi"],
+        enabled={"mindshub_air": False, "kimi": True},
+        role_defaults={"planning": "kimi", "coding": "kimi", "router": "kimi"},
+    )
+    asked = {}
+
+    async def zdr_on(**kwargs):
+        asked.update(kwargs)
+        return True
+
+    monkeypatch.setattr("cowork.services.mindshub_zdr.zdr_on_for", zdr_on)
+    with _Endpoint() as endpoint:
+        payload = endpoint.call()
+
+    assert payload["routing"]["zdr"] is True
+    # Nor can Jev pick the browser's steps, so the browser has no decisions model.
+    assert payload["routing"]["decisions"] is None
+    # Asked with the stored settings, the same answer a turn gets.
+    assert asked["settings"].minds_api_key is not None
 
 
 def test_the_gate_model_is_availability_adjusted_like_resolution_is(monkeypatch):

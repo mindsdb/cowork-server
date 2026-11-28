@@ -27,7 +27,7 @@ from cowork.common.history_scrub import scrub_credentials, scrubbed_openai_dump
 from cowork.common.logger import get_logger, log_context
 from cowork.common.paths import cowork_home, makedirs_below_nofollow, pod_local_only
 from cowork.common.settings.app_settings import get_app_settings
-from cowork.common.settings.user_settings import current_settings_scope, effective_turn_limits
+from cowork.common.settings.user_settings import Provider, current_settings_scope, effective_turn_limits
 from cowork.deployment_identity import identity_for_turn, learned_memory_scope
 from cowork.db.personal_resources import PersonalResource
 from cowork.db.scoped import LOCAL_SCOPE, ScopedSession, TenantScope, tenant_scope_required
@@ -57,6 +57,7 @@ from cowork.services.connectors.connections import service
 from cowork.services.connectors.notion_pages import describe_project_pages
 from cowork.services.conversation_folders import ConversationFolderService, folder_refusal
 from cowork.services.conversations import read_earlier_answers
+from cowork.services.mindshub_teams import ZdrState
 from cowork.services.live_apps import (
     TurnLiveApps,
     current_live_app_launcher,
@@ -204,7 +205,7 @@ _OVERLAID_SETTINGS: tuple[str, ...] = (
 )
 
 
-def _overlay_user_settings(anton_settings, user) -> list[str]:
+def _overlay_user_settings(anton_settings, user, *, zdr: ZdrState = ZdrState.OFF) -> list[str]:
     """Copy the Cowork DB's settings onto anton's settings object.
 
     Extracted from ``_build_chat_session`` so it can be tested against a REAL
@@ -214,6 +215,8 @@ def _overlay_user_settings(anton_settings, user) -> list[str]:
     (a total agent outage) both shipped green.
 
     Returns the attrs actually applied, so a caller or test can assert on it.
+
+    *zdr*: the org's ZDR state. Unknown turns Jev off like on; web search goes only when it is known on.
 
     The three budgets come from ``effective_turn_limits``, so the
     ``limits_enabled`` switch decides them.
@@ -262,15 +265,24 @@ def _overlay_user_settings(anton_settings, user) -> list[str]:
     # The Jev opt-out covers anton's completion check too, so an organization
     # that turns Jev off sends it nothing. Only ever turns it off: on leaves
     # anton's own setting alone. An organization MindsHub refuses Jev to needs
-    # no switch: anton stops asking after the first refusal.
-    if getattr(user, "jev_decisions_enabled", True) is False and hasattr(anton_settings, "verifier_jev"):
+    # no switch: anton stops asking after the first refusal. Under ZDR it is never asked at all.
+    zdr_on = zdr is not ZdrState.OFF
+    jev_off = zdr_on or getattr(user, "jev_decisions_enabled", True) is False
+    if jev_off and hasattr(anton_settings, "verifier_jev"):
         anton_settings.verifier_jev = "off"
         applied.append("verifier_jev")
     # The same pattern for classify(): only ever turns it off. An anton that
-    # predates the setting has no classify() to turn off.
-    if getattr(user, "jev_classify_enabled", True) is False and hasattr(anton_settings, "classify_jev"):
+    # predates the setting has no classify() to turn off. Under ZDR it is off too.
+    classify_off = zdr_on or getattr(user, "jev_classify_enabled", True) is False
+    if classify_off and hasattr(anton_settings, "classify_jev"):
         anton_settings.classify_jev = "off"
         applied.append("classify_jev")
+    # Under ZDR MindsHub drops native web search, so the scratchpad's web_search() goes
+    # when its coding model runs there. An anton that predates the setting keeps it.
+    web_search_off = zdr is ZdrState.ON and getattr(user, "resolved_coding_provider", None) is Provider.MINDS_CLOUD
+    if web_search_off and hasattr(anton_settings, "scratchpad_web_search"):
+        anton_settings.scratchpad_web_search = "off"
+        applied.append("scratchpad_web_search")
     return applied
 
 
@@ -948,6 +960,22 @@ def _live_apps_rule(apps: TurnLiveApps | None) -> str:
     return rule
 
 
+async def _turn_zdr_state(user) -> ZdrState:
+    """ZDR for this in-process turn's org, asked with the stored MindsHub key; UNKNOWN when the read fails."""
+    from cowork.services.mindshub_zdr import zdr_state_for
+
+    try:
+        return await zdr_state_for(scope=_units_scope(), settings=user)
+    except Exception:
+        logger.warning("Could not read ZDR for the turn", exc_info=True)
+        return ZdrState.UNKNOWN
+
+
+async def _turn_zdr_on(user) -> bool:
+    """``_turn_zdr_state`` as a yes/no; unknown counts as on (it only keeps Jev and the browser off)."""
+    return await _turn_zdr_state(user) is not ZdrState.OFF
+
+
 def _units_scope() -> TenantScope:
     """The scope a turn's own database units run under: the one its settings
     resolve against (use_settings_scope). stream_response runs only in local
@@ -1241,6 +1269,8 @@ class AntonHarness:
         # The scheduler's own turn (see HarnessProvider).
         schedule_id: str | None = None,
         docs: bool = False,
+        # The handler's ZDR read for this turn; None reads it here (_turn_zdr_state).
+        zdr: ZdrState | None = None,
     ) -> AsyncIterator[str]:
         if get_app_settings().tenancy_mode == "org":
             # Org-mode turns must run on the remote worker, never in this
@@ -1413,6 +1443,7 @@ class AntonHarness:
                 interactive=interactive,
                 ui_locale=ui_locale,
                 docs=docs,
+                zdr=zdr,
                 **({"scheduled": True} if schedule_id is not None else {}),
             )
             session, turn_scratch_dir, seed_info = built.session, built.turn_scratch_dir, built.seed_info
@@ -1758,6 +1789,7 @@ class AntonHarness:
         interactive: bool = True,
         ui_locale: str | None = None,
         docs: bool = False,
+        zdr: ZdrState | None = None,
         scheduled: bool = False,
     ) -> BuiltChatSession:
         """Build the same core runtime the Anton CLI uses, scoped to one project
@@ -1782,6 +1814,7 @@ class AntonHarness:
                 ui_locale=ui_locale,
                 live_app_notices=notices,
                 docs=docs,
+                zdr=zdr,
                 scheduled=scheduled,
             )
         except BaseException:
@@ -1813,6 +1846,7 @@ class AntonHarness:
         live_app_notices: list[UUID],
         ui_locale: str | None = None,
         docs: bool,
+        zdr: ZdrState | None = None,
         scheduled: bool = False,
     ) -> BuiltChatSession:
         """_build_chat_session's work. ``live_app_notices`` gets the launch
@@ -1903,7 +1937,10 @@ class AntonHarness:
             anton_settings.skills_extra_roots.append(DOC_SKILLS_ROOT)
 
         user = await run_on_unit_threads(get_user_settings)
-        _overlay_user_settings(anton_settings, user)
+        # The handler's read (made with the caller's bearer) wins; the stored key's is the fallback.
+        if zdr is None:
+            zdr = await _turn_zdr_state(user)
+        _overlay_user_settings(anton_settings, user, zdr=zdr)
 
         RECALL_HISTORY_TOOL = self._recall_history_tool(conversation, user)
         elicitor = build_elicitor(
@@ -2039,7 +2076,7 @@ class AntonHarness:
         # only then. Never for a channel turn.
         turn_browser = await _browser_config(
             user, channel_context=channel_context,
-            conversation_id=str(conversation.id), project_id=conversation.project_id,
+            conversation_id=str(conversation.id), project_id=conversation.project_id, zdr=zdr,
         )
         project_context = (
             # Conversational only. The next line hands the agent the real path,
@@ -2465,7 +2502,8 @@ class AntonHarness:
                 # Hosted web search stays off when COWORK_OPENAI_COMPATIBLE_API
                 # puts planning on the Responses API. The client above uses
                 # this same settings snapshot, even if settings change mid-build.
-                **web_tool_kwargs_for(user.resolved_planning_provider),
+                # Off only when ZDR is known on: a failed read keeps web search.
+                **web_tool_kwargs_for(user.resolved_planning_provider, zdr_on=zdr is ZdrState.ON),
                 # "Conversation started" stamp for the cache-stable prompt prefix
                 # (anton 2a). The live current time is rendered separately in the
                 # volatile tail, so resuming days later still reports the real "now".
@@ -2538,6 +2576,7 @@ class AntonHarness:
 
 async def _browser_config(
     user, *, channel_context: ChannelContext | None, conversation_id: str, project_id,
+    zdr: ZdrState | None = None,
 ) -> "BrowserConfig | None":
     """anton's browser for an in-process turn: the desktop app's own browser,
     with the task's own session, or None.
@@ -2561,6 +2600,12 @@ async def _browser_config(
     from cowork.services.browser import browser_runs, desktop_browser_config, desktop_organization_off
 
     if channel_context is not None or not browser_runs(user):
+        return None
+    from cowork.handlers.jev_route import browser_needs_zdr
+
+    # Under ZDR MindsHub refuses Jev, so a browser whose steps it would pick doesn't run.
+    # *zdr*: the turn's read, when it has one; else read here.
+    if browser_needs_zdr(user) and (zdr is not ZdrState.OFF if zdr is not None else await _turn_zdr_on(user)):
         return None
     from cowork.common.settings.app_settings import TurnQueueSettings
     from cowork.handlers.jev_route import own_decision_target

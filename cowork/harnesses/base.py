@@ -6,6 +6,7 @@ from typing_extensions import TypedDict
 from cowork.models.conversation import Conversation
 
 if TYPE_CHECKING:
+    from cowork.services.mindshub_teams import ZdrState
     from cowork.streaming.liveness import ModelWaitTicker
 
 
@@ -99,6 +100,9 @@ class HarnessProvider(Protocol):
         # harness with doc tools registers them then. Others accept and
         # ignore it.
         docs: bool = False,
+        # The org's ZDR state the handler read for this turn (with the caller's
+        # bearer); None when it read none. Harnesses without ZDR rules ignore it.
+        zdr: "ZdrState | None" = None,
     ) -> AsyncIterator[str]:
         ...
 

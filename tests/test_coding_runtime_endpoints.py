@@ -189,3 +189,29 @@ def test_legacy_computer_id_in_registration_body_never_touches_an_existing_compu
     assert current.name == existing.name
     assert current.registration_epoch == existing.registration_epoch
     assert {existing.id, registered["id"]} <= {item.id for item in control.list_computers().items}
+
+
+@pytest.mark.parametrize(("state", "web_search"), [("on", False), ("off", True), ("unknown", True)])
+async def test_a_remote_run_loses_codex_web_search_only_when_zdr_is_known_on(
+    monkeypatch: pytest.MonkeyPatch, state: str, web_search: bool,
+) -> None:
+    from types import SimpleNamespace
+
+    from cowork.common.settings import user_settings
+    from cowork.db.scoped import LOCAL_SCOPE
+    from cowork.services import mindshub_zdr
+    from cowork.services.mindshub_teams import ZdrState
+    from tests.test_coding_runtime_caches import lease
+
+    async def zdr_state_for(**_kwargs):
+        return ZdrState(state)
+
+    monkeypatch.setattr(mindshub_zdr, "zdr_state_for", zdr_state_for)
+    monkeypatch.setattr(user_settings, "get_user_settings", lambda *_args, **_kwargs: SimpleNamespace())
+    leased = lease()
+    leased.execution.web_search = True
+
+    out = await coding_runtime._without_zdr_web_search(leased, LOCAL_SCOPE)
+
+    assert out.execution.web_search is web_search
+    assert leased.execution.web_search is True

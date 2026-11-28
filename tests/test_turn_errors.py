@@ -347,7 +347,7 @@ def _handler_with_raising_formatter(exc: Exception) -> ResponsesHandler:
 
     async def _stream_response(
         *, conversation, input, model=None, reasoning_effort=None, disabled_connections=None,
-        trace_tags=None, trace_metadata=None, tool_messages=False, model_wait=None, interactive=True, ui_locale=None, schedule_id=None, docs=False,
+        trace_tags=None, trace_metadata=None, tool_messages=False, model_wait=None, interactive=True, ui_locale=None, schedule_id=None, docs=False, zdr=None,
     ):
         if False:
             yield
@@ -2696,6 +2696,9 @@ def test_wire_code_inventory_matches_the_renderer_contract():
         # another model is a way forward. The renderer branch lands in
         # mindsdb/cowork's ChatView.jsx + its turnFailureCards list.
         "model_restricted",
+        # Zero data retention rules the model out. Shares the model card; the
+        # renderer gives it ZDR copy instead of naming an admin.
+        "zdr_restricted",
         # ENG-1585 — a spent organization budget. Split off the credits card
         # because credits cannot lift it; an admin raises it in Budgets. The
         # renderer branch lands in mindsdb/cowork's ChatView.jsx.
@@ -3354,6 +3357,53 @@ def test_remote_model_restricted_error_keeps_its_own_code():
     assert te.remote_turn_error("ModelRestrictedError: ") == (
         te.MODEL_RESTRICTED_CODE, te.MODEL_RESTRICTED_USER_MESSAGE,
     )
+
+
+def _zdr_failure(*, url, carrier="header"):
+    """The gateway's ZDR 403 as an anton without ZdrRestrictedError surfaces it."""
+    exc = _restricted_failure(url=url, carrier=carrier)
+    inner = exc.__cause__
+    if carrier == "header":
+        inner.response.headers["X-MindsHub-Deny-Detail"] = "zdr_restricted"
+    else:
+        inner.body["deny_detail"] = "zdr_restricted"
+    return exc
+
+
+@pytest.mark.parametrize("carrier", ["header", "body"])
+def test_the_zdr_deny_detail_maps_to_zdr_restricted(carrier):
+    code, message = te.friendly_turn_error(_zdr_failure(url=_minds_gateway_url(), carrier=carrier))
+    assert code == te.ZDR_RESTRICTED_CODE
+    assert message == te.ZDR_RESTRICTED_USER_MESSAGE
+
+
+@pytest.mark.parametrize("carrier", ["header", "body"])
+def test_a_third_party_cannot_claim_zdr_ruled_out_the_model(carrier):
+    exc = _zdr_failure(url="https://openrouter.ai/api/v1/chat/completions", carrier=carrier)
+    result = te.friendly_turn_error(exc)
+    assert result is None or result[0] != te.ZDR_RESTRICTED_CODE
+
+
+def test_anton_zdr_error_keeps_its_copy_in_process():
+    copy = "Zero data retention is on for your organization, so the model 'sonnet' isn't available."
+    exc = _FakeModelErr(copy, "zdr_restricted", "sonnet")
+    assert te.model_unavailable_info(exc) == ("zdr_restricted", "sonnet")
+    assert te.friendly_turn_error(exc) == (te.ZDR_RESTRICTED_CODE, copy)
+
+
+def test_remote_zdr_restricted_error_keeps_its_own_code():
+    code, message = te.remote_turn_error("ZdrRestrictedError: no 'sonnet' under ZDR")
+    assert (code, message) == (te.ZDR_RESTRICTED_CODE, "no 'sonnet' under ZDR")
+    assert te.remote_turn_error("ZdrRestrictedError: ") == (
+        te.ZDR_RESTRICTED_CODE, te.ZDR_RESTRICTED_USER_MESSAGE,
+    )
+
+
+def test_zdr_restricted_is_a_model_unavailable_code():
+    # The scheduler's default-model fallback and the switch-model card key on this set.
+    assert te.ZDR_RESTRICTED_CODE in te.MODEL_UNAVAILABLE_CODES
+    lowered = te.ZDR_RESTRICTED_USER_MESSAGE.lower()
+    assert "another model" in lowered and "credit" not in lowered and "admin" not in lowered
 
 
 def test_model_restricted_copy_offers_another_model_not_credits():

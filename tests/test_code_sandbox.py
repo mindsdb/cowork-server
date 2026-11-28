@@ -1637,7 +1637,7 @@ def _run_probe_handler(monkeypatch, *, scope: TenantScope) -> list[dict]:
     monkeypatch.setattr(
         probe_handler, "_read_probe_settings", lambda _session: SimpleNamespace(resolved_planning_provider=None),
     )
-    monkeypatch.setattr("cowork.services.providers.web_tool_kwargs_for", lambda _provider: {})
+    monkeypatch.setattr("cowork.services.providers.web_tool_kwargs_for", lambda _provider, **_: {})
     store = SubmissionStore()
     monkeypatch.setattr(probe_handler, "store", store)
     submission_id = store.stage(

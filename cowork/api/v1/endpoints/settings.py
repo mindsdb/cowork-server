@@ -31,7 +31,7 @@ from cowork.api.v1.permissions import (
     require,
 )
 from cowork.common.paths import cowork_home
-from cowork.db.scoped import ScopedSession, TenantScope, get_tenant_scope, unsafe_unscoped_session
+from cowork.db.scoped import TenantScope, get_tenant_scope
 from cowork.db.session import get_session
 from cowork.db.units import run_db
 from cowork.handlers.jev_route import is_web_address
@@ -47,20 +47,17 @@ from cowork.schemas.settings import (
 )
 from cowork.services.providers import (
     MODEL_VALUE_SETTINGS,
-    MindsModelListing,
     check_config_status,
     fetch_minds_models,
     fetch_org_model_catalog,
     model_value_rejection,
-    persist_enabled_model_map,
-    persist_image_model_map,
-    persist_org_model_availability,
-    persist_role_defaults_map,
     ping_providers,
     resolve_stored_key,
     validate_provider as validate_provider_svc,
     warm_enabled_model_map,
+    zdr_blocked_ids,
 )
+from cowork.services.model_list_refresh import note_saved_model_list_refreshed, persist_catalog_maps
 from cowork.services.org_branding import remove_brand_skill
 from cowork.services.settings import SettingService, unit_setting_service
 
@@ -246,7 +243,9 @@ def _turns_on(updates: dict[str, Any], key: str) -> bool:
     return isinstance(value, str) and value.strip().lower() in ("true", "1", "yes", "on")
 
 
-async def _reject_browser_that_cant_run(scope: TenantScope, updates: dict[str, Any]) -> None:
+async def _reject_browser_that_cant_run(
+    scope: TenantScope, updates: dict[str, Any], request: Request | None = None,
+) -> None:
     """400 on turning the browser on where it can't run: with no decisions
     model to pick its steps (`jev_route.decisions_available`), or on the web
     with an LLM other than MindsHub, whose browser router takes only a
@@ -266,7 +265,24 @@ async def _reject_browser_that_cant_run(scope: TenantScope, updates: dict[str, A
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="The browser needs MindsHub as the model provider.",
         )
+    from cowork.services.mindshub_zdr import ZdrState, browser_zdr_state
+
     if decisions_available(settings):
+        zdr = await browser_zdr_state(scope=scope, settings=settings, org_bearer=caller_bearer(request))
+        if zdr is ZdrState.ON:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=(
+                    "The browser can't use Jev on MindsHub while zero data retention is on. "
+                    "It needs a decision model of the organization's own."
+                ),
+            )
+        if zdr is ZdrState.UNKNOWN:
+            # Unknown still counts as on, without saying ZDR is on.
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="The browser can't be turned on right now. Try again shortly.",
+            )
         return
     if browser.own_decisions_unused(settings):
         # Set up, but this deployment's browser can't ask it, as status
@@ -316,7 +332,7 @@ async def bulk_upsert_settings(
     _reject_malformed_role_defaults(body.values or {})
     _reject_decision_model_url_without_host(updates=body.values or {})
     await _reject_unservable_models(scope, body.values or {}, request)
-    await _reject_browser_that_cant_run(scope, body.values or {})
+    await _reject_browser_that_cant_run(scope, body.values or {}, request)
     try:
         updated = await run_db(
             lambda session: unit_setting_service(session).save_all(body.values), scope=scope
@@ -345,7 +361,7 @@ async def upsert_setting(
     _reject_malformed_role_defaults({key: body.value})
     _reject_decision_model_url_without_host(updates={key: body.value})
     await _reject_unservable_models(scope, {key: body.value}, request)
-    await _reject_browser_that_cant_run(scope, {key: body.value})
+    await _reject_browser_that_cant_run(scope, {key: body.value}, request)
     try:
         return await run_db(
             lambda session: unit_setting_service(session).upsert_setting(key, body.value),
@@ -774,31 +790,6 @@ def _fill_missing(target: dict, extra: dict, *, skip: Optional[set[str]] = None)
         target.setdefault(key, value)
 
 
-def _persist_catalog_maps(
-    session: ScopedSession, *, prior: UserSettings, listing: MindsModelListing, write_availability: bool
-) -> None:
-    """The catalog's writes from ``recommended_models``, as one unit: the
-    availability map when the listing named any model, then the role defaults.
-
-    Org mode splits the availability write. The listing is the caller's own
-    (auth applies the model rules for their org, workspace and team), and the
-    map is an org row every member's resolution reads, so the caller's
-    restricted models are stored for the caller alone. A desktop install has
-    one member and keeps them in the map.
-    """
-    raw = unsafe_unscoped_session(session)
-    scope = session.scope
-    if write_availability:
-        if scope.org_mode:
-            persist_org_model_availability(raw, scope, prior=prior, listing=listing)
-        else:
-            persist_enabled_model_map(
-                raw, scope, prior.minds_model_enabled, listing.enabled, listing.ids
-            )
-            persist_image_model_map(raw, scope, prior.minds_image_model_enabled, listing)
-    persist_role_defaults_map(raw, scope, prior.minds_role_defaults, listing.role_defaults)
-
-
 _REFRESH_SCOPES = ("all", "minds")
 
 
@@ -961,10 +952,12 @@ async def recommended_models(
         # gateway.
         await run_db(
             partial(
-                _persist_catalog_maps, prior=s, listing=listing, write_availability=bool(live)
+                persist_catalog_maps, prior=s, listing=listing, write_availability=bool(live)
             ),
             scope=scope,
         )
+        if live:
+            note_saved_model_list_refreshed(scope)
         # The picker asks the server which model each role starts on, so it has to
         # be told the same answer resolution will give. Left on the compiled table,
         # the two disagree the moment a default moves in config and the user sees
@@ -982,6 +975,7 @@ async def recommended_models(
             pair["minds-cloud"] = minds_role_start_models(
                 declared=declared_roles,
                 enabled_map=live_enabled or s._minds_enabled_map(),
+                blocked=zdr_blocked_ids(listing) if live_enabled else s._minds_zdr_blocked_ids(),
             )
         model_efforts.update(live_efforts)
         model_enabled.update(live_enabled)
@@ -1100,11 +1094,30 @@ async def recommended_models(
     # the caller may edit the organization's own decision model, as for the
     # provider and its keys (`_require_org_admin_for`): an organization admin,
     # or anyone on a local server, where the person is the admin.
+    from cowork.services.mindshub_zdr import zdr_on_for
+
+    mode = gate_mode(gate_settings)
+    # Read once wherever something ZDR turns off could run: Jev gating turns or picking
+    # the browser's steps, or a role on MindsHub (Jev classify, voice calls).
+    on_mindshub = (
+        mode == "jev"
+        or decisions_model(gate_settings) == "mindshub"
+        or Provider.MINDS_CLOUD in (gate_settings.resolved_planning_provider, gate_settings.resolved_coding_provider)
+    )
+    zdr = (
+        await zdr_on_for(scope=scope, settings=gate_settings, org_bearer=caller_bearer(request))
+        if on_mindshub else False
+    )
     routing = {
-        "mode": gate_mode(gate_settings), "routerProvider": gate["provider"],
-        "decisions": decisions_model(gate_settings),
+        "mode": mode, "routerProvider": gate["provider"],
+        # Under ZDR MindsHub refuses Jev, so the browser has no decisions model unless the org set its own.
+        "decisions": decisions_model(gate_settings, zdr_on=zdr),
         "canSetDecisionModel": not scope.org_mode or can_manage_org(principal),
     }
+
+    # Under ZDR Jev, classify and voice are off whatever their switches say, so Settings shows them off and disabled.
+    if on_mindshub:
+        routing["zdr"] = zdr
 
     # No image picker where Anton's images won't go to MindsHub: a pick there does nothing.
     if not gate_settings._images_go_to_mindshub():

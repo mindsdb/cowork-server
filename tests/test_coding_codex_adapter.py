@@ -165,6 +165,8 @@ def test_codex_child_environment_never_contains_the_real_mindshub_key() -> None:
     assert environment == {
         "CODEX_HOME": "/tmp/codex-home",
         "MINDSHUB_CODEX_API_KEY": "session-inference-token",
+        "CODEX_API_KEY": "",
+        "CODEX_ACCESS_TOKEN": "",
     }
     assert "mdb_real-secret" not in environment.values()
 

@@ -190,8 +190,13 @@ def artifact(tmp_path):
     return folder, metadata, artifact_id
 
 
+# The real ZDR check; the autouse fixture stubs it off for every other test.
+_REAL_ZDR_BLOCKS = quick_edit_service.zdr_blocks
+
+
 @pytest.fixture(autouse=True)
-def _clean():
+def _clean(monkeypatch):
+    monkeypatch.setattr(quick_edit_service, "zdr_blocks", awaitable(lambda *_a, **_k: False))
     yield
     preview_checks.reset()
     quick_edit_service.quick_edit_locks.reset()
@@ -415,6 +420,50 @@ def test_no_decisions_model_goes_straight_to_the_chat(client, fake_anton, artifa
     assert (folder / "index.html").read_text(encoding="utf-8") == ORIGINAL
 
 
+def test_zdr_sends_the_message_to_the_chat_without_asking_jev(client, fake_anton, artifact, monkeypatch):
+    """Under ZDR MindsHub refuses Jev, so neither Jev nor the editor runs."""
+    folder, _metadata, artifact_id = artifact
+    asked = []
+
+    async def zdr_blocks(decisions, **kwargs):
+        asked.append(kwargs["org_bearer"])
+        return True
+
+    monkeypatch.setattr(quick_edit_service, "zdr_blocks", zdr_blocks)
+    fake_anton.edit = None
+
+    events = events_of(client.post(
+        f"/api/v1/artifacts/workspace/project/{artifact_id}/quick-edits",
+        json={"message": "Make the title blue"}, headers={"Authorization": "Bearer caller-token"},
+    ).text)
+
+    assert events[0] == ("route", {"route": "agent", "confidence": 1.0, "ms": 0, "reason": "zdr_on"})
+    assert [name for name, _ in events] == ["route", "done"]
+    assert fake_anton.route_calls == [] and fake_anton.edit_calls == []
+    assert asked == ["caller-token"]
+    assert (folder / "index.html").read_text(encoding="utf-8") == ORIGINAL
+
+
+@pytest.mark.parametrize(("decisions", "read", "blocked"), [
+    (Decisions(True, model="jev"), True, True),
+    (Decisions(True, model="jev", base_url="https://api.mindshub.ai/v1", api_key="k"), True, True),
+    (Decisions(True, model="jev", base_url="https://api.mindshub.ai/v1", api_key="k"), False, False),
+    (Decisions(True, model="jev", base_url="https://api.mindshub.ai/v1", api_key="k"), RuntimeError("down"), True),
+    (Decisions(True, model="own", base_url="https://own.example/v1", api_key="k"), True, False),
+    (Decisions(False), True, False),
+])
+async def test_zdr_blocks_only_jev_on_mindshub(monkeypatch, decisions, read, blocked):
+    from cowork.services import mindshub_zdr
+
+    async def zdr_on_for(**kwargs):
+        if isinstance(read, Exception):
+            raise read
+        return read
+
+    monkeypatch.setattr(mindshub_zdr, "zdr_on_for", zdr_on_for)
+    assert await _REAL_ZDR_BLOCKS(decisions, scope=LOCAL_SCOPE, user=None) is blocked
+
+
 def test_an_organization_that_turned_jev_off_has_no_decisions():
     from cowork.common.settings.user_settings import Provider, UserSettings
 
@@ -585,11 +634,11 @@ async def test_the_capability_follows_the_agent_permissions_and_support(monkeypa
     monkeypatch.setattr(workspace_ep, "has_product_permission", allowed)
     caps = {"canEdit": True, "canAddressWithAgent": True, "canResolveComments": True}
     monkeypatch.setattr(workspace_ep, "quick_edit_available", lambda: True)
-    monkeypatch.setattr(workspace_ep, "direct_edit_available", awaitable(lambda scope: True))
+    monkeypatch.setattr(workspace_ep, "direct_edit_available", awaitable(lambda scope, **_: True))
     current = await workspace_ep._current_capabilities(LOCAL_SCOPE, caps)
     assert (current["canQuickEdit"], current["quickEditDirect"]) == (True, True)
     # No decisions model: the bar still shows, as a shortcut into the chat.
-    monkeypatch.setattr(workspace_ep, "direct_edit_available", awaitable(lambda scope: False))
+    monkeypatch.setattr(workspace_ep, "direct_edit_available", awaitable(lambda scope, **_: False))
     current = await workspace_ep._current_capabilities(LOCAL_SCOPE, caps)
     assert (current["canQuickEdit"], current["quickEditDirect"]) == (True, False)
     monkeypatch.setattr(workspace_ep, "quick_edit_available", lambda: False)
@@ -597,6 +646,44 @@ async def test_the_capability_follows_the_agent_permissions_and_support(monkeypa
     monkeypatch.setattr(workspace_ep, "quick_edit_available", lambda: True)
     reviewer = {"canEdit": False, "canAddressWithAgent": False, "canResolveComments": False}
     assert (await workspace_ep._current_capabilities(LOCAL_SCOPE, reviewer))["canQuickEdit"] is False
+
+
+@pytest.mark.parametrize(("blocked", "direct"), [(False, True), (True, False)])
+async def test_under_zdr_the_bar_does_not_offer_direct_edits(monkeypatch, blocked, direct):
+    """Under ZDR MindsHub refuses Jev, so the bar sends messages straight to the chat."""
+    monkeypatch.setattr(quick_edit_service, "anton_quick_edit", lambda: FakeAnton().api())
+    monkeypatch.setattr(
+        quick_edit_service, "decisions_for_scope",
+        awaitable(lambda anton, scope: ("the-user", Decisions(available=True, model="jev"))),
+    )
+    asked = []
+
+    async def zdr_blocks(decisions, **kwargs):
+        asked.append((kwargs["user"], kwargs["org_bearer"]))
+        return blocked
+
+    monkeypatch.setattr(quick_edit_service, "zdr_blocks", zdr_blocks)
+    assert await quick_edit_service.direct_edit_available(LOCAL_SCOPE, org_bearer="caller-token") is direct
+    assert asked == [("the-user", "caller-token")]
+
+
+async def test_the_capability_reads_zdr_as_the_caller(monkeypatch):
+    async def allowed(scope, permission):
+        return True
+
+    monkeypatch.setattr(workspace_ep, "has_product_permission", allowed)
+    monkeypatch.setattr(workspace_ep, "quick_edit_available", lambda: True)
+    asked = []
+
+    async def direct(scope, *, org_bearer=""):
+        asked.append(org_bearer)
+        return False
+
+    monkeypatch.setattr(workspace_ep, "direct_edit_available", direct)
+    caps = {"canEdit": True, "canAddressWithAgent": True, "canResolveComments": True}
+    current = await workspace_ep._current_capabilities(LOCAL_SCOPE, caps, org_bearer="caller-token")
+    assert current["quickEditDirect"] is False
+    assert asked == ["caller-token"]
 
 
 async def test_permissions_are_checked_in_the_agent_repair_order(monkeypatch):

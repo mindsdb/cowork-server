@@ -14,6 +14,8 @@ from uuid import uuid4
 import pytest
 
 from cowork.common.settings.app_settings import get_app_settings
+from cowork.services import mindshub_teams
+from cowork.services.mindshub_zdr import PUSH_ZDR_ANSWER_MAX_AGE_S, ZdrState
 from cowork.services.push import dispatch, hooks
 from cowork.services.push.payloads import PushKind
 from cowork.streaming import watchers
@@ -23,6 +25,16 @@ from cowork.streaming.registry import RunHandle, RunRegistry, TurnLifecycle
 ORG = "11111111-1111-1111-1111-111111111111"
 OWNER = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
 OTHER = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
+
+
+def _seen_zdr(state: ZdrState | None, *, age_s: float = 0.0) -> None:
+    """Record the org's last ZDR answer as read ``age_s`` ago; None forgets it."""
+    import time
+
+    if state is None:
+        mindshub_teams._org_zdr_seen.pop(ORG, None)
+    else:
+        mindshub_teams._org_zdr_seen[ORG] = (state, time.monotonic() - age_s)
 
 
 @pytest.fixture
@@ -37,8 +49,12 @@ def pushes(monkeypatch):
         sent.append((org_id, user_id, payload))
 
     monkeypatch.setattr(hooks, "notify_user", record)
+    # The org's ZDR last read as off; zdr_on() below changes it.
+    mindshub_teams.reset_caches_for_tests()
+    _seen_zdr(ZdrState.OFF)
     watchers.reset()
     yield sent
+    mindshub_teams.reset_caches_for_tests()
     watchers.reset()
     dispatch.set_senders(None)
     get_app_settings.cache_clear()
@@ -255,6 +271,137 @@ async def test_a_scheduled_run_pushes_its_owner(pushes):
     assert (payload.kind, payload.title, payload.body, payload.path) == (
         PushKind.SCHEDULED_RUN_FINISHED, "Daily report", "Scheduled run didn't finish.", "/c/c1",
     )
+
+
+# ── zero data retention: no user content ──────────────────────────────
+
+_ZDR_CASES = [
+    pytest.param(lambda: _seen_zdr(ZdrState.ON), id="on"),
+    pytest.param(lambda: _seen_zdr(None), id="never-read"),
+    pytest.param(lambda: _seen_zdr(ZdrState.OFF, age_s=PUSH_ZDR_ANSWER_MAX_AGE_S + 1), id="read-too-long-ago"),
+]
+
+
+async def test_a_finished_task_names_its_conversation_with_zdr_off(tmp_path, pushes, monkeypatch):
+    monkeypatch.setattr(hooks, "_conversation_title", lambda session, conversation_id: "Plan the offsite")
+    hooks.turn_ended(await _handle(tmp_path, "completed"))
+    await _drained()
+    ((_, _, payload),) = pushes
+    assert payload.title == "Plan the offsite"
+
+
+@pytest.mark.parametrize("zdr", _ZDR_CASES)
+async def test_under_zdr_a_finished_task_leaves_its_title_out(tmp_path, pushes, monkeypatch, zdr):
+    zdr()
+    monkeypatch.setattr(hooks, "_conversation_title", lambda session, conversation_id: "Plan the offsite")
+    hooks.turn_ended(await _handle(tmp_path, "completed"))
+    await _drained()
+    ((_, _, payload),) = pushes
+    assert (payload.title, payload.body) == ("Your task", "Finished.")
+
+
+@pytest.mark.parametrize("zdr", _ZDR_CASES)
+async def test_under_zdr_a_scheduled_run_leaves_its_name_out(pushes, zdr):
+    zdr()
+    hooks.scheduled_run_ended(
+        org_id=ORG, user_id=OWNER, schedule_name="Daily report", conversation_id="c1", succeeded=True,
+    )
+    await _drained()
+    ((_, _, payload),) = pushes
+    assert (payload.title, payload.body, payload.path) == ("Scheduled task", "Scheduled run finished.", "/c/c1")
+
+
+@pytest.mark.parametrize("zdr", _ZDR_CASES)
+async def test_under_zdr_a_share_leaves_the_artifact_title_out(pushes, zdr):
+    zdr()
+    hooks.artifact_shared(
+        org_id=ORG, sharer_id=OWNER, sharer_name="owner@example.com",
+        recipient_ids=[OTHER], artifact_title="Q3 layoffs", url="https://view.example/r/1",
+    )
+    await _drained()
+    ((_, _, payload),) = pushes
+    assert payload.title == "owner@example.com shared an artifact with you"
+    assert "Q3" not in str(payload.apns_body()) + str(payload.fcm_message("device"))
+
+
+# The state a push read for itself wins over the process's last answer, which is only a fallback.
+
+async def test_a_turn_longer_than_the_fallback_window_keeps_its_title_with_zdr_off(tmp_path, pushes, monkeypatch):
+    _seen_zdr(ZdrState.OFF, age_s=PUSH_ZDR_ANSWER_MAX_AGE_S + 1)
+    monkeypatch.setattr(hooks, "_conversation_title", lambda session, conversation_id: "Plan the offsite")
+    hooks.turn_ended(await _handle(tmp_path, "completed", zdr=ZdrState.OFF))
+    await _drained()
+    ((_, _, payload),) = pushes
+    assert payload.title == "Plan the offsite"
+
+
+@pytest.mark.parametrize("state", [ZdrState.ON, ZdrState.UNKNOWN])
+async def test_a_turn_that_read_zdr_on_is_generic_whatever_was_read_since(tmp_path, pushes, monkeypatch, state):
+    _seen_zdr(ZdrState.OFF)
+    monkeypatch.setattr(hooks, "_conversation_title", lambda session, conversation_id: "Plan the offsite")
+    hooks.turn_ended(await _handle(tmp_path, "completed", zdr=state))
+    await _drained()
+    ((_, _, payload),) = pushes
+    assert (payload.title, payload.body) == ("Your task", "Finished.")
+
+
+async def test_a_share_that_read_zdr_off_keeps_its_title_with_no_earlier_read(pushes):
+    _seen_zdr(None)
+    hooks.artifact_shared(
+        org_id=ORG, sharer_id=OWNER, sharer_name="owner@example.com",
+        recipient_ids=[OTHER], artifact_title="Q3", url="https://view.example/r/1", zdr=ZdrState.OFF,
+    )
+    await _drained()
+    ((_, _, payload),) = pushes
+    assert payload.title == "owner@example.com shared “Q3” with you"
+
+
+@pytest.mark.parametrize("state", [ZdrState.ON, ZdrState.UNKNOWN])
+async def test_a_share_that_read_zdr_on_is_generic(pushes, state):
+    hooks.artifact_shared(
+        org_id=ORG, sharer_id=OWNER, sharer_name="owner@example.com",
+        recipient_ids=[OTHER], artifact_title="Q3 layoffs", url="https://view.example/r/1", zdr=state,
+    )
+    await _drained()
+    ((_, _, payload),) = pushes
+    assert payload.title == "owner@example.com shared an artifact with you"
+
+
+async def test_a_scheduled_run_that_read_zdr_off_keeps_its_name_with_no_earlier_read(pushes):
+    _seen_zdr(None)
+    hooks.scheduled_run_ended(
+        org_id=ORG, user_id=OWNER, schedule_name="Daily report", conversation_id="c1", succeeded=True,
+        zdr=ZdrState.OFF,
+    )
+    await _drained()
+    ((_, _, payload),) = pushes
+    assert payload.title == "Daily report"
+
+
+def test_a_turn_keeps_the_first_zdr_state_it_read():
+    lifecycle = TurnLifecycle()
+    lifecycle.note_zdr(ZdrState.OFF)
+    lifecycle.note_zdr(ZdrState.ON)
+    assert lifecycle.zdr is ZdrState.OFF
+
+
+async def test_a_permissions_read_records_the_orgs_zdr_for_pushes(monkeypatch):
+    from cowork.services.mindshub_client import MindsHubAnswer, MindsHubReply
+
+    browser = {"permitted": True, "enabled": True, "daily_bytes": 1, "disabled_reason": None}
+    payload = {"permissions": [], "browser": browser, "zdr_mode": "off"}
+
+    async def reply(path, bearer):
+        return MindsHubReply(MindsHubAnswer.OK, payload=payload)
+
+    monkeypatch.setattr(mindshub_teams, "get_mindshub_reply", reply)
+    mindshub_teams.reset_caches_for_tests()
+    try:
+        assert hooks.push_zdr_on(ORG) is True
+        await mindshub_teams.fetch_mindshub_permissions(bearer_token="jwt", org_id=ORG, user_id=OWNER)
+        assert hooks.push_zdr_on(ORG) is False
+    finally:
+        mindshub_teams.reset_caches_for_tests()
 
 
 # ── watchers across replicas (Redis stream backend) ───────────────────

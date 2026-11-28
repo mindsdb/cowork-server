@@ -1924,7 +1924,10 @@ def test_review_command_uses_codex_native_review_lifecycle(tmp_path: Path) -> No
     assert engine.prompts == ["First turn"]
 
 
-def test_task_controls_persist_and_restart_idle_runtime(tmp_path: Path) -> None:
+def test_task_controls_persist_and_restart_idle_runtime(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from cowork.coding import runtime as runtime_module
+
+    monkeypatch.setattr(runtime_module, "_zdr_known_on", lambda _credentials: False)
     repo = repository(tmp_path)
     engine = FakeEngine()
     service = service_with(tmp_path, engine)
@@ -1962,6 +1965,40 @@ def test_task_controls_persist_and_restart_idle_runtime(tmp_path: Path) -> None:
     assert config.network_access is True
     assert config.web_search is True
 
+
+
+@pytest.mark.parametrize(("state", "web_search"), [("on", False), ("off", True), ("unknown", True)])
+def test_zdr_turns_off_codex_web_search_only_when_known_on(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, state: str, web_search: bool,
+) -> None:
+    # Codex runs on MindsHub, which drops web search under ZDR; a failed read keeps it.
+    from cowork.services import mindshub_zdr
+    from cowork.services.mindshub_teams import ZdrState
+
+    asked: list[str] = []
+
+    async def zdr_state_quietly(*, bearer_token, org_id, user_id):
+        asked.append(bearer_token)
+        return ZdrState(state)
+
+    monkeypatch.setattr(mindshub_zdr, "zdr_state_quietly", zdr_state_quietly)
+    repo = repository(tmp_path)
+    engine = FakeEngine()
+    service = service_with(tmp_path, engine)
+    created = service.create_session(
+        SessionCreateRequest(path=str(repo), prompt="First turn"), CREDS, "fake", "fake-model"
+    )
+    wait_for_status(service, created.id, SessionStatus.completed)
+    assert engine.configs[-1].web_search is False
+    assert asked == []
+
+    service.update_session_config(created.id, SessionUpdateRequest(web_search=True))
+    engine.is_closed = False
+    service.submit_turn(created.id, "Second turn", CREDS)
+    wait_for_status(service, created.id, SessionStatus.completed)
+
+    assert engine.configs[-1].web_search is web_search
+    assert asked == [CREDS.minds_api_key]
 
 
 def test_task_controls_clear_the_effort_only_on_an_explicit_null(tmp_path: Path) -> None:

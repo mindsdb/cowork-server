@@ -12,6 +12,7 @@ from cowork.deployment_identity import identity_for_turn
 from cowork.handlers import first_take, response_routing, responses
 from cowork.schemas.responses import ResponsesRequest
 from cowork.server import create_app
+from cowork.services.mindshub_teams import ZdrState
 from _self_hosted import enable_self_hosted
 
 
@@ -34,6 +35,11 @@ def isolated_identity(monkeypatch):
 
 
 def _initialize(monkeypatch, tmp_path, *, branded: bool, name: str = PRODUCT):
+    # A non-ZDR org: self-hosted gates on Jev via MindsHub, where unknown ZDR skips the gate and take.
+    async def zdr_off(**kwargs):
+        return ZdrState.OFF
+
+    monkeypatch.setattr(responses.mindshub_zdr, "zdr_state", zdr_off)
     if branded:
         pack = tmp_path / "pack.json"
         pack.write_text(json.dumps({"name": name}), encoding="utf-8")

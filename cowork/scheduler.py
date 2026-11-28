@@ -852,6 +852,7 @@ async def _execute_schedule(
     trial = trigger == RunTrigger.trial
     from cowork.handlers.responses import ResponsesHandler
     from cowork.schemas.responses import ResponsesRequest
+    from cowork.services.model_list_refresh import refresh_saved_model_list_if_stale
     from cowork.services.product_permissions import (
         ProductPermissionUnavailable,
         report_permission_unavailable,
@@ -921,6 +922,8 @@ async def _execute_schedule(
         scheduled = await run_db(partial(_read_schedule, schedule_id=schedule_id), scope=SYSTEM_SCOPE)
 
         await require_product_permission(scope_from_principal(scheduled.principal), "product.execute")
+        # Nobody picked this run's model: resolve it against a fresh model list (zero data retention, rules).
+        await refresh_saved_model_list_if_stale(scope_from_principal(scheduled.principal))
 
         conversation_id = await run_db(
             partial(_link_conversation, run_id=run_id, scheduled=scheduled, conversation_id=conversation_id),
@@ -1241,9 +1244,16 @@ def _push_run_ending(
         scheduled_run_ended(
             org_id=principal.org_id, user_id=principal.user_id, schedule_name=scheduled.title,
             conversation_id=str(conversation_id) if conversation_id else None, succeeded=succeeded,
+            zdr=_turn_zdr(conversation_id),
         )
     except Exception:
         logger.warning("Could not push a scheduled run's ending", exc_info=True, extra={"event": "push_schedule_failed"})
+
+
+def _turn_zdr(conversation_id: UUID | None):
+    """The ZDR state the run's turn read at its start (TurnLifecycle.zdr); None without one."""
+    handle = registry.get(str(conversation_id)) if conversation_id else None
+    return getattr(getattr(handle, "lifecycle", None), "zdr", None)
 
 
 def _push_reaped_run(push: ReapedRunPush) -> None:

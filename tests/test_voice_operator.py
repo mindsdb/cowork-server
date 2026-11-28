@@ -16,6 +16,25 @@ from cowork.server import create_app
 BEARER = "Bearer user-jwt"
 
 
+@pytest.fixture(autouse=True)
+def zdr(monkeypatch):
+    """ZDR off unless a test sets ``state.on``; ``state.asked`` holds each bearer it was read with."""
+    from types import SimpleNamespace
+
+    from cowork.api.v1.endpoints import voice as voice_ep
+
+    state = SimpleNamespace(on=False, asked=[])
+
+    async def _zdr_state(*, bearer_token, org_id, user_id):
+        state.asked.append(bearer_token)
+        if isinstance(state.on, Exception):
+            raise state.on
+        return voice_ep.ZdrState.ON if state.on else voice_ep.ZdrState.OFF
+
+    monkeypatch.setattr(voice_ep, "zdr_state", _zdr_state)
+    return state
+
+
 @pytest.fixture
 def inference(monkeypatch):
     seen: list[httpx.Request] = []
@@ -361,6 +380,14 @@ def test_what_anton_waits_on_is_screen_data():
     )
     screen = operator.system_prompt(snapshot, None).split("<screen>\n", 1)[1]
     assert "Check the policy box" in screen and screen.count("</screen>") == 1
+
+
+async def test_under_zdr_the_operator_refuses_before_mindshub_hears_anything(inference, zdr):
+    zdr.on = True
+    response = await _operate({"messages": [{"role": "user", "content": "open my last task"}]})
+    assert response.status_code == 403
+    assert response.json()["detail"]["code"] == "zdr_restricted"
+    assert inference.seen == []
 
 
 # ── widgets and inline pieces in the chat (ENG-4684) ─────────────────────

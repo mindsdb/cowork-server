@@ -16,6 +16,7 @@ from cowork.db.scoped import TenantScope, get_tenant_scope, tenant_scope_require
 from cowork.db.units import run_db
 from cowork.handlers.datasource_relay import relay_cloud_submission
 from cowork.handlers.probe import ProbeHandler
+from cowork.principal import caller_bearer
 from cowork.schemas.connectors import ConnectorField, ConnectorTestAnswer, InvalidConnectorIdError, SubmitFormRequest
 from cowork.services.connectors.catalog import ConnectorCatalog
 from cowork.services.connectors.datasource_capabilities import load_datasource_capabilities
@@ -141,7 +142,7 @@ async def submit_form_route(req: SubmitFormRequest, request: Request, scope: Ten
         connector_id = _connector_id(req)
         if _relayed_in_org_mode(connector_id):
             return await relay_cloud_submission(req, connector_id, req.resolve_method(), scope, request)
-    return await submit_form(req, scope)
+    return await submit_form(req, scope, mindshub_bearer=caller_bearer(request))
 
 
 @router.post(
@@ -259,7 +260,7 @@ async def submission_replaces_route(req: SubmitFormRequest, scope: TenantScopeDe
     return {"replaces": replaces}
 
 
-async def submit_form(req: SubmitFormRequest, scope: TenantScope) -> StreamingResponse:
+async def submit_form(req: SubmitFormRequest, scope: TenantScope, *, mindshub_bearer: str = "") -> StreamingResponse:
     """Stage a submission and stream its probe; never used for a cloud datasource in org mode."""
     connector_id = _connector_id(req)
 
@@ -371,7 +372,7 @@ async def submit_form(req: SubmitFormRequest, scope: TenantScope) -> StreamingRe
         checked_against_stored_spec=stamped,
     )
 
-    handler = ProbeHandler(scope=scope)
+    handler = ProbeHandler(scope=scope, mindshub_bearer=mindshub_bearer)
     return StreamingResponse(
         handler.run(submission_id, connector_id, method, req.name, req.conversation_id),
         media_type="text/event-stream",

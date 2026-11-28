@@ -11,6 +11,11 @@
 
 Every hook returns at once and does its work on a detached task
 (dispatch.spawn), so a push never slows or fails the turn, run or share.
+
+Under zero data retention, or when it can't be told (mindshub_zdr.push_zdr_on),
+a push carries no user content: no conversation title, schedule name or
+artifact title, only the generic wording. Each caller passes the ZDR state it
+read (a turn's is recorded at its start, TurnLifecycle.zdr).
 """
 from __future__ import annotations
 
@@ -21,6 +26,8 @@ from functools import partial
 from typing import TYPE_CHECKING
 from uuid import UUID
 
+from cowork.services.mindshub_teams import ZdrState
+from cowork.services.mindshub_zdr import push_zdr_on
 from cowork.services.push import payloads
 from cowork.services.push.dispatch import notify_user, push_enabled, spawn
 
@@ -93,7 +100,7 @@ async def _task_finished(handle: RunHandle) -> None:
         if await is_watched(handle.conversation_id, handle.turn_id):
             return
         org_id, user_id = handle.org_id or "", handle.user_id or ""
-        title = await run_db(
+        title = None if push_zdr_on(org_id, lifecycle.zdr) else await run_db(
             partial(_conversation_title, conversation_id=handle.conversation_id),
             scope=scope_for_identity(org_id=org_id, user_id=user_id),
         )
@@ -106,25 +113,29 @@ async def _task_finished(handle: RunHandle) -> None:
 
 def scheduled_run_ended(
     *, org_id: str | None, user_id: str | None, schedule_name: str | None,
-    conversation_id: str | None, succeeded: bool,
+    conversation_id: str | None, succeeded: bool, zdr: ZdrState | None = None,
 ) -> None:
-    """Push a scheduled run's ending to the schedule's owner."""
+    """Push a scheduled run's ending to the schedule's owner. *zdr*: the run's ZDR state, if read."""
     if not org_id or not user_id or not push_enabled():
         return
     spawn(notify_user(org_id, user_id, payloads.scheduled_run_finished(
-        conversation_id=conversation_id, schedule_name=schedule_name, succeeded=succeeded,
+        conversation_id=conversation_id, schedule_name=None if push_zdr_on(org_id, zdr) else schedule_name,
+        succeeded=succeeded,
     )))
 
 
 def artifact_shared(
     *, org_id: str | None, sharer_id: str | None, sharer_name: str | None,
     recipient_ids: Iterable[str], artifact_title: str | None, url: str | None, artifact_ref: str | None = None,
+    zdr: ZdrState | None = None,
 ) -> None:
     """Push a share to each person the sharer asked to notify, never to the
-    sharer themself."""
+    sharer themself. *zdr*: the sharer's org ZDR state, read for this share."""
     recipients = [user_id for user_id in dict.fromkeys(recipient_ids) if user_id and user_id != sharer_id]
     if not org_id or not recipients or not push_enabled():
         return
+    if push_zdr_on(org_id, zdr):
+        artifact_title = None
     payload = payloads.artifact_shared(sharer=sharer_name, artifact_title=artifact_title, url=url, artifact_ref=artifact_ref)
     for user_id in recipients:
         spawn(notify_user(org_id, user_id, payload))

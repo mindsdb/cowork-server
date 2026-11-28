@@ -23,7 +23,7 @@ import logging
 import time
 from collections.abc import Awaitable, Callable, Coroutine
 from dataclasses import dataclass, field
-from typing import Any, Optional
+from typing import TYPE_CHECKING, Any, Optional
 from weakref import WeakValueDictionary
 from uuid import UUID, uuid4
 
@@ -33,6 +33,9 @@ from cowork.streaming import turn_claim
 from cowork.streaming.buffer import RedisStreamBuffer, StreamBuffer
 from cowork.streaming.turn_claim import TurnClaim, TurnClaimUnavailable
 from cowork.turnqueue.redis_client import DISCARDED_CANCEL_REASON, SYNC_CALL_BUDGET_S, redis_deadline
+
+if TYPE_CHECKING:
+    from cowork.services.mindshub_teams import ZdrState
 
 logger = logging.getLogger(__name__)
 
@@ -176,6 +179,9 @@ class TurnLifecycle:
     ``interactive`` is False for a turn no person started in the app (a
     scheduled run). Such a turn gets no "task finished" push from the
     registry; the scheduler sends its own.
+
+    ``zdr`` is the org's ZDR state read at the turn's start, so its push needn't ask
+    again when it ends; None when the turn couldn't read it.
     """
 
     discarded: bool = False
@@ -190,6 +196,12 @@ class TurnLifecycle:
     cancel_requested: bool = False
     interactive: bool = True
     identity: RunIdentity = field(default_factory=RunIdentity)
+    zdr: ZdrState | None = None
+
+    def note_zdr(self, state: ZdrState) -> None:
+        """Record the ZDR state the turn read, unless one is recorded already."""
+        if self.zdr is None:
+            self.zdr = state
 
     def note_discarded_elsewhere(self) -> None:
         """Mark the turn discarded by a delete another replica served: a

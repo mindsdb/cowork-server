@@ -48,6 +48,7 @@ from cowork.common.settings.user_settings import get_user_settings
 from cowork.db.scoped import TenantScope, get_tenant_scope
 from cowork.db.units import run_on_unit_threads
 from cowork.handlers.jev_route import decisions_model
+from cowork.services import mindshub_zdr
 from cowork.principal import Principal, can_manage_org, get_principal, mindshub_credential
 from cowork.services import browser as browser_service
 from cowork.services.browser_contract import SESSION_ID
@@ -106,10 +107,13 @@ def _raise(exc: browser_service.BrowserServiceError) -> NoReturn:
     dependencies=[Depends(require(AuthenticatedInOrgMode))],
 )
 async def browse_status(request: Request, scope: ScopeDep, principal: PrincipalDep) -> browser_service.BrowseStatus:
+    user = await run_on_unit_threads(partial(get_user_settings, scope))
+    bearer = mindshub_credential(request)
     try:
         return await browser_service.browse_status(
-            await run_on_unit_threads(partial(get_user_settings, scope)), bearer=mindshub_credential(request),
+            user, bearer=bearer,
             org_id=scope.org_id or "", user_id=scope.user_id or "",
+            zdr_on=await mindshub_zdr.browser_zdr_on(scope=scope, settings=user, org_bearer=bearer),
             # Who may set the decision model, as the settings routes decide
             # who may write an organization setting.
             can_set_decisions_model=not scope.org_mode or can_manage_org(principal),
@@ -133,9 +137,11 @@ async def browse_provision(
     except browser_service.BrowserServiceError as exc:
         _raise(exc)
     # The router started it for the caller, so it is theirs to use.
+    zdr_on = await mindshub_zdr.browser_zdr_on(scope=scope, settings=user, org_bearer=mindshub_credential(request))
     return browser_service.BrowseStatus(
-        enabled=browser_service.browser_runs(user), available=True, status=warmed.status,
-        decisions_model=decisions_model(user), own_decisions_unused=browser_service.own_decisions_unused(user),
+        enabled=browser_service.browser_runs(user, zdr_on=zdr_on), available=True, status=warmed.status,
+        decisions_model=decisions_model(user, zdr_on=zdr_on),
+        own_decisions_unused=browser_service.own_decisions_unused(user),
     )
 
 

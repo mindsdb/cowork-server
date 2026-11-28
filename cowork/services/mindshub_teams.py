@@ -36,7 +36,9 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from collections.abc import Callable
+from enum import StrEnum
 from typing import Any, NamedTuple, TypeVar
 
 from pydantic import BaseModel, Field, ValidationError
@@ -92,6 +94,18 @@ class MindsHubTeamListing(BaseModel):
         return next((team.id for team in self.teams if team.is_default), "")
 
 
+# entitlements/me's ``zdr_mode`` when ZDR is off; auth builds without the field mean off.
+ZDR_OFF = "off"
+
+
+class ZdrState(StrEnum):
+    """Whether ZDR is on, off, or couldn't be read (which callers treat as on)."""
+
+    OFF = "off"
+    ON = "on"
+    UNKNOWN = "unknown"
+
+
 class MindsHubPermissions(BaseModel):
     """The caller's resolved permissions in the active organization.
 
@@ -107,6 +121,8 @@ class MindsHubPermissions(BaseModel):
     #: MindsHub refused the credential itself (401): the caller signs in again,
     #: which says nothing about their browser access.
     signed_out: bool = False
+    #: The organization's ZDR mode (``off``, ``standard``, ``strict``); None when unknown.
+    zdr_mode: str | None = None
     #: The organization the answer is for, from the browser block: the active
     #: organization for a Keycloak token, the key's own organization for an API
     #: key. None when the answer carried none.
@@ -116,6 +132,18 @@ class MindsHubPermissions(BaseModel):
         """Auth's own answer when it couldn't read membership: no permissions
         and no browser block. Kept only as long as a failure."""
         return self.reachable and self.browser is None and not self.permissions
+
+    @property
+    def zdr_state(self) -> ZdrState:
+        """The ZDR mode as read; no mode, or auth's outage answer, is unknown."""
+        if self.zdr_mode is None or self.is_outage_answer():
+            return ZdrState.UNKNOWN
+        return ZdrState.OFF if self.zdr_mode == ZDR_OFF else ZdrState.ON
+
+    @property
+    def zdr_on(self) -> bool:
+        """Whether ZDR is on; an unknown mode, or auth's outage answer, counts as on."""
+        return self.zdr_state is not ZdrState.OFF
 
 
 def _refused_permissions(status_code: int | None) -> MindsHubPermissions:
@@ -138,6 +166,17 @@ _teams_cache: CallerTtlCache[MindsHubTeamListing] = CallerTtlCache(keep_s=_MAX_T
 _permissions_cache: CallerTtlCache[MindsHubPermissions] = CallerTtlCache(keep_s=_MAX_THROTTLED_AGE_S)
 
 _Read = TypeVar("_Read", MindsHubTeamListing, MindsHubPermissions)
+
+# Each organization's last known ZDR answer and when it was read, for a push that has no credential to ask with.
+_org_zdr_seen: dict[str, tuple[ZdrState, float]] = {}
+
+
+def recent_org_zdr_state(org_id: str, *, max_age_s: float) -> ZdrState:
+    """The org's last ON/OFF answer read in this process within ``max_age_s``, else UNKNOWN."""
+    seen = _org_zdr_seen.get(org_id) if org_id else None
+    if seen is None or time.monotonic() - seen[1] > max_age_s:
+        return ZdrState.UNKNOWN
+    return seen[0]
 
 
 def _parse_teams(payload: Any) -> MindsHubTeamListing:
@@ -167,12 +206,14 @@ def _parse_permissions(payload: Any) -> MindsHubPermissions:
         browser = BrowserEntitlement.model_validate(payload.get(BROWSER_ENTITLEMENT_KEY))
     except ValidationError:
         browser = None
+    zdr_mode = payload.get("zdr_mode", ZDR_OFF)
     block = payload.get(BROWSER_ENTITLEMENT_KEY)
     organization_id = block.get("organization_id") if isinstance(block, dict) else None
     return MindsHubPermissions(
         permissions=frozenset(str(p) for p in payload["permissions"] if isinstance(p, str)),
         reachable=True,
         browser=browser,
+        zdr_mode=zdr_mode if isinstance(zdr_mode, str) else None,
         organization_id=organization_id if isinstance(organization_id, str) and organization_id else None,
     )
 
@@ -291,11 +332,14 @@ async def fetch_mindshub_permissions(*, bearer_token: str, org_id: str, user_id:
     """The caller's ``permissions[]`` from their entitlements."""
     if not bearer_token:
         return MindsHubPermissions()
-    return await _cached_read(
+    permissions = await _cached_read(
         _permissions_cache, path=ENTITLEMENTS_PATH, bearer_token=bearer_token, org_id=org_id,
         user_id=user_id, parse=_parse_permissions, unknown=MindsHubPermissions,
         none_granted=_refused_permissions, failed=MindsHubPermissions.is_outage_answer,
     )
+    if org_id and permissions.zdr_state is not ZdrState.UNKNOWN:
+        _org_zdr_seen[org_id] = (permissions.zdr_state, time.monotonic())
+    return permissions
 
 
 async def fetch_teams_and_permissions(
@@ -327,3 +371,4 @@ async def org_team_ids(*, bearer_token: str) -> frozenset[str] | None:
 def reset_caches_for_tests() -> None:
     _teams_cache.clear()
     _permissions_cache.clear()
+    _org_zdr_seen.clear()

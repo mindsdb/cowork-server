@@ -31,6 +31,10 @@ ADDON_ID = "a" * 32
 
 @pytest.fixture(autouse=True)
 def _remote_backend(monkeypatch):
+    async def _zdr_off(scope, org_bearer):
+        return False
+
+    monkeypatch.setattr(addon_route, "_zdr_on", _zdr_off)
     monkeypatch.setenv("COWORK_TURN_BACKEND", "remote")
     monkeypatch.setenv("COWORK_TURN_ADDON_ROUTING_ENABLED", "true")
     yield

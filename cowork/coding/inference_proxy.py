@@ -44,6 +44,9 @@ TERMINAL_RATE_LIMIT_CODES = frozenset(
 # 403, but the credential is fine: read as the status's generic code it would
 # tell the user to sign in again.
 KEPT_UPSTREAM_CODES = {402: frozenset({"budget_exceeded"}), 403: frozenset({"model_not_in_tier"})}
+# A 403 whose deny detail says zero data retention rules the model out: the
+# credential is fine, so it must not read as a sign-in failure.
+ZDR_RESTRICTED_DETAIL = "zdr_restricted"
 RATE_LIMIT_RETRIES = 3
 RATE_LIMIT_DEFAULT_WAIT_SECONDS = 2.0
 # Codex holds the request open while the proxy waits, so the total wait stays
@@ -122,6 +125,19 @@ def upstream_error_code(body: bytes) -> str:
     error = payload.get("error") if isinstance(payload, dict) else None
     code = error.get("code") if isinstance(error, dict) else None
     return code if isinstance(code, str) else ""
+
+
+def upstream_deny_detail(body: bytes, header: str | None = None) -> str:
+    """The gateway's ``deny_detail`` for a refusal, from the header or ``error.deny_detail``."""
+    if isinstance(header, str) and header:
+        return header.strip().lower()
+    try:
+        payload = json.loads(body[:MAX_REJECTION_BODY_BYTES])
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return ""
+    error = payload.get("error") if isinstance(payload, dict) else None
+    detail = error.get("deny_detail") if isinstance(error, dict) else None
+    return detail.strip().lower() if isinstance(detail, str) else ""
 
 
 def upstream_budget_scope(body: bytes, header: str | None = None) -> str:
@@ -255,6 +271,10 @@ async def proxy_inference(request: Request, path: str, credentials: EngineCreden
             (c for c in (upstream_error_code(raw), upstream.headers.get("x-mindshub-reason", "")) if c in kept),
             None,
         )
+        if upstream.status_code == 403 and code is None:
+            detail = upstream_deny_detail(raw, upstream.headers.get("x-mindshub-deny-detail"))
+            if detail == ZDR_RESTRICTED_DETAIL:
+                code = ZDR_RESTRICTED_DETAIL
         return _terminal_response(upstream, raw, code)
     return _UpstreamStreamingResponse(upstream)
 

@@ -16,6 +16,7 @@ from pydantic import SecretStr
 
 from cowork.common.settings.user_settings import Provider, UserSettings
 from cowork.harnesses.anton_harness import harness
+from cowork.services.mindshub_teams import ZdrState
 
 # A local address, so a request that escapes the stubs below is refused at
 # once rather than sent anywhere.
@@ -54,12 +55,19 @@ def _settings(provider: Provider) -> UserSettings:
 
 
 async def _session_config(
-    monkeypatch, settings: UserSettings, *, changed_settings: UserSettings | None = None
+    monkeypatch, settings: UserSettings, *, changed_settings: UserSettings | None = None,
+    zdr: ZdrState = ZdrState.OFF, handler_zdr: ZdrState | None = None,
 ):
-    """One turn's ChatSessionConfig, built by the real harness."""
+    """One turn's ChatSessionConfig, built by the real harness. *zdr*: the stored key's
+    read; *handler_zdr*: the handler's read passed to the harness."""
     from cowork.db.scoped import LOCAL_SCOPE, ScopedSession
     from cowork.db.session import get_open_session
     from cowork.services.conversations import ConversationService
+
+    async def _turn_zdr_state(_user):
+        return zdr
+
+    monkeypatch.setattr(harness, "_turn_zdr_state", _turn_zdr_state)
 
     monkeypatch.setattr(
         "cowork.common.settings.user_settings.get_user_settings", lambda: settings
@@ -85,7 +93,7 @@ async def _session_config(
         conversation = ConversationService(
             ScopedSession(db, LOCAL_SCOPE)
         ).create_conversation(topic="web tools")
-        config = (await harness.AntonHarness()._build_chat_session(conversation)).session
+        config = (await harness.AntonHarness()._build_chat_session(conversation, zdr=handler_zdr)).session
     return config
 
 
@@ -166,6 +174,56 @@ async def test_web_tools_keep_their_defaults_off_the_switched_path(
     assert (config.web_search_enabled, config.web_fetch_enabled) == (True, True)
 
 
+@pytest.mark.asyncio
+async def test_zdr_turns_off_mindshubs_web_tools(monkeypatch, openai_compatible_api, anton_responses_ready):
+    # Under ZDR MindsHub drops native web tools, so the session doesn't offer them.
+    openai_compatible_api(None)
+    anton_responses_ready()
+
+    config = await _session_config(monkeypatch, _settings(Provider.MINDS_CLOUD), zdr=ZdrState.ON)
+    await config.llm_client.aclose()
+
+    assert (config.web_search_enabled, config.web_fetch_enabled) == (False, False)
+
+
+@pytest.mark.asyncio
+async def test_an_unreadable_zdr_keeps_mindshubs_web_tools(monkeypatch, openai_compatible_api, anton_responses_ready):
+    # Only a known ZDR turns them off; a failed read doesn't cost a non-ZDR user web search.
+    openai_compatible_api(None)
+    anton_responses_ready()
+
+    config = await _session_config(monkeypatch, _settings(Provider.MINDS_CLOUD), zdr=ZdrState.UNKNOWN)
+    await config.llm_client.aclose()
+
+    assert (config.web_search_enabled, config.web_fetch_enabled) == (True, True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("handler_zdr", [ZdrState.OFF, ZdrState.ON])
+async def test_the_handlers_zdr_read_wins_over_the_stored_keys(
+    monkeypatch, openai_compatible_api, anton_responses_ready, handler_zdr,
+):
+    # The stored key can't read the org (UNKNOWN); the handler's bearer read is what the turn uses.
+    openai_compatible_api(None)
+    anton_responses_ready()
+    overlaid: list[ZdrState] = []
+    overlay = harness._overlay_user_settings
+
+    def _overlay(anton_settings, user, *, zdr=ZdrState.OFF):
+        overlaid.append(zdr)
+        return overlay(anton_settings, user, zdr=zdr)
+
+    monkeypatch.setattr(harness, "_overlay_user_settings", _overlay)
+    config = await _session_config(
+        monkeypatch, _settings(Provider.MINDS_CLOUD), zdr=ZdrState.UNKNOWN, handler_zdr=handler_zdr,
+    )
+    await config.llm_client.aclose()
+
+    assert overlaid == [handler_zdr]
+    on = handler_zdr is ZdrState.ON
+    assert (config.web_search_enabled, config.web_fetch_enabled) == (not on, not on)
+
+
 async def _probe_session_config(
     monkeypatch, settings: UserSettings, *, changed_settings: UserSettings | None = None
 ):
@@ -210,6 +268,36 @@ async def _probe_session_config(
     (config,) = configs
     await config.llm_client.aclose()
     return config
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("known_on", [True, False])
+async def test_a_probe_under_zdr_drops_the_scratchpads_web_search(
+    monkeypatch, openai_compatible_api, anton_responses_ready, known_on
+):
+    import anton.core.settings as anton_settings
+
+    from cowork.handlers import probe as handler_module
+
+    class CoreSettings:
+        # Stands in for an anton that has the switch.
+        scratchpad_web_search = "on"
+
+    async def zdr_known_on(_self, _settings):
+        return known_on
+
+    monkeypatch.setattr(anton_settings, "CoreSettings", CoreSettings)
+    monkeypatch.setattr(handler_module.ProbeHandler, "_zdr_known_on", zdr_known_on)
+    openai_compatible_api(None)
+    anton_responses_ready()
+
+    config = await _probe_session_config(monkeypatch, _settings(Provider.MINDS_CLOUD))
+
+    assert (config.web_search_enabled, config.web_fetch_enabled) == (not known_on,) * 2
+    if known_on:
+        assert config.settings.scratchpad_web_search == "off"
+    else:
+        assert config.settings is None
 
 
 @pytest.mark.asyncio

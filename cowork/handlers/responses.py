@@ -178,6 +178,8 @@ from cowork.services import product_permissions
 from cowork.services.product_permissions import (
     ProductPermissionDenied, ProductPermissionUnavailable, require_product_permission,
 )
+from cowork.services import mindshub_zdr
+from cowork.services.mindshub_teams import ZdrState
 from cowork.services.memory import apply_turn_memory, build_turn_memory
 from cowork.services.projects import ProjectNotFoundError, ProjectService, is_comparison_sandbox
 from cowork.services.queued_repairs import QueuedRepairs
@@ -809,14 +811,14 @@ def _failed_frame_for(exc: Exception, *, request_id: str | None = None) -> str:
     return response_failed_sse(GENERIC_TURN_ERROR_MESSAGE, GENERIC_TURN_ERROR_CODE, request_id=request_id)
 
 
-def _allowed_web_tools(provider_kind: Provider) -> frozenset[str]:
+def _allowed_web_tools(provider_kind: Provider, *, zdr_on: bool = False) -> frozenset[str]:
     """The native web tools a direct answer may use: the same switches the
     agent's turns honor (`web_tool_switches`: the server's ANTON_WEB_* env,
-    and openai_compatible on the Responses flavor, where hosted search would
-    bypass the egress gateway)."""
+    openai_compatible on the Responses flavor, where hosted search would
+    bypass the egress gateway, and MindsHub under ZDR, which drops them)."""
     from cowork.services.providers import web_tool_switches
 
-    switches = web_tool_switches(provider_kind)
+    switches = web_tool_switches(provider_kind, zdr_on=zdr_on)
     if switches.get("internet_research_enabled") is False:
         return frozenset()
     return frozenset(
@@ -971,6 +973,8 @@ class ResponsesHandler:
         self.first_take: FirstTake | None = None
         # The gate's scrubbed history, set by _route_request for a direct answer.
         self.routing_history: list[dict] | None = None
+        # The org's ZDR state read once the turn is routed, recorded on its lifecycle for the push.
+        self.turn_zdr: ZdrState | None = None
 
     def _get_harness(self):
         if self.harness is None:
@@ -1123,6 +1127,7 @@ class ResponsesHandler:
                     has_doc=_turn_needs_doc_agent(request, remote_docs=remote_docs),
                     doc_open=_turn_has_doc(request, remote_docs=remote_docs),
                 )
+                self.turn_zdr = await self._zdr_state_quietly(turn_llm)
             except BaseException:
                 # A refused or cancelled request must not leave the take's model call running.
                 if getattr(self, "first_take", None) is not None:
@@ -1184,6 +1189,8 @@ class ResponsesHandler:
                 answer_binding = self._answer_binding(
                     model=request.model, reasoning_effort=request.reasoning_effort, turn_llm=turn_llm,
                     web=not has_files,
+                    # Under ZDR MindsHub drops native web tools; only a known answer turns them off.
+                    zdr_on=not has_files and await self._direct_answer_zdr() is ZdrState.ON,
                 )
                 answer_history = self.routing_history or _routing_history(
                     start.gate_rows or [], start.harness_input,
@@ -1249,6 +1256,7 @@ class ResponsesHandler:
                         remote=TurnQueueSettings().is_remote,
                     ),
                     interactive=self.interactive,
+                    zdr=self.turn_zdr,
                 )
 
                 def delegated(buffer: StreamBuffer, metadata: dict[str, str]):
@@ -1361,6 +1369,7 @@ class ResponsesHandler:
                     ui_locale=self.ui_locale,
                     schedule_id=self.schedule_id,
                     docs=_client_shows_docs(request),
+                    zdr=self.turn_zdr,
                 )
                 return await self._collect(stream, start.conversation_id, request.model, original_content)
 
@@ -1713,7 +1722,7 @@ class ResponsesHandler:
                         return binding if binding is not None else _settings_binding()
 
                     correlation_id = (turn_llm or {}).get("correlation_id")
-                    if first_take:
+                    if first_take and await self._first_take_allowed(turn_llm):
                         self.first_take = _start_first_take(
                             binding,
                             binding_factory=binding_for_turn,
@@ -1736,12 +1745,18 @@ class ResponsesHandler:
                         },
                     ))
                     gate_started = time.monotonic()
-                    jev = self._jev_gate(turn_llm)
+                    jev, jev_may_fall_back = await self._turn_gate(turn_llm)
                     if jev == "off":
                         # The organization opted out of Jev: no fast path on
                         # MindsHub, and no LLM gate in its place, so every
                         # turn runs the agent.
                         decision = RouteDecision(route=DELEGATED_AGENTIC, reason="jev_disabled")
+                    elif jev == "zdr_on" or (
+                        # A doc-open turn skips Jev for the LLM gate, whose MindsHub model ZDR refuses.
+                        doc_open and callable(jev) and jev_may_fall_back is not None and not await jev_may_fall_back()
+                    ):
+                        # ZDR: MindsHub refuses Jev and the LLM gate's model, so the agent decides.
+                        decision = RouteDecision(route=DELEGATED_AGENTIC, reason="zdr_on")
                     else:
                         decision = await decide_route(
                             history=history,
@@ -1754,6 +1769,7 @@ class ResponsesHandler:
                             binding_factory=binding_for_turn,
                             # Jev cannot be told a doc is open; the LLM gate is.
                             jev=None if doc_open else jev,
+                            jev_may_fall_back=jev_may_fall_back,
                             ui_locale=self.ui_locale,
                         )
                     gate_ms = round((time.monotonic() - gate_started) * 1000)
@@ -1811,7 +1827,86 @@ class ResponsesHandler:
             self.first_take = None
         await _drop_gate_key(turn_llm)
 
-    def _jev_gate(self, turn_llm: dict | None):
+    async def _turn_gate(self, turn_llm: dict | None):
+        """`_jev_gate` with the organization's ZDR applied, plus whether a failed
+        decision may fall back to the LLM gate (None: it may). Jev under ZDR is
+        "zdr_on"; the org's own model keeps deciding, but not the MindsHub LLM gate."""
+        settings = await run_on_unit_threads(partial(get_user_settings, self.scope))
+        jev = self._jev_gate(turn_llm, settings)
+        if not callable(jev):
+            return jev, None
+        mode = jev_route.gate_mode(settings)
+        if mode == "jev":
+            return ("zdr_on" if await self.zdr_on(turn_llm, settings) else jev), None
+        if mode == "own" and settings.resolved_router_provider is Provider.MINDS_CLOUD:
+
+            async def may_fall_back() -> bool:
+                return not await self.zdr_on(turn_llm, settings)
+
+            return jev, may_fall_back
+        return jev, None
+
+    async def _first_take_allowed(self, turn_llm: dict | None) -> bool:
+        """The take runs on the gate's model, so under ZDR it is skipped when that model is on MindsHub."""
+        settings = await run_on_unit_threads(partial(get_user_settings, self.scope))
+        if settings.resolved_router_provider is not Provider.MINDS_CLOUD:
+            return True
+        return not await self.zdr_on(turn_llm, settings)
+
+    async def _zdr_state_quietly(self, turn_llm: dict | None) -> ZdrState | None:
+        """``zdr_state`` for a path that must not fail the turn: None when it can't be asked
+        without a settings read, which the producer then makes from the turn's snapshot."""
+        try:
+            has_credential = (
+                (self.scope.org_mode and getattr(self, "mindshub_bearer", None))
+                or ((turn_llm or {}).get("llm") or {}).get("api_key")
+            )
+            if not has_credential:
+                return None
+            return await self.zdr_state(turn_llm)
+        except PoolTimeoutError:
+            raise
+        except Exception:
+            logger.warning("Could not read ZDR for the turn", exc_info=True)
+            return None
+
+    async def _direct_answer_zdr(self) -> ZdrState | None:
+        """ZDR for a direct answer's web tools: the turn's read, else, on the desktop, one on the
+        stored MindsHub key when the answer runs there. None when it can't be read."""
+        if self.turn_zdr is not None:
+            return self.turn_zdr
+        settings = await run_on_unit_threads(partial(get_user_settings, self.scope))
+        if settings.resolved_planning_provider is not Provider.MINDS_CLOUD:
+            return None
+        try:
+            self.turn_zdr = await self.zdr_state(None, settings)
+        except PoolTimeoutError:
+            raise
+        except Exception:
+            logger.warning("Could not read ZDR for the direct answer", exc_info=True)
+        return self.turn_zdr
+
+    async def zdr_on(self, turn_llm: dict | None = None, settings: UserSettings | None = None) -> bool:
+        """Whether ZDR is on for this turn's organization (unknown counts as on)."""
+        return await self.zdr_state(turn_llm, settings) is not ZdrState.OFF
+
+    async def zdr_state(self, turn_llm: dict | None = None, settings: UserSettings | None = None) -> ZdrState:
+        """ZDR for this turn's organization.
+        Asks as the caller on the web, else on the MindsHub key the turn uses."""
+        if self.scope.org_mode and self.mindshub_bearer:
+            bearer = self.mindshub_bearer
+        else:
+            # A remote turn's minted key, else the stored key (on the desktop, the held credential).
+            bearer = ((turn_llm or {}).get("llm") or {}).get("api_key")
+            if not bearer:
+                if settings is None:
+                    settings = await run_on_unit_threads(partial(get_user_settings, self.scope))
+                bearer = provider_api_key_str(settings, Provider.MINDS_CLOUD)
+        return await mindshub_zdr.zdr_state(
+            bearer_token=bearer or "", org_id=self.scope.org_id or "", user_id=self.scope.user_id or "",
+        )
+
+    def _jev_gate(self, turn_llm: dict | None, settings: UserSettings | None = None):
         """How this turn is gated: a decision callable, "off" when the turn
         answers on MindsHub and the organization opted out of Jev there, or
         None for the LLM gate. A decision MindsHub refuses falls back to the
@@ -1823,7 +1918,7 @@ class ResponsesHandler:
         on MindsHub, on the turn's minted key when the gate minted one, else
         on the stored MindsHub key. Turns on other providers, or on MindsHub
         with no key to ask Jev with, keep the LLM gate."""
-        settings = get_user_settings(self.scope)
+        settings = settings or get_user_settings(self.scope)
         queue_settings = TurnQueueSettings()
         mode = jev_route.gate_mode(settings)
         if mode == "llm":
@@ -1857,7 +1952,7 @@ class ResponsesHandler:
 
     def _answer_binding(
         self, *, model: str | None, reasoning_effort: str | None = None, turn_llm: dict | None,
-        web: bool = True,
+        web: bool = True, zdr_on: bool = False,
     ) -> RouterBinding | None:
         """The model that writes a direct answer the gate routed: the
         composer's pick, else the planning model, on the planning provider,
@@ -1888,7 +1983,7 @@ class ResponsesHandler:
             return None
         return RouterBinding(
             provider=provider, model=answer_model, label=provider_kind.value,
-            reasoning_effort=reasoning_effort, web_tools=_allowed_web_tools(provider_kind) if web else frozenset(),
+            reasoning_effort=reasoning_effort, web_tools=_allowed_web_tools(provider_kind, zdr_on=zdr_on) if web else frozenset(),
         )
 
     async def _router_binding(self) -> tuple[RouterBinding | None, dict | None]:
@@ -1902,7 +1997,7 @@ class ResponsesHandler:
                 or provider_api_key(settings, Provider.MINDS_CLOUD) is not None):
             return None, None
         from anton.core.llm.openai import OpenAIProvider
-        from cowork.turnqueue.producer import mint_turn_llm
+        from cowork.turnqueue.producer import mint_turn_llm, turn_coding_model
 
         corr = str(uuid4())
         gate = await mint_turn_llm(
@@ -1911,6 +2006,7 @@ class ResponsesHandler:
             correlation_id=corr,
             settings=TurnQueueSettings(),
             workspace_id=getattr(settings, "hub_workspace_id", "") or None,
+            coding_model=turn_coding_model(settings),
         )
         provider = OpenAIProvider(
             api_key=gate.block["api_key"],
@@ -2003,7 +2099,9 @@ class ResponsesHandler:
             )
 
         # turn_id comes from handle(): same numbering as the delegated path.
-        lifecycle = TurnLifecycle(identity=RunIdentity(correlation_id=corr), interactive=self.interactive)
+        lifecycle = TurnLifecycle(
+            identity=RunIdentity(correlation_id=corr), interactive=self.interactive, zdr=self.turn_zdr,
+        )
         handle = await registry.start(
             conversation_id=str(conversation_id),
             turn_id=turn_id,
@@ -3493,6 +3591,9 @@ class ResponsesHandler:
                 conversation_id=str(conv_id),
                 org_id=self.scope.org_id,
                 user_id=self.scope.user_id,
+                # Read at the turn's start; None reads it there, recording it for the push.
+                zdr=lifecycle.zdr if lifecycle.zdr is not None else await self._zdr_state_quietly(turn_llm),
+                note_zdr=lifecycle.note_zdr,
                 input_text=pod_input,
                 model=model,
                 reasoning_effort=reasoning_effort,
@@ -4066,6 +4167,8 @@ class ResponsesHandler:
                 ui_locale=self.ui_locale,
                 schedule_id=self.schedule_id,
                 docs=docs,
+                # Read at the turn's start with the caller's bearer, as the remote producer gets it.
+                zdr=lifecycle.zdr if lifecycle is not None else None,
             )
             event_count = 0
             completed_frame: str | None = None
