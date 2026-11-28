@@ -71,7 +71,7 @@ async def _remote_turn(monkeypatch, *, flag: bool, may_manage: bool, **body) -> 
         project_path = Path(service.get_conversation(conversation_id).project.path)
     try:
         transport = httpx.ASGITransport(app=create_app())
-        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
             answered = await asyncio.wait_for(client.post("/api/v1/responses/", json={
                 "input": "Tighten the intro", "stream": True, "conversation": str(conversation_id), **body,
             }), timeout=10)

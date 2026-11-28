@@ -500,7 +500,7 @@ async def _request_repair(*, folder: Path, conversation, revision: str | None = 
     assert artifact_id == ARTIFACT_ID
     current = current_source(folder, metadata, artifact_id)["revision"]["id"]
     transport = httpx.ASGITransport(app=create_app(), raise_app_exceptions=False)
-    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+    async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
         return await client.post(f"{WORKSPACE}/agent-repairs", json={
             "expectedRevisionId": revision or current, "commentThreadId": "t1",
             "thread": [{"text": "fix it"}], "conversationId": str(conversation),

@@ -424,7 +424,7 @@ def test_a_run_place_is_given_back_when_its_run_ends():
 def _client() -> httpx.AsyncClient:
     from cowork.server import create_app
 
-    return httpx.AsyncClient(transport=httpx.ASGITransport(app=create_app()), base_url="http://test")
+    return httpx.AsyncClient(transport=httpx.ASGITransport(app=create_app()), base_url="http://testserver")
 
 
 async def _run_now(schedule_id: UUID) -> httpx.Response:

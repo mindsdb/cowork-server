@@ -35,7 +35,7 @@ def inference(monkeypatch):
 
 async def _operate(body: dict) -> httpx.Response:
     transport = httpx.ASGITransport(app=create_app())
-    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+    async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
         return await client.post("/api/v1/voice/operate", headers={"X-MindsHub-Authorization": BEARER}, json=body)
 
 

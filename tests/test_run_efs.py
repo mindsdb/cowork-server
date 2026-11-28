@@ -127,7 +127,7 @@ def org_app(monkeypatch):
     monkeypatch.setenv("COWORK_IDENTITY_ENFORCE", "enforce")
     get_app_settings.cache_clear()
     transport = httpx.ASGITransport(app=create_app(), raise_app_exceptions=False)
-    yield httpx.AsyncClient(transport=transport, base_url="http://test")
+    yield httpx.AsyncClient(transport=transport, base_url="http://testserver")
     get_app_settings.cache_clear()
 
 

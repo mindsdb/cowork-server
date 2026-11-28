@@ -393,7 +393,7 @@ async def test_liveness_answers_at_once_while_a_hostile_export_converts(
     ticks = [0]
     latencies: list[float] = []
     transport = httpx.ASGITransport(app=create_app(), raise_app_exceptions=False)
-    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+    async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
         assert (await client.get(LIVE)).status_code == 200
         beat = asyncio.create_task(_heartbeat(ticks))
         # The loop's own tick rate on this machine, with nothing else running.

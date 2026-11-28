@@ -28,7 +28,7 @@ async def test_ready_answers_with_the_pool_held_full_and_settings_unreachable(
     held = one_connection_pool.connect()
     try:
         transport = httpx.ASGITransport(app=create_app())
-        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
             loop = asyncio.get_running_loop()
             started = loop.time()
             response = await client.get("/api/v1/health/ready")
@@ -72,7 +72,7 @@ async def test_ready_answers_within_budget_while_every_file_store_call_is_slow(m
     monkeypatch.setattr(io, "open", slow_open)
 
     transport = httpx.ASGITransport(app=app)
-    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+    async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
         loop = asyncio.get_running_loop()
         started = loop.time()
         response = await client.get("/api/v1/health/ready")

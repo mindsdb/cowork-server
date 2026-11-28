@@ -381,7 +381,7 @@ def test_live_answers_even_when_the_threadpool_is_saturated():
             await asyncio.sleep(0.1)  # let both actually acquire a limiter token
 
             transport = httpx.ASGITransport(app=app)
-            async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
                 start = time.monotonic()
                 res = await client.get("/api/v1/health/live")
                 elapsed = time.monotonic() - start

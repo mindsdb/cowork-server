@@ -3,11 +3,10 @@
 from __future__ import annotations
 
 import ipaddress
-from urllib.parse import urlparse
 
 from fastapi import HTTPException, Request, status
 
-_TRUSTED_LOOPBACK_HOSTS = frozenset({"localhost"})
+from cowork.common import trusted_hosts
 
 
 def _is_loopback_ip(value: str | None) -> bool:
@@ -29,16 +28,11 @@ def _is_loopback_ip(value: str | None) -> bool:
 def _is_loopback_address(value: str | None) -> bool:
     """Whether an address literal, or a host name trusted as local, is loopback."""
     name = (value or "").strip().strip("[]").casefold()
-    return name in _TRUSTED_LOOPBACK_HOSTS or _is_loopback_ip(name)
+    return name in trusted_hosts.TRUSTED_HOSTS or _is_loopback_ip(name)
 
 
 def _trusted_loopback_host(value: str) -> bool:
-    try:
-        hostname = urlparse(f"//{value}").hostname
-    except ValueError:
-        # An unbalanced IPv6 literal such as "[::1" names no host.
-        return False
-    return _is_loopback_address(hostname)
+    return _is_loopback_address(trusted_hosts.hostname(value))
 
 
 def require_local(request: Request) -> None:

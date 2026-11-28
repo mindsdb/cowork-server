@@ -35,7 +35,7 @@ def service(monkeypatch):
 async def _post(path: str, body: dict) -> httpx.Response:
     app = create_app()
     app.dependency_overrides[get_tenant_scope] = lambda: SCOPE
-    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://testserver") as client:
         return await client.post(f"/api/v1/browse{path}", headers={"X-MindsHub-Authorization": BEARER}, json=body)
 
 

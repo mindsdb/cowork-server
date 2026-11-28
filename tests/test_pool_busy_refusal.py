@@ -64,7 +64,7 @@ async def _ask_while_others_are_served(*, project_id: str | None = None) -> _Mea
             ticks += 1
 
     transport = httpx.ASGITransport(app=create_app(), raise_app_exceptions=False)
-    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+    async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
 
         async def probe_liveness():
             nonlocal live_answers
@@ -131,7 +131,7 @@ async def test_a_connection_that_frees_within_pool_timeout_is_used(one_connectio
     asyncio.get_running_loop().call_later(WAIT / 2, held_elsewhere.close)
     try:
         async with httpx.AsyncClient(
-            transport=httpx.ASGITransport(app=create_app()), base_url="http://test",
+            transport=httpx.ASGITransport(app=create_app()), base_url="http://testserver",
         ) as client:
             response = await asyncio.wait_for(
                 client.post("/api/v1/responses/", json={"input": "hi", "stream": True}),
@@ -211,7 +211,7 @@ async def test_a_direct_answer_whose_save_finds_no_connection_is_refused_as_busy
     monkeypatch.setattr(ConversationService, "save_assistant_turn", no_connection)
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=create_app(), raise_app_exceptions=False),
-        base_url="http://test",
+        base_url="http://testserver",
     ) as client:
         response = await client.post("/api/v1/responses/", json={"input": "hi", "stream": False})
 

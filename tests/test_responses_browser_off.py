@@ -51,7 +51,7 @@ async def _ask(monkeypatch, harness: _SeesBrowser, **body) -> httpx.Response:
     monkeypatch.setattr(responses_mod, "decide_route", decide)
     monkeypatch.setattr(responses_mod, "get_harness", lambda name: harness)
     transport = httpx.ASGITransport(app=create_app())
-    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+    async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
         return await asyncio.wait_for(
             client.post(
                 "/api/v1/responses/",

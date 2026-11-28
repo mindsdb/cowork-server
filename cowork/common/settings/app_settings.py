@@ -1143,6 +1143,46 @@ class AppSettings(Settings):
             ]
         return self
 
+    # NoDecode: a bare name or a comma-separated list is the natural thing to
+    # type here, and failing JSON decoding would stop the server from booting.
+    allowed_hosts: Annotated[list[str], NoDecode] = Field(
+        default=[],
+        validation_alias=AliasChoices("COWORK_ALLOWED_HOSTS"),
+        description=(
+            "Extra Host names accepted whenever token auth is off in local "
+            "tenancy (JSON array or comma-separated). localhost, IP addresses and "
+            "the COWORK_PUBLIC_BASE_URL host are always accepted; any other name, "
+            "e.g. a domain, a tunnel or a Docker service name, must be listed here."
+        ),
+    )
+
+    @field_validator("allowed_hosts", mode="before")
+    @classmethod
+    def _split_allowed_hosts(cls, v: object) -> object:
+        if not isinstance(v, str):
+            return v
+        # An IPv6 literal such as [::1] also starts with [ like a JSON array
+        # does, so only a value that actually parses as one is treated as one.
+        if v.strip().startswith("["):
+            try:
+                parsed = json.loads(v)
+            except ValueError:
+                parsed = None
+            if isinstance(parsed, list):
+                return parsed
+        return [name.strip() for name in v.split(",") if name.strip()]
+
+    @field_validator("allowed_hosts")
+    @classmethod
+    def _validate_allowed_hosts(cls, v: list[str]) -> list[str]:
+        for entry in v:
+            if "/" in entry or "*" in entry:
+                raise ValueError(
+                    f"COWORK_ALLOWED_HOSTS entry {entry!r} must be a bare host name, e.g. "
+                    "cowork.example.com or tunnel.example:8443 — no scheme, path or wildcard."
+                )
+        return v
+
     # Which connector methods this deployment may run as a cloud datasource:
     # `{"manifest_version": 1, "enabled": ["postgres:host-port"]}`. A string,
     # not a dict: pydantic-settings parses a dict field from the environment

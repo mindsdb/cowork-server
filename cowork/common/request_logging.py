@@ -20,6 +20,9 @@ _REFUSAL_REASONS = frozenset(
         "expected_organization_missing",
         "expected_organization_invalid",
         "organization_mismatch",
+        # RebindingHostMiddleware (cowork/host_middleware.py): a Host an
+        # operator hasn't listed in COWORK_ALLOWED_HOSTS.
+        "untrusted_host",
         # A desktop-launched server's refusals of a caller that holds the
         # bearer token but not the app's own secrets (cowork.api.v1.permissions.
         # WindowProof and connections.require_app_secret).

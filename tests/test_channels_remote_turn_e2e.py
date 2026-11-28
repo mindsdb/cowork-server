@@ -154,7 +154,7 @@ def test_slack_message_gets_a_reply_via_the_remote_worker(monkeypatch, org_mode_
     try:
         async def flow():
             transport = httpx.ASGITransport(app=app)
-            async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
                 assert await adapters.get_or_refresh("slack", ORG_A) is not None
                 body = _slack_event_body("T-ORG-A-REMOTE", "Ev-remote-1")
                 r = await client.post(
@@ -246,7 +246,7 @@ def test_a_remote_turn_failure_delivers_an_error_message_not_silence(monkeypatch
     try:
         async def flow():
             transport = httpx.ASGITransport(app=app)
-            async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
                 assert await adapters.get_or_refresh("slack", ORG_A) is not None
                 body = _slack_event_body("T-ORG-A-REMOTE-FAIL", "Ev-remote-fail-1")
                 r = await client.post(
@@ -386,7 +386,7 @@ def test_a_remote_allowance_stop_posts_the_allowance_message_not_out_of_credits(
     try:
         async def flow():
             transport = httpx.ASGITransport(app=app)
-            async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
                 assert await adapters.get_or_refresh("slack", ORG_A) is not None
                 body = _slack_event_body("T-ORG-A-BILLING", "Ev-remote-billing-1")
                 r = await client.post(
@@ -490,7 +490,7 @@ def test_a_turn_sends_only_its_own_artifacts_from_the_shared_project_base(monkey
     try:
         async def flow():
             transport = httpx.ASGITransport(app=app)
-            async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
                 assert await adapters.get_or_refresh("slack", ORG_A) is not None
                 body = _slack_event_body("T-ORG-A-ARTIFACTS", "Ev-remote-artifacts-1")
                 r = await client.post(

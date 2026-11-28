@@ -334,7 +334,7 @@ async def test_request_boundary_correlates_concurrent_refusals_and_stream_failur
     )
     ids = [f"00000000-0000-0000-0000-{i:012d}" for i in range(4)]
     async with httpx.AsyncClient(
-        transport=httpx.ASGITransport(app=app), base_url="http://test"
+        transport=httpx.ASGITransport(app=app), base_url="http://testserver"
     ) as client:
         responses = await asyncio.gather(
             *(

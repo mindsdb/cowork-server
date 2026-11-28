@@ -118,7 +118,7 @@ def held_pool(one_connection_pool):
 @pytest.fixture
 async def client():
     transport = httpx.ASGITransport(app=create_app(), raise_app_exceptions=False)
-    async with httpx.AsyncClient(transport=transport, base_url="http://test") as c:
+    async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as c:
         yield c
 
 

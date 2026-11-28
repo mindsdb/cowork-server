@@ -432,7 +432,7 @@ async def test_run_now_is_refused_when_the_organization_is_at_its_limit(schedule
     schedule_id = schedules()
     monkeypatch.setattr(scheduler, "org_runs_full", lambda _session, _schedule: True)
 
-    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=create_app()), base_url="http://test") as client:
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=create_app()), base_url="http://testserver") as client:
         answer = await client.post(f"/api/v1/schedules/{schedule_id}/run-now")
 
     assert answer.status_code == 409
@@ -451,7 +451,7 @@ async def test_run_now_taking_the_organizations_last_place_is_counted_in_its_cla
     schedule_id = schedules(org_id="org-a")
     monkeypatch.setattr(scheduler, "org_runs_full", lambda _session, _schedule: False)
 
-    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=create_app()), base_url="http://test") as client:
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=create_app()), base_url="http://testserver") as client:
         answer = await client.post(f"/api/v1/schedules/{schedule_id}/run-now")
 
     assert answer.status_code == 409

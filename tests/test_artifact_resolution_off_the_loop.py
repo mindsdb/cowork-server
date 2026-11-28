@@ -184,7 +184,7 @@ async def test_every_artifact_route_leaves_the_loop_and_liveness_free_while_its_
     loop = asyncio.get_running_loop()
     ticks = [0]
     transport = httpx.ASGITransport(app=_marked(create_app()), raise_app_exceptions=False)
-    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+    async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
         beat = asyncio.create_task(_heartbeat(ticks))
         started = loop.time()
         routes = [asyncio.create_task(client.request(m, p, json=b)) for m, p, b in ROUTES]
@@ -258,7 +258,7 @@ async def test_a_draft_leaves_the_loop_and_liveness_free_while_its_file_is_slow(
     api = httpx.ASGITransport(app=create_app(), raise_app_exceptions=False)
     drafts = httpx.ASGITransport(app=owners_draft.app, raise_app_exceptions=False)
     async with (
-        httpx.AsyncClient(transport=api, base_url="http://test") as client,
+        httpx.AsyncClient(transport=api, base_url="http://testserver") as client,
         httpx.AsyncClient(transport=drafts, base_url=owners_draft.base_url) as draft_client,
     ):
         beat = asyncio.create_task(_heartbeat(ticks))
@@ -405,7 +405,7 @@ async def test_a_stuck_file_store_refuses_artifact_reviews_and_nothing_else(stuc
     slots = db_session.settings.storage.efs_slots
     extra = 4
     transport = httpx.ASGITransport(app=_marked(create_app()), raise_app_exceptions=False)
-    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+    async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
         reviews: list[asyncio.Task[httpx.Response]] = []
         refused: list[tuple[httpx.Response, float]] = []
         try:
@@ -457,7 +457,7 @@ async def test_a_lookup_waiting_on_the_file_store_holds_no_pooled_connection(stu
     state, released = stuck_lookup
     engine = db_session.get_engine(db_session.settings.database.uri)
     transport = httpx.ASGITransport(app=_marked(create_app()), raise_app_exceptions=False)
-    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+    async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
         review = asyncio.create_task(client.get(REVIEW))
         try:
             for _ in range(100):
@@ -531,7 +531,7 @@ async def test_a_second_member_gets_a_slot_while_the_first_holds_their_share(
     loop = asyncio.get_running_loop()
     held = db_session.settings.storage.efs_share
     transport = httpx.ASGITransport(app=_marked(create_app()), raise_app_exceptions=False)
-    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+    async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
         firsts = [
             asyncio.create_task(client.get(org_project_review, headers=_as(FIRST_MEMBER)))
             for _ in range(db_session.settings.storage.efs_slots)
@@ -643,7 +643,7 @@ async def test_the_artifacts_list_finds_each_cards_export_source_on_a_file_store
 
     monkeypatch.setattr(artifact_export, "_is_single_named_file", spy)
     transport = httpx.ASGITransport(app=create_app())
-    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+    async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
         response = await client.get("/api/v1/artifacts/", params={"project_id": str(GENERAL_PROJECT_ID)})
 
     assert response.status_code == 200, response.text
@@ -674,7 +674,7 @@ async def test_a_busy_file_store_answers_503_not_a_failed_operation(
     monkeypatch.setattr(module, step, busy)
     params = {"project_id": str(GENERAL_PROJECT_ID)} if method == "DELETE" else None
     transport = httpx.ASGITransport(app=create_app(), raise_app_exceptions=False)
-    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+    async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
         response = await client.request(method, path, json=body, params=params)
 
     assert response.status_code == 503, response.text
@@ -1110,7 +1110,7 @@ async def test_with_every_file_store_call_stuck_the_projects_list_answers(
     storage = db_session.settings.storage
     members = [f"5c0a1e5e-0000-4000-8000-0000000001{n:02d}" for n in range(storage.efs_slots // storage.efs_share + 1)]
     transport = httpx.ASGITransport(app=create_app(), raise_app_exceptions=False)
-    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+    async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
         warm = await client.get("/api/v1/projects/", headers=_as(FIRST_MEMBER))
         assert warm.status_code == 200, warm.text
         with _every_file_store_call_stuck(monkeypatch) as stuck:
@@ -1146,7 +1146,7 @@ async def test_lists_stuck_on_the_general_folder_leave_database_routes_answering
     monkeypatch.setattr(db_session.settings.database, "pool_timeout", 1)
     headers = _as(FIRST_MEMBER)
     transport = httpx.ASGITransport(app=create_app(), raise_app_exceptions=False)
-    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+    async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
         warm = await client.get("/api/v1/projects/", headers=headers)
         assert warm.status_code == 200, warm.text
         slots = anyio.CapacityLimiter(4)

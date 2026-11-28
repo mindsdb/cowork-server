@@ -253,7 +253,7 @@ _APP_CLIENT = httpx.AsyncClient
 async def _post(url: str, body: dict) -> httpx.Response:
     """POST through the real app, so the query string and body are parsed as a client sends them."""
     transport = httpx.ASGITransport(app=create_app())
-    async with _APP_CLIENT(transport=transport, base_url="http://cowork.test") as client:
+    async with _APP_CLIENT(transport=transport, base_url="http://testserver") as client:
         return await client.post(url, json=body)
 
 

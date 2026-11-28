@@ -82,7 +82,7 @@ def _receive_from_a_client_that_stays():
 
 def _client(app) -> httpx.AsyncClient:
     transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
-    return httpx.AsyncClient(transport=transport, base_url="http://test")
+    return httpx.AsyncClient(transport=transport, base_url="http://testserver")
 
 
 async def test_an_org_member_lists_projects_while_every_default_thread_is_held(org_deployment):

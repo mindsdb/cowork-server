@@ -40,7 +40,7 @@ def inference(monkeypatch):
 
 async def _call(method: str, path: str, **kwargs) -> httpx.Response:
     transport = httpx.ASGITransport(app=create_app())
-    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+    async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
         return await client.request(
             method, f"/api/v1/voice{path}", headers={"X-MindsHub-Authorization": BEARER}, **kwargs
         )

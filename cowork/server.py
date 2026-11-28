@@ -18,6 +18,7 @@ from contextlib import asynccontextmanager
 from functools import partial
 from pathlib import Path
 from types import FrameType
+from urllib.parse import urlparse
 
 import psutil
 from fastapi import FastAPI
@@ -56,6 +57,7 @@ from cowork.draft_host.listener import start_draft_listener, stop_draft_listener
 from cowork.handlers.turn_errors import SERVER_BUSY_CODE, server_busy_message
 from cowork.harnesses.anton_harness.settings import AntonHarnessSettings, check_write_approval_startup
 from cowork.harnesses.memory.policy import memory_start_warning
+from cowork.host_middleware import RebindingHostMiddleware
 from cowork.managed import (
     ManagedFolder,
     SharedRegistryError,
@@ -1396,8 +1398,8 @@ def create_app() -> FastAPI:
         )
         logger.info("auth: bearer-token authentication enabled")
 
-    # Configure CORS outside the authentication and principal layers. The
-    # no-store wrapper added below remains outermost.
+    # Configure CORS outside the authentication and principal layers. Only the
+    # no-store wrapper and, when present, the Host check sit outside it.
     app.add_middleware(
         CORSMiddleware,
         allow_origins=settings.allowed_origins,
@@ -1423,6 +1425,17 @@ def create_app() -> FastAPI:
             "/api/v1/capabilities",
         ),
     )
+
+    # Without a token, a DNS-rebound page could reach every route under its own
+    # hostname. Outermost, so it refuses before CORS, auth or any handler. The
+    # public base URL's host is the operator's own tunnel or domain.
+    if settings.tenancy_mode == "local" and not settings.require_auth:
+        public_host = urlparse(settings.public_base_url).hostname or ""
+        app.add_middleware(
+            RebindingHostMiddleware,
+            allowed_hosts=[*settings.allowed_hosts, public_host],
+            exempt_paths=channel_webhook_paths,
+        )
 
     # Include v1 API routes
     app.include_router(v1_router)

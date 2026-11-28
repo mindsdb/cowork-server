@@ -354,7 +354,7 @@ async def test_a_route_on_a_file_store_unit_logs_the_5xx_it_answers(
     transport = httpx.ASGITransport(app=create_app(), raise_app_exceptions=False)
     # After create_app, which sets up the app's logging again.
     owned_logger(units.db_session.logger.name)
-    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+    async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
         response = await client.post("/api/v1/projects/", json={"name": f"busy-{uuid4().hex[:8]}"}, headers=identity)
 
     assert response.status_code == 503, response.text
