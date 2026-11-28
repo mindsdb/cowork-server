@@ -66,6 +66,10 @@ _NO_CUSTOM_IN_ORG = (
     "Custom connectors cannot be connected in an organization yet. "
     "Use a connector from Connect Apps and Data."
 )
+_NO_TOKEN_FORM_IN_ORG = (
+    "This sign-in method is not available in the hosted app. "
+    "Use the connector's sign-in option instead."
+)
 
 
 def _resolve_fields(spec, method_id: str | None) -> list:
@@ -127,13 +131,28 @@ def _relayed_in_org_mode(connector_id: str) -> bool:
     return spec is not None and spec.category == _DATABASE_CATEGORY
 
 
+def _refused_in_org_mode(connector_id: str) -> bool:
+    """True when an org's submission for this built-in could only be kept on this server.
+
+    No org turn reads this server's vault, so such a credential is refused.
+    SharePoint keeps its own refusal in submit_form, and custom or unknown ids
+    keep theirs there too.
+    """
+    return (
+        registry.get_connector(connector_id) is not None
+        and connector_id != SHAREPOINT
+        and not _relayed_in_org_mode(connector_id)
+    )
+
+
 @router.post("/", name="submit_form", dependencies=[Depends(require(WindowProof))])
 async def submit_form_route(req: SubmitFormRequest, request: Request, scope: TenantScopeDep) -> StreamingResponse:
     """Answer one form submission.
 
     In org mode a cloud datasource or built-in database submission goes to
     the relay, which stores an enabled method in auth's encrypted store and
-    refuses the rest, so no database password is saved locally. Every other
+    refuses the rest, so no database password is saved locally. Any other
+    built-in is refused with 403 before it is staged or probed. Every other
     submission takes submit_form. The relay needs ``request`` to forward the
     caller's bearer to auth.
     """
@@ -141,6 +160,8 @@ async def submit_form_route(req: SubmitFormRequest, request: Request, scope: Ten
         connector_id = _connector_id(req)
         if _relayed_in_org_mode(connector_id):
             return await relay_cloud_submission(req, connector_id, req.resolve_method(), scope, request)
+        if _refused_in_org_mode(connector_id):
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=_NO_TOKEN_FORM_IN_ORG)
     return await submit_form(req, scope)
 
 
@@ -236,15 +257,16 @@ async def submission_replaces_route(req: SubmitFormRequest, scope: TenantScopeDe
 
     ``{"replaces": {"name", "label"}}``, or ``{"replaces": null}`` when submitting
     would create a new connection. A named submission already targets its
-    connection, so it never counts as a replacement.
+    connection, so it never counts as a replacement. In org mode nothing is
+    saved to this server's vault, so nothing there is replaced.
     """
     connector_id = _connector_id(req)
     form_spec = req.form_spec or {}
     if (
-        req.name.strip()
+        scope.org_mode
+        or req.name.strip()
         or form_spec.get("_extends_connection") is not None
         or connector_id == SHAREPOINT
-        or (scope.org_mode and _relayed_in_org_mode(connector_id))
     ):
         return {"replaces": None}
     credentials = {

@@ -24,6 +24,7 @@ from cowork.services.connectors import connector_test_flow
 from cowork.services.connectors.catalog import ConnectorCatalog
 from cowork.harnesses.anton_harness import tools
 from cowork.services.connectors.custom_connectors import CustomConnectorService, UnstorableFormError, check_handcrafted_form
+from cowork.services.connectors.persist import ORG_LOCAL_SAVE_REFUSAL
 from cowork.services.connectors.probe import ProbeOutcome
 from cowork.services.connectors.submissions import store
 from tests._connector_test_request import with_test_request
@@ -177,13 +178,17 @@ class TestProbeStream:
         assert _rows(engine) == []
 
     @pytest.mark.asyncio
-    async def test_in_org_mode_the_connection_is_saved_but_no_definition(self, engine, vault):
+    async def test_in_org_mode_neither_the_connection_nor_a_definition_is_saved(self, engine, vault):
+        """An org's credential belongs in auth's data vault; the save after a
+        passing probe refuses it and names the fixed refusal, not the token."""
         _Probe.verdict = "success"
 
-        await _probe(HTTPBIN_FORM, {"token": "any-token"}, scope=ORG)
+        stream = await _probe(HTTPBIN_FORM, {"token": "any-token"}, scope=ORG)
 
-        assert len(vault.list_connections()) == 1
+        assert vault.list_connections() == []
         assert _rows(engine) == []
+        assert ORG_LOCAL_SAVE_REFUSAL in stream
+        assert "any-token" not in stream
 
     @pytest.mark.asyncio
     async def test_a_second_connect_updates_the_definition(self, engine, vault):
