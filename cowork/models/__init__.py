@@ -34,3 +34,4 @@ from cowork.models.task_object import TaskObject  # noqa: F401
 from cowork.models.live_app_preview import LiveAppPreview  # noqa: F401
 
 from cowork.models.content_report import ContentReport  # noqa: F401
+from cowork.models.teams_contact import TeamsContact  # noqa: F401

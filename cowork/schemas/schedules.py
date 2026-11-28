@@ -191,6 +191,8 @@ class ScheduleCreateRequest(CamelRequest):
     timezone: str = "UTC"
     project_id: UUID | None = None
     enabled: bool = True
+    # Post each completed run's result to the owner's personal chat with the Teams bot.
+    deliver_to_teams: bool = False
     # Connections the task's runs leave out; none means every connection.
     disabled_connections: list[DisabledConnection] | None = None
 
@@ -213,6 +215,7 @@ class ScheduleUpdateRequest(CamelRequest):
     timezone: str | None = None
     project_id: UUID | None = None
     enabled: bool | None = None
+    deliver_to_teams: bool | None = None
     # Replaces the list; [] gives the task every connection again.
     disabled_connections: list[DisabledConnection] | None = None
 
@@ -238,6 +241,7 @@ class ScheduleResponse(CamelResponse):
     last_result_conversation_id: UUID | None
     last_error: str | None
     missed_runs: int
+    deliver_to_teams: bool = False
     consecutive_failures: int = 0
     auto_paused_at: datetime | None = None
     paused_at: datetime | None = None
@@ -279,6 +283,9 @@ class ScheduleRunResponse(CamelResponse):
     outcome: AttemptOutcome | None = None
     # The pinned model that could not be served before using the account default.
     unavailable_model: str | None = None
+    # Posting the result to the owner's Teams chat: sending, delivered, failed or unknown (the server
+    # stopped while sending, so it isn't sent again); None when the schedule doesn't post to Teams.
+    teams_delivery: str | None = None
     # The cron slot the run was for; a run that started well after it was
     # missed or delayed (the app closed, the computer asleep). None on a
     # manual run.

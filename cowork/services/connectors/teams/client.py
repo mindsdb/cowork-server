@@ -26,6 +26,7 @@ try:
     from microsoft_teams.api.activities.message import MessageActivityInput
     from microsoft_teams.api.activities.typing import TypingActivityInput
     from microsoft_teams.api.clients.conversation.client import ConversationClient
+    from microsoft_teams.api.clients.conversation.params import CreateConversationParams
     from microsoft_teams.api.models import Account, ChannelData, StreamInfoEntity, TeamsChannelAccount
     from microsoft_teams.common.http import Client, ClientOptions
 except ImportError:
@@ -70,6 +71,14 @@ class TeamsUnavailableError(RuntimeError):
 
 class TeamsAuthError(RuntimeError):
     """Microsoft refused the bot's credentials."""
+
+
+class TeamsPartlySent(RuntimeError):
+    """Posting messages in a chat failed after ``posted`` of them went out; the cause is the error."""
+
+    def __init__(self, posted: int) -> None:
+        super().__init__(f"failed after {posted} message(s) posted")
+        self.posted = posted
 
 
 def teams_available() -> bool:
@@ -170,6 +179,23 @@ class TeamsClient:
             return _real_id(sent.id) or stream_id
         sent = await self._conversations(service_url).reply_to_activity(conversation_id, activity_id, activity)
         return sent.id
+
+    async def message_person(self, service_url: str, tenant_id: str, aad_object_id: str, texts: list[str]) -> list[str]:
+        """Post ``texts``, in order, in the bot's personal chat with the person ``aad_object_id``, which
+        Teams opens, or finds, for the bot; returns the new messages' ids. A message nobody asked for:
+        Teams refuses it unless the person has the bot installed for themselves."""
+        conversations = self._conversations(service_url)
+        chat = await conversations.create(CreateConversationParams(
+            members=[Account(id=aad_object_id)], tenant_id=tenant_id, channel_data={"tenant": {"id": tenant_id}},
+        ))
+        sent = []
+        for text in texts:
+            activity = MessageActivityInput(text=without_images(text)).with_text_format(TEXT_FORMAT)
+            try:
+                sent.append((await conversations.create_activity(chat.id, activity)).id)
+            except Exception as error:
+                raise TeamsPartlySent(len(sent)) from error
+        return sent
 
     async def get_member(self, service_url: str, conversation_id: str, member_id: str) -> TeamsChannelAccount:
         return await self._conversations(service_url).members_client.get_by_id(conversation_id, member_id)

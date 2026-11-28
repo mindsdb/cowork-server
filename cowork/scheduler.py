@@ -263,6 +263,8 @@ class _ScheduledTurn:
     prompt: str
     model: str | None
     project_id: UUID | None
+    # Post each completed run's result to the owner's Teams chat (connectors/teams/delivery.py).
+    deliver_to_teams: bool = False
     disabled_connections: list[dict] | None = None
 
 
@@ -586,6 +588,7 @@ def _read_schedule(session: ScopedSession, *, schedule_id: UUID) -> _ScheduledTu
         prompt=schedule.prompt,
         model=schedule.model,
         project_id=schedule.project_id,
+        deliver_to_teams=bool(schedule.deliver_to_teams),
         disabled_connections=schedule.disabled_connections or None,
     )
 
@@ -1215,6 +1218,9 @@ async def _execute_schedule(
             if not lease_lost.is_set() and trigger != RunTrigger.trial:
                 if push_succeeded is not None:
                     _push_run_ending(scheduled, conversation_id=conversation_id, succeeded=push_succeeded)
+                    _post_result_to_teams(
+                        scheduled, run_id=run_id, conversation_id=conversation_id, succeeded=push_succeeded,
+                    )
                 if push_succeeded is not None or shutdown_failed:
                     await _post_run_notice(run_id, schedule_id=schedule_id)
 
@@ -1244,6 +1250,32 @@ def _push_run_ending(
         )
     except Exception:
         logger.warning("Could not push a scheduled run's ending", exc_info=True, extra={"event": "push_schedule_failed"})
+
+
+def _post_result_to_teams(
+    scheduled: _ScheduledTurn | None, *, run_id: UUID, conversation_id: UUID | None, succeeded: bool,
+) -> None:
+    """Post a finished run's result to its owner's Teams chat, or a short notice when it failed, when
+    the schedule asks. Fire and forget, like push: posting never holds up or fails a run; the run
+    records how it went."""
+    if scheduled is None or not scheduled.deliver_to_teams:
+        return
+    from cowork.services.connectors.teams.bot import running_bot
+
+    if running_bot() is None:
+        # No Teams bot on this install (desktop, cloud): nothing to post with, nothing to record.
+        return
+    try:
+        from cowork.services.connectors.teams.delivery import deliver_run_result
+        from cowork.services.push.dispatch import spawn
+
+        spawn(deliver_run_result(
+            run_id=run_id, user_id=scheduled.principal.user_id if scheduled.principal else None,
+            conversation_id=conversation_id, title=scheduled.title, succeeded=succeeded,
+        ))
+    except Exception:
+        logger.warning("Could not start posting a scheduled run's result to Teams", exc_info=True,
+                       extra={"event": "teams_delivery_failed"})
 
 
 def _push_reaped_run(push: ReapedRunPush) -> None:

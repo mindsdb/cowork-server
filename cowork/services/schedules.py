@@ -168,6 +168,7 @@ class ScheduleService:
         timezone: str = "UTC",
         project_id: UUID | None = None,
         enabled: bool = True,
+        deliver_to_teams: bool = False,
         recurrence: dict | None = None,
         disabled_connections: list[dict] | None = None,
     ) -> Schedule:
@@ -186,6 +187,7 @@ class ScheduleService:
             timezone=timezone,
             project_id=target_project_id,
             enabled=enabled,
+            deliver_to_teams=deliver_to_teams,
             disabled_connections=disabled_connections or None,
             # `timezone` is this method's zone-name argument here.
             paused_at=None if enabled else datetime.now(timezone_.utc),

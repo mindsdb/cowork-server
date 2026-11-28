@@ -79,6 +79,8 @@ class StandInTeams:
 
     def handler(self, request: httpx.Request) -> httpx.Response:
         self.requests.append(request)
+        if request.method == "POST" and request.url.path.endswith("/v3/conversations"):
+            return httpx.Response(201, json={"id": "a:personal-chat"})
         if request.method == "POST" and request.url.path.endswith("/activities"):
             stream_id = (json.loads(request.content).get("channelData") or {}).get("streamId")
             if self.empty or stream_id:
@@ -316,6 +318,42 @@ async def test_every_reply_is_extended_markdown_so_tables_and_headings_show(sdk,
     body = json.loads(teams.requests[0].content)
     assert body["textFormat"] == "extendedmarkdown"
     assert body["text"] == f"<at>Ana</at>\n\n{table}"
+    await client.aclose()
+
+
+async def test_message_person_opens_their_personal_chat_and_posts_each_part_in_order(sdk):
+    teams = StandInTeams()
+    client = _client(sdk, StandInLogin(), teams)
+
+    sent = await client.message_person(SERVICE_URL, TENANT, "aad-1", ["**Weekly sales**\n\nPart one",
+                                                                     "Part two ![chart](https://evil.example/c)"])
+
+    opened, *posted = teams.requests
+    assert opened.url.path == "/amer/v3/conversations"
+    chat = json.loads(opened.content)
+    assert chat["members"] == [{"id": "aad-1"}] and chat["tenantId"] == TENANT
+    assert chat["channelData"] == {"tenant": {"id": TENANT}}
+    assert [req.url.path for req in posted] == ["/amer/v3/conversations/a:personal-chat/activities"] * 2
+    assert [json.loads(req.content)["text"] for req in posted] == ["**Weekly sales**\n\nPart one",
+                                                                   "Part two [chart](https://evil.example/c)"]
+    assert {json.loads(req.content)["textFormat"] for req in posted} == {"extendedmarkdown"}
+    assert {req.headers["authorization"] for req in teams.requests} == {"Bearer tok-1"}
+    assert sent == ["reply-1", "reply-1"]
+    await client.aclose()
+
+
+async def test_message_person_says_how_many_parts_went_out_before_one_failed(sdk):
+    teams = StandInTeams()
+    answers = iter([httpx.Response(201, json={"id": "a:personal-chat"}), httpx.Response(201, json={"id": "m-1"}),
+                    httpx.Response(503)])
+    client = _client(sdk, StandInLogin(), teams)
+    client._http = httpx.AsyncClient(transport=httpx.MockTransport(lambda request: next(answers)))
+
+    with pytest.raises(sdk.TeamsPartlySent) as failed:
+        await client.message_person(SERVICE_URL, TENANT, "aad-1", ["Part one", "Part two"])
+
+    assert failed.value.posted == 1
+    assert isinstance(failed.value.__cause__, httpx.HTTPStatusError)
     await client.aclose()
 
 
