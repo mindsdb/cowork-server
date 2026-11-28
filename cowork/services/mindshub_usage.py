@@ -23,9 +23,9 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import math
 from typing import Any, Optional
 
+from cowork.common.numeric import finite_float
 from cowork.schemas.mindshub_usage import (
     PLAN_STATUSES,
     PLAN_TIERS,
@@ -118,13 +118,8 @@ def _parse_free_tokens(payload: Any) -> Optional[MindsHubFreeTokens]:
     # and hand the caller a full allowance on a malformed body. A JSON integer
     # too large for a float raises rather than clamping, which would take the
     # whole usage route down with it.
-    if not isinstance(percent, (int, float)) or isinstance(percent, bool):
-        return None
-    try:
-        percent = float(percent)
-    except (OverflowError, ValueError):
-        return None
-    if not math.isfinite(percent):
+    percent = finite_float(percent)
+    if percent is None:
         return None
 
     percent = max(0.0, min(100.0, percent))
@@ -151,13 +146,8 @@ def _percent_used(value: Any) -> Optional[int]:
     an integer too large for a float would otherwise slip through as a full or
     an empty window.
     """
-    if not isinstance(value, (int, float)) or isinstance(value, bool):
-        return None
-    try:
-        number = float(value)
-    except (OverflowError, ValueError):
-        return None
-    if not math.isfinite(number):
+    number = finite_float(value)
+    if number is None:
         return None
     return int(round(max(0.0, min(100.0, number))))
 
