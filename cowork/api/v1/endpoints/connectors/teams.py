@@ -87,6 +87,8 @@ class MemberResponse(BaseModel):
     user_principal_name: str | None
     aad_object_id: str | None
     tenant_id: str | None
+    # "user" for a member of the tenant; Microsoft marks a guest or an anonymous person otherwise.
+    user_role: str | None = None
 
 
 class _CappedBody(APIRoute):
@@ -207,6 +209,7 @@ async def member(
         user_principal_name=account.user_principal_name,
         aad_object_id=account.aad_object_id,
         tenant_id=account.tenant_id,
+        user_role=account.user_role,
     )
 
 

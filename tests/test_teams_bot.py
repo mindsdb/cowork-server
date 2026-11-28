@@ -98,6 +98,7 @@ class StandInTeams:
             user_principal_name="ada@example.com",
             aad_object_id="aad-1",
             tenant_id="tenant-1",
+            user_role="user",
         )
 
     async def aclose(self) -> None:
@@ -406,6 +407,7 @@ def test_signed_member_lookup_returns_the_person(client, stand_in):
         "user_principal_name": "ada@example.com",
         "aad_object_id": "aad-1",
         "tenant_id": "tenant-1",
+        "user_role": "user",
     }
     assert stand_in.calls == [("member", SERVICE_URL, "19:abc@thread.tacv2", "29:user-1")]
 

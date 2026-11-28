@@ -250,6 +250,9 @@ class ConnectorMetadataResponse(BaseModel):
     # run yet, so the directory can list it under a desktop-only group instead
     # of hiding it. Always True on desktop, where the whole registry works.
     cloud_available: bool = True
+    # A bot people ask from another app, not a data source (Microsoft Teams
+    # (Bot)): the directory labels it, and connecting it saves no credential.
+    bot: bool = False
     # Built in Cowork and stored per org (or per local install), not shipped
     # in the static registry.
     custom: bool = False

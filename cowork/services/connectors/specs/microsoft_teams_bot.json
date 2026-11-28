@@ -1,0 +1,30 @@
+{
+  "id": "microsoft_teams_bot",
+  "label": "Microsoft Teams (Bot)",
+  "bot": true,
+  "aliases": ["teams bot", "mindshub in teams"],
+  "keywords": ["teams", "bot", "chat", "channel"],
+  "description": "Ask MindsHub from Teams chats and channels.",
+  "notice": "A bot, not a data connector: connecting lets you ask MindsHub in Teams. MindsHub only sees the messages you send it or @mention it in, never your other Teams messages.",
+  "category": "communication",
+  "logo": "chats",
+  "logo_color": "#6264A7",
+  "logo_url": "logos/microsoft_teams.svg",
+  "form": {
+    "form_id": "microsoft_teams_bot-connector",
+    "title": "Microsoft Teams (Bot)",
+    "subtitle": "Ask MindsHub from Teams chats and channels.",
+    "logo": "chats",
+    "logo_color": "#6264A7",
+    "logo_url": "logos/microsoft_teams.svg",
+    "methods": [
+      {
+        "id": "teams-connection",
+        "label": "Connect",
+        "description": "Connect, then send MindsHub a message in Teams: you're paired by your Microsoft sign-in name, which must be your MindsHub email. Guest accounts can't connect. Disconnect here at any time.",
+        "recommended": true,
+        "submit_action": "teams_connection"
+      }
+    ]
+  }
+}

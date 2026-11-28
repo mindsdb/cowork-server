@@ -93,3 +93,12 @@ python -m cowork.services.connectors.teams check
 It asks Microsoft for the bot's token and prints whether Microsoft accepted the credentials. It
 exits 0 when they work and the internal key is set, 1 when Microsoft refuses them or the key is
 missing, and 2 when Teams isn't configured or available.
+
+## The connector
+
+With every setting above and the Teams packages, the connector directory also lists **Microsoft
+Teams (Bot)** (`cowork/services/connectors/specs/microsoft_teams_bot.json`), beside the Graph
+"Microsoft Teams" connector. It is a bot, not a data source: its one method, `teams_connection`,
+saves no credential, and the agent's connector lookup never offers it. Where Teams isn't set up,
+it isn't listed or served at all. The self-hosted stack's recording proxy answers its Connect and
+Disconnect, since the pairing between a Teams user and a person lives there.
