@@ -54,7 +54,7 @@ def credential(monkeypatch):
 def published(monkeypatch):
     seen = []
 
-    def resolve(raw_path, *, scope):
+    def resolve(raw_path, *, scope, allow_website=False):
         seen.append(raw_path)
         return "rid-1"
 
@@ -270,3 +270,34 @@ def test_delete_purges_the_analytics(monkeypatch, credential, published):
     assert res.content == b""
     assert upstream.calls[0].method == "DELETE"
     assert upstream.calls[0].url == "https://view.example/a/rid-1/_stats"
+
+
+@pytest.fixture
+def website(monkeypatch, tmp_path):
+    folder = tmp_path / "artifacts" / "rep"
+    folder.mkdir(parents=True)
+    (folder / "report.html").write_text("<html></html>", encoding="utf-8")
+    (folder / "metadata.json").write_text(json.dumps({"slug": "rep", "type": "html-app"}), encoding="utf-8")
+    (folder / ".published.json").write_text(json.dumps({"report.html": {
+        "report_id": "rid-1", "url": "https://hk1.mindshub.co/", "published": True, "mode": "website",
+    }}), encoding="utf-8")
+    monkeypatch.setattr("cowork.services.artifacts._scan_artifact_dirs", lambda *, scope: [folder.parent])
+    return str(folder / "report.html")
+
+
+def test_delete_purges_the_analytics_of_a_website(monkeypatch, credential, website):
+    upstream = _upstream(monkeypatch, 204, None)
+
+    res = _delete(website)
+
+    assert res.status_code == 204
+    assert upstream.calls[0].method == "DELETE"
+    assert upstream.calls[0].url == "https://view.example/a/rid-1/_stats"
+
+
+@pytest.mark.parametrize("call", [_get, _put, _viewer])
+def test_reading_and_settings_of_a_website_are_unavailable(credential, website, call):
+    res = call(website)
+
+    assert res.status_code == 404
+    assert res.json()["detail"]["code"] == "stats_unavailable"

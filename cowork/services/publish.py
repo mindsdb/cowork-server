@@ -15,6 +15,7 @@ import re
 import stat
 import tempfile
 import threading
+import time
 import urllib.error
 from collections import OrderedDict
 from collections.abc import Callable
@@ -389,6 +390,90 @@ class AccessModeChanged(PublishRejected):
         super().__init__("The artifact's sharing changed outside the Share dialog")
 
 
+# html_upload's refusals of a website publish (400, field access/mode), which
+# publish_artifact also raises itself before an upload that would get one.
+WEBSITE_REQUIRES_PUBLISH_KEY_CODE = "website_requires_publish_key"
+WEBSITE_NOT_SUPPORTED_CODE = "website_not_supported"
+WEBSITE_REQUIRES_OWNER_CODE = "website_requires_owner"
+WEBSITE_NOT_ENABLED_CODE = "website_not_enabled"
+WEBSITE_REFUSALS = {
+    WEBSITE_REQUIRES_PUBLISH_KEY_CODE: (
+        "A public website can only be published from an organization's Share panel in Cowork."
+    ),
+    WEBSITE_NOT_SUPPORTED_CODE: "Only static artifacts can be published as a public website.",
+    WEBSITE_REQUIRES_OWNER_CODE: (
+        "Only the artifact's owner can make it a public website, by choosing \"Public website\" "
+        "in the Share panel."
+    ),
+    WEBSITE_NOT_ENABLED_CODE: (
+        "Public websites are turned off on this deployment. Choose another access option in the Share panel."
+    ),
+}
+
+
+class WebsiteRefused(PublishRejected):
+    """A website publish refused before anything changed: by html_upload, or
+    by publish_artifact before the upload. The same publish is refused again
+    until the artifact's access changes. Autopublish remembers only
+    website_requires_owner (for WEBSITE_REFUSAL_TTL_S, or until a successful publish);
+    the other codes are retried on its next pass. ``status_code`` and ``code`` are what a
+    route answers, with refusal()."""
+
+    status_code: int = 409
+
+    def __init__(self, code: str, *, remembered: bool = False) -> None:
+        super().__init__(WEBSITE_REFUSALS[code])
+        self.code = code
+        # True when this server answered from _website_refusals, with no upload.
+        self.remembered = remembered
+
+    def refusal(self) -> Refusal:
+        return Refusal(detail=str(self), code=self.code)
+
+
+# A website re-publish the upload service refused with
+# WEBSITE_REQUIRES_OWNER_CODE, by published folder: the stamp of the entry it
+# was refused under and when this memory ends. The refusal repeats until the
+# owner saves, and each try uploads the whole bundle, so a re-publish that
+# isn't the owner's save skips it meanwhile. A successful publish of the folder
+# forgets it. Per process.
+WEBSITE_REFUSAL_TTL_S = 15 * 60.0
+_website_refusals: dict[str, tuple[tuple, float]] = {}
+# Autopublish threads, live sync and request threads all touch the table.
+_website_refusals_lock = threading.Lock()
+
+
+def _clock() -> float:
+    return time.monotonic()
+
+
+def _entry_stamp(entry: Any) -> tuple:
+    """What identifies the stored entry a publish read; an owner's save on
+    any replica changes it."""
+    entry = entry if isinstance(entry, dict) else {}
+    return (entry.get("report_id"), entry.get("mode"), entry.get("published_mtime"), entry.get("last_md5"))
+
+
+def _website_refusal_remembered(published_dir: Path, entry: Any) -> bool:
+    with _website_refusals_lock:
+        remembered = _website_refusals.get(str(published_dir))
+        if remembered is None:
+            return False
+        stamp, until = remembered
+        if _clock() >= until or stamp != _entry_stamp(entry):
+            _website_refusals.pop(str(published_dir), None)
+            return False
+        return True
+
+
+def _remember_website_refusal(published_dir: Path, entry: Any) -> None:
+    now = _clock()
+    with _website_refusals_lock:
+        for key in [k for k, (_, until) in _website_refusals.items() if until <= now]:
+            del _website_refusals[key]
+        _website_refusals[str(published_dir)] = (_entry_stamp(entry), now + WEBSITE_REFUSAL_TTL_S)
+
+
 class UploadError(NamedTuple):
     """An upload-service answer `classify_upload_error` left to its caller."""
 
@@ -433,14 +518,16 @@ def classify_upload_error(exc: Exception) -> UploadError | None:
     (`auth_unavailable`); any other 503 is the upload service itself. A 403 is
     a denial with `permission_denied`, and MindsHub's refusal of a share with
     everyone with SHARE_ORG_REQUIRED_CODE (ShareOrgRequired, its reason,
-    clipped, as the text). Every other HTTP answer comes back as an
+    clipped, as the text). A 400 with one of html_upload's website codes is
+    WebsiteRefused. Every other HTTP answer comes back as an
     UploadError; a failure that got no HTTP answer returns None.
 
     A failed asynchronous job (`PublishJobFailed`) carries the status /upload
-    would have answered. The server records the answer's code too, but anton
-    does not pass it on, so a job's refusal maps by status alone: its 503 is
-    the upload service itself, and a 403 share_org_required or permission_denied
-    comes back as an UploadError.
+    would have answered, and the answer's code when the job recorded one. A
+    400 with a website code is WebsiteRefused, as for a synchronous answer.
+    Any other refusal maps by status alone: its 503 is the upload service
+    itself, and a 403 share_org_required or permission_denied comes back as an
+    UploadError.
     """
     from cowork.services.product_permissions import ProductPermissionDenied, ProductPermissionUnavailable
 
@@ -452,23 +539,36 @@ def classify_upload_error(exc: Exception) -> UploadError | None:
             PublishTooLarge,
             UploadServiceUnavailable,
             ShareOrgRequired,
+            WebsiteRefused,
         ),
     ):
         raise exc
     if isinstance(exc, PublishJobFailed):
-        if exc.status_code == 503:
+        status, code, body, error = exc.status_code, getattr(exc, "code", None), str(exc), None
+    elif isinstance(exc, urllib.error.HTTPError):
+        status = exc.code
+        body, code, error = _read_http_error_body(exc)
+    else:
+        return None
+    if status == 400 and code in WEBSITE_REFUSALS:
+        # Leaves publish_artifact before its own failure log. The deployments'
+        # log keeps only this template, so the status and code go in fields it
+        # keeps too.
+        logger.warning(
+            "Publish service answered HTTP %s code=%s body=%r", status, code, body[:200],
+            extra={"status_code": status, "reason": code},
+        )
+        raise WebsiteRefused(code) from exc
+    if isinstance(exc, PublishJobFailed):
+        if status == 503:
             # Leaves publish_artifact before its failure log, like the typed
             # refusals below; str(exc) names the job to find in the worker's log.
             logger.warning(
-                "Publish service answered HTTP %s code=%s body=%r", 503, None, str(exc)[:200],
+                "Publish service answered HTTP %s code=%s body=%r", 503, None, body[:200],
                 extra={"status_code": 503, "reason": "publish_job_failed"},
             )
             raise UploadServiceUnavailable() from exc
-        return UploadError(exc.status_code, None, exc.message)
-    if not isinstance(exc, urllib.error.HTTPError):
-        return None
-    status = exc.code
-    body, code, error = _read_http_error_body(exc)
+        return UploadError(status, None, exc.message)
     typed: HTTPException | ShareOrgRequired | None = None
     if status == 413:
         typed = PublishTooLarge()
@@ -1268,17 +1368,16 @@ def _publish_markdown_body(md_text: str) -> str:
 
 
 def kept_access(entry: Any, *, org_mode: bool) -> ArtifactAccessRequest:
-    """The access a re-publish that isn't a person's save keeps (live sync,
-    autopublish, an update): the entry's mode and password. In MindsHub mode
-    a restricted entry doesn't say who the rule shares with, so this names
-    nobody and publish_artifact takes all of it from MindsHub's rule
-    (_plan_access); ``owner_only`` keeps a rule that names nobody restricted
-    to its owner, never public. The pod can write the entry, so in MindsHub
-    mode publish_artifact checks the mode this builds before anything
-    uploads: one that isn't restricted while MindsHub still holds a rule, or
-    one wider than the sharing the owner last chose
-    (cowork.services.artifact_owner_choice), is refused (AccessModeChanged).
-    Elsewhere the entry is the record (anton's access_from_owner_side)."""
+    """The access a re-publish that isn't a person's save keeps (live sync, autopublish, an update):
+    the entry's mode and password. A website entry is kept as a website without the owner's
+    confirmation, so the upload service keeps it only where its own row already says website
+    (_upload_access). In MindsHub mode a restricted entry doesn't say who the rule shares with, so
+    this names nobody and publish_artifact takes all of it from MindsHub's rule (_plan_access);
+    ``owner_only`` keeps a rule that names nobody restricted to its owner, never public. The pod can
+    write the entry, so in MindsHub mode publish_artifact checks the mode this builds before
+    anything uploads: one that isn't restricted while MindsHub still holds a rule, or one wider than
+    the sharing the owner last chose (cowork.services.artifact_owner_choice), is refused
+    (AccessModeChanged). Elsewhere the entry is the record (anton's access_from_owner_side)."""
     publisher_access = access_from_owner_side(entry)
     if org_mode and publisher_access.get("mode") == AccessMode.RESTRICTED:
         # The entry's audience fields aren't the record here, so they are
@@ -1789,6 +1888,47 @@ def pending_datasources(raw_path: str, *, scope: TenantScope | None) -> list[dic
     return datasource_labels(vault, pending) if pending else []
 
 
+CONFIRMED_BY_OWNER_FIELD = "confirmed_by_owner"
+
+
+def _refuse_a_website(
+    *, scope: TenantScope | None, owner_save: bool, is_fullstack: bool, project_id: str | None, artifact_slug: str,
+) -> None:
+    """Raise WebsiteRefused for a website publish this server never sends:
+    outside MindsHub mode (only its publish key can carry one), for a
+    full-stack artifact, or as the owner's save while websites are off here.
+    Any other website publish goes to the upload service, which keeps a
+    website only where its own access row already says so."""
+    if scope is None or not scope.org_mode:
+        code = WEBSITE_REQUIRES_PUBLISH_KEY_CODE
+    elif is_fullstack:
+        code = WEBSITE_NOT_SUPPORTED_CODE
+    elif owner_save and not get_app_settings().artifact_websites_enabled():
+        code = WEBSITE_NOT_ENABLED_CODE
+    else:
+        return
+    logger.warning(
+        "Refused a website publish before upload",
+        extra={
+            "event": "artifact_website_refused",
+            "reason": code,
+            **log_context(project_id=project_id, artifact_slug=artifact_slug),
+        },
+    )
+    raise WebsiteRefused(code)
+
+
+def _upload_access(effective_access: dict[str, Any], *, owner_save: bool) -> dict[str, Any]:
+    """The access block anton's publisher sends. Only the owner's own save of
+    a website carries CONFIRMED_BY_OWNER_FIELD, which lets the upload service
+    create a website; every other publish goes without it, whatever reached
+    this far."""
+    access = {key: value for key, value in effective_access.items() if key != CONFIRMED_BY_OWNER_FIELD}
+    if owner_save and access.get("mode") == AccessMode.WEBSITE:
+        access[CONFIRMED_BY_OWNER_FIELD] = True
+    return access
+
+
 def publish_artifact(
     artifact: Path,
     *,
@@ -1882,6 +2022,11 @@ def publish_artifact(
     entry names no key for can't be checked: either is refused
     (AccessModeChanged) and logged before anything is uploaded.
 
+    A website publish is refused here outside MindsHub mode, for a full-stack
+    artifact, and as the owner's save while COWORK_ARTIFACT_WEBSITES is off
+    (_refuse_a_website). Only the owner's save sends confirmed_by_owner
+    (_upload_access).
+
     In MindsHub mode the owner's save also records the mode it publishes in
     (cowork.services.artifact_owner_choice), where the pod can't write, and
     every other publish is checked against that record before anything
@@ -1932,6 +2077,14 @@ def publish_artifact(
     # them only to answer 400.
     if is_fullstack and not is_mindshub_publish_url(publish_url):
         raise ValueError(FULLSTACK_PUBLISH_UNSUPPORTED)
+    def refuse_website(resolved: ArtifactAccessRequest | None) -> None:
+        if resolved is not None and resolved.mode == AccessMode.WEBSITE:
+            _refuse_a_website(
+                scope=scope, owner_save=owner_save, is_fullstack=is_fullstack,
+                project_id=project_id, artifact_slug=published_dir.name,
+            )
+
+    refuse_website(access)
 
     try:
         from anton.publisher import ArtifactOwnedByOtherUserError, StatePublishBlocked, publish
@@ -1981,6 +2134,20 @@ def publish_artifact(
         access = default_publish_access(
             access, password, report_id=report_id, previous=previous, scope=scope
         )
+        # A republish without an access keeps the entry's mode, which can be a
+        # website: the gate applies to the mode the publish resolves to.
+        refuse_website(access)
+        if access is not None and access.mode == AccessMode.WEBSITE:
+            if not owner_save and _website_refusal_remembered(published_dir, previous):
+                logger.warning(
+                    "Skipped a website re-publish the upload service refused",
+                    extra={
+                        "event": "artifact_website_refused",
+                        "reason": WEBSITE_REQUIRES_OWNER_CODE,
+                        **log_context(project_id=project_id, artifact_slug=published_dir.name),
+                    },
+                )
+                raise WebsiteRefused(WEBSITE_REQUIRES_OWNER_CODE, remembered=True)
         canonical_artifact_key = _authorization_key(published_dir, artifacts_base, project_id, scope)
         datasource_vault = None
         if is_fullstack:
@@ -2104,7 +2271,7 @@ def publish_artifact(
                 report_id=report_id,
                 publish_url=publish_url,
                 ssl_verify=ssl_verify,
-                access=plan.effective_access,
+                access=_upload_access(plan.effective_access, owner_save=owner_save),
                 access_version=plan.access_version,
                 pwd_version=plan.pwd_version,
                 artifact_key=canonical_artifact_key,
@@ -2147,7 +2314,12 @@ def publish_artifact(
                     artifact_key=canonical_artifact_key,
                     owner_side=owner_side,
                 )
-            upload_error = classify_upload_error(exc)
+            try:
+                upload_error = classify_upload_error(exc)
+            except WebsiteRefused as refused:
+                if refused.code == WEBSITE_REQUIRES_OWNER_CODE:
+                    _remember_website_refusal(published_dir, previous)
+                raise
             logger.exception("Publishing failed")
             # A 401's text ("Invalid token") says less than the credentials advice below.
             if (
@@ -2175,6 +2347,8 @@ def publish_artifact(
             if md_tmp_dir is not None:
                 md_tmp_dir.cleanup()
 
+        with _website_refusals_lock:
+            _website_refusals.pop(str(published_dir), None)
         # Owner-side state for the next publish, stored in the entry below and
         # never part of the response.
         password_hash = result.pop("password_hash", None)

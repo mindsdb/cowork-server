@@ -30,11 +30,13 @@ ARTIFACT_KEY_MAX_CHARS = 64
 
 class AccessMode(StrEnum):
     """Who a published artifact's link opens for, narrowest first: the people
-    its restricted rule names, anyone with the password, or anyone."""
+    its restricted rule names, anyone with the password, anyone, or anyone at
+    the artifact's own site address (a public website, MindsHub mode only)."""
 
     RESTRICTED = "restricted"
     PASSWORD = "password"
     PUBLIC = "public"
+    WEBSITE = "website"
 
 
 class ArtifactOwnerChoice(BaseSQLModel, table=True):

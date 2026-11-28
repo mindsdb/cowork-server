@@ -17,6 +17,7 @@ from urllib.parse import quote
 from fastapi import HTTPException
 
 from cowork.common.minds_tls import minds_ssl_verify
+from cowork.models.artifact_owner_choice import AccessMode
 from cowork.services import artifacts as _artifacts
 from cowork.services.product_permissions import ProductPermissionDenied
 from cowork.services.publish import PublisherUnavailable, _resolve_publish_target
@@ -27,6 +28,8 @@ if TYPE_CHECKING:
 NOT_PUBLISHED_MESSAGE = "Artifact is not published"
 PUBLISH_CREDENTIAL_MISSING_CODE = "publish_credential_missing"
 PUBLISH_CREDENTIAL_REJECTED_CODE = "publish_credential_rejected"
+STATS_UNAVAILABLE_MESSAGE = "Stats are not available for this artifact."
+WEBSITE_STATS_MESSAGE = "Viewer analytics are not available for a public website."
 
 _REPORT_ID_RE = re.compile(r"[A-Za-z0-9_-]+")
 _TIMEOUT_SECONDS = 15
@@ -41,7 +44,12 @@ class StatsOwnedByOtherAccount(StatsError):
 
 
 class StatsUnavailable(StatsError):
-    """The artifact is published, but the service keeps no stats for it."""
+    """The artifact is published, but the service keeps no stats for it, or
+    it is a public website, which has no viewer analytics."""
+
+    def __init__(self, message: str = STATS_UNAVAILABLE_MESSAGE) -> None:
+        super().__init__(message)
+        self.message = message
 
 
 class StatsForbidden(StatsError):
@@ -233,7 +241,7 @@ def delete_stats(*, publish_url: str, key: str, report_id: str) -> None:
     _request("DELETE", _stats_url(publish_url, report_id), key=key)
 
 
-def _report_id_from_record(published_dir: Path, published_key: str) -> str:
+def _report_id_from_record(published_dir: Path, published_key: str, *, allow_website: bool = False) -> str:
     published_json = published_dir / ".published.json"
     if not published_json.is_file():
         raise FileNotFoundError(NOT_PUBLISHED_MESSAGE)
@@ -244,6 +252,8 @@ def _report_id_from_record(published_dir: Path, published_key: str) -> str:
     entry = published_map.get(published_key) if isinstance(published_map, dict) else None
     if not isinstance(entry, dict) or not entry.get("published", True):
         raise FileNotFoundError(NOT_PUBLISHED_MESSAGE)
+    if entry.get("mode") == AccessMode.WEBSITE and not allow_website:
+        raise StatsUnavailable(WEBSITE_STATS_MESSAGE)
     report_id = str(entry.get("report_id") or "").strip()
     if report_id:
         # A dot-only id would be normalized out of the URL path by the HTTP client.
@@ -257,23 +267,25 @@ def _report_id_from_record(published_dir: Path, published_key: str) -> str:
     raise FileNotFoundError(NOT_PUBLISHED_MESSAGE)
 
 
-def report_id_for_path(raw_path: str, *, scope: TenantScope | None) -> str:
-    """Desktop: the report id of a published artifact path inside ``scope``'s roots."""
+def report_id_for_path(raw_path: str, *, scope: TenantScope | None, allow_website: bool = False) -> str:
+    """Desktop: the report id of a published artifact path inside ``scope``'s roots.
+
+    ``allow_website`` lets a website's id through, for deleting stats gathered before it became one."""
     artifact = _artifacts.resolve_artifact_path(raw_path, scope=scope, allow_dir=True)
     if artifact is None:
         raise FileNotFoundError("Artifact not found")
     _target, published_dir, published_key, _is_fullstack = _resolve_publish_target(
         artifact, container_dirs=_artifacts._scan_artifact_dirs(scope=scope)
     )
-    return _report_id_from_record(published_dir, published_key)
+    return _report_id_from_record(published_dir, published_key, allow_website=allow_website)
 
 
-def report_id_for_folder(folder: Path) -> str:
+def report_id_for_folder(folder: Path, *, allow_website: bool = False) -> str:
     """Org: the report id of a published artifact folder."""
     _target, published_dir, published_key, _is_fullstack = _resolve_publish_target(
         folder, container_dirs=[folder.parent]
     )
-    return _report_id_from_record(published_dir, published_key)
+    return _report_id_from_record(published_dir, published_key, allow_website=allow_website)
 
 
 def stats_http_exception(exc: Exception, *, desktop: bool) -> HTTPException:
@@ -289,10 +301,7 @@ def stats_http_exception(exc: Exception, *, desktop: bool) -> HTTPException:
             "message": "Stats are not available for this account.",
         })
     if isinstance(exc, StatsUnavailable):
-        return HTTPException(404, detail={
-            "code": "stats_unavailable",
-            "message": "Stats are not available for this artifact.",
-        })
+        return HTTPException(404, detail={"code": "stats_unavailable", "message": exc.message})
     if isinstance(exc, StatsForbidden):
         return HTTPException(403, detail={"code": exc.code, "message": exc.message})
     if isinstance(exc, StatsUpgradeRequired):

@@ -184,6 +184,8 @@ def health() -> dict:
         # through signed links (cowork/draft_host). The web client reads it at
         # boot and then opens an HTML draft by link instead of through srcdoc.
         "draft_links": get_app_settings().draft_links_enabled(),
+        # Whether the Share panel offers "Public website" (MindsHub mode only).
+        "artifact_websites": get_app_settings().artifact_websites_offered(),
         # Whether the agent works on docs here: always on the desktop; in org
         # mode only with remote docs and ask_user both on, because doc tools
         # answer the pod on the stdin only an interactive turn keeps open.

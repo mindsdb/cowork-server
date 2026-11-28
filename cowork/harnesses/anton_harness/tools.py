@@ -200,6 +200,46 @@ SELF_HOSTED_PUBLISH_PROMPT = _PUBLISH_PROMPT.format(
     heading="CONTENT SHARING POLICY:",
     from_chat="publishing works straight from chat",
 )
+# The tool never publishes a public website: only the owner's save in the
+# Share panel turns one on.
+WEBSITE_PUBLISH_PROMPT = (
+    "PUBLIC WEBSITE:\n"
+    "- An artifact's owner can make it a public website in its Share panel (\"Public website\").\n"
+    "  This tool never does, and it has no access_mode for it.\n"
+    "- When the user asks to make an artifact a website, tell them to choose \"Public website\" in\n"
+    "  the artifact's Share panel. Don't publish it with another access mode instead.\n"
+    "- When this tool answers that an artifact is a public website, don't publish it: saved changes\n"
+    "  reach the site automatically, and who can open it is changed in the Share panel.\n"
+)
+WEBSITE_REQUEST_ANSWER = (
+    "This tool can't make an artifact a public website. Tell the user to open the artifact's Share "
+    "panel and choose \"Public website\"; only the artifact's owner can turn it on. Don't publish it "
+    "with another access mode instead."
+)
+WEBSITES_UNAVAILABLE_ANSWER = (
+    "Websites are not available on this deployment. Tell the user so, and don't publish the "
+    "artifact with another access mode unless they choose one."
+)
+
+
+def _websites_offered() -> bool:
+    """Whether the Share panel offers "Public website" here."""
+    return get_app_settings().artifact_websites_offered()
+
+
+def _website_request_answer() -> str:
+    return WEBSITE_REQUEST_ANSWER if _websites_offered() else WEBSITES_UNAVAILABLE_ANSWER
+
+
+def _website_answer(title: str, url: str) -> str:
+    """What the tool answers for an artifact that is a live public website."""
+    where = f" at {url}" if url else ""
+    return (
+        f"{title} is a public website{where}. Saved changes reach it automatically, so don't publish "
+        "it. Who can open it is changed only in the artifact's Share panel, by its owner."
+    )
+
+
 # Appended where a first publish without access raises AccessChoiceRequired:
 # a shared publish token has no owner to let in.
 FIRST_PUBLISH_ACCESS_RULE = (
@@ -313,6 +353,8 @@ async def _cowork_publish_or_preview(session: Any, tc_input: dict):
 
     abs_path = str(file_path)
 
+    from cowork.models.artifact_owner_choice import AccessMode
+
     # 'ask'/'preview' are non-destructive: report current publish state so the
     # LLM can choose publish-vs-re-publish. State is resolved by the service so
     # fullstack (.published.json at the artifact root) and static (next to the
@@ -325,6 +367,10 @@ async def _cowork_publish_or_preview(session: Any, tc_input: dict):
     # even when explicitly asked. The wording below makes clear it CAN act.
     if action in ("ask", "preview"):
         state = _published_state(abs_path)
+        # A website is kept live by saves; the tool never re-publishes it.
+        owner_state = _published_owner_state(abs_path)
+        if owner_state.get("mode") == AccessMode.WEBSITE and owner_state.get("published", True) is not False:
+            return _website_answer(title, str(state.get("url") or owner_state.get("url") or ""))
         if state.get("published") and state.get("url"):
             return (
                 f"{title} is already published at {state['url']}. "
@@ -350,10 +396,16 @@ async def _cowork_publish_or_preview(session: Any, tc_input: dict):
     # Resolve the access spec: explicit tool fields > preserve previous > the service's default.
     from pydantic import ValidationError
 
-    from cowork.models.artifact_owner_choice import AccessMode
     from cowork.schemas.artifact_access import ArtifactAccessRequest, access_refusal
 
     access_mode = tc_input.get("access_mode")
+    # NOTE: _published_owner_state (not _published_state): the latter drops
+    # mode/access_password, which would silently reset to public.
+    prev = _published_owner_state(abs_path)
+    if prev.get("mode") == AccessMode.WEBSITE and prev.get("published", True) is not False:
+        return _website_answer(title, str(prev.get("url") or ""))
+    if access_mode == AccessMode.WEBSITE:
+        return _website_request_answer()
     if access_mode == "password":
         pw = (tc_input.get("password") or "").strip()
         if not pw:
@@ -383,14 +435,16 @@ async def _cowork_publish_or_preview(session: Any, tc_input: dict):
         access = ArtifactAccessRequest(mode=AccessMode.PUBLIC)
     else:
         # No access fields: preserve the artifact's previous access on re-publish.
-        # NOTE: _published_owner_state (not _published_state): the latter drops
-        # mode/access_password, which would silently reset to public.
-        prev = _published_owner_state(abs_path)
         try:
-            # None on a first publish: publish_artifact applies the default
+            # None on a first publish, and for a taken-down website (which only
+            # its owner publishes): publish_artifact applies the default
             # (owner-only, or a refusal where a shared publish token can't
             # publish privately).
-            access = _access_from_state(prev) if prev.get("report_id") else None
+            access = (
+                _access_from_state(prev)
+                if prev.get("report_id") and prev.get("mode") != AccessMode.WEBSITE
+                else None
+            )
         except ValidationError as exc:
             # The entry is a file the agent can write, so its access fields can
             # hold any type; publishing without them would change who sees it.
@@ -555,6 +609,14 @@ async def _cowork_publish_or_preview(session: Any, tc_input: dict):
         notes += (
             " Only the user can open the link; they can change who can open it in the Share dialog."
         )
+    # The service re-reads the entry under its lock, so the owner may have turned
+    # the site back on since `prev` was read: trust the result, not `prev`.
+    result_mode = result.get("accessMode") if isinstance(result, dict) else None
+    if prev.get("mode") == AccessMode.WEBSITE and access is None and result_mode != AccessMode.WEBSITE:
+        notes += (
+            " It is no longer a public website: it was published with the default access, "
+            "and only its owner can make it a website again in the Share panel."
+        )
     if unapproved:
         notes += " It was published without the credentials of: " + ", ".join(
             item["label"] for item in unapproved
@@ -590,7 +652,8 @@ def build_cowork_publish_tool():
     On a self-hosted deployment the copy names neither the desktop app
     nor MindsHub publishing. Where publishes go through a shared publish
     token, on either kind of host, the prompt also says a first publish
-    must name its access.
+    must name its access. In MindsHub mode with websites on, the prompt
+    also says websites are turned on only in the Share panel.
     """
     from anton.tools import PUBLISH_TOOL
     from anton.core.tools.tool_defs import ToolDef
@@ -602,6 +665,8 @@ def build_cowork_publish_tool():
     # The same scope _publish_artifact publishes in.
     if uses_shared_publish_token(current_settings_scope()):
         prompt += FIRST_PUBLISH_ACCESS_RULE
+    if _websites_offered():
+        prompt += WEBSITE_PUBLISH_PROMPT
     return ToolDef(
         name=PUBLISH_TOOL.name,
         description=SELF_HOSTED_PUBLISH_DESCRIPTION if self_hosted else COWORK_PUBLISH_DESCRIPTION,

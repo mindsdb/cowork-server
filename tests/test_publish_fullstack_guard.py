@@ -218,3 +218,23 @@ async def test_agent_publish_tool_reports_the_refusal_without_a_key_stop(
     assert f"PUBLISH FAILED: {publish.FULLSTACK_PUBLISH_UNSUPPORTED}" in text
     assert "STOP" not in text
     publisher.upload.assert_not_called()
+
+
+def test_a_fullstack_website_is_refused_before_upload(fullstack, artifacts_base, publisher):
+    from cowork.db.scoped import TenantScope
+    from cowork.models.artifact_owner_choice import AccessMode
+    from cowork.schemas.artifact_access import ArtifactAccessRequest
+    from cowork.services.publish import WEBSITE_NOT_SUPPORTED_CODE, WebsiteRefused
+
+    scope = TenantScope(
+        org_mode=True, org_id="0a0a0a0a-0000-4000-8000-000000000001", user_id="0b0b0b0b-0000-4000-8000-000000000001",
+    )
+    with pytest.raises(WebsiteRefused) as refused:
+        publish.publish_artifact(
+            fullstack, artifacts_base=artifacts_base, api_key="k", publish_url="https://api.staging.mindshub.ai",
+            access=ArtifactAccessRequest(mode=AccessMode.WEBSITE), scope=scope, project_id="proj-1",
+            owner_save=True,
+        )
+    assert refused.value.code == WEBSITE_NOT_SUPPORTED_CODE
+    publisher.upload.assert_not_called()
+    publisher.vault.assert_not_called()

@@ -2450,3 +2450,320 @@ async def test_a_member_who_may_review_reads_the_owners_audience_without_the_pas
     }
     reads = [body for path, body in issuer.calls if path.endswith("/read/")]
     assert reads and all(body["owner_keycloak_id"] == scope.user_id for body in reads)
+
+
+SITE_URL = "https://hk1-staging.mindshub.co/"
+
+
+@pytest.fixture
+def websites_on(websites_setting):
+    websites_setting("on")
+
+
+def _website_refusal_records(caplog):
+    return [
+        r for r in caplog.records
+        if r.name == "cowork.services.publish" and getattr(r, "event", None) == "artifact_website_refused"
+    ]
+
+
+def test_the_owners_website_save_confirms_it_to_the_upload_service(
+    issuer, scope, local_id, owned_artifact, monkeypatch, websites_on
+):
+    """Only the owner's save sends confirmed_by_owner. The site's URL from
+    html_upload reaches the result and the entry, the entry never stores the
+    confirmation, and the owner's record says website."""
+    from cowork.models.artifact_owner_choice import AccessMode
+    from cowork.services.artifact_owner_choice import OwnerChoice
+
+    _session, project, _conversation, folder = owned_artifact
+    run, uploads = _org_publisher(issuer, folder, scope, project, monkeypatch, view_url=SITE_URL)
+
+    result = run({"mode": "website"}, owner_save=True)
+
+    assert uploads[-1]["access"] == {"mode": "website", "confirmed_by_owner": True}
+    assert (result["accessMode"], result["url"]) == ("website", SITE_URL)
+    entry = _entry(folder)
+    assert (entry["mode"], entry["url"]) == ("website", SITE_URL)
+    assert "confirmed_by_owner" not in entry
+    assert _owner_choice(result["artifactKey"], scope) == OwnerChoice(AccessMode.WEBSITE, published=True)
+
+
+def test_the_owners_website_save_is_refused_while_websites_are_off(
+    issuer, scope, local_id, owned_artifact, monkeypatch, caplog, websites_setting
+):
+    from cowork.services.publish import WEBSITE_NOT_ENABLED_CODE, WebsiteRefused
+
+    websites_setting("off")
+    _session, project, _conversation, folder = owned_artifact
+    run, uploads = _org_publisher(issuer, folder, scope, project, monkeypatch)
+
+    with caplog.at_level(logging.WARNING, logger="cowork.services.publish"):
+        with pytest.raises(WebsiteRefused) as refused:
+            run({"mode": "website"}, owner_save=True)
+
+    assert refused.value.code == WEBSITE_NOT_ENABLED_CODE
+    assert uploads == []
+    assert not (folder / ".published.json").exists()
+    [record] = _website_refusal_records(caplog)
+    assert record.reason == WEBSITE_NOT_ENABLED_CODE
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("setting", ("on", "off"))
+@pytest.mark.parametrize("how", ("live_sync", "autopublish"))
+async def test_a_website_is_kept_on_republish_without_the_owners_confirmation(
+    issuer, scope, local_id, owned_artifact, monkeypatch, websites_setting, how, setting
+):
+    """Live sync and autopublish keep an existing website, with the setting
+    on or off, and never send confirmed_by_owner: html_upload keeps a
+    website only where its own row already says so."""
+    _session, project, _conversation, folder = owned_artifact
+    websites_setting("on")
+    run, uploads = _org_publisher(issuer, folder, scope, project, monkeypatch, view_url=SITE_URL)
+    run({"mode": "website"}, owner_save=True)
+    websites_setting(setting)
+
+    assert await _republish(how, folder, scope, project, monkeypatch) is True
+    assert uploads[-1]["access"] == {"mode": "website"}
+
+
+@pytest.mark.asyncio
+async def test_an_entry_an_agent_rewrites_to_a_website_is_never_confirmed(
+    issuer, scope, local_id, owned_artifact, monkeypatch, websites_on
+):
+    """An artifact its owner never saved has no owner record. An agent
+    rewrites its entry to a website, with confirmed_by_owner and another
+    site's key. Autopublish sends the website without the confirmation, so
+    html_upload refuses it unless its own row already says website."""
+    _session, project, _conversation, folder = owned_artifact
+    run, uploads = _org_publisher(issuer, folder, scope, project, monkeypatch)
+    run({"mode": "public"})
+    _plant_entry(folder, mode="website", confirmed_by_owner=True, artifact_key=artifact_key(uuid4().hex))
+
+    assert await _autopublish_once(folder, scope, project) is True
+    assert uploads[-1]["access"] == {"mode": "website"}
+
+
+@pytest.mark.asyncio
+async def test_a_forged_confirmation_in_the_previous_entry_never_reaches_the_upload(
+    issuer, scope, local_id, owned_artifact, monkeypatch, websites_on
+):
+    """publish_artifact hands anton the entry, which the pod can write, as
+    previous_access. A forged confirmed_by_owner there never reaches the
+    request /upload gets: anton's real publisher builds the body."""
+    _session, project, _conversation, folder = owned_artifact
+    run, _uploads = _org_publisher(issuer, folder, scope, project, monkeypatch, view_url=SITE_URL)
+    run({"mode": "website"}, owner_save=True)
+    _plant_entry(folder, confirmed_by_owner=True)
+    sent = []
+
+    def request(url, api_key, **kwargs):
+        sent.append(json.loads(kwargs["payload"]))
+        return json.dumps({"view_url": SITE_URL, "report_id": "report-1"})
+
+    monkeypatch.setattr("anton.publisher.publish", _ANTON_PUBLISH)
+    fake_minds_requests(monkeypatch, request)
+
+    assert await _autopublish_once(folder, scope, project) is True
+    assert sent[-1]["access"] == {"mode": "website"}
+
+
+def test_a_republish_without_access_of_a_live_website_is_sent_without_the_confirmation(
+    issuer, scope, local_id, owned_artifact, monkeypatch, websites_on
+):
+    _session, project, _conversation, folder = owned_artifact
+    run, uploads = _org_publisher(issuer, folder, scope, project, monkeypatch, view_url=SITE_URL)
+    run({"mode": "website"}, owner_save=True)
+
+    publish_artifact(
+        folder, artifacts_base=folder.parent, api_key="key", publish_url="https://view.test",
+        scope=scope, project_id=str(project.id), access=None,
+    )
+
+    assert uploads[-1]["access"] == {"mode": "website"}
+
+
+def _upload_refuses_website(monkeypatch, code, attempts, *, as_job=False):
+    """anton's publisher reaches /upload, counted in ``attempts``, and the
+    upload service refuses the website with ``code``, in its answer or, with
+    ``as_job``, in the status of the asynchronous job."""
+
+    def refused(_source, **kwargs):
+        attempts.append(kwargs["access"])
+        if as_job:
+            from anton.publisher import PublishJobFailed
+
+            raise PublishJobFailed(400, "access/mode", job_id="a" * 32, report_id="r", code=code)
+        body = io.BytesIO(json.dumps({"error": "access/mode", "code": code}).encode())
+        raise urllib.error.HTTPError("https://view.test/upload", 400, "Bad Request", {}, body)
+
+    monkeypatch.setattr("anton.publisher.publish", refused)
+
+
+@pytest.fixture
+def fresh_website_refusals(monkeypatch):
+    from cowork.services import publish as publish_service
+
+    monkeypatch.setattr(publish_service, "_website_refusals", {})
+    return publish_service
+
+
+@pytest.mark.asyncio
+async def test_a_website_refused_as_ownerless_is_not_uploaded_again_by_autopublish_or_live_sync(
+    issuer, scope, local_id, owned_artifact, monkeypatch, websites_on, fresh_website_refusals,
+):
+    _session, project, _conversation, folder = owned_artifact
+    run, _uploads = _org_publisher(issuer, folder, scope, project, monkeypatch, view_url=SITE_URL)
+    run({"mode": "website"}, owner_save=True)
+    attempts = []
+    _upload_refuses_website(monkeypatch, "website_requires_owner", attempts)
+
+    assert await _autopublish_once(folder, scope, project) is False
+    assert await _autopublish_once(folder, scope, project) is False
+    assert await _live_sync(folder, scope, project, monkeypatch) is False
+
+    assert attempts == [{"mode": "website"}]
+
+
+@pytest.mark.asyncio
+async def test_an_ownerless_refusal_from_an_async_job_is_remembered_like_the_synchronous_one(
+    issuer, scope, local_id, owned_artifact, monkeypatch, websites_on, fresh_website_refusals,
+):
+    _session, project, _conversation, folder = owned_artifact
+    run, _uploads = _org_publisher(issuer, folder, scope, project, monkeypatch, view_url=SITE_URL)
+    run({"mode": "website"}, owner_save=True)
+    attempts = []
+    _upload_refuses_website(monkeypatch, "website_requires_owner", attempts, as_job=True)
+
+    assert await _autopublish_once(folder, scope, project) is False
+    assert await _autopublish_once(folder, scope, project) is False
+
+    assert attempts == [{"mode": "website"}]
+
+
+@pytest.mark.asyncio
+async def test_a_remembered_website_refusal_ends_after_its_ttl(
+    issuer, scope, local_id, owned_artifact, monkeypatch, websites_on, fresh_website_refusals,
+):
+    publish_service = fresh_website_refusals
+    _session, project, _conversation, folder = owned_artifact
+    run, _uploads = _org_publisher(issuer, folder, scope, project, monkeypatch, view_url=SITE_URL)
+    run({"mode": "website"}, owner_save=True)
+    attempts = []
+    _upload_refuses_website(monkeypatch, "website_requires_owner", attempts)
+    assert await _autopublish_once(folder, scope, project) is False
+
+    later = time.monotonic() + publish_service.WEBSITE_REFUSAL_TTL_S + 1
+    monkeypatch.setattr(publish_service, "_clock", lambda: later)
+    assert await _autopublish_once(folder, scope, project) is False
+
+    assert len(attempts) == 2
+
+
+def test_a_refusal_remembered_while_another_thread_reads_the_table_does_not_raise(
+    tmp_path, monkeypatch, fresh_website_refusals,
+):
+    import threading
+
+    publish_service = fresh_website_refusals
+    monkeypatch.setattr(publish_service, "_clock", lambda: 1000.0)
+    errors = []
+    other_threads = []
+
+    class InsertWhileIterating(dict):
+        """Lets another thread remember a refusal after the first item is read."""
+
+        def items(self):
+            def walk():
+                for number, pair in enumerate(super(InsertWhileIterating, self).items()):
+                    yield pair
+                    if number == 0 and not other_threads:
+                        thread = threading.Thread(target=other)
+                        other_threads.append(thread)
+                        thread.start()
+                        thread.join(timeout=0.5)
+
+            return walk()
+
+    def other():
+        try:
+            publish_service._remember_website_refusal(tmp_path / "other", {})
+        except Exception as exc:  # pragma: no cover - the failure being tested
+            errors.append(exc)
+
+    table = InsertWhileIterating()
+    table[str(tmp_path / "a")] = ((), 2000.0)
+    table[str(tmp_path / "b")] = ((), 2000.0)
+    monkeypatch.setattr(publish_service, "_website_refusals", table)
+
+    publish_service._remember_website_refusal(tmp_path / "c", {})
+    for thread in other_threads:
+        thread.join()
+
+    assert errors == []
+    assert {str(tmp_path / name) for name in ("a", "b", "c", "other")} <= set(dict.keys(table))
+
+
+def test_remembering_a_website_refusal_drops_expired_ones(tmp_path, monkeypatch, fresh_website_refusals):
+    publish_service = fresh_website_refusals
+    now = [1000.0]
+    monkeypatch.setattr(publish_service, "_clock", lambda: now[0])
+    publish_service._remember_website_refusal(tmp_path / "a", {})
+    now[0] += publish_service.WEBSITE_REFUSAL_TTL_S + 1
+    publish_service._remember_website_refusal(tmp_path / "b", {})
+    assert list(publish_service._website_refusals) == [str(tmp_path / "b")]
+
+
+@pytest.mark.asyncio
+async def test_other_website_refusals_are_retried(
+    issuer, scope, local_id, owned_artifact, monkeypatch, websites_on, fresh_website_refusals,
+):
+    _session, project, _conversation, folder = owned_artifact
+    run, _uploads = _org_publisher(issuer, folder, scope, project, monkeypatch, view_url=SITE_URL)
+    run({"mode": "website"}, owner_save=True)
+    attempts = []
+    _upload_refuses_website(monkeypatch, "website_not_enabled", attempts)
+
+    assert await _autopublish_once(folder, scope, project) is False
+    assert await _autopublish_once(folder, scope, project) is False
+
+    assert len(attempts) == 2
+    assert fresh_website_refusals._website_refusals == {}
+
+
+@pytest.mark.asyncio
+async def test_a_successful_publish_forgets_the_website_refusal(
+    issuer, scope, local_id, owned_artifact, monkeypatch, websites_on, fresh_website_refusals,
+):
+    """The owner's save never checks the memory, and its success deletes it:
+    the next autopublish uploads again."""
+    publish_service = fresh_website_refusals
+    _session, project, _conversation, folder = owned_artifact
+    run, uploads = _org_publisher(issuer, folder, scope, project, monkeypatch, view_url=SITE_URL)
+    run({"mode": "website"}, owner_save=True)
+    _upload_refuses_website(monkeypatch, "website_requires_owner", [])
+    assert await _autopublish_once(folder, scope, project) is False
+    assert str(folder) in publish_service._website_refusals
+
+    run, uploads = _org_publisher(issuer, folder, scope, project, monkeypatch, view_url=SITE_URL)
+    run({"mode": "website"}, owner_save=True)
+    assert publish_service._website_refusals == {}
+    assert await _autopublish_once(folder, scope, project) is True
+    assert uploads[-1]["access"] == {"mode": "website"}
+
+
+@pytest.mark.asyncio
+async def test_a_live_sync_refused_as_a_website_logs_no_traceback(
+    issuer, scope, local_id, owned_artifact, monkeypatch, websites_on, fresh_website_refusals, caplog
+):
+    _session, project, _conversation, folder = owned_artifact
+    run, _uploads = _org_publisher(issuer, folder, scope, project, monkeypatch, view_url=SITE_URL)
+    run({"mode": "website"}, owner_save=True)
+    _upload_refuses_website(monkeypatch, "website_requires_owner", [])
+
+    with caplog.at_level(logging.WARNING):
+        assert await _live_sync(folder, scope, project, monkeypatch) is False
+    assert not [
+        r for r in caplog.records if r.name == "cowork.api.v1.endpoints.artifact_workspace" and r.exc_info
+    ]

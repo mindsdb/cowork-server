@@ -27,6 +27,7 @@ from fastapi import FastAPI, HTTPException
 # publish_calls holds the fake, for every later test in the run.
 import cowork.services.artifact_autopublish  # noqa: F401
 from cowork.api.v1.endpoints import artifact_workspace as aw
+from cowork.common.settings.app_settings import get_app_settings
 from cowork.db.scoped import TenantScope, get_tenant_scope
 from cowork.schemas.artifact_access import ArtifactAccessRequest
 from cowork.principal import ORG_MANAGE_ROLE, Principal
@@ -253,7 +254,7 @@ async def test_a_malformed_save_is_a_400_with_a_sentence_never_a_422(as_owner, p
     access object, as the dialog sends them."""
     refusals = [
         ({"access": {"mode": "restricted", "allowed_user_ids": "nope"}}, "allowed_user_ids must be a list."),
-        ({"access": {"mode": "everyone"}}, "mode: Input should be 'restricted', 'password' or 'public'."),
+        ({"access": {"mode": "everyone"}}, "mode: Input should be 'restricted', 'password', 'public' or 'website'."),
         ({"access": {"mode": "restricted", "org_allowed": "maybe"}}, "org_allowed must be true or false."),
         ({"access": {"mode": "restricted", "notify": "everyone"}}, "notify must be an object."),
         ({"access": {"mode": "restricted", "notify": {"emails": "a@example.com"}}}, "notify.emails must be a list."),
@@ -264,6 +265,14 @@ async def test_a_malformed_save_is_a_400_with_a_sentence_never_a_422(as_owner, p
     for body, detail in refusals:
         answer = await _put_access(body)
         assert (answer.status_code, answer.json()) == (400, {"detail": detail}), body
+    assert publish_calls == []
+
+
+async def test_a_website_save_with_another_access_field_is_a_400(as_owner, publish_calls, publish_context):
+    from cowork.schemas.artifact_access import WEBSITE_FIELDS_REFUSAL
+
+    answer = await _put_access({"access": {"mode": "website", "password": "pw"}})
+    assert (answer.status_code, answer.json()) == (400, {"detail": WEBSITE_FIELDS_REFUSAL})
     assert publish_calls == []
 
 
@@ -1362,3 +1371,65 @@ async def test_on_the_desktop_the_audience_is_the_owners_less_the_password(
     assert (out["accessMode"], out["accessEmails"], out["names"]) == ("restricted", ["a@example.com"], True)
     assert "accessPassword" not in out
     assert stored_rule.reads == [] and stored_rule.held_reads == []
+
+
+async def test_a_website_refusal_is_a_409_with_its_code(as_owner, publish_context, monkeypatch):
+    """However the publish ends in a website refusal, the Share dialog gets
+    its sentence and code, never the 502 of a failed publish."""
+    from cowork.services.publish import WEBSITE_REFUSALS, WEBSITE_REQUIRES_OWNER_CODE, WebsiteRefused
+
+    def refused(*args, **kwargs):
+        raise WebsiteRefused(WEBSITE_REQUIRES_OWNER_CODE)
+
+    monkeypatch.setattr("cowork.services.publish.publish_artifact", refused)
+    answer = await aw.set_artifact_access(
+        "proj", ARTIFACT_ID, aw._AccessBody(access={"mode": "public"}), ORG_SCOPE, _REQUEST,
+        principal=_REQUEST.state.principal,
+    )
+    assert _answer(answer) == (409, {"detail": WEBSITE_REFUSALS[WEBSITE_REQUIRES_OWNER_CODE], "code": WEBSITE_REQUIRES_OWNER_CODE})
+    assert _lock_is_free(as_owner)
+
+
+async def test_a_website_save_while_websites_are_off_is_a_409_and_publishes_nothing(
+    as_owner, publish_context, monkeypatch, websites_setting,
+):
+    from unittest import mock
+
+    from cowork.services.publish import WEBSITE_NOT_ENABLED_CODE, WEBSITE_REFUSALS
+
+    websites_setting("off")
+    upload = mock.Mock()
+    monkeypatch.setattr("anton.publisher.publish", upload)
+
+    refused = await aw.set_artifact_access(
+        "proj", ARTIFACT_ID, aw._AccessBody(access={"mode": "website"}), ORG_SCOPE, _REQUEST,
+        principal=_REQUEST.state.principal,
+    )
+
+    assert _answer(refused) == (409, {"detail": WEBSITE_REFUSALS[WEBSITE_NOT_ENABLED_CODE], "code": WEBSITE_NOT_ENABLED_CODE})
+    upload.assert_not_called()
+    assert not (as_owner / ".published.json").exists()
+    assert _lock_is_free(as_owner)
+
+
+async def test_the_upload_services_website_refusal_of_a_save_is_a_409_with_its_code(
+    as_owner, publish_context, monkeypatch, websites_setting,
+):
+    from cowork.services.publish import WEBSITE_REFUSALS, WEBSITE_REQUIRES_PUBLISH_KEY_CODE
+
+    websites_setting("on")
+    _upload_service_answers(
+        monkeypatch, 400, "Bad Request",
+        json.dumps({"error": "access/mode", "code": WEBSITE_REQUIRES_PUBLISH_KEY_CODE}).encode(),
+    )
+
+    refused = await aw.set_artifact_access(
+        "proj", ARTIFACT_ID, aw._AccessBody(access={"mode": "website"}), ORG_SCOPE, _REQUEST,
+        principal=_REQUEST.state.principal,
+    )
+
+    assert _answer(refused) == (
+        409, {"detail": WEBSITE_REFUSALS[WEBSITE_REQUIRES_PUBLISH_KEY_CODE], "code": WEBSITE_REQUIRES_PUBLISH_KEY_CODE},
+    )
+    assert not (as_owner / ".published.json").exists()
+    assert _lock_is_free(as_owner)

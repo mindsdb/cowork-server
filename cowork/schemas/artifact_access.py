@@ -37,6 +37,14 @@ NOTIFY_FIELD = "notify"
 _ALLOWED_EMAILS_REFUSAL = (
     f"{PUBLISHER_EMAILS_FIELD} is not an access field; send {AudienceField.ALLOWED_EMAILS}."
 )
+# A website is open to everyone at its own address, so a save of one carries
+# its mode alone.
+_WEBSITE_EXCLUDED_FIELDS = (
+    "password", "allowed_emails", "org_allowed", "allowed_team_ids", "allowed_user_ids", "owner_only", NOTIFY_FIELD,
+)
+WEBSITE_FIELDS_REFUSAL = (
+    "A public website is open to everyone: send its mode alone, with no password, people, teams or notify."
+)
 
 
 class ShareNotifyRequest(CamelRequest):
@@ -64,7 +72,9 @@ class ArtifactAccessRequest(CamelRequest):
     leaves out (None) keeps what the artifact's rule holds. ``owner_only``
     keeps a rule that names nobody restricted to its owner. ``notify`` names
     the people a Share dialog save added and chose to tell; it is never
-    stored, and the publish takes it on its own.
+    stored, and the publish takes it on its own. A website (MindsHub mode only)
+    carries ``mode`` alone; ``confirmed_by_owner`` is not a field here, so a
+    client or an entry that carries it changes nothing.
 
     Any other field is ignored, except a top-level ``emails`` (anton's name
     for the outside addresses), which an app tab from an older build still
@@ -88,6 +98,14 @@ class ArtifactAccessRequest(CamelRequest):
         if isinstance(data, dict) and PUBLISHER_EMAILS_FIELD in data:
             raise ValueError(_ALLOWED_EMAILS_REFUSAL)
         return data
+
+    @model_validator(mode="after")
+    def _website_takes_its_mode_alone(self) -> ArtifactAccessRequest:
+        if self.mode is AccessMode.WEBSITE and any(
+            getattr(self, name) is not None for name in _WEBSITE_EXCLUDED_FIELDS
+        ):
+            raise ValueError(WEBSITE_FIELDS_REFUSAL)
+        return self
 
     @property
     def restricted(self) -> bool:

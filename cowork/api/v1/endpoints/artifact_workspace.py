@@ -577,6 +577,7 @@ async def _sync_live_artifact(
         PublishOwnedByOtherUser,
         PublishTooLarge,
         ShareOrgRequired,
+        WebsiteRefused,
         desktop_publish_credential,
         publish_artifact,
         published_artifact_access,
@@ -670,11 +671,13 @@ async def _sync_live_artifact(
         # connections in the publish dialog, so no traceback.
         logger.warning("Could not synchronize live artifact %s: new connections need approval", folder)
         return False
-    except (AccessModeChanged, ShareOrgRequired):
+    except (AccessModeChanged, ShareOrgRequired, WebsiteRefused):
         # publish_artifact logged the refusal: a mode changed after the
         # owner's last save, or MindsHub refusing a share with everyone that
         # an entry from before the rule changed still asks for. It repeats on
-        # every save until the owner saves the artifact's sharing again.
+        # every save until the owner saves the artifact's sharing again. A
+        # website refusal was logged with its code; a refusal as not the
+        # owner's is remembered for a while (cowork.services.publish._website_refusals).
         return False
     except Exception:
         logger.warning("Could not synchronize live artifact %s", folder, exc_info=True)
@@ -1611,7 +1614,7 @@ async def _publish_live(
     the access and stored rule come from *plan*, run under the lock. Shared by
     the Share dialog's save and Publish changes (ENG-4595), with the same
     refusals mapped to the same statuses."""
-    from cowork.services.publish import PublishRejected, PublisherUnavailable, ShareOrgRequired
+    from cowork.services.publish import PublishRejected, PublisherUnavailable, ShareOrgRequired, WebsiteRefused
     from cowork.services.publish import publish_artifact as _publish_bundle
     from cowork.services.artifact_access import ArtifactAccessRefused, ArtifactAccessUnavailable
     from cowork.services.artifact_locks import refresh
@@ -1680,9 +1683,9 @@ async def _publish_live(
     # PublisherUnavailable and PublishRejected are RuntimeErrors, so they come first.
     except PublisherUnavailable as exc:
         raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(exc)) from exc
-    except ShareOrgRequired as exc:
-        # This server's check or MindsHub refused the share with everyone, so
-        # nothing was published: a 403 the app can tell apart by its code.
+    except (ShareOrgRequired, WebsiteRefused) as exc:
+        # Refused before anything was published: the status and the code the
+        # app tells apart (403 share_org_required, 409 for a website).
         return JSONResponse(exc.refusal().model_dump(), status_code=exc.status_code)
     except PublishRejected as exc:
         raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=str(exc)) from exc
@@ -1778,13 +1781,15 @@ class CommentsAccessResponse(CamelResponse):
     current_revision: dict[str, Any] | None
 
 
-async def _call_stats_service(scope: TenantScope, folder: Path, call: Callable[..., Any]) -> Any:
+async def _call_stats_service(
+    scope: TenantScope, folder: Path, call: Callable[..., Any], *, allow_website: bool = False
+) -> Any:
     """Run one stats request with a publish key minted for it, then revoke the key."""
     from cowork.services import artifact_stats as stats
 
     key = None
     try:
-        report_id = await run_efs(partial(stats.report_id_for_folder, folder), scope=scope)
+        report_id = await run_efs(partial(stats.report_id_for_folder, folder, allow_website=allow_website), scope=scope)
         _artifacts_base, publish_url, key = await run_on_unit_threads(
             partial(_owner_publish_context, scope, folder)
         )
@@ -1923,7 +1928,7 @@ async def delete_artifact_stats(
     _source, folder, _metadata, _capabilities = await _owner_workspace(
         scope, project_ref, artifact_id
     )
-    await _call_stats_service(scope, folder, stats.delete_stats)
+    await _call_stats_service(scope, folder, stats.delete_stats, allow_website=True)
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 

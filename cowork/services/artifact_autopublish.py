@@ -40,6 +40,7 @@ from cowork.services.publish import (
     PublishOwnedByOtherUser,
     PublishRejected,
     PublishTooLarge,
+    WebsiteRefused,
     kept_access,
     publish_artifact,
 )
@@ -108,6 +109,9 @@ REASON_UNCHANGED = "unchanged"
 # Another conversion held the server's one slot, so whether a Markdown page
 # changed is unknown: the project's self-heal asks again later.
 REASON_CONVERSION_BUSY = "conversion_busy"
+# A website re-publish skipped because the upload service refused it as not
+# the owner's a short while ago (cowork.services.publish._website_refusals).
+REASON_WEBSITE_REFUSED = "website_refused"
 
 
 @dataclass(frozen=True)
@@ -522,6 +526,12 @@ async def _publish_one(
         await _release(artifacts_base, slug, scope=scope)
         _record("deferred", slug=slug, reason=REASON_CONVERSION_BUSY)
         _ask_again_later(artifacts_base=Path(artifacts_base), scope=scope, project_id=project_id)
+        return False
+    except WebsiteRefused as exc:
+        # publish_artifact logged it with its code. Only a refusal as not the
+        # owner's is remembered there; any other is tried again next pass.
+        await _release(artifacts_base, slug, scope=scope)
+        _record("skipped", slug=slug, reason=REASON_WEBSITE_REFUSED if exc.remembered else exc.code)
         return False
     except Exception as exc:
         # A synchronous failure (a 502 a second in, ValueError from the target
