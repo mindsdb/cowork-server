@@ -241,11 +241,11 @@ def dir_replace(d: PinnedDir, source_name: str, destination_name: str) -> None:
         os.replace(d.path / source_name, d.path / destination_name)
 
 
-def dir_mkdir(d: PinnedDir, name: str) -> None:
+def dir_mkdir(d: PinnedDir, name: str, *, mode: int = 0o777) -> None:
     if d.fd is not None:
-        os.mkdir(name, dir_fd=d.fd)
+        os.mkdir(name, mode, dir_fd=d.fd)
     else:
-        os.mkdir(d.path / name)
+        os.mkdir(d.path / name, mode)
 
 
 def dir_rmdir(d: PinnedDir, name: str) -> None:

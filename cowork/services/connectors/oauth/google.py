@@ -397,6 +397,10 @@ class OAuthService:
     def clear_outcome(self, state: str, settings: OAuthSettings) -> None:
         self._store(settings).clear_outcome(state)
 
+    def poll_status(self, state: str, settings: OAuthSettings) -> dict:
+        outcome = self._store(settings).get_outcome(state, consume_terminal=True)
+        return outcome if outcome is not None else {"status": "expired"}
+
     def _store(self, settings: OAuthSettings) -> OAuthStateStore:
         return OAuthStateStore(settings.state_path)
 
@@ -436,17 +440,19 @@ class OAuthService:
         redirect_uri = self._redirect_uri(service, settings)
         started_at = datetime.now(timezone.utc).isoformat()
 
-        self._store(settings).set_pending(
-            service,
-            state=state,
-            verifier=verifier,
-            redirect_uri=redirect_uri,
-            started_at=started_at,
-            client_id=cid,
-            client_secret=csecret,
-            extra_fields=extra_fields,
-        )
-        self._store(settings).set_outcome(state, {"status": "pending"})
+        try:
+            self._store(settings).set_pending(
+                service,
+                state=state,
+                verifier=verifier,
+                redirect_uri=redirect_uri,
+                started_at=started_at,
+                client_id=cid,
+                client_secret=csecret,
+                extra_fields=extra_fields,
+            )
+        except (OSError, ValueError) as exc:
+            raise HTTPException(status_code=500, detail="Could not save the connector sign-in state.") from exc
 
         query_params = {
             "client_id": client_id,
@@ -731,7 +737,13 @@ class OAuthService:
             all_connections = []
             vault = None
 
-        state_data = self._store(oauth_settings)._load()
+        try:
+            state_data = self._store(oauth_settings).read_all()
+        except OSError as exc:
+            # The catalogue only shows the state, so a failed read costs the
+            # pending and last-error fields, not the page.
+            _log.warning("Could not read OAuth state for catalogue: %s", exc)
+            state_data = {}
         items = []
 
         for service_id, cfg in OAUTH_SERVICES.items():

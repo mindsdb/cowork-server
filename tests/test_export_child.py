@@ -25,6 +25,7 @@ import subprocess
 import sys
 import threading
 import time
+from collections.abc import Callable
 from pathlib import Path
 from uuid import uuid4
 
@@ -385,36 +386,52 @@ def hostile_desktop_artifact(local_mode, short_wall):
     artifact_identity._clear_identity_indexes()
 
 
+async def _probe_live(client: httpx.AsyncClient, *, until: Callable[[], bool]) -> list[float]:
+    """Probe liveness every 0.1 s until *until* answers true, and return each probe's wait.
+
+    A probe is due 0.1 s after the one before it was due, or when that one
+    answered if it answered later, and its wait runs from then to its answer.
+    A loop that wakes late counts against the probe, and one stall counts
+    once, not again against each probe that catches up after it.
+    """
+    loop = asyncio.get_running_loop()
+    waits: list[float] = []
+    due = loop.time()
+    while not until():
+        await asyncio.sleep(max(0.0, due - loop.time()))
+        response = await client.get(LIVE)
+        answered = loop.time()
+        assert response.status_code == 200
+        waits.append(answered - due)
+        due = max(due + 0.1, answered)
+    return waits
+
+
 async def test_liveness_answers_at_once_while_a_hostile_export_converts(
     hostile_desktop_artifact, granted_product_permissions
 ):
     folder, metadata = hostile_desktop_artifact
     loop = asyncio.get_running_loop()
     ticks = [0]
-    latencies: list[float] = []
     transport = httpx.ASGITransport(app=create_app(), raise_app_exceptions=False)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
         assert (await client.get(LIVE)).status_code == 200
         beat = asyncio.create_task(_heartbeat(ticks))
-        # The loop's own tick rate on this machine, with nothing else running.
-        await asyncio.sleep(1.0)
-        free_rate = ticks[0] / 1.0
-        ticks[0] = 0
-        started = loop.time()
-        export = asyncio.create_task(
-            client.post(
-                f"/api/v1/artifacts/workspace/local/{metadata.id}/export", json={"format": "docx"}
-            )
-        )
         try:
-            # Each probe is due every 0.1 s and timed from when it was due, so
-            # a loop that wakes late counts against it, not only a slow answer.
-            while not export.done():
-                due = started + 0.1 * len(latencies)
-                await asyncio.sleep(max(0.0, due - loop.time()))
-                response = await client.get(LIVE)
-                latencies.append(loop.time() - due)
-                assert response.status_code == 200
+            # The same probes and ticks for a second with nothing exporting:
+            # what this machine answers under the load it has now.
+            quiet_from = loop.time()
+            calm = await _probe_live(client, until=lambda: loop.time() - quiet_from >= 1.0)
+            free_rate = ticks[0] / (loop.time() - quiet_from)
+            ticks[0] = 0
+            started = loop.time()
+            export = asyncio.create_task(
+                client.post(
+                    f"/api/v1/artifacts/workspace/local/{metadata.id}/export",
+                    json={"format": "docx"},
+                )
+            )
+            latencies = await _probe_live(client, until=export.done)
             answered = await export
         finally:
             beat.cancel()
@@ -422,13 +439,17 @@ async def test_liveness_answers_at_once_while_a_hostile_export_converts(
                 await beat
         elapsed = loop.time() - started
 
-    # A shared CI runner can stall one probe on its own, so the check is the
-    # 95th percentile against the ticket's 100 ms, and every probe far under
-    # the seconds the in-process conversion held the loop.
-    assert statistics.quantiles(latencies, n=20)[-1] < 0.1, sorted(latencies)[-5:]
-    assert max(latencies) < 0.5, f"liveness took {max(latencies):.3f}s"
+    # Both bounds sit on top of what the same probes took with nothing
+    # exporting, so a slow runner doesn't count against the export. The 95th
+    # percentile keeps the ticket's 100 ms. The slowest probe stays under
+    # 1.5 s: a shared CI runner stalled this process once for 0.76 s on its
+    # own, and the in-process conversion held the loop for 4.9 s.
+    slowest = f"slowest {sorted(latencies)[-5:]}, calm {sorted(calm)[-3:]}"
+    calm_p95 = statistics.quantiles(calm, n=20)[-1]
+    assert statistics.quantiles(latencies, n=20)[-1] < 0.1 + calm_p95, slowest
+    assert max(latencies) < 1.5 + max(calm), slowest
     # A conversion holding the server's GIL starves the loop of its ticks.
-    assert ticks[0] >= 0.5 * free_rate * elapsed, f"{ticks[0]} ticks in {elapsed:.1f}s at {free_rate}/s"
+    assert ticks[0] >= 0.5 * free_rate * elapsed, f"{ticks[0]} ticks in {elapsed:.1f}s at {free_rate:.0f}/s"
     assert answered.status_code == 413, answered.text
     assert answered.json()["detail"] == "This file can't be exported."
     assert elapsed >= WALL_SECONDS - 1, "the export ended before the conversion was killed"

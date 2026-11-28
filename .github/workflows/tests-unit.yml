@@ -241,6 +241,9 @@ jobs:
           tests/test_artifact_export_service.py
           tests/test_export_child.py
           tests/test_publish_markdown.py
+          tests/test_projects_tenancy.py::test_desktop_first_write_protects_adopted_project_data
+          tests/test_oauth_state_private.py::test_invalid_destination_raises_before_publishing
+          tests/test_oauth_state_private.py::test_local_oauth_disk_work_uses_workers_and_terminal_status_is_consumed_once
           -p scripts.pytest_inventory --test-cohort=desktop-export
           --test-inventory="$TEST_REPORT_DIR/inventory.json"
           --junitxml="$TEST_REPORT_DIR/junit.xml"

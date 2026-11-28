@@ -15,6 +15,7 @@ from uuid import UUID
 from cowork.common.paths import (
     PinnedDir,
     O_NOFOLLOW,
+    dir_atomic_write,
     dir_lstat,
     dir_open,
     dir_scandir,
@@ -22,6 +23,7 @@ from cowork.common.paths import (
     opened_subdir_nofollow,
     pinned_dir,
 )
+from cowork.common.private_project import private_project_folder
 from cowork.common.settings.app_settings import get_app_settings
 from cowork.db.personal_resources import PersonalResource
 from cowork.db.scoped import LOCAL_SCOPE, TenantScope, scoped_user_storage_root
@@ -82,6 +84,7 @@ class MemoryStore:
         *,
         nofollow_base: Path | None = None,
         nofollow_tail: tuple[str, ...] = (),
+        private_project: bool = False,
     ) -> None:
         self._root = root
         # When set, slot I/O opens the store directory by walking
@@ -92,6 +95,7 @@ class MemoryStore:
         # COWORK_HOME, which the pod mounts read-only).
         self._nofollow_base = nofollow_base
         self._nofollow_tail = nofollow_tail
+        self._private_project = private_project
 
     @property
     def root(self) -> Path:
@@ -125,6 +129,11 @@ class MemoryStore:
         `.anton`/`memory` chain can redirect the caller; slot files are then
         opened O_NOFOLLOW relative to it."""
         if self._nofollow_base is not None:
+            if self._private_project and create:
+                with pinned_dir(self._nofollow_base, nofollow_base=True) as project:
+                    with private_project_folder(project, memory=True) as d:
+                        yield d
+                return
             with opened_subdir_nofollow(
                 self._nofollow_base, *self._nofollow_tail, create=create
             ) as d:
@@ -216,7 +225,23 @@ class MemoryStore:
 
     def write(self, slot_id: MemorySlot | str, content: str) -> None:
         name = self._filename(slot_id)
+        content = content.rstrip() + "\n"
+        self._write_bytes(name, content.replace("\n", os.linesep).encode("utf-8"))
+
+    def _write_bytes(self, name: str, payload: bytes) -> None:
         with self._root_fd(create=True) as root:
+            if self._private_project:
+                # Replace the entry so even an existing hard link can't direct
+                # private memory into a file outside this project.
+                try:
+                    existing = dir_lstat(root, name)
+                except FileNotFoundError:
+                    pass
+                else:
+                    if not stat.S_ISREG(existing.st_mode) or getattr(existing, "st_reparse_tag", 0) & 0x20000000:
+                        raise PermissionError("Expected a regular project memory file")
+                dir_atomic_write(root, name, content=payload)
+                return
             # O_NOFOLLOW refuses a symlink squatting the slot name (writing
             # through it would land in another org); a real slot file opens
             # normally and is truncated.
@@ -226,8 +251,8 @@ class MemoryStore:
                 os.O_WRONLY | os.O_CREAT | os.O_TRUNC | O_NOFOLLOW,
                 0o600,
             )
-            with open(sfd, "w", encoding="utf-8") as f:
-                f.write(content.rstrip() + "\n")
+            with open(sfd, "wb") as f:
+                f.write(payload)
 
     def restore_exact(
         self,
@@ -248,15 +273,7 @@ class MemoryStore:
             return
         name = self._filename(slot_id)
         payload = content.encode("utf-8") if isinstance(content, str) else content
-        with self._root_fd(create=True) as root:
-            sfd = dir_open(
-                root,
-                name,
-                os.O_WRONLY | os.O_CREAT | os.O_TRUNC | O_NOFOLLOW,
-                0o600,
-            )
-            with open(sfd, "wb") as f:
-                f.write(payload)
+        self._write_bytes(name, payload)
 
     def delete(self, slot_id: MemorySlot | str) -> None:
         name = self._filename(slot_id)
@@ -303,6 +320,7 @@ class ProjectMemoryStore(MemoryStore):
             Path(project_path) / ".anton" / "memory",
             nofollow_base=Path(project_path),
             nofollow_tail=(".anton", "memory"),
+            private_project=get_app_settings().protect_desktop_project_dirs,
         )
 
     def _validate_slot(self, slot_id: MemorySlot) -> None:
